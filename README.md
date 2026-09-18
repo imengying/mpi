@@ -92,6 +92,35 @@ mpi --resume     # 继续最近一次会话（等价于 /resume）
 mpi --check      # 只检查配置与环境，不进交互
 ```
 
+## 发布
+
+推一个 `v*.*.*` 标签就会自动编译并发布 GitHub Release，**tag 就是版本号**：
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+产物为 `mpi-<版本>-<target>.tar.gz`（内含二进制、README、LICENSE）与对应的 `.sha256`。
+targets：
+
+| target | runner |
+|---|---|
+| `x86_64-unknown-linux-gnu` | ubuntu-24.04（glibc） |
+| `aarch64-unknown-linux-gnu` | ubuntu-24.04-arm（glibc） |
+| `x86_64-apple-darwin` | macos-15-intel |
+| `aarch64-apple-darwin` | macos-15 |
+
+Linux 二进制依赖 runner 自带的 glibc（当前 2.39），构建摘要里会列出它实际引用到的
+最高 `GLIBC_x.y` 符号版本，方便确认需要多新的系统。
+
+`--version` 取的是 tag：工作流把 tag 以 `MPI_BUILD_VERSION` 传入构建（`build.rs` 把它
+声明为 rerun 触发条件，避免缓存留下旧值），并在打包前校验 `mpi --version` 与 tag 一致，
+不一致直接报错退出。本地构建没有这个变量，回退到 `Cargo.toml` 里的版本。
+
+构建用 `--locked`，即按 `Cargo.lock` 里锁定的版本编译；依赖更新走
+`cargo update` 后提交 lock 文件。
+
 ## 命令
 
 | 命令 | 作用 |

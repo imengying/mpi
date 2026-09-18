@@ -54,6 +54,15 @@ pub fn environment_block(cwd: &Path, session_id: &str, shell: &str) -> String {
     )
 }
 
+/// The per-session environment block, which is stored as the first user message.
+///
+/// Several places need to tell it apart from something the user actually typed: resuming
+/// must not echo it back as if it were user input, and the `/resume` list must not quote it
+/// as the session's headline.
+pub fn is_environment_block(message: &Message) -> bool {
+    message.text().trim_start().starts_with("<environment>")
+}
+
 /// What the user typed.
 pub enum Input {
     Line(String),
@@ -125,7 +134,7 @@ impl Agent {
 
     /// Resume an existing session file.
     pub fn resume(config: Config, cwd: PathBuf, path: &Path, interactive: bool) -> anyhow::Result<Self> {
-        let session = Session::open(path)?;
+        let mut session = Session::open(path)?;
         let model_spec = session
             .header()
             .model
@@ -155,10 +164,45 @@ impl Agent {
         let messages = session.context_messages();
         let tail = messages.len().saturating_sub(6);
         for message in &messages[tail..] {
+            if is_environment_block(message) {
+                continue;
+            }
             if matches!(message, Message::User { .. }) {
                 screen.push_lines(ui_compact::user_lines(&message.text()));
             }
         }
+        // The working directory travels with the session: the newest environment block names
+        // it, so running the tools somewhere else would make the transcript lie about where
+        // it is. The header records where the session *started*, which is not the same thing
+        // once it has been resumed elsewhere.
+        let recorded = session.current_cwd().unwrap_or_else(|| PathBuf::from(&session.header().cwd));
+        if recorded == cwd {
+            // Same directory as before: nothing to say and nothing to write.
+        } else {
+            let missing = !recorded.is_dir();
+            screen.push_lines(ui_compact::note_lines(
+                &if missing {
+                    format!(
+                        "会话原目录 {} 已不存在，本次在 {} 继续；已写入新的环境信息。",
+                        recorded.display(),
+                        cwd.display()
+                    )
+                } else {
+                    format!(
+                        "会话原目录 {}，本次在 {} 继续；已写入新的环境信息。",
+                        recorded.display(),
+                        cwd.display()
+                    )
+                },
+                crate::ui::screen::Style::new(Color::Dim),
+            ));
+            // Append a fresh block instead of rewriting the old one: the file is append-only,
+            // and the newest block is the one the model should trust.
+            let block = environment_block(&cwd, &session.header().id, &config.shell.path);
+            session.push_message(Message::user_text(block), None, None)?;
+            session.relocate(&cwd)?;
+        }
+        screen.flush();
         Ok(Agent {
             config,
             client,

@@ -289,6 +289,53 @@ impl Session {
             .rposition(|record| matches!(record, Record::Compacted { .. }))
     }
 
+    /// The working directory named by the newest environment block in the context.
+    ///
+    /// `header.cwd` is what the session *started* with and never changes; after a resume in
+    /// a different directory it is the environment block, not the header, that says where
+    /// the work is happening now.
+    pub fn current_cwd(&self) -> Option<PathBuf> {
+        self.context_messages().iter().rev().find_map(|message| {
+            crate::agent::r#loop::is_environment_block(message)
+                .then(|| {
+                    message
+                        .text()
+                        .lines()
+                        .find_map(|line| line.strip_prefix("工作目录: ").map(PathBuf::from))
+                })
+                .flatten()
+        })
+    }
+
+    /// Point the session header at `cwd`. The header line itself is never rewritten: the
+    /// update is appended as a `session_info` record, like the session name.
+    pub fn relocate(&mut self, cwd: &Path) -> Result<(), SessionError> {
+        if self.header.cwd == cwd.to_string_lossy() {
+            return Ok(());
+        }
+        let id = self.next_id();
+        let record = Record::SessionInfo {
+            parent_id: self.last_id.clone(),
+            id: id.clone(),
+            name: self.name(),
+            timestamp: now(),
+        };
+        let _ = record;
+        // `SessionInfo` carries only the name, so the directory update rides on the
+        // turn-context record, which is exactly what that record type exists for.
+        let record = Record::TurnContext {
+            parent_id: self.last_id.clone(),
+            id: id.clone(),
+            cwd: cwd.to_string_lossy().to_string(),
+            model: self.header.model.clone(),
+            level: String::new(),
+            timestamp: now(),
+        };
+        self.append(record, id)?;
+        self.header.cwd = cwd.to_string_lossy().to_string();
+        Ok(())
+    }
+
     /// The last `session_info` record wins; the header is never rewritten. An explicit
     /// `null` name clears it, which is why the record type keeps `Option`.
     pub fn name(&self) -> Option<String> {
@@ -581,16 +628,25 @@ pub fn list_in(dir: &Path) -> Vec<SessionSummary> {
         let Ok(meta) = entry.metadata() else { continue };
         let modified = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
         let Ok(session) = Session::open(&path) else { continue };
+        // The environment block is the first *user* message in the conversation, but it is
+        // bookkeeping rather than something the user said, so it counts for neither the
+        // message total nor the snippet.
+        let is_environment = |record: &Record| -> bool {
+            match record.message() {
+                Some(message) => message.text().trim_start().starts_with("<environment>"),
+                None => false,
+            }
+        };
         let messages = session
             .records()
             .iter()
-            .filter(|record| record.message().is_some())
+            .filter(|record| record.message().is_some() && !is_environment(record))
             .count();
         let snippet = session
             .records()
             .iter()
             .find_map(|record| match record.message() {
-                Some(Message::User { .. }) => Some(record.message().unwrap().text()),
+                Some(message) if !is_environment(record) => Some(message.text()),
                 _ => None,
             })
             .unwrap_or_default();
@@ -773,6 +829,88 @@ mod tests {
         assert_eq!(&stamp[10..11], "T");
         // 1 700 000 000 = 2023-11-14T22:13:20Z
         assert_eq!(civil_from_unix(1_700_000_000), (2023, 11, 14, 22, 13, 20));
+    }
+
+    #[test]
+    fn the_resume_list_skips_the_environment_block() {
+        // The environment block is a user message in the file, so treating every user
+        // message as the headline would show `<environment> 工作目录: …` instead of what the
+        // session was actually about.
+        let (mut session, dir) = temp_session("resume-snippet");
+        session
+            .push_message(Message::user_text("帮我重构 config.rs"), None, None)
+            .unwrap();
+        session
+            .push_message(Message::assistant_text("好，我先读一下"), None, None)
+            .unwrap();
+        // Session::create writes only the header; the environment block belongs to
+        // `Agent::new`, so these two pushes are the whole conversation.
+        assert_eq!(session.context_messages().len(), 2);
+
+        let summaries = list_in(&dir);
+        assert_eq!(summaries.len(), 1);
+        let summary = &summaries[0];
+        assert_eq!(summary.messages, 2, "the environment block must not be counted");
+        assert_eq!(summary.snippet, "帮我重构 config.rs", "{}", summary.snippet);
+        assert!(!summary.snippet.contains("<environment>"));
+        assert_eq!(summary.label(40), "帮我重构 config.rs");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_session_with_only_the_environment_block_has_an_empty_snippet() {
+        let (session, dir) = temp_session("resume-empty");
+        // A freshly created session has no conversation at all, so there is nothing to
+        // list and nothing to quote.
+        assert_eq!(session.context_messages().len(), 0);
+        let summaries = list_in(&dir);
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].messages, 0, "only the environment block is present");
+        assert_eq!(summaries[0].snippet, "");
+        // The fallback label says so rather than showing an empty row.
+        assert_eq!(summaries[0].label(40), "(空白会话)");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn resuming_elsewhere_moves_the_recorded_directory() {
+        // The header records where the session *started*; the newest environment block says
+        // where it is happening now. Resuming in another directory must append a block and
+        // update the header, so a second resume does not think it moved again.
+        let (mut session, dir) = temp_session("relocate");
+        let elsewhere = std::env::temp_dir().join("mpi-relocate-target");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+
+        assert!(session.current_cwd().is_none(), "no block yet");
+        session.relocate(&elsewhere).unwrap();
+        assert_eq!(session.header().cwd, elsewhere.to_string_lossy());
+        // Only the header moved; there is still no conversation, so no environment block.
+        assert!(session.current_cwd().is_none());
+
+        let block = crate::agent::r#loop::environment_block(&elsewhere, "sid", "/usr/bin/zsh");
+        session.push_message(Message::user_text(block), None, None).unwrap();
+        assert_eq!(session.current_cwd().as_deref(), Some(elsewhere.as_path()));
+
+        // Relocating to the same place is a no-op.
+        let before = session.records().len();
+        session.relocate(&elsewhere).unwrap();
+        assert_eq!(session.records().len(), before);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn current_cwd_takes_the_newest_block() {
+        let (mut session, dir) = temp_session("cwd-blocks");
+        for cwd in ["/tmp/one", "/tmp/two", "/tmp/three"] {
+            let block = crate::agent::r#loop::environment_block(Path::new(cwd), "sid", "zsh");
+            session.push_message(Message::user_text(block), None, None).unwrap();
+        }
+        assert_eq!(
+            session.current_cwd().as_deref(),
+            Some(Path::new("/tmp/three")),
+            "the newest block wins"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
