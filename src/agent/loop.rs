@@ -1,0 +1,867 @@
+//! The agent loop: one user turn in, streamed assistant output and tool calls out.
+//!
+//! Two invariants shape this file:
+//!
+//! * **The system prompt never changes.** It contains no cwd, no clock, no branch and no
+//!   model name, so it stays a stable cache prefix for the whole session. Everything that
+//!   describes the environment lives in a single session-stable block at the head of the
+//!   conversation (see [`environment_block`]).
+//! * **Every risky action goes through the gate.** Tool calls are assessed one at a time;
+//!   a refusal is handed back to the model as text with the reason attached, because a
+//!   refusal without a reason makes the model retry the same command forever.
+
+use std::path::{Path, PathBuf};
+
+use crate::agent::compact::{self, CompactError, CompactionState, Reason, RetryBudget, SummaryRequest};
+use crate::agent::session::Session;
+use crate::auth::guard::PermissionGate;
+use crate::auth::policy::{self, Dialect};
+use crate::config::{Config, Defaults, ModelConfig, Provider};
+use crate::llm::client::Client;
+use crate::llm::{self, Delta, Message, Request, StopReason};
+use crate::tools::{self, ToolOutput};
+use crate::ui::compact as ui_compact;
+use crate::ui::footer::{self, FooterState};
+use crate::ui::screen::{Action, Screen};
+use crate::ui::theme::Color;
+use crate::util;
+
+/// The system prompt. **Byte-for-byte identical on every request**: adding a timestamp, a
+/// path or a branch here would invalidate the cached prefix for the whole conversation.
+pub const SYSTEM_PROMPT: &str = "\
+你是 mpi，一个运行在用户终端里的编程助手。
+
+工作方式：
+- 需要了解代码时先读文件再下结论，不要凭猜测修改。
+- 一次只做用户要求的事，不做多余的改动与重构。
+- 修改文件用 edit 做精确替换，创建文件用 write。
+- 执行命令用 bash（zsh）。只读命令会自动执行，其它命令会先请求用户授权；
+  被拒绝时用户会看到原因，不要改写命令绕过授权，也不要重复同一条被拒的命令。
+- 回答用中文，简洁直接，不要复述已经说过的内容。";
+
+/// A per-session environment snapshot. It is stored as the head of the conversation rather
+/// than in the system prompt, and it does not change while the session lives — a mutable
+/// clock in here would break the cache on every turn.
+pub fn environment_block(cwd: &Path, session_id: &str, shell: &str) -> String {
+    format!(
+        "<environment>\n工作目录: {}\n平台: {}\nshell: {}\n会话开始: {}\n会话 id: {}\n</environment>\n\n\
+         如果你需要确认当前状态，用工具查看，不要假设上面的信息仍然有效。",
+        cwd.display(),
+        std::env::consts::OS,
+        shell,
+        crate::agent::session::now(),
+        session_id
+    )
+}
+
+/// What the user typed.
+pub enum Input {
+    Line(String),
+    Exit,
+}
+
+/// The outcome of one assistant turn.
+enum TurnEnd {
+    /// The model finished and there is nothing left to do.
+    Done,
+    /// Tool results were produced; keep going.
+    Continue,
+}
+
+pub struct Agent {
+    pub config: Config,
+    pub client: Client,
+    pub screen: Screen,
+    pub session: Session,
+    gate: PermissionGate,
+    pub cwd: PathBuf,
+    model_spec: String,
+    level: String,
+    compaction: CompactionState,
+    retry: RetryBudget,
+    /// Set while a turn is streaming, so `/compact` can refuse instead of corrupting it.
+    streaming: bool,
+}
+
+impl Agent {
+    pub fn new(config: Config, cwd: PathBuf, interactive: bool) -> anyhow::Result<Self> {
+        let model_spec = config
+            .default_model
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("配置里没有可用的模型"))?;
+        let level = {
+            let (_, model) = config
+                .find(&model_spec)
+                .ok_or_else(|| anyhow::anyhow!("default_model「{model_spec}」不存在"))?;
+            model.levels().first().cloned().unwrap_or_default()
+        };
+        let dialect = policy::configured_dialect(&config.shell.path);
+        let session = Session::create(&cwd, &model_spec)?;
+        let client = Client::new()?;
+        let mut screen = Screen::new();
+        screen.push_lines(ui_compact::note_lines(
+            &format!("mpi · 会话 {}", &session.header().id[..8]),
+            crate::ui::screen::Style::new(Color::Dim),
+        ));
+        // The environment block becomes the head of the conversation, immediately after the
+        // system prompt, and is persisted with the session.
+        let block = environment_block(&cwd, &session.header().id, &config.shell.path);
+        let mut session = session;
+        session.push_message(Message::user_text(block), None, None)?;
+        Ok(Agent {
+            config,
+            client,
+            screen,
+            session,
+            gate: PermissionGate::new(interactive, dialect),
+            cwd,
+            model_spec,
+            level,
+            compaction: CompactionState::default(),
+            retry: RetryBudget::default(),
+            streaming: false,
+        })
+    }
+
+    /// Resume an existing session file.
+    pub fn resume(config: Config, cwd: PathBuf, path: &Path, interactive: bool) -> anyhow::Result<Self> {
+        let session = Session::open(path)?;
+        let model_spec = session
+            .header()
+            .model
+            .clone();
+        let model_spec = if config.find(&model_spec).is_some() {
+            model_spec
+        } else {
+            config
+                .default_model
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("配置里没有可用的模型"))?
+        };
+        let level = {
+            let (_, model) = config.find(&model_spec).unwrap();
+            model.levels().first().cloned().unwrap_or_default()
+        };
+        let dialect = policy::configured_dialect(&config.shell.path);
+        let client = Client::new()?;
+        let mut screen = Screen::new();
+        let name = session.name().unwrap_or_else(|| "未命名".into());
+        screen.push_lines(ui_compact::note_lines(
+            &format!("已恢复会话 {name}（{} 条消息）", session.context_messages().len()),
+            crate::ui::screen::Style::new(Color::Dim),
+        ));
+        // Replay the transcript so the user can see where the work stopped. Only the tail
+        // is shown: the full history is already in the context.
+        let messages = session.context_messages();
+        let tail = messages.len().saturating_sub(6);
+        for message in &messages[tail..] {
+            if matches!(message, Message::User { .. }) {
+                screen.push_lines(ui_compact::user_lines(&message.text()));
+            }
+        }
+        Ok(Agent {
+            config,
+            client,
+            screen,
+            session,
+            gate: PermissionGate::new(interactive, dialect),
+            cwd,
+            model_spec,
+            level,
+            compaction: CompactionState::default(),
+            retry: RetryBudget::default(),
+            streaming: false,
+        })
+    }
+
+    pub fn model_spec(&self) -> &str {
+        &self.model_spec
+    }
+
+    pub fn level(&self) -> &str {
+        &self.level
+    }
+
+    fn model(&self) -> anyhow::Result<(&Provider, &ModelConfig)> {
+        self.config
+            .find(&self.model_spec)
+            .ok_or_else(|| anyhow::anyhow!("模型「{}」不在配置里", self.model_spec))
+    }
+
+    /// Read one line, updating the footer around the call.
+    pub fn read_input(&mut self) -> Action {
+        // Everything queued above is committed here, so the prompt always appears below a
+        // complete transcript.
+        self.render_footer(None);
+        let action = self.screen.read_input();
+        match action {
+            Ok(action) => action,
+            Err(err) => {
+                self.screen.push_lines(ui_compact::note_lines(
+                    &format!("读取输入失败：{err}"),
+                    crate::ui::screen::Style::new(Color::Red),
+                ));
+                Action::Eof
+            }
+        }
+    }
+
+    /// Draw the two-line footer (plus a status row when something is in flight).
+    pub fn render_footer(&mut self, busy: Option<&str>) {
+        let (model, level) = match self.model() {
+            Ok((_, model)) => (Some(model), self.level.clone()),
+            Err(_) => (None, self.level.clone()),
+        };
+        let cache_hit = self.session.totals.hit_rate();
+        let context_tokens = self.session.last_usage.as_ref().map(|usage| {
+            usage.input + usage.output + usage.cache_read + usage.cache_write
+        });
+        let context_window = model.and_then(|model| model.context_window);
+        let state = FooterState {
+            cwd: &self.cwd,
+            branch: footer::git_branch(&self.cwd),
+            session_name: self.session.name(),
+            totals: self.session.totals,
+            cache_hit_rate: cache_hit,
+            context_tokens: if self.compaction.tokens_unknown { None } else { context_tokens },
+            context_window,
+            model,
+            level: &level,
+            compacting: self.compaction.running,
+            busy,
+        };
+        let lines = footer::render(&state, &self.screen.theme, self.screen.width());
+        self.screen.set_footer(lines);
+        self.screen.render();
+    }
+
+    /// Handle a slash command. Returns false when the session should end.
+    pub async fn command(&mut self, input: &str) -> anyhow::Result<bool> {
+        let (name, argument) = match input.strip_prefix('/') {
+            Some(rest) => match rest.split_once(' ') {
+                Some((name, argument)) => (name, argument.trim()),
+                None => (rest.trim(), ""),
+            },
+            None => return Ok(true),
+        };
+        match name {
+            "exit" | "quit" => return Ok(false),
+            "model" => self.command_model().await?,
+            "name" => self.command_name(argument)?,
+            "compact" => self.command_compact(argument).await?,
+            "new" => self.command_new()?,
+            "resume" => self.command_resume().await?,
+            other => {
+                self.screen.push_lines(ui_compact::note_lines(
+                    &format!("未知命令：/{other}（可用：/model /name /compact /new /resume /exit）"),
+                    crate::ui::screen::Style::new(Color::Yellow),
+                ));
+            }
+        }
+        Ok(true)
+    }
+
+    fn command_name(&mut self, argument: &str) -> anyhow::Result<()> {
+        // `/name` without an argument clears the name, exactly like pi.
+        let name = if argument.is_empty() {
+            None
+        } else {
+            Some(argument.replace('\n', " "))
+        };
+        self.session.set_name(name.as_deref())?;
+        let note = match &name {
+            Some(name) => format!("会话名已设为「{}」", util::truncate(name, Defaults::SESSION_NAME_WIDTH, "…")),
+            None => "会话名已清空".to_string(),
+        };
+        self.screen.push_lines(ui_compact::note_lines(&note, crate::ui::screen::Style::new(Color::Dim)));
+        Ok(())
+    }
+
+    fn command_new(&mut self) -> anyhow::Result<()> {
+        let model_spec = self.model_spec.clone();
+        self.session = Session::create(&self.cwd, &model_spec)?;
+        let block = environment_block(&self.cwd, &self.session.header().id, &self.config.shell.path);
+        self.session.push_message(Message::user_text(block), None, None)?;
+        self.gate.reset();
+        self.screen.clear_transcript();
+        self.screen.push_lines(ui_compact::note_lines(
+            &format!("新会话 {}", &self.session.header().id[..8]),
+            crate::ui::screen::Style::new(Color::Dim),
+        ));
+        Ok(())
+    }
+
+    async fn command_resume(&mut self) -> anyhow::Result<()> {
+        let summaries = crate::agent::session::list();
+        if summaries.is_empty() {
+            self.screen.push_lines(ui_compact::note_lines(
+                "还没有可恢复的会话。",
+                crate::ui::screen::Style::new(Color::Dim),
+            ));
+            return Ok(());
+        }
+        let items: Vec<String> = summaries
+            .iter()
+            .map(|summary| {
+                format!(
+                    "{}   {}   {} 条消息",
+                    summary.label(40),
+                    summary.modified_label(),
+                    summary.messages
+                )
+            })
+            .collect();
+        let Some(index) = self.screen.pick("恢复历史会话", &items) else {
+            return Ok(());
+        };
+        let target = summaries[index].path.clone();
+        if target == self.session.path() {
+            return Ok(());
+        }
+        // Flush anything pending before pointing the loop at another file.
+        let model_spec = self.model_spec.clone();
+        match Session::open(&target) {
+            Ok(session) => {
+                self.session = session;
+                self.gate.reset();
+                self.screen.clear_transcript();
+                let name = self.session.name().unwrap_or_else(|| "未命名".into());
+                self.screen.push_lines(ui_compact::note_lines(
+                    &format!("已切到会话「{name}」"),
+                    crate::ui::screen::Style::new(Color::Dim),
+                ));
+                if self.config.find(&model_spec).is_some() {
+                    self.model_spec = model_spec;
+                }
+                let messages = self.session.context_messages();
+                let tail = messages.len().saturating_sub(6);
+                for message in &messages[tail..] {
+                    if matches!(message, Message::User { .. }) {
+                        self.screen.push_lines(ui_compact::user_lines(&message.text()));
+                    }
+                }
+            }
+            Err(err) => {
+                self.screen.push_lines(ui_compact::note_lines(
+                    &format!("无法打开会话：{err}"),
+                    crate::ui::screen::Style::new(Color::Red),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// `/model`: pick a model, then — only for a reasoning model — pick a thinking level.
+    ///
+    /// The two-step flow is why there is no `/thinking` command: the level belongs to the
+    /// model, and a model that cannot reason is asked nothing.
+    async fn command_model(&mut self) -> anyhow::Result<()> {
+        let catalogue = self.config.catalogue();
+        if catalogue.is_empty() {
+            self.screen.push_lines(ui_compact::note_lines(
+                "配置里没有模型。",
+                crate::ui::screen::Style::new(Color::Yellow),
+            ));
+            return Ok(());
+        }
+        let current_index = catalogue
+            .iter()
+            .position(|(_, spec)| *spec == self.model_spec)
+            .unwrap_or(0);
+        let items: Vec<String> = catalogue
+            .iter()
+            .map(|(provider, spec)| {
+                let (_, model) = self.config.find(spec).unwrap();
+                // The listed entries and their levels are exactly what the config declares;
+                // nothing is hidden and nothing is added.
+                if model.reasoning {
+                    format!(
+                        "{} ({} · {})",
+                        model.display_name(),
+                        provider,
+                        model.levels().join("/")
+                    )
+                } else {
+                    format!("{} ({})", model.display_name(), provider)
+                }
+            })
+            .collect();
+        let Some(index) = self.screen.pick_at("选择模型", &items, current_index) else {
+            return Ok(());
+        };
+        let spec = catalogue[index].1.clone();
+        self.model_spec = spec.clone();
+        let (_, model) = self.config.find(&spec).expect("chosen from the catalogue");
+        let model_name = model.display_name().to_string();
+        let levels = model.levels();
+        let mut note = format!("已切换到 {model_name}");
+
+        if levels.is_empty() {
+            self.level.clear();
+            note.push_str("（该模型不支持推理）");
+        } else {
+            let current = levels.iter().position(|level| *level == self.level).unwrap_or(0);
+            let level_items: Vec<String> = levels.iter().map(|level| level.to_string()).collect();
+            if let Some(chosen) = self.screen.pick_at("思考级别", &level_items, current) {
+                self.level = levels[chosen].clone();
+            }
+            // A level that came from another model may not exist here.
+            let (clamped, moved) = llm::clamp_level(model, &self.level);
+            if moved {
+                note.push_str(&format!(" · 思考级别 {level} 不受支持，已调整为 {clamped}", level = self.level));
+            }
+            self.level = clamped;
+            note.push_str(&format!(" · {}", self.level));
+        }
+        self.screen.push_lines(ui_compact::note_lines(&note, crate::ui::screen::Style::new(Color::Dim)));
+        Ok(())
+    }
+
+    /// `/compact`: always allowed on request, but it reports the reason when there is
+    /// nothing to cut.
+    async fn command_compact(&mut self, instructions: &str) -> anyhow::Result<()> {
+        if self.streaming {
+            self.screen.push_lines(ui_compact::note_lines(
+                "正在流式输出，无法压缩；等这一轮结束后再试。",
+                crate::ui::screen::Style::new(Color::Yellow),
+            ));
+            return Ok(());
+        }
+        let custom = (!instructions.trim().is_empty()).then_some(instructions);
+        match self.compact(Reason::Manual, custom).await {
+            Ok(()) => {}
+            Err(err) => {
+                self.screen.push_lines(ui_compact::note_lines(
+                    &err.to_string(),
+                    crate::ui::screen::Style::new(Color::Yellow),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Run one compaction and write the checkpoint.
+    async fn compact(&mut self, reason: Reason, custom: Option<&str>) -> Result<(), CompactError> {
+        if self.compaction.running {
+            return Err(CompactError::InProgress);
+        }
+        self.compaction.begin(reason)?;
+        self.render_footer(Some(reason.banner()));
+        let result = self.compact_inner(reason, custom).await;
+        self.compaction.finish();
+        self.render_footer(None);
+        result
+    }
+
+    async fn compact_inner(&mut self, reason: Reason, custom: Option<&str>) -> Result<(), CompactError> {
+        let (provider, model) = self
+            .model()
+            .map_err(|err| CompactError::Summarize(err.to_string()))?;
+        let messages = self.session.context_messages();
+        let previous = self.session.last_checkpoint_index().and_then(|index| {
+            match &self.session.records()[index] {
+                crate::agent::session::Record::Compacted { summary, .. } => Some(summary.clone()),
+                _ => None,
+            }
+        });
+        let real_usage = self.session.last_usage.as_ref().map(|usage| {
+            usage.input + usage.output + usage.cache_read + usage.cache_write
+        });
+        let request = SummaryRequest {
+            provider,
+            model,
+            session_id: &self.session.header().id,
+            previous_summary: previous.as_deref(),
+            custom_instructions: custom,
+            level: &self.level,
+        };
+        // The keep-recent window is scaled to the model's capacity: keeping a fixed 20k in a
+        // 6k window would produce a checkpoint larger than the history it replaced.
+        let keep_recent = model
+            .context_window
+            .map(compact::keep_recent_for)
+            .unwrap_or(Defaults::KEEP_RECENT_TOKENS);
+        let outcome = compact::run(
+            &self.client,
+            request,
+            &messages,
+            SYSTEM_PROMPT,
+            keep_recent,
+            real_usage,
+        )
+        .await?;
+        // A compaction that did not actually shrink anything is worth saying out loud: it
+        // means the summary request cost more than it saved.
+        let grew = outcome.tokens_after >= outcome.tokens_before;
+        self.session
+            .push_compaction(
+                reason.label(),
+                &outcome.summary,
+                outcome.replacement.clone(),
+                outcome.read_files.clone(),
+                outcome.modified_files.clone(),
+                Some(outcome.usage),
+            )
+            .map_err(|err| CompactError::Session(err.to_string()))?;
+        let saved = outcome.tokens_before.saturating_sub(outcome.tokens_after);
+        let note = if grew {
+            // Compaction is not free; if it did not help, the user should know that the model's
+            // window is too small for the summary to pay for itself.
+            format!(
+                "已压缩上下文（{}）：约 {} → {} token，这次没有变小；\n\
+                 该模型窗口偏小，摘要本身的开销超过了省下的量。",
+                reason.label(),
+                util::fmt_tokens(outcome.tokens_before, true),
+                util::fmt_tokens(outcome.tokens_after, true),
+            )
+        } else {
+            format!(
+                "已压缩上下文（{}）：约 {} → {} token（省下约 {}）",
+                reason.label(),
+                util::fmt_tokens(outcome.tokens_before, true),
+                util::fmt_tokens(outcome.tokens_after, true),
+                util::fmt_tokens(saved, true),
+            )
+        };
+        self.screen
+            .push_lines(ui_compact::note_lines(&note, crate::ui::screen::Style::new(Color::Dim)));
+        Ok(())
+    }
+
+    /// Run one user turn to completion.
+    pub async fn run_turn(&mut self, input: &str) -> anyhow::Result<()> {
+        self.screen.collapse_all();
+        self.screen.push_lines(ui_compact::user_lines(input));
+        self.session
+            .push_message(Message::user_text(input.to_string()), None, None)?;
+        self.retry.reset();
+
+        loop {
+            match self.assistant_turn().await {
+                Ok(TurnEnd::Done) => break,
+                Ok(TurnEnd::Continue) => continue,
+                Err(err) => {
+                    self.screen.push_lines(ui_compact::note_lines(
+                        &format!("请求失败：{err}"),
+                        crate::ui::screen::Style::new(Color::Red),
+                    ));
+                    break;
+                }
+            }
+        }
+        // A finished task leaves every block collapsed and everything committed.
+        self.screen.collapse_all();
+        self.render_footer(None);
+        Ok(())
+    }
+
+    /// One request/response cycle, including its tool calls.
+    async fn assistant_turn(&mut self) -> anyhow::Result<TurnEnd> {
+        let (provider, model, compat) = {
+            let (provider, model) = self.model()?;
+            let compat = provider.compat(model);
+            (provider.clone(), model.clone(), compat)
+        };
+        // Threshold compaction runs before the request, using real usage when it is still
+        // valid and an estimate otherwise.
+        if let Some(window) = model.context_window {
+            let limit = compact::threshold_for(window);
+            let messages = self.session.context_messages();
+            let real_usage = self.session.last_usage.as_ref().map(|usage| {
+                usage.input + usage.output + usage.cache_read + usage.cache_write
+            });
+            let used = compact::estimate_context(&messages, SYSTEM_PROMPT, real_usage);
+            if used > limit {
+                self.screen.push_lines(ui_compact::note_lines(
+                    &format!(
+                        "上下文已用 {}/{}，接近上限，正在压缩…",
+                        util::fmt_tokens(used, true),
+                        util::fmt_tokens(window, true)
+                    ),
+                    crate::ui::screen::Style::new(Color::Yellow),
+                ));
+                if let Err(err) = self.compact(Reason::Threshold, None).await {
+                    // A failed automatic compaction must not lose the turn; the request
+                    // may still fit, and if it does not the overflow path will try again.
+                    self.screen.push_lines(ui_compact::note_lines(
+                        &format!("自动压缩未完成：{err}"),
+                        crate::ui::screen::Style::new(Color::Yellow),
+                    ));
+                }
+            }
+        }
+
+        let mut messages = self.session.context_messages();
+        // Some gateways reject a history that ends with a tool result.
+        if compat.requires_assistant_after_tool_result
+            && matches!(messages.last(), Some(Message::Tool { .. }))
+        {
+            messages.push(Message::assistant_text("继续。"));
+        }
+        let tools = tools::specs();
+        let level = self.level.clone();
+        let session_id = self.session.header().id.clone();
+        let request = Request {
+            model: &model,
+            provider: &provider,
+            messages: &messages,
+            tools: &tools,
+            level: &level,
+            session_id: &session_id,
+            cache_hints: true,
+        };
+
+        self.streaming = true;
+        self.screen.begin_stream();
+        let completion = {
+            let screen = &mut self.screen;
+            let result = self
+                .client
+                .stream(&request, &mut |delta| match delta {
+                    Delta::Text(text) => screen.push_text(&text),
+                    Delta::Thinking(text) => screen.push_thinking(&text),
+                })
+                .await;
+            result
+        };
+        self.streaming = false;
+        // On a transport failure the streamed preview is discarded, so the transcript does
+        // not show a half-written answer that was never recorded.
+        let completion = match completion {
+            Ok(completion) => completion,
+            Err(err) => {
+                // Nothing is committed, so the discarded preview leaves no trace.
+                self.screen.discard_stream();
+                if let Some(retried) = self.recover_overflow(&err.message()).await? {
+                    return Ok(retried);
+                }
+                return Err(err.into());
+            }
+        };
+        self.screen.end_stream();
+
+        // An overflow can also arrive as a "successful" response: either the prompt alone
+        // filled the window, or the server truncated it and left no room to answer. Both
+        // are compacted here, before the message is recorded.
+        let overflow = compact::detect_overflow(&completion, model.context_window, model.max_tokens());
+        if let Some(signal) = overflow {
+            self.screen.push_lines(ui_compact::note_lines(
+                &describe_overflow(&signal),
+                crate::ui::screen::Style::new(Color::Yellow),
+            ));
+            let retried = self.recover_overflow("").await?;
+            if let Some(end) = retried {
+                return Ok(end);
+            }
+            // A response that finished successfully cannot be continued by resending, so
+            // the compaction alone is the recovery; nothing else to retry.
+            return Ok(TurnEnd::Done);
+        }
+
+        self.session
+            .push_message(completion.message.clone(), Some(completion.usage), Some(completion.stop_reason))?;
+        self.session.push_token_count(completion.usage)?;
+        self.compaction.observe_usage();
+        self.render_footer(None);
+
+        if let Some(error) = &completion.error {
+            self.screen.push_lines(ui_compact::note_lines(
+                &format!("上游返回错误：{error}"),
+                crate::ui::screen::Style::new(Color::Red),
+            ));
+            return Ok(TurnEnd::Done);
+        }
+        Ok(self.after_completion(&completion))
+    }
+
+    /// Decide what to do after a response that is not an overflow.
+    fn after_completion(&mut self, completion: &llm::Completion) -> TurnEnd {
+        let calls = completion.tool_calls();
+        if calls.is_empty() {
+            // A length stop with no tool calls means the answer was cut off; say so rather
+            // than silently pretending it finished.
+            if completion.stop_reason == StopReason::Length {
+                self.screen.push_lines(ui_compact::note_lines(
+                    "输出达到长度上限，回答可能不完整。可以继续要求补全。",
+                    crate::ui::screen::Style::new(Color::Yellow),
+                ));
+            }
+            return TurnEnd::Done;
+        }
+        // Tool calls are executed inline; the next request carries their results.
+        self.execute_tools(&calls);
+        TurnEnd::Continue
+    }
+
+    /// Execute every tool call from one assistant message, in order.
+    ///
+    /// A refused call still produces a result: the model receives the refusal text with
+    /// the policy's reason, and the transcript shows the same failure. Skipping the tool
+    /// result entirely would break the call/result pairing the providers expect.
+    fn execute_tools(&mut self, calls: &[(String, String, serde_json::Value)]) {
+        let cwd = self.cwd.clone();
+        for (id, name, arguments) in calls {
+            let output = match block_on(self.gate.check(id, name, arguments, &cwd)) {
+                Ok(()) => {
+                    let result = block_on(tools::execute(name, arguments, &cwd));
+                    self.gate.finish(id);
+                    result
+                }
+                Err(refusal) => {
+                    self.gate.finish(id);
+                    // The refusal is echoed with the attempted call, so the transcript shows
+                    // what the user declined rather than an anonymous failure.
+                    ToolOutput::error_for(name, arguments, refusal.message())
+                }
+            };
+            let _ = self.session.push_message(
+                Message::Tool {
+                    tool_call_id: id.clone(),
+                    name: name.clone(),
+                    content: output.content.clone(),
+                },
+                None,
+                None,
+            );
+            let block = ui_compact::tool_block(name, arguments, &output);
+            self.screen.push(block);
+        }
+    }
+
+    /// The single overflow recovery attempt for this turn. Returns `Some(..)` when the turn
+    /// was handled here, `None` when the caller should carry on with normal error handling.
+    async fn recover_overflow(&mut self, error_text: &str) -> anyhow::Result<Option<TurnEnd>> {
+        let (_, model) = self.model()?;
+        let is_overflow = error_text.is_empty()
+            || compact::looks_like_overflow(error_text);
+        if !is_overflow || !self.retry.available() || model.context_window.is_none() {
+            return Ok(None);
+        }
+        self.retry.spend();
+        self.screen.push_lines(ui_compact::note_lines(
+            "上下文超限，正在压缩后重试…",
+            crate::ui::screen::Style::new(Color::Yellow),
+        ));
+        // Drop the failed assistant message before compacting: keeping it would fold a
+        // half-written answer into the summary.
+        self.session.drop_last_assistant()?;
+        if let Err(err) = self.compact(Reason::Overflow, None).await {
+            self.screen.push_lines(ui_compact::note_lines(
+                &format!("压缩失败：{err}。请减少上下文或换用窗口更大的模型。"),
+                crate::ui::screen::Style::new(Color::Red),
+            ));
+            return Ok(Some(TurnEnd::Done));
+        }
+        Ok(Some(TurnEnd::Continue))
+    }
+}
+
+/// Drive a future to completion on a private current-thread runtime.
+///
+/// Tool execution is synchronous by nature (spawn a process, read a file) while the agent
+/// loop is async. Rather than colour everything async, the two points where sync code has
+/// to wait on async work go through here — and both of them complete without ever yielding
+/// to the outer runtime, so blocking the thread is safe and predictable.
+fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a private runtime")
+            .block_on(future)
+    })
+}
+
+/// Result of the environment probe used by `--check`.
+pub fn describe_environment(cwd: &Path, config: &Config) -> String {
+    let models = config.catalogue().len();
+    let session_dir = crate::config::sessions_dir();
+    format!(
+        "工作目录: {}\nshell: {}\n模型数: {models}\n会话目录: {}\n",
+        cwd.display(),
+        config.shell.path,
+        session_dir.display()
+    )
+}
+
+/// Exposed for tests: the dialect mpi will hand to the policy.
+pub fn dialect_for(config: &Config) -> Dialect {
+    policy::configured_dialect(&config.shell.path)
+}
+
+/// Human-readable form of an overflow signal, shown before the compaction starts.
+pub fn describe_overflow(signal: &compact::OverflowSignal) -> String {
+    match signal {
+        compact::OverflowSignal::ExplicitError => "上游报告上下文超限，正在压缩后重试…".to_string(),
+        compact::OverflowSignal::SilentOverflow { prompt_tokens, context_window } => format!(
+            "输入 {}/{} token 已超出窗口，正在压缩后重试…",
+            util::fmt_tokens(*prompt_tokens, true),
+            util::fmt_tokens(*context_window, true)
+        ),
+        compact::OverflowSignal::LengthCut { output_tokens, max_tokens } => format!(
+            "输出只剩 {}/{max_tokens} token，疑似上下文挤占，正在压缩后重试…",
+            output_tokens
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_system_prompt_has_no_volatile_content() {
+        // The prompt is the first cache breakpoint, so anything that changes between turns
+        // would invalidate the whole conversation's cache.
+        assert!(!SYSTEM_PROMPT.contains('/'), "a path would break the cache");
+        assert!(!SYSTEM_PROMPT.contains("20"), "a timestamp would break the cache");
+        assert!(SYSTEM_PROMPT.contains("mpi"));
+        assert!(SYSTEM_PROMPT.contains("授权"));
+    }
+
+    #[test]
+    fn the_environment_block_is_separate_from_the_system_prompt() {
+        let cwd = Path::new("/tmp/project");
+        let block = environment_block(cwd, "abc123", "/usr/bin/zsh");
+        assert!(block.contains("/tmp/project"));
+        assert!(block.contains("/usr/bin/zsh"));
+        assert!(block.contains("abc123"));
+        assert!(block.starts_with("<environment>"));
+    }
+
+    #[test]
+    fn the_environment_block_is_stable_for_the_same_inputs() {
+        let cwd = Path::new("/tmp/project");
+        let first = environment_block(cwd, "id", "/usr/bin/zsh");
+        let second = environment_block(cwd, "id", "/usr/bin/zsh");
+        // Only the "session start" line may differ, and only if the clock ticks between
+        // the two calls; everything else must be identical.
+        let strip = |text: &str| {
+            text.lines()
+                .filter(|line| !line.starts_with("会话开始:"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert_eq!(strip(&first), strip(&second));
+    }
+
+    #[test]
+    fn the_dialect_comes_from_the_configured_shell() {
+        let mut config = Config::default();
+        config.shell.path = "/usr/bin/zsh".into();
+        assert_eq!(dialect_for(&config), Dialect::Zsh);
+        config.shell.path = "/bin/bash".into();
+        assert_eq!(dialect_for(&config), Dialect::Bash);
+    }
+
+    #[test]
+    fn check_output_names_the_environment() {
+        let config: Config = serde_json::from_str(
+            r#"{"providers":[{"name":"p","api":"openai-completions","models":[{"id":"m"}]}]}"#,
+        )
+        .unwrap();
+        let text = describe_environment(Path::new("/tmp"), &config);
+        assert!(text.contains("/tmp"));
+        assert!(text.contains("模型数: 1"));
+    }
+}
