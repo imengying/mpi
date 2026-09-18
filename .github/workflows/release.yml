@@ -25,6 +25,10 @@ jobs:
     # `cargo test --release` also builds the binary: a step-scoped value would let that
     # rebuild it without the version, and the packaged binary would be the versionless one.
     env:
+      # Without the leading `v`, so `--version`, the check below and the artifact names all
+      # quote the same string. This is set for the whole job because `cargo test --release`
+      # also builds the binary; a step-scoped value would let that rebuild it without the
+      # version.
       MPI_BUILD_VERSION: ${{ github.ref_name }}
     strategy:
       fail-fast: false
@@ -41,7 +45,7 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -49,7 +53,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@v2.9.2
         with:
           key: ${{ matrix.target }}
 
@@ -110,7 +114,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: mpi-${{ matrix.target }}
           path: |
@@ -125,12 +129,12 @@ jobs:
     steps:
       # The release notes are built from `git log` between tags, and the default shallow
       # clone has neither the history nor any tags, so both have to be fetched.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
           fetch-tags: true
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: mpi-*
           path: artifacts
