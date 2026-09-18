@@ -57,6 +57,18 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      - name: Install test dependencies
+        # The tools shell out to zsh, and the policy's allow-list names rg. The runners do
+        # not ship both, and the tests assert on their real behaviour, so they have to be
+        # there rather than skipped.
+        if: matrix.os == 'ubuntu-24.04'
+        run: |
+          set -euo pipefail
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends zsh ripgrep
+          which zsh; which rg
+          zsh --version
+
       - name: Build
         # `build.rs` declares MPI_BUILD_VERSION as a rerun trigger, so a cached build cannot
         # keep a stale value when the tag changes.
