@@ -103,11 +103,7 @@ jobs:
             | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["license"])' \
             > "dist/$NAME/LICENSE.txt"
           tar -C dist -czf "dist/$NAME.tar.gz" "$NAME"
-          if command -v shasum >/dev/null; then
-            (cd dist && shasum -a 256 "$NAME.tar.gz" > "$NAME.tar.gz.sha256")
-          else
-            (cd dist && sha256sum "$NAME.tar.gz" > "$NAME.tar.gz.sha256")
-          fi
+          # No .sha256 alongside: GitHub computes checksums for release assets itself.
           ls -la dist
 
       - name: Report the glibc the Linux binary needs
@@ -129,9 +125,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: mpi-${{ matrix.target }}
-          path: |
-            dist/*.tar.gz
-            dist/*.sha256
+          path: dist/*.tar.gz
           if-no-files-found: error
 
   release:
@@ -175,4 +169,4 @@ jobs:
           gh release create "$GITHUB_REF_NAME" \
             --title "mpi ${VERSION}" \
             --notes-file notes.md \
-            artifacts/*.tar.gz artifacts/*.sha256
+            artifacts/*.tar.gz
