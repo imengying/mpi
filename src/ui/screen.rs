@@ -749,15 +749,17 @@ impl Screen {
         true
     }
 
-    /// Replace the buffer with the highlighted command, ready for an argument.
-    fn accept_menu(&mut self) -> bool {
-        let Some((name, _)) = self.menu.get(self.menu_selected).cloned() else {
-            return false;
-        };
-        self.editing = Some(format!("/{name} "));
-        self.menu.clear();
-        self.menu_selected = 0;
-        true
+    /// Take the highlighted command as the line to submit.
+    ///
+    /// The menu exists to save typing, so picking from it *runs* the command. Completing it
+    /// with a trailing space instead would make the user press Enter twice to do the thing
+    /// they just chose — and the second press is not obviously part of picking a menu item.
+    ///
+    /// `None` when there is nothing to take.
+    fn accepted_command(&self) -> Option<String> {
+        self.menu
+            .get(self.menu_selected)
+            .map(|(name, _)| format!("/{name}"))
     }
 
     /// Keep the live region smaller than the screen, dropping the oldest preview rows.
@@ -1048,18 +1050,16 @@ impl Screen {
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
             match key.code {
                 KeyCode::Enter => {
-                    let line = self.editing.clone().unwrap_or_default();
-                    // Enter accepts the highlighted command while the menu is open, so a
-                    // chosen command is never submitted half-typed. It only submits when
-                    // the buffer is an exact command already (`/exit`), which is the one
-                    // case where accepting would do nothing.
-                    if !self.menu.is_empty()
-                        && self.menu.get(self.menu_selected).map(|(name, _)| name.as_str())
-                            != line.strip_prefix('/').map(str::trim)
-                    {
-                        self.accept_menu();
-                        self.render();
-                        continue;
+                    let mut line = self.editing.clone().unwrap_or_default();
+                    // Enter runs the highlighted command. When the buffer already spells
+                    // that command out (`/exit` typed by hand, or a `/model` argument in
+                    // progress), it is taken as written so an argument survives.
+                    if let Some(accepted) = self.accepted_command() {
+                        let typed = line.strip_prefix('/').map(str::trim).unwrap_or_default();
+                        let has_argument = typed.contains(' ');
+                        if !has_argument {
+                            line = accepted;
+                        }
                     }
                     // Images travel with the line, and an image with no text at all is a
                     // valid message: the user may only want to show a screenshot.
@@ -1409,13 +1409,26 @@ mod tests {
     }
 
     #[test]
-    fn accepting_the_menu_replaces_the_buffer_with_a_full_command() {
+    fn a_menu_selection_is_the_command_that_runs() {
         let mut screen = screen_with_commands();
         screen.editing = Some("/re".into());
         screen.sync_menu();
-        assert!(screen.accept_menu());
-        assert_eq!(screen.editing.as_deref(), Some("/resume "));
-        assert!(screen.menu.is_empty());
+        // Enter takes the highlighted entry as a whole command: the menu is there to save
+        // typing, so picking from it must not require a second Enter to submit.
+        assert_eq!(screen.accepted_command().as_deref(), Some("/resume"));
+        assert_eq!(screen.menu.len(), 1, "the filter left only the match");
+
+        // Moving the highlight moves what Enter would run.
+        screen.editing = Some("/".into());
+        screen.sync_menu();
+        screen.move_menu(1);
+        assert_eq!(screen.accepted_command(), Some("/name".into()));
+
+        // With no menu open there is nothing to accept, and the buffer is submitted as
+        // typed.
+        screen.editing = Some("你好".into());
+        screen.sync_menu();
+        assert_eq!(screen.accepted_command(), None);
     }
 
     #[test]

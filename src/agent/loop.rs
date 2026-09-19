@@ -388,6 +388,17 @@ impl Agent {
             .filter(|name| !name.trim().is_empty())
             .unwrap_or_else(|| "未命名".into());
         let path = self.session.path().display().to_string();
+        // Nothing was written, so there is nothing to confirm or to remove. This check
+        // comes first because it is the accurate answer: the other branches would offer to
+        // `rm` a path that does not exist.
+        if !self.session.is_saved() {
+            self.deleted = true;
+            self.screen.push_lines(ui_compact::note_lines(
+                "本会话没有内容，未生成文件。",
+                crate::ui::screen::Style::new(Color::Dim),
+            ));
+            return Ok(false);
+        }
         // A destructive action needs an explicit yes, and the non-interactive path has no
         // way to give one: `pick` answers with the highlighted entry there, and that would
         // turn `echo /delete | mpi` into an unattended delete. Refuse instead, and say how
@@ -411,10 +422,17 @@ impl Agent {
             ));
             return Ok(true);
         }
-        self.session.delete()?;
+        let removed = self.session.delete()?;
         self.deleted = true;
+        let note = if removed {
+            format!("已删除会话文件：{path}")
+        } else {
+            // A session that never said anything has no file: there was nothing to delete,
+            // and reporting a path as deleted would be false.
+            "本会话没有内容，未生成文件。".to_string()
+        };
         self.screen.push_lines(ui_compact::note_lines(
-            &format!("已删除会话文件：{path}"),
+            &note,
             crate::ui::screen::Style::new(Color::Dim),
         ));
         Ok(false)
@@ -425,6 +443,11 @@ impl Agent {
         self.deleted
     }
 
+    /// The session, for the few questions the loop asks about it on the way out.
+    pub fn session(&self) -> &Session {
+        &self.session
+    }
+
     fn command_new(&mut self) -> anyhow::Result<()> {
         let model_spec = self.model_spec.clone();
         self.session = Session::create(&self.cwd, &model_spec)?;
@@ -433,8 +456,10 @@ impl Agent {
         self.session.push_message(Message::user_text(block), None, None)?;
         self.gate.reset();
         self.screen.clear_transcript();
+        // The id is not announced: it is printed on the way out, with the command that
+        // resumes it, which is the only place it is useful.
         self.screen.push_lines(ui_compact::note_lines(
-            &format!("新会话 {}", &self.session.header().id[..8]),
+            "新会话开始。",
             crate::ui::screen::Style::new(Color::Dim),
         ));
         Ok(())

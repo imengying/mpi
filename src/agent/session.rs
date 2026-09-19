@@ -127,6 +127,18 @@ impl Record {
         }
     }
 
+    /// Whether this record is the one that makes a session worth keeping.
+    ///
+    /// The environment block is bookkeeping every session starts with, and a name, a model
+    /// switch or a turn context on its own is not a conversation. Only a real message —
+    /// what the user said, or what came back to them — earns a file.
+    fn starts_a_conversation(&self) -> bool {
+        match self.message() {
+            Some(message) => !crate::agent::r#loop::is_environment_block(message),
+            None => false,
+        }
+    }
+
     pub fn usage(&self) -> Option<Usage> {
         match self {
             Record::ResponseItem { usage, .. }
@@ -137,12 +149,25 @@ impl Record {
     }
 }
 
-/// An open session file, plus the bookkeeping needed to append safely.
+/// Where a session's records live.
+///
+/// Three states, and the difference between the first two is the whole point: a session
+/// that has not happened yet must leave no file behind, and a session the user deleted must
+/// never get one again. `Option<File>` could not tell those apart.
+enum Storage {
+    /// No file yet. Records are held in memory until the session becomes a conversation.
+    Buffered,
+    /// The file exists and is open for appending.
+    Open(std::fs::File),
+    /// The file is gone. Nothing may create it again.
+    Deleted,
+}
+
+/// A session, plus the bookkeeping needed to append safely.
 pub struct Session {
     header: SessionHeader,
     path: PathBuf,
-    /// `None` once the file has been deleted, so nothing can be written to a gone file.
-    file: Option<std::fs::File>,
+    storage: Storage,
     last_id: Option<String>,
     records: Vec<Record>,
     /// Cumulative usage over everything written so far, for the footer.
@@ -181,14 +206,13 @@ impl Session {
             cwd: cwd.to_string_lossy().to_string(),
             model: model.to_string(),
         };
-        let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
+        // Nothing is written here. A file appears with the first record that makes this a
+        // conversation, so launching mpi and leaving does not add a session to the list.
         let record = Record::SessionMeta { format: FORMAT, header: header.clone() };
-        writeln!(file, "{}", serde_json::to_string(&record).unwrap())?;
-        file.flush()?;
         Ok(Session {
             header,
             path,
-            file: Some(file),
+            storage: Storage::Buffered,
             last_id: Some(id),
             records: vec![record],
             totals: Usage::default(),
@@ -223,7 +247,7 @@ impl Session {
         let mut session = Session {
             header,
             path: path.to_path_buf(),
-            file: Some(std::fs::OpenOptions::new().append(true).open(path)?),
+            storage: Storage::Open(std::fs::OpenOptions::new().append(true).open(path)?),
             last_id,
             records,
             totals: Usage::default(),
@@ -498,30 +522,74 @@ impl Session {
     /// The handle is closed first: an open handle keeps the file alive and, on Windows,
     /// blocks the unlink outright. After this the session is inert — [`Session::append`]
     /// refuses, so a late write cannot recreate the file the user just deleted.
-    pub fn delete(&mut self) -> Result<(), SessionError> {
+    /// Returns whether there was a file to remove: a session that never became a
+    /// conversation has nothing on disk, and claiming otherwise would be a lie.
+    pub fn delete(&mut self) -> Result<bool, SessionError> {
         // Closing is what the drop does; taking it out of the field is what makes the
-        // "already deleted" state representable.
-        drop(self.file.take());
-        std::fs::remove_file(&self.path)?;
+        // "already deleted" state representable. A buffered session goes straight there:
+        // it has no file to unlink, but it must still be sealed so a late write cannot
+        // create one behind the user's back.
+        let removed = match self.storage {
+            Storage::Buffered => false,
+            Storage::Open(_) => true,
+            Storage::Deleted => false,
+        };
+        if let Storage::Open(file) = std::mem::replace(&mut self.storage, Storage::Deleted) {
+            drop(file);
+            std::fs::remove_file(&self.path)?;
+        }
         self.records.clear();
         self.last_id = None;
-        Ok(())
+        Ok(removed)
     }
 
     fn append(&mut self, record: Record, id: String) -> Result<(), SessionError> {
-        let line = serde_json::to_string(&record)
-            .map_err(|err| SessionError::Parse(err.to_string()))?;
-        let Some(file) = self.file.as_mut() else {
-            return Err(SessionError::Deleted);
-        };
-        writeln!(file, "{line}")?;
-        file.flush()?;
+        // The file is created by the record that turns an empty launch into a conversation;
+        // until then everything is buffered, including the header and the environment block,
+        // and is written out in one go. Keeping those out of the file is not only about
+        // tidiness: a file whose only content is a header and an environment block is a
+        // session in the resume list that has nothing to resume.
+        if matches!(self.storage, Storage::Buffered) && record.starts_a_conversation() {
+            self.persist()?;
+        }
+        match &mut self.storage {
+            Storage::Buffered => {}
+            Storage::Open(file) => {
+                let line = serde_json::to_string(&record)
+                    .map_err(|err| SessionError::Parse(err.to_string()))?;
+                writeln!(file, "{line}")?;
+                file.flush()?;
+            }
+            Storage::Deleted => return Err(SessionError::Deleted),
+        }
         if let Some(usage) = record.usage() {
             self.totals.add(&usage);
         }
         self.last_id = Some(id);
         self.records.push(record);
         Ok(())
+    }
+
+    /// Create the file and write everything buffered so far, in order.
+    fn persist(&mut self) -> Result<(), SessionError> {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+        for record in &self.records {
+            let line = serde_json::to_string(record)
+                .map_err(|err| SessionError::Parse(err.to_string()))?;
+            writeln!(file, "{line}")?;
+        }
+        file.flush()?;
+        self.storage = Storage::Open(file);
+        Ok(())
+    }
+
+    /// Whether this session has a file on disk right now, and therefore something
+    /// `/resume` could bring back.
+    pub fn is_saved(&self) -> bool {
+        matches!(self.storage, Storage::Open(_))
     }
 
     fn next_id(&self) -> String {
@@ -756,12 +824,19 @@ mod tests {
         (session, dir)
     }
 
+    /// A session that has already said something, and therefore has a file. Tests about
+    /// listing, finding or deleting a session need one that exists on disk.
+    fn temp_session_with_a_message(name: &str) -> (Session, PathBuf) {
+        let (mut session, dir) = temp_session(name);
+        session
+            .push_message(Message::user_text("你好"), None, None)
+            .unwrap();
+        (session, dir)
+    }
+
     #[test]
     fn a_session_can_be_found_by_an_id_prefix() {
-        let dir = std::env::temp_dir().join(format!("mpi-find-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let session = Session::create_in(&dir, &dir, "work/m").unwrap();
+        let (session, dir) = temp_session_with_a_message("find");
         let id = session.id().to_string();
 
         // The full id works, and so does any unique prefix of it — that is what makes the
@@ -788,8 +863,13 @@ mod tests {
         // sessions created in the same moment share a long leading run — the common prefix
         // is what a user is most likely to type, which is exactly when guessing would be
         // worst.
-        Session::create_in(&dir, &dir, "work/m").unwrap();
-        Session::create_in(&dir, &dir, "work/m").unwrap();
+        // Both sessions must have a file to appear in the list, so both say something.
+        for _ in 0..2 {
+            let mut session = Session::create_in(&dir, &dir, "work/m").unwrap();
+            session
+                .push_message(Message::user_text("你好"), None, None)
+                .unwrap();
+        }
 
         let ids: Vec<String> = list_in(&dir).into_iter().map(|s| s.id).collect();
         assert_eq!(ids.len(), 2);
@@ -836,13 +916,70 @@ mod tests {
     }
 
     #[test]
+    fn deleting_an_unsaved_session_reports_that_there_was_nothing_to_delete() {
+        let (mut session, dir) = temp_session("delete-unsaved");
+        assert!(!session.is_saved());
+        // No file, so nothing was removed — and the caller must be told, or `/delete` would
+        // offer an `rm` path that does not exist.
+        assert!(!session.delete().unwrap());
+        assert!(!session.path().exists());
+
+        // A late write must still not create the file: the user asked for this session to
+        // end, and re-creating it minutes later would be exactly what `/delete` prevents.
+        let after = session.push_message(Message::user_text("迟到的消息"), None, None);
+        assert!(matches!(after, Err(SessionError::Deleted)), "{after:?}");
+        assert!(!session.path().exists());
+        assert!(list_in(&dir).is_empty());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_file_with_nothing_in_it_still_gets_a_label() {
+        // New sessions no longer produce such a file, but older ones exist on disk, and a
+        // `/resume` row with an empty description would look like a bug.
+        let summary = SessionSummary {
+            path: PathBuf::from("/tmp/x.jsonl"),
+            id: "01a0b8d0".into(),
+            name: None,
+            modified: std::time::SystemTime::UNIX_EPOCH,
+            messages: 0,
+            snippet: String::new(),
+        };
+        assert_eq!(summary.label(40), "(空白会话)");
+        // A name wins over the missing snippet.
+        let named = SessionSummary { name: Some("我的会话".into()), ..summary };
+        assert_eq!(named.label(40), "我的会话");
+    }
+
+    #[test]
+    fn a_name_alone_does_not_create_a_session_file() {
+        // Naming an empty session is not a conversation. It must not leave a file that
+        // `/resume` would list with nothing to show.
+        let (mut session, dir) = temp_session("name-only");
+        session.set_name(Some("只有名字")).unwrap();
+        assert!(!session.is_saved(), "a name is not a conversation");
+        assert!(list_in(&dir).is_empty());
+
+        // The first message persists the name too, which is what the user set it for.
+        session
+            .push_message(Message::user_text("你好"), None, None)
+            .unwrap();
+        assert!(session.is_saved());
+        let reopened = Session::open(session.path()).unwrap();
+        assert_eq!(reopened.name().as_deref(), Some("只有名字"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn deleting_removes_the_file_and_refuses_later_writes() {
         let (mut session, dir) = temp_session("delete");
         session.push_message(Message::user_text("hello"), None, None).unwrap();
         let path = session.path().to_path_buf();
         assert!(path.is_file());
 
-        session.delete().unwrap();
+        assert!(session.delete().unwrap(), "a saved session had a file to remove");
         assert!(!path.exists(), "the file is gone");
 
         // A write after the delete must not bring the file back: the user asked for it to
@@ -856,7 +993,7 @@ mod tests {
 
     #[test]
     fn a_deleted_session_disappears_from_the_resume_list() {
-        let (mut session, dir) = temp_session("delete-list");
+        let (mut session, dir) = temp_session_with_a_message("delete-list");
         session.set_name(Some("要删掉的会话")).unwrap();
         let path = session.path().to_path_buf();
         assert_eq!(list_in(&dir).len(), 1);
@@ -870,7 +1007,7 @@ mod tests {
 
     #[test]
     fn the_header_is_the_first_line_and_is_never_rewritten() {
-        let (mut session, dir) = temp_session("header");
+        let (mut session, dir) = temp_session_with_a_message("header");
         let before = std::fs::read_to_string(session.path()).unwrap();
         session.set_name(Some("我的会话")).unwrap();
         session.set_name(Some("改个名字")).unwrap();
@@ -1030,17 +1167,57 @@ mod tests {
     }
 
     #[test]
-    fn a_session_with_only_the_environment_block_has_an_empty_snippet() {
-        let (session, dir) = temp_session("resume-empty");
-        // A freshly created session has no conversation at all, so there is nothing to
-        // list and nothing to quote.
-        assert_eq!(session.context_messages().len(), 0);
-        let summaries = list_in(&dir);
-        assert_eq!(summaries.len(), 1);
-        assert_eq!(summaries[0].messages, 0, "only the environment block is present");
-        assert_eq!(summaries[0].snippet, "");
-        // The fallback label says so rather than showing an empty row.
-        assert_eq!(summaries[0].label(40), "(空白会话)");
+    fn an_empty_session_never_reaches_the_disk() {
+        let (mut session, dir) = temp_session("empty");
+        // Starting mpi and leaving must not add a session to the list, so nothing is
+        // written until there is something to remember.
+        assert!(!session.path().exists(), "no file before the first message");
+        assert!(list_in(&dir).is_empty());
+        assert!(!session.is_saved());
+
+        // The environment block alone does not count: it is bookkeeping every session
+        // starts with, not a conversation.
+        session
+            .push_message(
+                Message::user_text("<environment>\n工作目录: /tmp\n</environment>"),
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(!session.path().exists(), "the environment block alone is not a session");
+        assert!(list_in(&dir).is_empty());
+
+        // The first real message brings the whole beginning with it, in order, so the file
+        // is exactly what it would have been had it been written from the start.
+        session
+            .push_message(Message::user_text("你好"), None, None)
+            .unwrap();
+        assert!(session.is_saved());
+        assert!(session.path().is_file());
+        let text = std::fs::read_to_string(session.path()).unwrap();
+        let kinds: Vec<&str> = text
+            .lines()
+            .map(|line| {
+                if line.contains("session_meta") {
+                    "header"
+                } else if line.contains("<environment>") {
+                    "env"
+                } else {
+                    "said"
+                }
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec!["header", "env", "said"],
+            "the buffered records are flushed in order, header first"
+        );
+        assert_eq!(list_in(&dir).len(), 1);
+        // Reopening sees the same conversation, header included.
+        let reopened = Session::open(session.path()).unwrap();
+        assert_eq!(reopened.id(), session.id());
+        assert_eq!(reopened.context_messages().len(), 2);
+
         let _ = std::fs::remove_dir_all(dir);
     }
 

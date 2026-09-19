@@ -124,8 +124,10 @@ fn run(cli: Cli) -> anyhow::Result<()> {
     //
     // After `/delete` there is no session to resume, so nothing is printed — offering a
     // command for a file that no longer exists would be worse than silence.
-    if !agent.session_deleted() {
-        let id = agent.session.id();
+    // A session that never said anything has no file, so there is no command to give: the
+    // id would name nothing, and printing one anyway would send the user to an error.
+    if !agent.session_deleted() && agent.session().is_saved() {
+        let id = agent.session().id();
         agent.screen.push_lines(ui_compact::note_lines(
             &format!("继续此会话：mpi resume {id}"),
             mpi::ui::screen::Style::new(Color::Dim),
