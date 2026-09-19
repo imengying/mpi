@@ -98,7 +98,8 @@ pub async fn execute_with_shell(
         content,
         display: Display::Command { expanded: false, footer },
         is_error: failed,
-    })
+duration: None,
+})
 }
 
 #[cfg(test)]

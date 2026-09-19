@@ -80,7 +80,8 @@ pub async fn execute(arguments: &serde_json::Value, cwd: &Path) -> Result<ToolOu
         content,
         display: Display::File { verb: "列出", path: target.to_string() },
         is_error: false,
-    })
+duration: None,
+})
 }
 
 #[cfg(test)]

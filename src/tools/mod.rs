@@ -25,15 +25,37 @@ pub struct ToolOutput {
     pub display: Display,
     /// Set when the model should be told the call failed.
     pub is_error: bool,
+    /// How long execution took, for the `耗时` footer. Presentation only.
+    ///
+    /// Measured around execution, not around the call's first render: the call is shown
+    /// before the authorization panel asks, so a number taken from the render would
+    /// include however long the user spent reading the dialog.
+    pub duration: Option<std::time::Duration>,
 }
 
 impl ToolOutput {
     pub fn text(content: impl Into<String>) -> Self {
-        ToolOutput { content: content.into(), display: Display::None, is_error: false }
+        ToolOutput {
+            content: content.into(),
+            display: Display::None,
+            is_error: false,
+            duration: None,
+        }
     }
 
     pub fn error(content: impl Into<String>) -> Self {
-        ToolOutput { content: content.into(), display: Display::None, is_error: true }
+        ToolOutput {
+            content: content.into(),
+            display: Display::None,
+            is_error: true,
+            duration: None,
+        }
+    }
+
+    /// Attach the measured execution time.
+    pub fn timed(mut self, duration: std::time::Duration) -> Self {
+        self.duration = Some(duration);
+        self
     }
 
     /// An error that still echoes what was attempted, so a refusal in the transcript shows
@@ -54,7 +76,12 @@ impl ToolOutput {
             },
             _ => Display::None,
         };
-        ToolOutput { content: content.into(), display, is_error: true }
+        ToolOutput {
+            content: content.into(),
+            display,
+            is_error: true,
+            duration: None,
+        }
     }
 
     /// Apply the shared output budget, parking the full text in a temp file when it
@@ -74,7 +101,12 @@ impl ToolOutput {
             },
             (other, _) => other,
         };
-        ToolOutput { content: truncated.text, display, is_error: self.is_error }
+        ToolOutput {
+            content: truncated.text,
+            display,
+            is_error: self.is_error,
+            duration: self.duration,
+        }
     }
 }
 
@@ -102,7 +134,7 @@ pub enum Display {
     },
 }
 
-fn verb_for(name: &str) -> &'static str {
+pub(crate) fn verb_for(name: &str) -> &'static str {
     match name {
         "read" => "读取",
         "write" => "写入",
@@ -137,6 +169,10 @@ pub async fn execute(
     arguments: &serde_json::Value,
     cwd: &Path,
 ) -> ToolOutput {
+    // Timed here, around the tool itself, so every tool reports the same way and none can
+    // forget to. Not around the render: the call is shown before the authorization panel
+    // asks, so a render-based number would include the time spent reading the dialog.
+    let started = std::time::Instant::now();
     let result = match name {
         "read" => read::execute(arguments, cwd).await,
         "write" => write::execute(arguments, cwd).await,
@@ -147,7 +183,11 @@ pub async fn execute(
         "ls" => ls::execute(arguments, cwd).await,
         other => return ToolOutput::error(format!("未知工具：{other}")),
     };
-    result.unwrap_or_else(|err| ToolOutput::error(err.to_string())).budget()
+    let elapsed = started.elapsed();
+    result
+        .unwrap_or_else(|err| ToolOutput::error(err.to_string()))
+        .budget()
+        .timed(elapsed)
 }
 
 /// Every tool needs a string argument; this keeps the error text uniform.

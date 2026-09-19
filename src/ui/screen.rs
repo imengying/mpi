@@ -380,6 +380,13 @@ pub struct Screen {
     /// Streaming preview: thinking tail plus the answer so far.
     streaming_thinking: Option<String>,
     streaming_answer: Option<String>,
+    /// The tool call in flight, as one line: `● $ sleep 30`.
+    ///
+    /// A tool can take minutes, and without it the screen would sit unchanged with no sign
+    /// that anything is happening. It is a *live* row, not a transcript block: the finished
+    /// call is committed afterwards with its output and duration, and this line disappears
+    /// in the same redraw.
+    running_call: Option<Vec<Span>>,
     /// Whether stdout is a terminal at all.
     interactive: bool,
     /// What was last written as the window title, so an unchanged title is not rewritten on
@@ -430,6 +437,7 @@ impl Screen {
             history: Vec::new(),
             history_index: None,
             streaming_thinking: None,
+            running_call: None,
             streaming_answer: None,
             interactive,
             title: None,
@@ -547,6 +555,7 @@ impl Screen {
         self.printed = 0;
         self.streaming_answer = None;
         self.streaming_thinking = None;
+        self.running_call = None;
         self.editing = None;
         self.erase_live();
         if self.interactive {
@@ -557,6 +566,33 @@ impl Screen {
     }
 
     // -- streaming ----------------------------------------------------------
+
+    /// Take the live region down so someone else can draw on the terminal.
+    ///
+    /// Used before the authorization panel, which writes straight to stdout and moves the
+    /// cursor itself: from that point `live_rows`/`cursor_row` no longer describe the screen,
+    /// and a later erase would climb from the wrong row and leave the old region behind.
+    /// Caller must [`Screen::render`] afterwards to put the region back.
+    pub fn suspend_live(&mut self) {
+        self.erase_live();
+    }
+
+    /// Show the tool call that is now running, as a single live line.
+    ///
+    /// Replaced (or cleared with [`Screen::clear_running`]) when the call finishes; the
+    /// finished call is committed to the transcript in its place.
+    pub fn set_running(&mut self, spans: Vec<Span>) {
+        self.running_call = Some(spans);
+        self.render();
+    }
+
+    /// Take the running line down. Called before the finished call is committed, so the two
+    /// never show at once.
+    pub fn clear_running(&mut self) {
+        if self.running_call.take().is_some() {
+            self.render();
+        }
+    }
 
     /// Begin a streaming answer: the thinking preview and the text so far live in the live
     /// region at the bottom of the screen until the turn ends.
@@ -630,6 +666,11 @@ impl Screen {
                 .collect();
             let wrapped = wrap_all(&body, self.width);
             lines.extend(wrapped);
+            self.trim_live(&mut lines);
+        }
+        if let Some(spans) = &self.running_call {
+            lines.extend(wrap_line(&Line::spans(spans.clone()), self.width));
+            lines.push(Line::blank());
             self.trim_live(&mut lines);
         }
         if let Some(editing) = &self.editing {
@@ -976,6 +1017,15 @@ impl Screen {
         };
         let saved_footer = self.footer.clone();
         let saved_editing = self.editing.take();
+        // Take the live region down before the panel draws. The panel writes straight to the
+        // terminal and moves the cursor itself, so `live_rows`/`cursor_row` — this struct's
+        // record of where the region is — stop describing the screen the moment it runs. The
+        // next erase would then climb from the wrong row and leave part of the old region
+        // behind, which is how a finished tool call kept a stale `●` line above it.
+        //
+        // Clearing first means the panel starts on a clean row, and the redraw at the end
+        // puts the region back from a known position.
+        self.erase_live();
         let result = loop {
             // The menu replaces the footer so it always sits in the same place.
             self.footer = self.menu_lines(title, items, cursor);

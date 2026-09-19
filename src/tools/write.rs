@@ -52,7 +52,8 @@ pub async fn execute(arguments: &serde_json::Value, cwd: &Path) -> Result<ToolOu
         content: format!("{action} {path}（{} 字节）", content.len()),
         display,
         is_error: false,
-    })
+duration: None,
+})
 }
 
 #[cfg(test)]

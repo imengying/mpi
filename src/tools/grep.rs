@@ -124,7 +124,8 @@ pub async fn execute(arguments: &serde_json::Value, cwd: &Path) -> Result<ToolOu
             content,
             display: Display::File { verb: "搜索", path: target.to_string() },
             is_error: false,
-        });
+duration: None,
+});
     }
     let mut content = body.clone();
     content.push_str(&format!("\n[共 {matched} 行匹配]\n"));
@@ -135,7 +136,8 @@ pub async fn execute(arguments: &serde_json::Value, cwd: &Path) -> Result<ToolOu
         content,
         display: Display::File { verb: "搜索", path: target.to_string() },
         is_error: false,
-    })
+duration: None,
+})
 }
 
 #[cfg(test)]

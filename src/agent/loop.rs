@@ -910,8 +910,23 @@ impl Agent {
     fn execute_tools(&mut self, calls: &[(String, String, serde_json::Value)]) {
         let cwd = self.cwd.clone();
         for (id, name, arguments) in calls {
+            // The call is shown while it runs: a command can take minutes, and the screen
+            // would otherwise sit unchanged with no sign that anything is happening. The
+            // line is taken down just before the finished call is committed, so only one of
+            // the two is ever on screen.
+            let running = ui_compact::running_line(name, arguments);
+            self.render_footer(None);
+            self.screen.set_running(running.clone());
+            // The authorization panel writes to the terminal directly and moves the cursor
+            // itself, so the live region is taken down first and put back afterwards.
+            // Otherwise the panel leaves the running line stranded above the call it
+            // belongs to.
+            self.screen.suspend_live();
             let output = match block_on(self.gate.check(id, name, arguments, &cwd)) {
                 Ok(()) => {
+                    // Approved: the wait is now the command's own, so the running line goes
+                    // back up before it starts.
+                    self.screen.set_running(running);
                     let result = block_on(tools::execute(name, arguments, &cwd));
                     self.gate.finish(id);
                     result
@@ -923,6 +938,7 @@ impl Agent {
                     ToolOutput::error_for(name, arguments, refusal.message())
                 }
             };
+            self.screen.clear_running();
             let _ = self.session.push_message(
                 Message::Tool {
                     tool_call_id: id.clone(),

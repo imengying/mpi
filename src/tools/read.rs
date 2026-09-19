@@ -62,7 +62,8 @@ pub async fn execute(arguments: &serde_json::Value, cwd: &Path) -> Result<ToolOu
         content: out,
         display: crate::tools::Display::File { verb: "读取", path: path.to_string() },
         is_error: false,
-    })
+duration: None,
+})
 }
 
 #[cfg(test)]
