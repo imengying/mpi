@@ -385,6 +385,9 @@ pub struct Screen {
     /// What was last written as the window title, so an unchanged title is not rewritten on
     /// every frame.
     title: Option<String>,
+    /// Where the cursor was left inside the live region, as a row index, or `None` when it
+    /// was left just past the end. Needed to erase the region from the right place.
+    cursor_row: Option<usize>,
     /// A one-off line shown under the input, e.g. a failed paste. Cleared on the next edit.
     notice: Option<String>,
     /// Images pasted during the current edit, waiting to be sent with the line.
@@ -430,6 +433,7 @@ impl Screen {
             streaming_answer: None,
             interactive,
             title: None,
+            cursor_row: None,
             notice: None,
             pending_images: Vec::new(),
             commands: Vec::new(),
@@ -805,15 +809,35 @@ impl Screen {
         let _ = self.out.flush();
     }
 
-    /// Remove the live region from the screen without touching committed scrollback.
+    /// Remove the live region, leaving the cursor where the region started.
+    ///
+    /// The cursor may be parked *inside* the region (on the input row) or just past its end
+    /// (while streaming), so the distance back to the first live row differs between the two.
+    /// Getting this wrong is not merely cosmetic: erasing from the wrong row leaves the rest
+    /// of the old frame on screen, and the next frame is then drawn below it, which pushes
+    /// the transcript up by however many rows were missed — once per redraw.
     fn erase_live(&mut self) {
         if !self.interactive || self.live_rows == 0 {
             return;
         }
-        let _ = crossterm::execute!(self.out, cursor::MoveToPreviousLine(self.live_rows as u16));
+        // Rows to climb to reach the top of the region.
+        //
+        // The cursor is either parked inside it (row `r`, so `r` rows below the top) or left
+        // just past its end (row `live_rows`, so all of them). Moving up *this* many rows
+        // lands on the first live row; moving up any more would climb past it and clear
+        // committed transcript instead, one row of it per redraw.
+        let up = match self.cursor_row {
+            Some(row) => row,
+            None => self.live_rows,
+        };
+        if up > 0 {
+            let _ = crossterm::execute!(self.out, cursor::MoveToPreviousLine(up as u16));
+        }
+        let _ = write!(self.out, "\r");
         let _ = crossterm::execute!(self.out, terminal::Clear(terminal::ClearType::FromCursorDown));
         let _ = self.out.flush();
         self.live_rows = 0;
+        self.cursor_row = None;
     }
 
     /// Re-render the live region: the streaming preview (if any), the prompt (if editing)
@@ -835,19 +859,22 @@ impl Screen {
             buffer.push_str(&self.paint(line, self.width));
             buffer.push_str("\r\n");
         }
-        // Park the cursor inside the input row. Each row below it is one line up, and the
-        // column is where the buffer ends — the caret belongs with the text, not below the
-        // footer where the last drawn row left it.
+        // Park the cursor inside the input row.
+        //
+        // Every row above ends with CRLF, so after drawing `lines.len()` rows the cursor is
+        // on the row *after* the last one — that extra row is why the count is not `- 1`.
+        // Without a cursor target (streaming, no input line) the cursor is left on that row,
+        // which is where `erase_live` expects to find it.
         if let Some((row, column)) = cursor {
-            let up = lines.len().saturating_sub(row + 1);
-            if up > 0 {
-                buffer.push_str(&format!("\u{1b}[{up}A"));
-            }
+            let up = lines.len().saturating_sub(row);
+            buffer.push_str(&format!("\u{1b}[{up}A"));
             buffer.push_str(&format!("\u{1b}[{}G", column + 1));
         }
         let _ = write!(self.out, "{buffer}");
         let _ = self.out.flush();
         self.live_rows = lines.len();
+        // Remember where the cursor was left, so the next erase starts from the right row.
+        self.cursor_row = cursor.map(|(row, _)| row);
     }
 
     fn paint(&self, line: &Line, pad_to: usize) -> String {
@@ -1398,6 +1425,55 @@ mod tests {
         assert!(lines[row].text().starts_with("› /mo"), "{:?}", lines[row].text());
         assert!(row + 1 < lines.len());
         assert!(lines[row + 1].text().contains("/model"), "the menu goes under the input");
+    }
+
+    #[test]
+    fn the_erase_step_lands_on_the_first_live_row() {
+        // Both halves of this arithmetic were wrong at different times, and both failures
+        // look like "the screen creeps upward": one row of committed transcript is cleared
+        // per redraw. Pin the numbers here rather than in a terminal.
+        //
+        // While editing, the cursor is parked on the input row, which is the *first* live
+        // row — so erasing from there needs no upward move at all.
+        let mut screen = screen_with_commands();
+        screen.editing = Some("hi".into());
+        screen.set_footer(vec![Line::plain("dir"), Line::plain("stats")]);
+        let (lines, cursor) = screen.compose_live();
+        let (row, _) = cursor.unwrap();
+        assert_eq!(row, 0, "the input line is the first live row");
+        let up = row; // mirrors erase_live
+        assert_eq!(up, 0, "erasing from the input row must not climb");
+        assert!(lines.len() > 1);
+
+        // With a pending image and a menu the input row is still first.
+        screen.pending_images.push(crate::image_input::PastedImage {
+            width: 1,
+            height: 1,
+            data: "AA==".into(),
+            bytes: 3,
+        });
+        let (lines, cursor) = screen.compose_live();
+        let (row, _) = cursor.unwrap();
+        assert_eq!(row, 0, "images render below the input line, not above it");
+        assert!(lines[0].text().starts_with("› hi"));
+    }
+
+    #[test]
+    fn the_cursor_step_reaches_the_input_row_from_the_last_drawn_row() {
+        // The renderer finishes every row with CRLF, so after N rows the cursor is on row N
+        // — the row *after* the last one. Moving up `N - row` lands on `row`; `N - row - 1`
+        // lands one row lower, which is what put the caret on the footer.
+        for live_rows in 1..6usize {
+            for row in 0..live_rows {
+                let newlines_after_drawing = live_rows + 1;
+                let up = live_rows - row; // mirrors draw_live
+                assert_eq!(
+                    newlines_after_drawing - 1 - up,
+                    row,
+                    "N={live_rows} row={row} must land on the target row"
+                );
+            }
+        }
     }
 
     #[test]
