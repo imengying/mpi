@@ -53,13 +53,21 @@ fn run(cli: Cli) -> anyhow::Result<()> {
     }
 
     let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
-    let mut agent = if cli.command == Some(Command::Resume) {
-        match most_recent_session() {
+    let mut agent = match &cli.command {
+        Some(Command::Resume { id: Some(id) }) => {
+            // An id that matches nothing is an error, not a silent fresh session: the user
+            // asked for a specific conversation and getting a blank one would hide the
+            // mistake until they noticed the missing history.
+            match mpi::agent::session::find_by_prefix(id) {
+                Ok(path) => Agent::resume(config, cwd, &path, interactive)?,
+                Err(err) => anyhow::bail!("{err}（用 /resume 或 mpi resume 查看会话列表）"),
+            }
+        }
+        Some(Command::Resume { id: None }) => match most_recent_session() {
             Some(path) => Agent::resume(config, cwd, &path, interactive)?,
             None => Agent::new(config, cwd, interactive)?,
-        }
-    } else {
-        Agent::new(config, cwd, interactive)?
+        },
+        _ => Agent::new(config, cwd, interactive)?,
     };
 
     // The turn loop: read a line, dispatch a slash command or run a turn.
@@ -110,11 +118,16 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         }
     }
 
-    // Say goodbye with the session path, so `/resume` has something to point at. After
-    // `/delete` there is no file, and saying it was saved would be a lie.
+    // Leave the user something they can act on: the exact command that brings this
+    // conversation back, not the path of the file it happens to live in. The id is the
+    // file name, so it is already the shortest thing that names the session.
+    //
+    // After `/delete` there is no session to resume, so nothing is printed — offering a
+    // command for a file that no longer exists would be worse than silence.
     if !agent.session_deleted() {
+        let id = agent.session.id();
         agent.screen.push_lines(ui_compact::note_lines(
-            &format!("会话已保存：{}", agent.session.path().display()),
+            &format!("继续此会话：mpi resume {id}"),
             mpi::ui::screen::Style::new(Color::Dim),
         ));
     }

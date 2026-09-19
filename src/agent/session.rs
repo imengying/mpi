@@ -238,6 +238,11 @@ impl Session {
         &self.header
     }
 
+    /// The session id, which is also the file stem: `~/.local/share/mpi/sessions/<id>.jsonl`.
+    pub fn id(&self) -> &str {
+        &self.header.id
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -631,6 +636,39 @@ impl SessionSummary {
 }
 
 /// List sessions in the default directory, newest first.
+/// Find one session by id, or by any unique prefix of it.
+///
+/// Matching a prefix is what makes the id printed on exit usable: the full uuid is awkward
+/// to retype, and the first few characters are already unique in practice. An ambiguous
+/// prefix is an error rather than a guess — resuming the wrong conversation silently is
+/// worse than asking for more characters.
+pub fn find_by_prefix(prefix: &str) -> Result<PathBuf, String> {
+    find_by_prefix_in(&sessions_dir(), prefix)
+}
+
+/// [`find_by_prefix`] against a given directory, so tests do not touch the real one.
+pub fn find_by_prefix_in(dir: &Path, prefix: &str) -> Result<PathBuf, String> {
+    let prefix = prefix.trim();
+    if prefix.is_empty() {
+        return Err("会话 id 不能为空".to_string());
+    }
+    let matches: Vec<SessionSummary> = list_in(dir)
+        .into_iter()
+        .filter(|summary| summary.id.starts_with(prefix))
+        .collect();
+    match matches.len() {
+        0 => Err(format!("找不到会话「{prefix}」")),
+        1 => Ok(matches[0].path.clone()),
+        n => {
+            let shown: Vec<&str> = matches.iter().take(4).map(|m| m.id.as_str()).collect();
+            Err(format!(
+                "「{prefix}」匹配到 {n} 个会话，请多给几位：{}",
+                shown.join("、")
+            ))
+        }
+    }
+}
+
 pub fn list() -> Vec<SessionSummary> {
     list_in(&sessions_dir())
 }
@@ -716,6 +754,85 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let session = Session::create_in(&dir, &dir, "work/m").unwrap();
         (session, dir)
+    }
+
+    #[test]
+    fn a_session_can_be_found_by_an_id_prefix() {
+        let dir = std::env::temp_dir().join(format!("mpi-find-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let session = Session::create_in(&dir, &dir, "work/m").unwrap();
+        let id = session.id().to_string();
+
+        // The full id works, and so does any unique prefix of it — that is what makes the
+        // command printed on exit usable without retyping 36 characters.
+        assert_eq!(find_by_prefix_in(&dir, &id).unwrap(), session.path());
+        assert_eq!(find_by_prefix_in(&dir, &id[..8]).unwrap(), session.path());
+        // Whitespace from a sloppy copy-paste is tolerated.
+        assert_eq!(find_by_prefix_in(&dir, &format!("  {}  ", &id[..8])).unwrap(), session.path());
+
+        // An unknown id is an error: silently starting a blank session would hide the typo
+        // until the user noticed the missing history.
+        assert!(find_by_prefix_in(&dir, "ffffffff").is_err());
+        assert!(find_by_prefix_in(&dir, "").is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_ambiguous_prefix_is_refused_rather_than_guessed() {
+        let dir = std::env::temp_dir().join(format!("mpi-ambig-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Two sessions, so a short prefix can match both. uuids are time-ordered (v7), so
+        // sessions created in the same moment share a long leading run — the common prefix
+        // is what a user is most likely to type, which is exactly when guessing would be
+        // worst.
+        Session::create_in(&dir, &dir, "work/m").unwrap();
+        Session::create_in(&dir, &dir, "work/m").unwrap();
+
+        let ids: Vec<String> = list_in(&dir).into_iter().map(|s| s.id).collect();
+        assert_eq!(ids.len(), 2);
+        // The longest prefix that still matches both: one character shorter than the point
+        // where the two ids diverge.
+        let shared = ids
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .iter()
+            .fold(usize::MAX, |acc, id| {
+                acc.min(
+                    ids[0]
+                        .chars()
+                        .zip(id.chars())
+                        .take_while(|(x, y)| x == y)
+                        .count(),
+                )
+            });
+        let ambiguous = &ids[0][..shared];
+        assert!(
+            shared > 0 && ids.iter().all(|id| id.starts_with(ambiguous)),
+            "the constructor did not produce a shared prefix: {ids:?}"
+        );
+        let err = find_by_prefix_in(&dir, ambiguous).unwrap_err();
+        assert!(err.contains("匹配到"), "{err}");
+        assert!(err.contains("请多给几位"), "{err}");
+
+        // A prefix one character longer than the shared run picks exactly one session.
+        let unique = &ids[0][..shared + 1];
+        assert_eq!(find_by_prefix_in(&dir, unique).unwrap(), dir_for(&dir, unique));
+        // And the full id stays unambiguous.
+        assert!(find_by_prefix_in(&dir, &ids[0]).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The path a session with this id prefix lives at.
+    fn dir_for(dir: &Path, id_prefix: &str) -> PathBuf {
+        list_in(dir)
+            .into_iter()
+            .find(|s| s.id.starts_with(id_prefix))
+            .expect("the id names a session")
+            .path
     }
 
     #[test]

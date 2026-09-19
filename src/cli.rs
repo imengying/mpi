@@ -11,8 +11,11 @@ pub fn version() -> &'static str {
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 pub enum Command {
-    /// 继续最近一次会话
-    Resume,
+    /// 继续最近一次会话；带 id 前缀时恢复指定的那个
+    Resume {
+        /// 会话 id（或其前缀）。省略则用最近一次。
+        id: Option<String>,
+    },
     /// 只检查配置与环境，不进交互
     Check,
     /// 更新到最新 Release
@@ -41,8 +44,18 @@ mod tests {
         use clap::Parser as _;
         for (arg, expected) in [("resume", "Resume"), ("check", "Check"), ("update", "Update")] {
             let cli = Cli::try_parse_from(["mpi", arg]).unwrap();
-            assert_eq!(format!("{:?}", cli.command), format!("Some({expected})"));
+            // `resume` carries an optional id, so match on the variant name.
+            let actual = format!("{:?}", cli.command);
+            assert!(actual.starts_with(&format!("Some({expected}")), "{actual}");
         }
+        // The id is optional, and a prefix is enough to name a session.
+        let with_id = Cli::try_parse_from(["mpi", "resume", "01a0b8d0"]).unwrap();
+        assert_eq!(
+            with_id.command,
+            Some(Command::Resume { id: Some("01a0b8d0".to_string()) })
+        );
+        let without = Cli::try_parse_from(["mpi", "resume"]).unwrap();
+        assert_eq!(without.command, Some(Command::Resume { id: None }));
         let plain = Cli::try_parse_from(["mpi"]).unwrap();
         assert!(plain.command.is_none());
     }

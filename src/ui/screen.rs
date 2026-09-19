@@ -1222,8 +1222,13 @@ pub fn teardown() {
     let _ = out.flush();
 }
 
-/// The window title: `π - <session name> - <directory>`, or `π - <directory>` when the
-/// session has no name yet.
+/// The window title: `π - <session name> - <project>`, or `π - <project>` when the session
+/// has no name yet.
+///
+/// The project is the **name** of its root directory, not the path it lives at. A terminal
+/// tab is a few centimetres wide, and `π - ~/文档/mpi` spends most of them on a location the
+/// user already knows — they are looking for which project, not where it is. A session name
+/// still takes precedence: it is what the user chose to call this conversation.
 ///
 /// Control characters are flattened: a session name is user input, and a newline or an
 /// escape byte in it would break out of the OSC sequence and let the rest be interpreted
@@ -1234,13 +1239,22 @@ pub fn window_title(name: Option<&str>, cwd: &Path) -> String {
     if let Some(name) = name {
         title.push_str(" - ");
         title.push_str(&util::one_line(name));
-    }
-    let cwd = short_cwd(cwd);
-    if !cwd.is_empty() {
+    } else if let Some(project) = project_label(cwd) {
         title.push_str(" - ");
-        title.push_str(&util::one_line(&cwd));
+        title.push_str(&project);
     }
     title
+}
+
+/// The project's name: the last component of the directory the work happens in.
+///
+/// Taken from the directory itself rather than from the git root so the title matches what
+/// the user typed to get here. The file-system root has no name, so it yields `None` and
+/// the title stays just `π` rather than becoming `π - /`.
+fn project_label(cwd: &Path) -> Option<String> {
+    let name = cwd.file_name()?.to_string_lossy().to_string();
+    let name = util::one_line(&name);
+    (!name.is_empty()).then_some(name)
 }
 
 /// Strip the window title on the way out, leaving the terminal as it was found.
@@ -1271,12 +1285,18 @@ mod tests {
     }
 
     #[test]
-    fn the_window_title_names_the_session_and_the_directory() {
-        let cwd = Path::new("/tmp/work");
-        assert_eq!(window_title(Some("重构解析器"), cwd), "π - 重构解析器 - /tmp/work");
-        // Before the session is named only the directory is left.
-        assert_eq!(window_title(None, cwd), "π - /tmp/work");
-        assert_eq!(window_title(Some("   "), cwd), "π - /tmp/work");
+    fn the_window_title_names_the_project_not_its_path() {
+        // The tab shows which project this is; where it lives is not the question a tab
+        // answers, and the path is what made the title unreadable.
+        let cwd = Path::new("/home/me/文档/mpi");
+        assert_eq!(window_title(None, cwd), "π - mpi");
+        // A session name wins: the user chose it deliberately.
+        assert_eq!(window_title(Some("重构解析器"), cwd), "π - 重构解析器");
+        assert_eq!(window_title(Some("   "), cwd), "π - mpi");
+        // Only the last component is used, so a deeply nested checkout stays short.
+        assert_eq!(window_title(None, Path::new("/a/b/c/deep-project")), "π - deep-project");
+        // The file-system root has no name to show.
+        assert_eq!(window_title(None, Path::new("/")), "π");
     }
 
     #[test]
@@ -1288,9 +1308,9 @@ mod tests {
         assert!(!title.contains('\u{1b}'), "{title:?}");
         assert!(!title.contains('\u{7}'), "{title:?}");
         // The injected sequence is removed outright, not merely neutralised.
-        assert_eq!(title, "π - ab - /tmp/work");
+        assert_eq!(title, "π - ab");
         // A bare BEL is dropped as well.
-        assert_eq!(window_title(Some("a\u{7}b"), cwd), "π - ab - /tmp/work");
+        assert_eq!(window_title(Some("a\u{7}b"), cwd), "π - ab");
         // A newline would split the title across two lines in the terminal's tab bar.
         assert!(!window_title(Some("a\nb"), cwd).contains('\n'));
     }

@@ -137,10 +137,8 @@ impl Agent {
         let client = Client::new()?;
         let mut screen = Screen::new();
         screen.set_commands(COMMANDS);
-        screen.push_lines(ui_compact::note_lines(
-            &format!("mpi · 会话 {}", &session.header().id[..8]),
-            crate::ui::screen::Style::new(Color::Dim),
-        ));
+        // The session id is deliberately *not* announced here: it is printed on the way out,
+        // as part of the command that resumes it, which is the only time it is useful.
         // No `AGENTS.md` means no system message at all: mpi has no prompt of its own.
         let system_prompt = system_prompt_from(&cwd);
         if let Some((path, text)) = load_agents_md(&cwd) {
