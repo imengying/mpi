@@ -684,10 +684,34 @@ impl Agent {
 
     /// Run one user turn to completion.
     pub async fn run_turn(&mut self, input: &str) -> anyhow::Result<()> {
+        self.run_turn_with_images(input, Vec::new()).await
+    }
+
+    /// A turn with pasted images attached.
+    ///
+    /// The images and the text become **one** user message: splitting them would let the
+    /// model answer the text without having seen the picture, which is the exact mistake a
+    /// screenshot is meant to prevent.
+    pub async fn run_turn_with_images(
+        &mut self,
+        input: &str,
+        images: Vec<crate::image_input::PastedImage>,
+    ) -> anyhow::Result<()> {
         self.screen.collapse_all();
         self.screen.push_lines(ui_compact::user_lines(input));
+        for image in &images {
+            self.screen.push_lines(ui_compact::note_lines(
+                &image.label(),
+                crate::ui::screen::Style::new(Color::Magenta),
+            ));
+        }
+        let mut content: Vec<crate::llm::Block> = Vec::new();
+        if !input.is_empty() {
+            content.push(crate::llm::Block::Text { text: input.to_string() });
+        }
+        content.extend(images.iter().map(crate::image_input::PastedImage::block));
         self.session
-            .push_message(Message::user_text(input.to_string()), None, None)?;
+            .push_message(Message::User { content }, None, None)?;
         self.retry.reset();
 
         loop {

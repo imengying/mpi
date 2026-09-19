@@ -20,6 +20,15 @@ pub enum Block {
     Text {
         text: String,
     },
+    /// An image the user pasted. `data` is the raw file bytes (not base64): each provider
+    /// wants a different envelope, and the session file stores it as-is so a resumed
+    /// session keeps the picture.
+    Image {
+        /// IANA media type, e.g. `image/png`. Both APIs want this spelled out.
+        media_type: String,
+        /// Base64 of the file bytes, ready to drop into either provider's envelope.
+        data: String,
+    },
     Thinking {
         thinking: String,
         /// Provider-supplied signature, when the API returns one.
@@ -102,10 +111,16 @@ impl Message {
             .collect()
     }
 
-    /// chars/4 estimate, counting text, thinking and tool-call arguments. Images are
-    /// not modelled here (mpi does not send any) but the constant is kept for parity.
+    /// chars/4 estimate, counting text, thinking and tool-call arguments.
+    ///
+    /// An image is charged a fixed cost rather than its byte length: providers bill by
+    /// tiles or by a visual-token formula, not by how well a PNG compressed, so measuring
+    /// the encoded bytes would be wildly wrong in both directions. The constant comes from
+    /// the observed cost of a typical screenshot.
     pub fn estimate_tokens(&self) -> u64 {
+        const IMAGE_TOKENS: u64 = 1_200;
         let mut chars = 0usize;
+        let mut images = 0u64;
         match self {
             Message::System { content } | Message::Tool { content, .. } => chars += content.len(),
             Message::User { content } | Message::Assistant { content, .. } => {
@@ -116,11 +131,12 @@ impl Message {
                         Block::ToolCall { name, arguments, .. } => {
                             chars += name.len() + arguments.to_string().len()
                         }
+                        Block::Image { .. } => images += 1,
                     }
                 }
             }
         }
-        (chars as u64).div_ceil(4)
+        (chars as u64).div_ceil(4) + images * IMAGE_TOKENS
     }
 }
 

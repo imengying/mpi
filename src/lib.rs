@@ -4,6 +4,7 @@ pub mod agent;
 pub mod auth;
 pub mod cli;
 pub mod config;
+pub mod image_input;
 pub mod llm;
 pub mod tools;
 pub mod ui;

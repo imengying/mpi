@@ -17,6 +17,7 @@ use crossterm::{cursor, terminal};
 use unicode_width::UnicodeWidthChar;
 
 use crate::config::Defaults;
+use crate::image_input::{self, PastedImage};
 use crate::ui::theme::{Color, Theme};
 use crate::util;
 
@@ -349,6 +350,9 @@ pub fn wrap_all(lines: &[Line], width: usize) -> Vec<Line> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     Line(String),
+    /// A line with one or more pasted images attached. The caller sends them as a single
+    /// user message so the text and the pictures stay together.
+    LineWithImages(String, Vec<PastedImage>),
     ToggleExpand,
     /// Ctrl+C on an empty line, or Ctrl+D.
     Interrupt,
@@ -381,6 +385,13 @@ pub struct Screen {
     /// What was last written as the window title, so an unchanged title is not rewritten on
     /// every frame.
     title: Option<String>,
+    /// A one-off line shown under the input, e.g. a failed paste. Cleared on the next edit.
+    notice: Option<String>,
+    /// Images pasted during the current edit, waiting to be sent with the line.
+    ///
+    /// Kept out of `editing` because a buffer is text; the image is attached to the message
+    /// the line becomes.
+    pending_images: Vec<PastedImage>,
     /// Every slash command, for completion and the menu.
     commands: Vec<(String, String)>,
     /// The slash-command menu shown under the input line, and which entry is highlighted.
@@ -419,6 +430,8 @@ impl Screen {
             streaming_answer: None,
             interactive,
             title: None,
+            notice: None,
+            pending_images: Vec::new(),
             commands: Vec::new(),
             menu: Vec::new(),
             menu_selected: 0,
@@ -625,6 +638,14 @@ impl Screen {
             // a CJK character counts as the two cells it occupies.
             let (prefix, text) = &rows[last];
             cursor = Some((lines.len() - 1, util::width(prefix) + util::width(text)));
+        }
+        // Pending images and one-off notices sit between the input and the menu: they are
+        // about what is being composed, so they belong next to it.
+        for image in &self.pending_images {
+            lines.push(Line::new(image.label(), Style::new(Color::Magenta)));
+        }
+        if let Some(notice) = &self.notice {
+            lines.push(Line::new(notice.clone(), Style::new(Color::Yellow)));
         }
         // The menu goes directly under the input line, above the footer.
         if !self.menu.is_empty() {
@@ -977,6 +998,8 @@ impl Screen {
         let guard = RawGuard::enter()?;
         self.editing = Some(String::new());
         self.history_index = None;
+        self.notice = None;
+        self.pending_images.clear();
         self.menu.clear();
         self.menu_selected = 0;
         self.render();
@@ -1011,19 +1034,49 @@ impl Screen {
                         self.render();
                         continue;
                     }
+                    // Images travel with the line, and an image with no text at all is a
+                    // valid message: the user may only want to show a screenshot.
+                    if !self.pending_images.is_empty() {
+                        let images = std::mem::take(&mut self.pending_images);
+                        break Action::LineWithImages(line, images);
+                    }
                     break Action::Line(line);
                 }
                 KeyCode::Char('o') if ctrl => break Action::ToggleExpand,
                 KeyCode::Char('c') if ctrl => {
-                    let empty = self.editing.as_deref().unwrap_or("").is_empty();
+                    let empty = self.editing.as_deref().unwrap_or("").is_empty()
+                        && self.pending_images.is_empty();
                     if empty {
                         break Action::Interrupt;
                     }
                     self.editing = Some(String::new());
+                    self.pending_images.clear();
                 }
                 KeyCode::Char('d') if ctrl => {
                     if self.editing.as_deref().unwrap_or("").is_empty() {
                         break Action::Eof;
+                    }
+                }
+                KeyCode::Char('v') if ctrl => {
+                    // An image on the clipboard wins over text: a screenshot tool usually
+                    // leaves both, and the user pressing Ctrl+V after a screenshot means
+                    // the picture. Text paste is the consolation path.
+                    match image_input::read_clipboard_image() {
+                        Ok(image) => {
+                            self.pending_images.push(image);
+                        }
+                        Err(image_input::ImageError::NoImage) => {
+                            if let Ok(text) = image_input::read_clipboard_text()
+                                && let Some(buffer) = &mut self.editing
+                            {
+                                // One line at a time: the editor has no multiline buffer,
+                                // and a raw newline would break the layout.
+                                buffer.push_str(&text.replace(['\n', '\r'], " "));
+                            }
+                        }
+                        Err(err) => {
+                            self.notice = Some(format!("粘贴失败：{err}"));
+                        }
                     }
                 }
                 KeyCode::Char('u') if ctrl => self.editing = Some(String::new()),
@@ -1091,16 +1144,22 @@ impl Screen {
                 }
                 _ => {}
             }
+            // A notice describes the last keystroke, so it does not outlive it.
+            self.notice = None;
             self.sync_menu();
             self.render();
         };
         self.menu.clear();
         self.menu_selected = 0;
         // The buffer is echoed from `self.editing` while typing; nothing to do here.
-        if let Action::Line(ref text) = action
+        let history_text = match &action {
+            Action::Line(text) | Action::LineWithImages(text, _) => Some(text.clone()),
+            _ => None,
+        };
+        if let Some(text) = history_text
             && !text.trim().is_empty()
         {
-            self.history.push(text.clone());
+            self.history.push(text);
             if self.history.len() > 200 {
                 self.history.remove(0);
             }

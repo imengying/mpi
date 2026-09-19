@@ -81,6 +81,22 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     ));
                 }
             }
+            Action::LineWithImages(line, images) => {
+                let line = line.trim().to_string();
+                // Slash commands are text-only: a command with an image attached is not
+                // something mpi defines, so the images are dropped rather than silently
+                // sent as a turn.
+                if line.starts_with('/') {
+                    if !futures_block(agent.command(&line))? {
+                        break;
+                    }
+                } else if let Err(err) = futures_block(agent.run_turn_with_images(&line, images)) {
+                    agent.screen.push_lines(ui_compact::note_lines(
+                        &format!("本轮失败：{err:#}"),
+                        mpi::ui::screen::Style::new(Color::Red),
+                    ));
+                }
+            }
             Action::ToggleExpand => {
                 if !agent.screen.toggle_last_collapsible() {
                     agent.screen.push_lines(ui_compact::note_lines(

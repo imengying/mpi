@@ -26,6 +26,25 @@ impl CacheControl {
     }
 }
 
+/// Where an image block's bytes come from.
+#[derive(Debug, Clone, Serialize)]
+struct ImageSource {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    media_type: String,
+    data: String,
+}
+
+impl ImageSource {
+    fn base64(media_type: &str, data: &str) -> Self {
+        ImageSource {
+            kind: "base64",
+            media_type: media_type.to_string(),
+            data: data.to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum OutBlock {
@@ -33,6 +52,11 @@ enum OutBlock {
         text: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
+    },
+    /// An image block. Anthropic takes base64 in a nested `source` object, unlike OpenAI's
+    /// single data-URI string.
+    Image {
+        source: ImageSource,
     },
     Thinking {
         thinking: String,
@@ -137,6 +161,9 @@ pub fn build_request(req: &Request<'_>) -> MessagesRequest {
                             Block::Text { text } => {
                                 Some(OutBlock::Text { text: text.clone(), cache_control: None })
                             }
+                            Block::Image { media_type, data } => Some(OutBlock::Image {
+                                source: ImageSource::base64(media_type, data),
+                            }),
                             _ => None,
                         })
                         .collect(),
@@ -159,6 +186,9 @@ pub fn build_request(req: &Request<'_>) -> MessagesRequest {
                             name: name.clone(),
                             input: arguments.clone(),
                         }),
+                        // A model cannot send an image back, so this never occurs in a
+                        // well-formed history; dropped rather than sent as an empty block.
+                        Block::Image { .. } => {}
                     }
                 }
                 if !out.is_empty() {

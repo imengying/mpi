@@ -24,13 +24,51 @@ impl CacheControl {
     }
 }
 
+/// One part of a message body. OpenAI shapes a text part and an image part differently, so
+/// the two are separate variants rather than one struct with optional fields.
 #[derive(Debug, Clone, Serialize)]
-struct ContentBlock {
-    #[serde(rename = "type")]
-    kind: &'static str,
-    text: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    cache_control: Option<CacheControl>,
+#[serde(untagged)]
+enum ContentBlock {
+    Text {
+        #[serde(rename = "type")]
+        kind: &'static str,
+        text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
+    },
+    Image {
+        #[serde(rename = "type")]
+        kind: &'static str,
+        image_url: ImageUrl,
+    },
+}
+
+/// The data-URI or plain URL form OpenAI expects for an image part.
+#[derive(Debug, Clone, Serialize)]
+struct ImageUrl {
+    url: String,
+}
+
+impl ContentBlock {
+    fn text(text: impl Into<String>, cache: bool) -> Self {
+        ContentBlock::Text {
+            kind: "text",
+            text: text.into(),
+            cache_control: cache.then(|| CacheControl::ephemeral(false)),
+        }
+    }
+
+    /// Inline image as a data URI, which is what both OpenAI and the gateways in front of
+    /// it accept; a separate upload endpoint would need a second round trip and a place to
+    /// keep the uploaded blob.
+    fn image(media_type: &str, base64_data: &str) -> Self {
+        ContentBlock::Image {
+            kind: "image_url",
+            image_url: ImageUrl {
+                url: format!("data:{media_type};base64,{base64_data}"),
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -173,7 +211,7 @@ pub fn build_request(req: &Request<'_>, stream: bool) -> ChatRequest {
                 messages.push(ChatMessage::new(role).text(content, last_block_hint));
             }
             Message::User { content } => {
-                messages.push(ChatMessage::new("user").text(&join_text(content), last_block_hint));
+                messages.push(ChatMessage::new("user").content(user_content(content, last_block_hint)));
             }
             Message::Assistant { content, .. } => {
                 let text = join_text(content);
@@ -322,6 +360,9 @@ fn join_text(blocks: &[Block]) -> String {
         .iter()
         .filter_map(|block| match block {
             Block::Text { text } => Some(text.clone()),
+            // An image has no text form. Callers that must preserve it use `user_content`,
+            // which builds parts; this function is for the places that want prose only.
+            Block::Image { .. } => None,
             Block::Thinking { .. } => None,
             Block::ToolCall { .. } => None,
         })
@@ -333,14 +374,44 @@ fn join_text(blocks: &[Block]) -> String {
 /// one to place here.
 fn text_content(text: &str, cache: bool) -> ChatContent {
     if cache {
-        ChatContent::Blocks(vec![ContentBlock {
-            kind: "text",
-            text: text.to_string(),
-            cache_control: Some(CacheControl::ephemeral(false)),
-        }])
+        ChatContent::Blocks(vec![ContentBlock::text(text, true)])
     } else {
         ChatContent::Text(text.to_string())
     }
+}
+
+/// A user message body: the text plus any pasted images, in that order.
+///
+/// The plain-string shape is kept when there is only text — some gateways reject the
+/// block-array form outright, and there is no reason to send it for an ordinary message.
+/// Once an image is present the array form is unavoidable, and the text goes in as its own
+/// part so the two do not run together.
+fn user_content(blocks: &[Block], last_block_hint: bool) -> ChatContent {
+    let has_image = blocks.iter().any(|block| matches!(block, Block::Image { .. }));
+    if !has_image {
+        return text_content(&join_text(blocks), last_block_hint);
+    }
+    let mut parts = Vec::new();
+    for block in blocks {
+        match block {
+            Block::Text { text } => {
+                if !text.is_empty() {
+                    parts.push(ContentBlock::text(text.clone(), false));
+                }
+            }
+            Block::Image { media_type, data } => {
+                parts.push(ContentBlock::image(media_type, data));
+            }
+            Block::Thinking { .. } | Block::ToolCall { .. } => {}
+        }
+    }
+    // The cache marker rides on the last part, which is what the prefix actually ends on.
+    if last_block_hint
+        && let Some(ContentBlock::Text { cache_control, .. }) = parts.last_mut()
+    {
+        *cache_control = Some(CacheControl::ephemeral(false));
+    }
+    ChatContent::Blocks(parts)
 }
 
 pub fn endpoint(base_url: &str) -> String {

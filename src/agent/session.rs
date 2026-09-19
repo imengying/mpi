@@ -695,6 +695,7 @@ pub fn message_preview(message: &Message, width: usize) -> String {
                     Block::Text { text } => text.clone(),
                     Block::Thinking { .. } => "[思考]".to_string(),
                     Block::ToolCall { name, .. } => format!("[{name}]"),
+                    Block::Image { .. } => "[图片]".to_string(),
                 })
                 .collect::<Vec<_>>()
                 .join(" ");
