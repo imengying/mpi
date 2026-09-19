@@ -890,51 +890,49 @@ pub fn describe_overflow(signal: &compact::OverflowSignal) -> String {
 
 /// `AGENTS.md` filenames, in the order pi looks for them.
 const AGENTS_FILES: &[&str] = &["AGENTS.md", "AGENTS.MD"];
-/// Read `AGENTS.md` from `cwd` and every directory above it.
+/// The project root: the nearest directory at or above `cwd` that holds a `.git`, or `cwd`
+/// itself when there is none.
 ///
-/// Nearest file wins: a project's own instructions shadow the ones in a monorepo root or the
-/// home directory, which is what lets a nested checkout override shared guidance. Several
-/// matches are joined nearest-last so the closest file has the final word.
+/// `.git` may be a directory (an ordinary checkout) or a file (a submodule or a linked
+/// worktree), so only its presence is checked.
+fn project_root(cwd: &Path) -> PathBuf {
+    cwd.ancestors()
+        .find(|dir| dir.join(".git").exists())
+        .unwrap_or(cwd)
+        .to_path_buf()
+}
+
+/// Read the project's `AGENTS.md`, and only that one.
 ///
-/// Nothing is read when no file exists — mpi has no built-in prompt, so the model gets a
-/// system message only if the user asked for one.
+/// The file is looked up in the project root — not in `cwd`, and not in any directory above
+/// the root. A checkout can be run from anywhere inside it and the instructions are the ones
+/// the project committed; conversely, a stray file in `/tmp` or in the parent of the project
+/// cannot inject instructions, which is what makes the lookup safe to do without asking.
+///
+/// Nothing is read when the file does not exist: mpi has no built-in prompt, so the model
+/// gets a system message only if the project asked for one.
 pub fn load_agents_md(cwd: &Path) -> Option<(PathBuf, String)> {
-    let mut found: Vec<(PathBuf, String)> = Vec::new();
-    for dir in cwd.ancestors() {
-        for name in AGENTS_FILES {
-            let path = dir.join(name);
-            if !path.is_file() {
-                continue;
-            }
-            match std::fs::read_to_string(&path) {
-                Ok(text) if !text.trim().is_empty() => {
-                    found.push((path.clone(), text));
-                    break;
-                }
-                Ok(_) => break,
-                Err(err) => {
-                    eprintln!("mpi: 读取 {} 失败：{err}", path.display());
-                    break;
-                }
-            }
+    let root = project_root(cwd);
+    for name in AGENTS_FILES {
+        let path = root.join(name);
+        if !path.is_file() {
+            continue;
         }
+        return match std::fs::read_to_string(&path) {
+            // Whitespace-only counts as absent: it would otherwise send an empty system
+            // message on every request.
+            Ok(text) if text.trim().is_empty() => None,
+            Ok(text) => {
+                let label = path.display().to_string();
+                Some((path, format!("<!-- {label} -->\n{}", text.trim_end())))
+            }
+            Err(err) => {
+                eprintln!("mpi: 读取 {} 失败：{err}", path.display());
+                None
+            }
+        };
     }
-    if found.is_empty() {
-        return None;
-    }
-    // `ancestors()` walks outward, so the list is nearest-first; the outer files go on top so
-    // the nearest one is read last and wins.
-    found.reverse();
-    let primary = found.last().map(|(path, _)| path.clone())?;
-    let text = found
-        .iter()
-        .map(|(path, text)| {
-            let label = path.display();
-            format!("<!-- {label} -->\n{}", text.trim_end())
-        })
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    Some((primary, text))
+    None
 }
 
 #[cfg(test)]
@@ -954,24 +952,59 @@ mod tests {
     }
 
     #[test]
-    fn a_nearer_agents_md_wins_over_an_outer_one() {
+    fn the_project_root_supplies_the_prompt() {
+        // Running from a subdirectory still picks up the project's own file, and a nested
+        // file below the root is not consulted: the root is what was committed.
         let root = std::env::temp_dir().join(format!("mpi-agents-{}", std::process::id()));
-        let inner = root.join("inner");
+        let nested = root.join("crates/inner");
         let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&inner).unwrap();
-        std::fs::write(root.join("AGENTS.md"), "外层规则").unwrap();
-        std::fs::write(inner.join("AGENTS.md"), "内层规则").unwrap();
+        // Only the project root is a checkout; the nested directory is a plain subdirectory,
+        // so the root is where the lookup stops.
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir(root.join(".git")).unwrap();
+        std::fs::write(root.join("AGENTS.md"), "根目录规则").unwrap();
+        std::fs::write(nested.join("AGENTS.md"), "内层规则").unwrap();
 
-        let (path, text) = load_agents_md(&inner).expect("both files are found");
-        // The reported path is the nearest file — that is what the UI names and what the
-        // user would edit.
-        assert_eq!(path, inner.join("AGENTS.md"));
-        // Both are sent, nearest last, so the closest instruction is the last one read.
-        let outer_at = text.find("外层规则").expect("outer text is included");
-        let inner_at = text.find("内层规则").expect("inner text is included");
-        assert!(outer_at < inner_at, "{text:?}");
+        let (path, text) = load_agents_md(&nested).expect("the root file is found");
+        assert_eq!(path, root.join("AGENTS.md"));
+        assert!(text.contains("根目录规则"));
+        assert!(!text.contains("内层规则"), "a nested file must not be read: {text:?}");
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn nothing_above_the_project_root_is_read() {
+        // The lookup stops at the root. Without that boundary, a directory the user does not
+        // control — a shared `/tmp`, another user's home — could inject instructions into the
+        // prompt of a project that never asked for them.
+        let outer = std::env::temp_dir().join(format!("mpi-outer-{}", std::process::id()));
+        let project = outer.join("project");
+        let _ = std::fs::remove_dir_all(&outer);
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(outer.join("AGENTS.md"), "外部注入").unwrap();
+        // No `.git` under the project: the root is the working directory itself.
+        assert!(load_agents_md(&project).is_none(), "the outer file must be ignored");
+
+        // With a `.git`, the root is the project, and the outer file is still ignored.
+        std::fs::create_dir(project.join(".git")).unwrap();
+        std::fs::write(project.join("AGENTS.md"), "本项目规则").unwrap();
+        let (_, text) = load_agents_md(&project).expect("the project file is found");
+        assert!(!text.contains("外部注入"), "{text:?}");
+
+        let _ = std::fs::remove_dir_all(&outer);
+    }
+
+    #[test]
+    fn a_project_without_a_git_directory_uses_the_working_directory() {
+        // A plain directory is its own project, so its file is read — the rule is "the root
+        // of what you are working on", not "only git checkouts".
+        let dir = std::env::temp_dir().join(format!("mpi-plain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("AGENTS.md"), "规则").unwrap();
+        assert!(load_agents_md(&dir).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
