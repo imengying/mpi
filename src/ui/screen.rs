@@ -825,12 +825,12 @@ impl Screen {
         // Rows to climb to reach the top of the region.
         //
         // The cursor is either parked inside it (row `r`, so `r` rows below the top) or left
-        // just past its end (row `live_rows`, so all of them). Moving up *this* many rows
-        // lands on the first live row; moving up any more would climb past it and clear
-        // committed transcript instead, one row of it per redraw.
+        // on the last drawn row, which is `live_rows - 1` below the top. Moving up *this*
+        // many rows lands on the first live row; moving up any more would climb past it and
+        // clear committed transcript instead, one row of it per redraw.
         let up = match self.cursor_row {
             Some(row) => row,
-            None => self.live_rows,
+            None => self.live_rows.saturating_sub(1),
         };
         if up > 0 {
             let _ = crossterm::execute!(self.out, cursor::MoveToPreviousLine(up as u16));
@@ -857,25 +857,38 @@ impl Screen {
         let (lines, cursor) = self.compose_live();
         self.erase_live();
         let mut buffer = String::new();
-        for line in &lines {
+        // Separate rows with CRLF but do **not** end the last one with it. A trailing newline
+        // leaves the cursor on a row that has nothing in it, and that empty row is the blank
+        // line under the footer: the live region is one row taller than what it draws.
+        //
+        // After the loop the cursor sits at the start of the row *after* the last drawn one
+        // (or on it, if the last row exactly filled the width). Both `erase_live` and the park
+        // below are written against that position.
+        for (index, line) in lines.iter().enumerate() {
+            if index > 0 {
+                buffer.push_str("\r\n");
+            }
             buffer.push_str(&self.paint(line, self.width));
-            buffer.push_str("\r\n");
         }
         // Park the cursor inside the input row.
         //
-        // Every row above ends with CRLF, so after drawing `lines.len()` rows the cursor is
-        // on the row *after* the last one — that extra row is why the count is not `- 1`.
-        // Without a cursor target (streaming, no input line) the cursor is left on that row,
-        // which is where `erase_live` expects to find it.
+        // Having drawn `lines.len()` rows without a final newline, the cursor is one row below
+        // the last drawn row, so it needs `lines.len() - 1 - row` steps up — one fewer than
+        // the number of rows. With no cursor target (streaming, no input line) it is left on
+        // that row, which is where `erase_live` expects to find it.
         if let Some((row, column)) = cursor {
-            let up = lines.len().saturating_sub(row);
-            buffer.push_str(&format!("\u{1b}[{up}A"));
+            let up = lines.len().saturating_sub(1).saturating_sub(row);
+            if up > 0 {
+                buffer.push_str(&format!("\u{1b}[{up}A"));
+            }
             buffer.push_str(&format!("\u{1b}[{}G", column + 1));
         }
         let _ = write!(self.out, "{buffer}");
         let _ = self.out.flush();
         self.live_rows = lines.len();
-        // Remember where the cursor was left, so the next erase starts from the right row.
+        // Where the cursor was left, so the next erase starts from the right row. With no
+        // cursor target it rests on the last drawn row, which is `live_rows - 1` rows below
+        // the top — `erase_live` derives that from `None` rather than storing it.
         self.cursor_row = cursor.map(|(row, _)| row);
     }
 
@@ -1493,19 +1506,45 @@ mod tests {
 
     #[test]
     fn the_cursor_step_reaches_the_input_row_from_the_last_drawn_row() {
-        // The renderer finishes every row with CRLF, so after N rows the cursor is on row N
-        // — the row *after* the last one. Moving up `N - row` lands on `row`; `N - row - 1`
-        // lands one row lower, which is what put the caret on the footer.
+        // Rows are separated by CRLF, so after drawing N rows the cursor is still on the last
+        // one — it is *not* pushed to the row below, which is what used to leave a blank line
+        // under the footer. From there, `N - 1 - row` steps up land on `row`.
         for live_rows in 1..6usize {
             for row in 0..live_rows {
-                let newlines_after_drawing = live_rows + 1;
-                let up = live_rows - row; // mirrors draw_live
+                let cursor_row_after_drawing = live_rows - 1;
+                let up = live_rows - 1 - row; // mirrors draw_live
                 assert_eq!(
-                    newlines_after_drawing - 1 - up,
+                    cursor_row_after_drawing - up,
                     row,
                     "N={live_rows} row={row} must land on the target row"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn erasing_reaches_the_first_live_row_from_either_resting_position() {
+        // Two places the cursor can be when the next frame starts, and both must climb to the
+        // first live row: parked on row `r` while editing, or left on the last drawn row when
+        // there is no input line (streaming). Climbing one row too far eats a line of the
+        // committed transcript on every redraw.
+        for live_rows in 1..6usize {
+            // Parked on the input row.
+            for row in 0..live_rows {
+                let cursor_row = Some(row);
+                let up = match cursor_row {
+                    Some(row) => row,
+                    None => live_rows.saturating_sub(1),
+                };
+                assert_eq!(up, row);
+            }
+            // Left on the last drawn row: `live_rows - 1` below the top.
+            let up = match None::<usize> {
+                Some(row) => row,
+                None => live_rows.saturating_sub(1),
+            };
+            assert_eq!(up, live_rows - 1, "N={live_rows}");
+            assert_eq!(live_rows - 1 - up, 0, "N={live_rows} must land on row 0");
         }
     }
 
