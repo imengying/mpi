@@ -672,14 +672,18 @@ impl Screen {
             for (index, (name, help)) in self.menu.iter().enumerate() {
                 let selected = index == self.menu_selected;
                 let marker = if selected { "› " } else { "  " };
-                let style = if selected {
+                // The command name is what is being picked, so it keeps the accent colour and
+                // only gains weight when highlighted. Painting the whole row grey made the
+                // list read as disabled text: the names are the point, the descriptions are
+                // the aside.
+                let name_style = if selected {
                     Style { bold: true, ..Style::new(Color::Cyan) }
                 } else {
-                    Style::new(Color::Dim)
+                    Style::new(Color::Cyan)
                 };
                 lines.push(Line::spans(vec![
-                    Span::new(marker, style),
-                    Span::new(format!("/{name}"), style),
+                    Span::new(marker, name_style),
+                    Span::new(format!("/{name}"), name_style),
                     Span::new("  ", Style::plain()),
                     Span::new(util::truncate(help, self.width.saturating_sub(6).min(60), "…"), Style::new(Color::Dim)),
                 ]));
@@ -1080,6 +1084,10 @@ impl Screen {
             match key.code {
                 KeyCode::Enter => {
                     let mut line = self.editing.clone().unwrap_or_default();
+                    // The line is on its way out, so clear the buffer now: the caller commits
+                    // it to the transcript and redraws, and a buffer that still holds the
+                    // submitted text would be drawn again as a fresh prompt.
+                    self.editing = Some(String::new());
                     // Enter runs the highlighted command. When the buffer already spells
                     // that command out (`/exit` typed by hand, or a `/model` argument in
                     // progress), it is taken as written so an argument survives.
@@ -1207,7 +1215,11 @@ impl Screen {
         };
         self.menu.clear();
         self.menu_selected = 0;
-        // The buffer is echoed from `self.editing` while typing; nothing to do here.
+        // Redraw once without the submitted line. The buffer is cleared when the line is
+        // taken, but the terminal is still showing the frame from the last keystroke, so
+        // without this the text sits in the input row until something else repaints —
+        // which, while the model is being waited on, can be seconds.
+        self.render();
         let history_text = match &action {
             Action::Line(text) | Action::LineWithImages(text, _) => Some(text.clone()),
             _ => None,

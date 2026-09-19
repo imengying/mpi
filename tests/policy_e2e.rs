@@ -111,9 +111,11 @@ fn headless_refuses_rather_than_approving() {
     let mut gate = PermissionGate::new(false, Dialect::Zsh);
     let input = serde_json::json!({"command": "rm -rf build"});
     let refusal = futures_block(gate.check("c1", "bash", &input, &dir)).unwrap_err();
+    // The refusal states what happened and why, and stops there: the trailing instruction
+    // to the model about not retrying read as a scolding in the user's transcript.
     assert_eq!(
         refusal.message(),
-        "未获得用户授权，操作未执行（命令会删除文件，需要确认目标）。请勿改写命令绕过授权，也不要重试同一条命令。"
+        "未获得用户授权，操作未执行（命令会删除文件，需要确认目标）"
     );
 }
 

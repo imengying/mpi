@@ -23,33 +23,41 @@ impl ColorMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Color {
+    /// The terminal's own foreground: no escape at all.
+    ///
+    /// This is what body text is drawn in, and it is the difference between a theme that
+    /// reads as one dark wash and one that reads as the user's terminal. Painting every
+    /// line an explicit grey overrides the foreground they chose, and everything that is
+    /// not an accent ends up the same colour.
+    Text,
+    /// Tool output. Also the terminal's own foreground: a command's output is the main
+    /// thing the user reads, and greying it out made the transcript look uniformly dim.
+    Output,
+    Dim,     // #808080 — hints, notes, anything the eye should skip
     Green,   // usage stats, working directory
     Magenta, // git branch, bash `$`
-    Cyan,    // model name, panel title and choices
-    Text,    // #a0a0a0 body
-    Output,  // #b8b8b8 command body
+    Cyan,    // model name, panel title and choices, command names
     Yellow,  // context warning
     Red,     // context error
-    Dim,     // #808080
     DiffAddedText,
     DiffRemovedText,
 }
 
 impl Color {
-    /// `(r, g, b, ansi256_index)`
-    fn rgb(self) -> (u8, u8, u8, u8) {
-        match self {
+    /// `(r, g, b, ansi256_index)`, or `None` to leave the terminal's colour alone.
+    fn rgb(self) -> Option<(u8, u8, u8, u8)> {
+        Some(match self {
+            Color::Text => return None,
             Color::Green => (0x8c, 0xcf, 0x7e, 114),
             Color::Magenta => (0xc5, 0x86, 0xc0, 175),
             Color::Cyan => (0x73, 0xc2, 0xcf, 80),
-            Color::Text => (0xa0, 0xa0, 0xa0, 247),
-            Color::Output => (0xb8, 0xb8, 0xb8, 250),
+            Color::Output => return None,
             Color::Yellow => (0xd6, 0xbb, 0x7a, 180),
             Color::Red => (0xf0, 0x8a, 0x83, 210),
             Color::Dim => (0x80, 0x80, 0x80, 244),
             Color::DiffAddedText => (0xa3, 0xd9, 0xa5, 151),
             Color::DiffRemovedText => (0xf2, 0xa2, 0x9a, 216),
-        }
+        })
     }
 }
 
@@ -69,7 +77,10 @@ impl Theme {
         if text.is_empty() {
             return String::new();
         }
-        let (r, g, b, idx) = color.rgb();
+        // Body text is returned untouched so it renders in the terminal's own colour.
+        let Some((r, g, b, idx)) = color.rgb() else {
+            return text.to_string();
+        };
         match self.mode {
             ColorMode::True => format!("\u{1b}[38;2;{r};{g};{b}m{text}\u{1b}[39m"),
             ColorMode::Ansi256 => format!("\u{1b}[38;5;{idx}m{text}\u{1b}[39m"),
@@ -128,5 +139,25 @@ mod tests {
     fn fallback_uses_256_colour_sgr() {
         let theme = Theme { mode: ColorMode::Ansi256 };
         assert_eq!(theme.fg(Color::Cyan, "x"), "\u{1b}[38;5;80mx\u{1b}[39m");
+    }
+
+    #[test]
+    fn body_text_keeps_the_terminals_own_colour() {
+        // Painting body text an explicit grey overrides the foreground the user chose and
+        // makes every non-accent line the same colour — the transcript read as one dark
+        // wash. Body text and tool output therefore carry no escape at all.
+        let theme = Theme { mode: ColorMode::True };
+        assert_eq!(theme.fg(Color::Text, "hello"), "hello");
+        assert_eq!(theme.fg(Color::Output, "command output"), "command output");
+        // An empty string stays empty rather than emitting a lone escape pair.
+        assert_eq!(theme.fg(Color::Text, ""), "");
+
+        // The accents are still painted; this is not "stop colouring anything".
+        for color in [Color::Green, Color::Magenta, Color::Cyan, Color::Dim] {
+            assert!(
+                theme.fg(color, "x").contains("\u{1b}[38"),
+                "{color:?} lost its colour"
+            );
+        }
     }
 }

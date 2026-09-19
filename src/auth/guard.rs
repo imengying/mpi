@@ -15,18 +15,20 @@ use sha2_shim::fingerprint;
 use crate::auth::policy::{self, Assessment, Dialect};
 use crate::ui::auth_panel::{self, PanelRequest};
 
-/// Why a call was refused, in the words the policy used, plus the instruction that stops
-/// the model from re-issuing the same command.
+/// Why a call was refused, in the words the policy used.
 pub struct Refusal {
     pub reason: String,
 }
 
 impl Refusal {
+    /// The text the model receives in place of the tool result.
+    ///
+    /// It states the refusal and the reason, and stops there. The instruction that used to
+    /// trail it ("do not rewrite the command to get around this, and do not retry the same
+    /// one") was telling the model what it already knows, and it read as a scolding in the
+    /// transcript the user has to look at.
     pub fn message(&self) -> String {
-        format!(
-            "{}。请勿改写命令绕过授权，也不要重试同一条命令。",
-            policy::refusal(Some(&self.reason))
-        )
+        policy::refusal(Some(&self.reason))
     }
 }
 
@@ -174,7 +176,11 @@ mod tests {
         let input = serde_json::json!({"command": "rm -rf /"});
         let error = futures_lite_block(gate.check("1", "bash", &input, &cwd)).unwrap_err();
         assert!(error.message().starts_with("未获得用户授权，操作未执行（"));
-        assert!(error.message().contains("请勿改写命令绕过授权"));
+        // The refusal says what happened and why, and no more. An instruction to the model
+        // about not retrying used to be appended; it is the model's business and the user
+        // had to read it in every refusal.
+        assert!(!error.message().contains("请勿改写"));
+        assert!(!error.message().contains("不要重试"));
     }
 
     #[test]
