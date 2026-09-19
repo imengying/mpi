@@ -285,6 +285,47 @@ fn coalesce(row: Vec<(char, Style)>) -> Vec<Span> {
     spans
 }
 
+/// Split the input buffer into display rows, each tagged with its prompt prefix.
+///
+/// Wrapping is done on the buffer as a whole with the prompt width subtracted, then the
+/// prompt is prefixed to the first row, so a long word breaks at the real screen edge
+/// instead of two columns early on every row. Every row carries a prefix string —
+/// `"> "` for the first, spaces for the rest — which is what keeps the continuation rows
+/// aligned under the text rather than under the prompt.
+///
+/// The break is by character width, not by word: an input line is not prose, and moving a
+/// partly-typed path or command onto its own row would make the caret jump around.
+fn input_rows(text: &str, width: usize, prompt_width: usize) -> Vec<(String, String)> {
+    let mut rows: Vec<(String, String)> = Vec::new();
+    let mut current = String::new();
+    let mut used = 0usize;
+    // Every row, continuation included, carries a two-column prefix so the text lines up
+    // under itself; the usable width is therefore the same on all of them.
+    let room = width.saturating_sub(prompt_width).max(1);
+    for c in text.chars() {
+        let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+        if used + cw > room && used > 0 {
+            rows.push((String::new(), std::mem::take(&mut current)));
+            used = 0;
+        }
+        current.push(c);
+        used += cw;
+    }
+    rows.push((String::new(), current));
+    // Tag the prefixes now that the row count is known.
+    rows.into_iter()
+        .enumerate()
+        .map(|(index, (_, text))| {
+            let prefix = if index == 0 {
+                "› ".to_string()
+            } else {
+                " ".repeat(prompt_width)
+            };
+            (prefix, text)
+        })
+        .collect()
+}
+
 /// The longest prefix shared by every name, used to fill in as much as is unambiguous.
 fn common_prefix(names: &[&str]) -> String {
     let Some(first) = names.first() else {
@@ -559,22 +600,31 @@ impl Screen {
             self.trim_live(&mut lines);
         }
         if let Some(editing) = &self.editing {
-            // One row: prompt, the buffer, then the caret. An input longer than the
-            // terminal is scrolled from the left so the caret stays visible, which is what
-            // a single-row editor has to do.
-            let available = self.width.saturating_sub(4);
-            let mut visible = editing.clone();
-            while util::width(&visible) > available {
-                visible.remove(0);
+            // The buffer wraps onto as many rows as it needs, so a long line stays fully
+            // readable — scrolling sideways would hide the beginning of what was typed and
+            // give no way to get back to it. The prompt occupies the first two columns of
+            // the first row only.
+            let prompt_width = 2;
+            let width = self.width.max(prompt_width + 1);
+            let rows = input_rows(editing, width, prompt_width);
+            let last = rows.len().saturating_sub(1);
+            for (index, (prefix, text)) in rows.iter().enumerate() {
+                // The prefix is drawn on every row: on continuation rows it is spaces, and
+                // skipping it would lose the alignment that makes the wrap readable.
+                let style = if index == 0 {
+                    Style::new(Color::Cyan)
+                } else {
+                    Style::plain()
+                };
+                lines.push(Line::spans(vec![
+                    Span::new(prefix.clone(), style),
+                    Span::plain(text.clone()),
+                ]));
             }
-            lines.push(Line::spans(vec![
-                Span::new("› ", Style::new(Color::Cyan)),
-                Span::plain(visible.clone()),
-            ]));
-            // The caret sits after the buffer, on the row just pushed. The prompt is two
-            // columns wide, and the width is measured in cells so a CJK character counts
-            // as the two columns it occupies.
-            cursor = Some((lines.len() - 1, 2 + util::width(&visible)));
+            // The caret is at the end of the last row. Both numbers are display columns, so
+            // a CJK character counts as the two cells it occupies.
+            let (prefix, text) = &rows[last];
+            cursor = Some((lines.len() - 1, util::width(prefix) + util::width(text)));
         }
         // The menu goes directly under the input line, above the footer.
         if !self.menu.is_empty() {
@@ -1289,6 +1339,62 @@ mod tests {
         assert!(lines[row].text().starts_with("› /mo"), "{:?}", lines[row].text());
         assert!(row + 1 < lines.len());
         assert!(lines[row + 1].text().contains("/model"), "the menu goes under the input");
+    }
+
+    #[test]
+    fn a_long_input_wraps_instead_of_scrolling_the_beginning_away() {
+        // 12 columns, prompt 2 wide: the first row holds 10 cells, later rows the full 12.
+        let text: String = ('a'..='z').collect();
+        let rows = input_rows(&text, 12, 2);
+        assert_eq!(rows[0].0, "› ");
+        assert_eq!(rows[0].1, "abcdefghij");
+        assert_eq!(rows[1].0, "  ", "continuation rows align with the text, not the prompt");
+        // Ten cells per row, because the two-column prefix is on every row.
+        assert_eq!(rows[1].1, "klmnopqrst");
+        assert_eq!(rows[2].1, "uvwxyz");
+        // Nothing is lost: the beginning stays readable, which is the point.
+        let rebuilt: String = rows.iter().map(|(_, text)| text.as_str()).collect();
+        assert_eq!(rebuilt, text);
+    }
+
+    #[test]
+    fn a_short_input_stays_on_one_row() {
+        let rows = input_rows("hello", 40, 2);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1, "hello");
+    }
+
+    #[test]
+    fn an_empty_input_still_has_a_row_for_the_caret() {
+        let rows = input_rows("", 40, 2);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1, "");
+    }
+
+    #[test]
+    fn a_wide_character_never_splits_across_rows() {
+        // 5 columns, prompt 2: three CJK cells fit on the first row, five on the rest.
+        let rows = input_rows("你好世界你好世界", 5, 2);
+        for (prefix, text) in &rows {
+            let total = util::width(prefix) + util::width(text);
+            assert!(total <= 5, "{prefix:?}{text:?} is {total} cells wide");
+        }
+        let rebuilt: String = rows.iter().map(|(_, text)| text.as_str()).collect();
+        assert_eq!(rebuilt, "你好世界你好世界");
+    }
+
+    #[test]
+    fn the_cursor_follows_the_last_wrapped_row() {
+        let mut screen = screen_with_commands();
+        screen.editing = Some(('a'..='z').collect());
+        screen.width = 12;
+        let (lines, cursor) = screen.compose_live();
+        let (row, column) = cursor.unwrap();
+        // The caret is on the last row, after its text — not on the first row where it
+        // would be if the input were being scrolled sideways.
+        assert_eq!(row, 2);
+        assert_eq!(lines[row].text(), "  uvwxyz", "the continuation row keeps its indent");
+        assert_eq!(column, 2 + 6);
     }
 
     #[test]
