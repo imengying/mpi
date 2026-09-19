@@ -41,6 +41,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("compact", "手动压缩上下文，可带一段自定义指示"),
     ("new", "新会话"),
     ("resume", "恢复历史会话"),
+    ("delete", "删除本会话并退出"),
     ("exit", "退出"),
 ];
 
@@ -115,6 +116,8 @@ pub struct Agent {
     /// `None` means "send no system message". Held rather than re-read so the prefix stays
     /// byte-identical for the life of the session even if the file changes underneath.
     system_prompt: Option<String>,
+    /// Set by `/delete`: there is no file left to report as saved on the way out.
+    deleted: bool,
 }
 
 impl Agent {
@@ -164,6 +167,7 @@ impl Agent {
             retry: RetryBudget::default(),
             streaming: false,
             system_prompt,
+            deleted: false,
         })
     }
 
@@ -255,6 +259,7 @@ impl Agent {
             retry: RetryBudget::default(),
             streaming: false,
             system_prompt,
+            deleted: false,
         })
     }
 
@@ -338,6 +343,7 @@ impl Agent {
             "compact" => self.command_compact(argument).await?,
             "new" => self.command_new()?,
             "resume" => self.command_resume().await?,
+            "delete" => return self.command_delete(),
             other => {
                 let available = COMMANDS
                     .iter()
@@ -367,6 +373,58 @@ impl Agent {
         };
         self.screen.push_lines(ui_compact::note_lines(&note, crate::ui::screen::Style::new(Color::Dim)));
         Ok(())
+    }
+
+    /// `/delete`: remove this session's file and leave.
+    ///
+    /// It asks first. The file is the only record of the conversation, and unlike every
+    /// other command here there is nothing to recover from — `/resume` will simply no
+    /// longer list it.
+    ///
+    /// Returns `false` to end the turn loop, which is the point of the command: the session
+    /// is gone, so there is nothing left to continue.
+    fn command_delete(&mut self) -> anyhow::Result<bool> {
+        let name = self
+            .session
+            .name()
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| "未命名".into());
+        let path = self.session.path().display().to_string();
+        // A destructive action needs an explicit yes, and the non-interactive path has no
+        // way to give one: `pick` answers with the highlighted entry there, and that would
+        // turn `echo /delete | mpi` into an unattended delete. Refuse instead, and say how
+        // to do it deliberately.
+        if !self.screen.interactive() {
+            self.screen.push_lines(ui_compact::note_lines(
+                &format!("未删除：需要交互确认。手动删除：rm {}", path),
+                crate::ui::screen::Style::new(Color::Yellow),
+            ));
+            return Ok(true);
+        }
+        let choice = self.screen.pick(
+            &format!("删除会话「{name}」？"),
+            &["不删，继续".to_string(), "是的，删除并退出".to_string()],
+        );
+        // The safe option is highlighted first, so a reflexive Enter keeps the session.
+        if choice != Some(1) {
+            self.screen.push_lines(ui_compact::note_lines(
+                "已取消，会话保留。",
+                crate::ui::screen::Style::new(Color::Dim),
+            ));
+            return Ok(true);
+        }
+        self.session.delete()?;
+        self.deleted = true;
+        self.screen.push_lines(ui_compact::note_lines(
+            &format!("已删除会话文件：{path}"),
+            crate::ui::screen::Style::new(Color::Dim),
+        ));
+        Ok(false)
+    }
+
+    /// Whether `/delete` removed the session file.
+    pub fn session_deleted(&self) -> bool {
+        self.deleted
     }
 
     fn command_new(&mut self) -> anyhow::Result<()> {

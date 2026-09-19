@@ -141,7 +141,8 @@ impl Record {
 pub struct Session {
     header: SessionHeader,
     path: PathBuf,
-    file: std::fs::File,
+    /// `None` once the file has been deleted, so nothing can be written to a gone file.
+    file: Option<std::fs::File>,
     last_id: Option<String>,
     records: Vec<Record>,
     /// Cumulative usage over everything written so far, for the footer.
@@ -158,6 +159,8 @@ pub enum SessionError {
     Io(#[from] std::io::Error),
     #[error("会话文件格式无法识别：{0}")]
     Parse(String),
+    #[error("会话已被删除")]
+    Deleted,
 }
 
 impl Session {
@@ -185,7 +188,7 @@ impl Session {
         Ok(Session {
             header,
             path,
-            file,
+            file: Some(file),
             last_id: Some(id),
             records: vec![record],
             totals: Usage::default(),
@@ -220,7 +223,7 @@ impl Session {
         let mut session = Session {
             header,
             path: path.to_path_buf(),
-            file: std::fs::OpenOptions::new().append(true).open(path)?,
+            file: Some(std::fs::OpenOptions::new().append(true).open(path)?),
             last_id,
             records,
             totals: Usage::default(),
@@ -485,11 +488,29 @@ impl Session {
         self.append(record, id)
     }
 
+    /// Delete the session file.
+    ///
+    /// The handle is closed first: an open handle keeps the file alive and, on Windows,
+    /// blocks the unlink outright. After this the session is inert — [`Session::append`]
+    /// refuses, so a late write cannot recreate the file the user just deleted.
+    pub fn delete(&mut self) -> Result<(), SessionError> {
+        // Closing is what the drop does; taking it out of the field is what makes the
+        // "already deleted" state representable.
+        drop(self.file.take());
+        std::fs::remove_file(&self.path)?;
+        self.records.clear();
+        self.last_id = None;
+        Ok(())
+    }
+
     fn append(&mut self, record: Record, id: String) -> Result<(), SessionError> {
         let line = serde_json::to_string(&record)
             .map_err(|err| SessionError::Parse(err.to_string()))?;
-        writeln!(self.file, "{line}")?;
-        self.file.flush()?;
+        let Some(file) = self.file.as_mut() else {
+            return Err(SessionError::Deleted);
+        };
+        writeln!(file, "{line}")?;
+        file.flush()?;
         if let Some(usage) = record.usage() {
             self.totals.add(&usage);
         }
@@ -694,6 +715,39 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let session = Session::create_in(&dir, &dir, "work/m").unwrap();
         (session, dir)
+    }
+
+    #[test]
+    fn deleting_removes_the_file_and_refuses_later_writes() {
+        let (mut session, dir) = temp_session("delete");
+        session.push_message(Message::user_text("hello"), None, None).unwrap();
+        let path = session.path().to_path_buf();
+        assert!(path.is_file());
+
+        session.delete().unwrap();
+        assert!(!path.exists(), "the file is gone");
+
+        // A write after the delete must not bring the file back: the user asked for it to
+        // be gone, and a late append would quietly recreate it.
+        let after = session.push_message(Message::user_text("late"), None, None);
+        assert!(matches!(after, Err(SessionError::Deleted)), "{after:?}");
+        assert!(!path.exists(), "a refused write must not recreate the file");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_deleted_session_disappears_from_the_resume_list() {
+        let (mut session, dir) = temp_session("delete-list");
+        session.set_name(Some("要删掉的会话")).unwrap();
+        let path = session.path().to_path_buf();
+        assert_eq!(list_in(&dir).len(), 1);
+
+        session.delete().unwrap();
+        assert!(list_in(&dir).is_empty(), "the deleted session is no longer offered");
+        assert!(!path.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

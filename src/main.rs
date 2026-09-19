@@ -94,11 +94,14 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         }
     }
 
-    // Say goodbye with the session id, so `/resume` has something to point at.
-    agent.screen.push_lines(ui_compact::note_lines(
-        &format!("会话已保存：{}", agent.session.path().display()),
-        mpi::ui::screen::Style::new(Color::Dim),
-    ));
+    // Say goodbye with the session path, so `/resume` has something to point at. After
+    // `/delete` there is no file, and saying it was saved would be a lie.
+    if !agent.session_deleted() {
+        agent.screen.push_lines(ui_compact::note_lines(
+            &format!("会话已保存：{}", agent.session.path().display()),
+            mpi::ui::screen::Style::new(Color::Dim),
+        ));
+    }
     agent.render_footer(None);
     Ok(())
 }
