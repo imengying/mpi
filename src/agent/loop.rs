@@ -659,14 +659,12 @@ impl Agent {
         self.screen.begin_stream();
         let completion = {
             let screen = &mut self.screen;
-            let result = self
-                .client
+            self.client
                 .stream(&request, &mut |delta| match delta {
                     Delta::Text(text) => screen.push_text(&text),
                     Delta::Thinking(text) => screen.push_thinking(&text),
                 })
-                .await;
-            result
+                .await
         };
         self.streaming = false;
         // On a transport failure the streamed preview is discarded, so the transcript does

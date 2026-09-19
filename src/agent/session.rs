@@ -515,11 +515,11 @@ impl Session {
         }
         // Usage recorded before the last checkpoint describes the *old*, larger context,
         // so it is not a valid reading for the threshold check.
-        if let Some(checkpoint) = self.last_checkpoint_index() {
-            if last_index.map(|index| index < checkpoint).unwrap_or(true) {
-                last_usage = None;
-                last_index = None;
-            }
+        if let Some(checkpoint) = self.last_checkpoint_index()
+            && last_index.map(|index| index < checkpoint).unwrap_or(true)
+        {
+            last_usage = None;
+            last_index = None;
         }
         self.totals = totals;
         self.last_usage = last_usage;
@@ -659,7 +659,7 @@ pub fn list_in(dir: &Path) -> Vec<SessionSummary> {
             snippet,
         });
     }
-    summaries.sort_by(|a, b| b.modified.cmp(&a.modified));
+    summaries.sort_by_key(|summary| std::cmp::Reverse(summary.modified));
     summaries
 }
 

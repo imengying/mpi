@@ -92,10 +92,10 @@ impl PermissionGate {
 /// file tools. The policy's own reason is deliberately *not* shown — it goes to the
 /// model through the refusal message, where it can be acted on.
 fn panel_body(tool: &str, input: &serde_json::Value) -> String {
-    if tool == "bash" {
-        if let Some(command) = input.get("command").and_then(|v| v.as_str()) {
-            return command.to_string();
-        }
+    if tool == "bash"
+        && let Some(command) = input.get("command").and_then(|v| v.as_str())
+    {
+        return command.to_string();
     }
     serde_json::to_string_pretty(input).unwrap_or_else(|_| input.to_string())
 }

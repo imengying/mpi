@@ -37,11 +37,10 @@ fn main() {
     let is_tag_push = env::var("GITHUB_REF_TYPE").is_ok_and(|t| t == "tag");
     if is_tag_push && !tag.is_empty() {
         let expected = normalise(tag);
-        if let Some(binary) = env::var("MPI_BUILD_VERSION").ok().map(normalise) {
-            if binary != expected {
-                panic!("MPI_BUILD_VERSION ({binary}) 与 tag ({expected}) 不一致");
-            }
+        if let Some(binary) = env::var("MPI_BUILD_VERSION").ok().map(normalise)
+            && binary != expected
+        {
+            panic!("MPI_BUILD_VERSION ({binary}) 与 tag ({expected}) 不一致");
         }
     }
-
 }

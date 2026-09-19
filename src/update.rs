@@ -57,6 +57,13 @@ async fn update() -> Result<()> {
         println!("已是最新版本：mpi {latest}");
         return Ok(());
     }
+    // A source build, or a build from a tag that has no Release yet, can report something
+    // newer than the latest Release. Replacing it would quietly move the user backwards.
+    if newer_than(current, &latest) {
+        println!("本地 mpi {current} 比最新 Release {latest} 更新，保持不变。");
+        println!("要强制安装 Release 版，请运行 install.sh。");
+        return Ok(());
+    }
 
     // A release always carries all four targets, so a miss here means the asset naming
     // changed — say so instead of downloading something guessed at.
@@ -119,6 +126,22 @@ async fn update() -> Result<()> {
     Ok(())
 }
 
+/// Is `a` a numerically newer version than `b`?
+///
+/// Only plain dotted numbers are compared. Anything else — a `dev` build string, a commit
+/// hash, a `-rc1` suffix — counts as unknown and is never treated as newer, because
+/// refusing an update on a guess would be worse than allowing it.
+fn newer_than(a: &str, b: &str) -> bool {
+    fn parse(version: &str) -> Option<Vec<u64>> {
+        let parts: Option<Vec<u64>> = version.split('.').map(|part| part.parse().ok()).collect();
+        parts.filter(|parts| !parts.is_empty())
+    }
+    match (parse(a), parse(b)) {
+        (Some(a), Some(b)) => a > b,
+        _ => false,
+    }
+}
+
 /// The release target this build corresponds to, or `None` where nothing is published.
 pub fn target_triple() -> Option<&'static str> {
     match (std::env::consts::ARCH, std::env::consts::OS) {
@@ -176,7 +199,52 @@ fn replace_current_exe(new_binary: &Path, exe: &Path) -> Result<()> {
     let staged = exe.with_file_name(".mpi.new");
     std::fs::copy(new_binary, &staged)
         .with_context(|| format!("写入 {} 失败（目录可写吗？）", staged.display()))?;
-    std::fs::rename(&staged, &exe)
-        .with_context(|| format!("替换 {} 失败", exe.display()))?;
+    std::fs::rename(staged, exe).with_context(|| format!("替换 {} 失败", exe.display()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dotted_versions_compare_numerically() {
+        // Not lexicographic: 0.9 < 0.10, and 9 answers to 2.
+        assert!(newer_than("0.1.10", "0.1.9"));
+        assert!(newer_than("0.2", "0.1.99"));
+        assert!(newer_than("1.0", "0.9.9"));
+        assert!(!newer_than("0.1.9", "0.1.10"));
+        assert!(!newer_than("0.1.3", "0.1.3"));
+    }
+
+    #[test]
+    fn unparsable_versions_never_count_as_newer() {
+        // A dev build tells the user to force the install instead of blocking on a guess.
+        for (a, b) in [
+            ("dev", "0.1.3"),
+            ("0.1.3-rc1", "0.1.3"),
+            ("", "0.1.3"),
+            ("0.1.x", "0.1.3"),
+        ] {
+            assert!(!newer_than(a, b), "{a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn the_release_target_is_one_we_publish() {
+        // `None` is legitimate on other platforms; what must not happen is a triple that no
+        // release carries, which would send `update` looking for an asset that cannot exist.
+        if let Some(triple) = target_triple() {
+            assert!(
+                [
+                    "x86_64-unknown-linux-gnu",
+                    "aarch64-unknown-linux-gnu",
+                    "x86_64-apple-darwin",
+                    "aarch64-apple-darwin",
+                ]
+                .contains(&triple),
+                "意外的 target：{triple}"
+            );
+        }
+    }
 }
