@@ -15,8 +15,9 @@ use mpi::ui::{compact as ui_compact, theme::Color};
 fn main() {
     let cli = Cli::parse();
     let result = run(cli);
-    // Leave the terminal in a usable state whatever happened.
+    // Leave the terminal as it was found, window title included.
     teardown();
+    mpi::ui::screen::clear_title();
     if let Err(err) = result {
         eprintln!("mpi: {err:#}");
         std::process::exit(1);

@@ -151,9 +151,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # The tag is the version, so the title is the version and the notes are the commits
-          # since the previous tag.
-          VERSION="${GITHUB_REF_NAME#v}"
+          # The tag is the version: the title is the tag itself (like pi), and the notes are
+          # the commits since the previous tag.
           PREVIOUS="$(git describe --tags --abbrev=0 "${GITHUB_REF_NAME}^" 2>/dev/null || true)"
           if [ -n "$PREVIOUS" ]; then
             RANGE="${PREVIOUS}..${GITHUB_REF_NAME}"
@@ -161,12 +160,10 @@ jobs:
             RANGE="${GITHUB_REF_NAME}"
           fi
           {
-            echo "mpi ${VERSION}"
-            echo
             git log --no-decorate --pretty='- %s (%h)' "$RANGE"
           } > notes.md
           ls -la artifacts
           gh release create "$GITHUB_REF_NAME" \
-            --title "mpi ${VERSION}" \
+            --title "$GITHUB_REF_NAME" \
             --notes-file notes.md \
             artifacts/*.tar.gz

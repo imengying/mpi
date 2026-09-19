@@ -139,7 +139,7 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
-产物为 `mpi-<版本>-<target>.tar.gz`（内含二进制、README、LICENSE）；校验和由 GitHub 在 Release 页面自行提供。
+产物为 `mpi-<版本>-<target>.tar.gz`（内含二进制、README、LICENSE）；校验和由 GitHub 在 Release 页面自行提供。Release 标题就是 tag 本身（如 `v0.1.3`）。
 targets：
 
 | target | runner |

@@ -20,6 +20,12 @@ use crate::config::Defaults;
 use crate::ui::theme::{Color, Theme};
 use crate::util;
 
+/// The name the window title leads with, as pi uses `π`.
+///
+/// The terminal title is the one piece of chrome the terminal draws itself, so it stays
+/// visible when a long output has scrolled the footer away.
+pub const APP_TITLE: &str = "π";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Style {
     pub fg: Color,
@@ -317,6 +323,9 @@ pub struct Screen {
     streaming_answer: Option<String>,
     /// Whether stdout is a terminal at all.
     interactive: bool,
+    /// What was last written as the window title, so an unchanged title is not rewritten on
+    /// every frame.
+    title: Option<String>,
 }
 
 impl Screen {
@@ -338,6 +347,7 @@ impl Screen {
             streaming_thinking: None,
             streaming_answer: None,
             interactive,
+            title: None,
         };
         screen.refresh_size();
         screen
@@ -345,6 +355,25 @@ impl Screen {
 
     pub fn interactive(&self) -> bool {
         self.interactive
+    }
+
+    /// Set the terminal's window title to `π - <name> - <directory>`.
+    ///
+    /// Written with the OSC 0 sequence, the same one pi sends. Nothing is printed when the
+    /// output is not a terminal, and an unchanged title is skipped so a redraw does not
+    /// spam the terminal with escape sequences.
+    pub fn set_title(&mut self, name: Option<&str>, cwd: &Path) {
+        if !self.interactive {
+            return;
+        }
+        let title = window_title(name, cwd);
+        if self.title.as_deref() == Some(title.as_str()) {
+            return;
+        }
+        // OSC 0;title BEL.
+        let _ = write!(self.out, "\u{1b}]0;{title}\u{7}");
+        let _ = self.out.flush();
+        self.title = Some(title);
     }
 
     pub fn width(&self) -> usize {
@@ -870,6 +899,37 @@ pub fn teardown() {
     let _ = out.flush();
 }
 
+/// The window title: `π - <session name> - <directory>`, or `π - <directory>` when the
+/// session has no name yet.
+///
+/// Control characters are flattened: a session name is user input, and a newline or an
+/// escape byte in it would break out of the OSC sequence and let the rest be interpreted
+/// as terminal commands.
+pub fn window_title(name: Option<&str>, cwd: &Path) -> String {
+    let mut title = String::from(APP_TITLE);
+    let name = name.map(str::trim).filter(|name| !name.is_empty());
+    if let Some(name) = name {
+        title.push_str(" - ");
+        title.push_str(&util::one_line(name));
+    }
+    let cwd = short_cwd(cwd);
+    if !cwd.is_empty() {
+        title.push_str(" - ");
+        title.push_str(&util::one_line(&cwd));
+    }
+    title
+}
+
+/// Strip the window title on the way out, leaving the terminal as it was found.
+pub fn clear_title() {
+    if !std::io::stdout().is_terminal() {
+        return;
+    }
+    let mut out = std::io::stdout();
+    let _ = write!(out, "\u{1b}]0;\u{7}");
+    let _ = out.flush();
+}
+
 /// A convenience wrapper for the home directory shortcut.
 pub fn short_cwd(cwd: &Path) -> String {
     util::shorten_home(cwd, dirs::home_dir().as_deref())
@@ -888,8 +948,40 @@ mod tests {
     }
 
     #[test]
-    fn a_collapsible_block_keeps_only_its_tail() {
-        let lines: Vec<Line> = (0..10).map(|i| Line::plain(format!("line {i}"))).collect();
+    fn the_window_title_names_the_session_and_the_directory() {
+        let cwd = Path::new("/tmp/work");
+        assert_eq!(window_title(Some("重构解析器"), cwd), "π - 重构解析器 - /tmp/work");
+        // Before the session is named only the directory is left.
+        assert_eq!(window_title(None, cwd), "π - /tmp/work");
+        assert_eq!(window_title(Some("   "), cwd), "π - /tmp/work");
+    }
+
+    #[test]
+    fn a_session_name_cannot_break_out_of_the_title_sequence() {
+        // The name is user input. A raw ESC or BEL here would end the OSC sequence early and
+        // let whatever follows be read as a terminal command, so both are stripped.
+        let cwd = Path::new("/tmp/work");
+        let title = window_title(Some("a\u{1b}]0;evil\u{7}b"), cwd);
+        assert!(!title.contains('\u{1b}'), "{title:?}");
+        assert!(!title.contains('\u{7}'), "{title:?}");
+        // The injected sequence is removed outright, not merely neutralised.
+        assert_eq!(title, "π - ab - /tmp/work");
+        // A bare BEL is dropped as well.
+        assert_eq!(window_title(Some("a\u{7}b"), cwd), "π - ab - /tmp/work");
+        // A newline would split the title across two lines in the terminal's tab bar.
+        assert!(!window_title(Some("a\nb"), cwd).contains('\n'));
+    }
+
+    #[test]
+    fn a_piped_screen_does_not_write_a_title() {
+        // `screen()` is non-interactive, so nothing should reach stdout.
+        let mut screen = screen();
+        screen.set_title(Some("demo"), Path::new("/tmp/work"));
+        assert!(screen.title.is_none());
+    }
+
+    #[test]
+    fn a_collapsible_block_keeps_only_its_tail() {        let lines: Vec<Line> = (0..10).map(|i| Line::plain(format!("line {i}"))).collect();
         let block = Block::collapsible(lines, 0, 0, 5);
         let rendered = block.render(40);
         assert_eq!(rendered.len(), 6);

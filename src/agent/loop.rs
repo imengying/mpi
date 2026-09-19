@@ -276,6 +276,9 @@ impl Agent {
         };
         let lines = footer::render(&state, &self.screen.theme, self.screen.width());
         self.screen.set_footer(lines);
+        // The session name and directory both live in the footer, so the window title is
+        // refreshed wherever the footer is — including a session switch.
+        self.screen.set_title(self.session.name().as_deref(), &self.cwd);
         self.screen.render();
     }
 
