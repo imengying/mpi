@@ -524,6 +524,22 @@ impl Screen {
         true
     }
 
+    /// Take the live region down for good, on the way out of the program.
+    ///
+    /// The region is not part of the transcript: it is the prompt and the footer, redrawn on
+    /// every keystroke. Leaving it on screen makes the shell inherit a terminal whose cursor
+    /// sits in the middle of a row, and zsh — which marks a partial line with `PROMPT_SP` —
+    /// then prints a `%` right after it, so the mpi prompt appears to survive as `› /%`.
+    ///
+    /// Erasing it means the cursor ends up back where the region started, on a line of its
+    /// own, which is where the shell expects to find it.
+    pub fn leave(&mut self) {
+        self.erase_live();
+        if self.interactive {
+            let _ = self.out.flush();
+        }
+    }
+
     /// Forget the transcript and wipe the screen. Used by `/new` and `/resume`, where the
     /// previous conversation is no longer relevant.
     pub fn clear_transcript(&mut self) {
@@ -1295,6 +1311,36 @@ mod tests {
         screen.width = 40;
         screen.height = 24;
         screen
+    }
+
+    #[test]
+    fn leaving_takes_the_live_region_down() {
+        // The live region is the prompt and the footer, not part of the transcript. If it is
+        // left on screen the shell inherits a cursor parked mid-row, and zsh marks a partial
+        // line with `%` — so mpi's prompt appears to survive as `› /%`.
+        //
+        // The draw and erase steps are tested above; what this pins is that the exit path
+        // actually erases, because the residue only shows up in a real shell.
+        //
+        // `interactive` has to be on: a piped run writes no escape sequences at all, and
+        // `erase_live` is a no-op there by design.
+        let mut screen = screen();
+        screen.interactive = true;
+        screen.editing = Some("/".into());
+        screen.set_footer(vec![Line::plain("dir"), Line::plain("stats")]);
+
+        // Draw once, as the input loop does, so there is a region to take down.
+        let (lines, cursor) = screen.compose_live();
+        assert!(cursor.is_some(), "an input line means a cursor to park");
+        screen.live_rows = lines.len();
+        screen.cursor_row = cursor.map(|(row, _)| row);
+
+        screen.leave();
+
+        // The region is gone, so a later erase has nothing to do — which is exactly the
+        // state that keeps the shell's marker off the screen.
+        assert_eq!(screen.live_rows, 0);
+        assert_eq!(screen.cursor_row, None);
     }
 
     #[test]

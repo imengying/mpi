@@ -128,7 +128,9 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             mpi::ui::screen::Style::new(Color::Dim),
         ));
     }
-    agent.render_footer(None);
+    // Take the live region down before returning: it is the input prompt and footer, not
+    // part of the transcript, and leaving it behind hands the shell a cursor parked mid-row.
+    agent.screen.leave();
     Ok(())
 }
 
