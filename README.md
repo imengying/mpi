@@ -127,7 +127,6 @@ mpi 没有内置模型目录，也不会去猜。没配置 providers 会直接�
 mpi              # 新会话
 mpi resume       # 继续最近一次会话（等价于 /resume）
 mpi resume <id>  # 继续指定会话，id 或其前缀（退出时会打印这条命令）
-mpi check        # 只检查配置与环境，不进交互
 mpi update       # 更新到最新 Release
 ```
 

@@ -981,18 +981,6 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
     })
 }
 
-/// Result of the environment probe used by `--check`.
-pub fn describe_environment(cwd: &Path, config: &Config) -> String {
-    let models = config.catalogue().len();
-    let session_dir = crate::config::sessions_dir();
-    format!(
-        "工作目录: {}\nshell: {}\n模型数: {models}\n会话目录: {}\n",
-        cwd.display(),
-        config.shell.path,
-        session_dir.display()
-    )
-}
-
 /// Exposed for tests: the dialect mpi will hand to the policy.
 pub fn dialect_for(config: &Config) -> Dialect {
     policy::configured_dialect(&config.shell.path)
@@ -1180,14 +1168,4 @@ mod tests {
         assert_eq!(dialect_for(&config), Dialect::Bash);
     }
 
-    #[test]
-    fn check_output_names_the_environment() {
-        let config: Config = serde_json::from_str(
-            r#"{"providers":[{"name":"p","api":"openai-completions","models":[{"id":"m"}]}]}"#,
-        )
-        .unwrap();
-        let text = describe_environment(Path::new("/tmp"), &config);
-        assert!(text.contains("/tmp"));
-        assert!(text.contains("模型数: 1"));
-    }
 }

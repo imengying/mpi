@@ -16,8 +16,6 @@ pub enum Command {
         /// 会话 id（或其前缀）。省略则用最近一次。
         id: Option<String>,
     },
-    /// 只检查配置与环境，不进交互
-    Check,
     /// 更新到最新 Release
     Update,
 }
@@ -42,7 +40,7 @@ mod tests {
     #[test]
     fn the_cli_parses_codex_style_subcommands() {
         use clap::Parser as _;
-        for (arg, expected) in [("resume", "Resume"), ("check", "Check"), ("update", "Update")] {
+        for (arg, expected) in [("resume", "Resume"), ("update", "Update")] {
             let cli = Cli::try_parse_from(["mpi", arg]).unwrap();
             // `resume` carries an optional id, so match on the variant name.
             let actual = format!("{:?}", cli.command);

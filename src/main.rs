@@ -6,7 +6,7 @@
 
 use clap::Parser;
 
-use mpi::agent::r#loop::{self, Agent};
+use mpi::agent::r#loop::Agent;
 use mpi::cli::{Cli, Command};
 use mpi::config::Config;
 use mpi::ui::screen::{teardown, Action};
@@ -46,11 +46,6 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             std::process::exit(1);
         }
     };
-
-    if cli.command == Some(Command::Check) {
-        print!("{}", r#loop::describe_environment(&cwd, &config));
-        return Ok(());
-    }
 
     let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
     let mut agent = match &cli.command {
