@@ -7,4 +7,5 @@ pub mod config;
 pub mod llm;
 pub mod tools;
 pub mod ui;
+pub mod update;
 pub mod util;

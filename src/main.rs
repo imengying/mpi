@@ -7,7 +7,7 @@
 use clap::Parser;
 
 use mpi::agent::r#loop::{self, Agent};
-use mpi::cli::Cli;
+use mpi::cli::{Cli, Command};
 use mpi::config::Config;
 use mpi::ui::screen::{teardown, Action};
 use mpi::ui::{compact as ui_compact, theme::Color};
@@ -24,6 +24,14 @@ fn main() {
 }
 
 fn run(cli: Cli) -> anyhow::Result<()> {
+    // Update does not touch the config or the session store, so it runs before the
+    // config load — `mpi update` has to work on a machine where the config is missing
+    // or broken too.
+    if cli.command == Some(Command::Update) {
+        mpi::update::run()?;
+        return Ok(());
+    }
+
     let cwd = std::env::current_dir()?;
     let config = match Config::load() {
         Ok(config) => config,
@@ -38,13 +46,13 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         }
     };
 
-    if cli.check {
+    if cli.command == Some(Command::Check) {
         print!("{}", r#loop::describe_environment(&cwd, &config));
         return Ok(());
     }
 
     let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
-    let mut agent = if cli.resume {
+    let mut agent = if cli.command == Some(Command::Resume) {
         match most_recent_session() {
             Some(path) => Agent::resume(config, cwd, &path, interactive)?,
             None => Agent::new(config, cwd, interactive)?,

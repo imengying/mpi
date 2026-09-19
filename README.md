@@ -9,12 +9,49 @@
 
 ## 安装
 
+### 一键安装
+
+自动识别系统与架构，下载最新 Release，按 GitHub 提供的 sha256 校验后装进
+`~/.local/bin`：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/imengying/mpi/main/install.sh | sh
+```
+
+指定版本或安装目录：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/imengying/mpi/main/install.sh | sh -s -- v0.1.3 --dir /usr/local/bin
+```
+
+装好后的升级不用重新跑脚本，`mpi update` 就地自更新：下载最新 Release、
+按 GitHub 提供的 sha256 校验、原子替换自身。
+
+脚本只依赖 POSIX sh、curl（或 wget）、tar。产物覆盖 Linux / macOS 的
+x86_64 / aarch64；Linux 产物要求 glibc ≥ 2.39（ubuntu-24.04 构建），脚本会先检查
+再下载，musl（Alpine 等）暂无产物。需要代理时设 `https_proxy` 环境变量即可，
+curl / wget 会自己认。
+
+mpi 用 zsh 执行命令（默认 `/usr/bin/zsh`），系统里得有它。
+
+### 手动安装
+
+到 [Releases](https://github.com/imengying/mpi/releases) 下载对应 target 的
+`mpi-<版本>-<target>.tar.gz`（targets 见[发布](#发布)），解压后放进 PATH：
+
+```sh
+tar -xzf mpi-*-*.tar.gz --strip-components=1
+install -m755 mpi ~/.local/bin/
+```
+
+### 从源码构建
+
 ```sh
 cargo build --release
 install -m755 target/release/mpi ~/.local/bin/mpi
 ```
 
-要求 rustc 1.98+（edition 2024）。shell 固定为 zsh（默认 `/usr/bin/zsh`）。
+要求 rustc 1.98+（edition 2024）。
 
 ## 配置
 
@@ -88,8 +125,9 @@ mpi 没有内置模型目录，也不会去猜。没配置 providers 会直接�
 
 ```sh
 mpi              # 新会话
-mpi --resume     # 继续最近一次会话（等价于 /resume）
-mpi --check      # 只检查配置与环境，不进交互
+mpi resume       # 继续最近一次会话（等价于 /resume）
+mpi check        # 只检查配置与环境，不进交互
+mpi update       # 更新到最新 Release
 ```
 
 ## 发布

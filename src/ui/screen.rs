@@ -859,9 +859,12 @@ impl Drop for RawGuard {
     }
 }
 
-/// Leave the terminal clean when mpi exits.
+/// Leave the terminal clean when mpi exits. Piped output gets no escape sequences.
 pub fn teardown() {
     let _ = terminal::disable_raw_mode();
+    if !std::io::stdout().is_terminal() {
+        return;
+    }
     let mut out = std::io::stdout();
     let _ = crossterm::execute!(out, cursor::Show);
     let _ = out.flush();
