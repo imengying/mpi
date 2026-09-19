@@ -6,7 +6,9 @@ description = "极简终端 AI 编程代理"
 license = "MIT"
 
 [dependencies]
-tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "process", "io-util", "fs", "sync", "signal"] }
+# `time` is for the working spinner: it advances the frame while a request or a command
+# blocks, which is exactly when no other event arrives to redraw on.
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "process", "io-util", "fs", "sync", "signal", "time"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "http2", "rustls", "charset"] }
 clap = { version = "4.6", features = ["derive"] }
 crossterm = "0.29"

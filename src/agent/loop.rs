@@ -26,7 +26,7 @@ use crate::llm::{self, Delta, Message, Request, StopReason};
 use crate::tools::{self, ToolOutput};
 use crate::ui::compact as ui_compact;
 use crate::ui::footer::{self, FooterState};
-use crate::ui::screen::{Action, Screen};
+use crate::ui::screen::{Action, Screen, WORKING_INTERVAL, WORKING_LABEL};
 use crate::ui::theme::Color;
 use crate::util;
 
@@ -605,6 +605,9 @@ impl Agent {
             return Ok(());
         }
         let custom = (!instructions.trim().is_empty()).then_some(instructions);
+        // Summarising the history is another long request, and outside a turn there is no
+        // spinner running already.
+        self.screen.set_working(WORKING_LABEL);
         match self.compact(Reason::Manual, custom).await {
             Ok(()) => {}
             Err(err) => {
@@ -613,7 +616,8 @@ impl Agent {
                     crate::ui::screen::Style::new(Color::Yellow),
                 ));
             }
-        }
+        };
+        self.screen.clear_working();
         Ok(())
     }
 
@@ -736,6 +740,11 @@ impl Agent {
         self.session
             .push_message(Message::User { content }, None, None)?;
         self.retry.reset();
+        // The spinner covers the whole turn, not one request: the model may think for a
+        // while before its first token, and a command may run for minutes. Both are times
+        // when nothing else on screen moves, and a mark that does not move cannot be told
+        // apart from a process that has hung.
+        self.screen.set_working(WORKING_LABEL);
 
         loop {
             match self.assistant_turn().await {
@@ -752,6 +761,7 @@ impl Agent {
         }
         // A finished task leaves every block collapsed and everything committed.
         self.screen.collapse_all();
+        self.screen.clear_working();
         self.render_footer(None);
         Ok(())
     }
@@ -824,14 +834,34 @@ impl Agent {
 
         self.streaming = true;
         self.screen.begin_stream();
+        // Deltas travel through a channel rather than straight into the screen, because the
+        // spinner has to be advanced from the same place: the sink cannot keep hold of the
+        // screen across the `select` below, and a model that has not produced its first
+        // token yet is exactly when the spinner matters.
+        let (sender, mut deltas) = tokio::sync::mpsc::unbounded_channel::<Delta>();
         let completion = {
-            let screen = &mut self.screen;
-            self.client
-                .stream(&request, &mut |delta| match delta {
-                    Delta::Text(text) => screen.push_text(&text),
-                    Delta::Thinking(text) => screen.push_thinking(&text),
-                })
-                .await
+            let mut sink = |delta: Delta| {
+                let _ = sender.send(delta);
+            };
+            let stream = self.client.stream(&request, &mut sink);
+            tokio::pin!(stream);
+            let mut ticker = ticker();
+            let result = loop {
+                tokio::select! {
+                    // A token outranks the spinner: text has to appear as it arrives, not on
+                    // the next frame. Everything already queued is drained with it, so a burst
+                    // of tokens costs one redraw rather than one per token.
+                    biased;
+                    Some(delta) = deltas.recv() => {
+                        apply_delta(&mut self.screen, delta);
+                        drain_deltas(&mut self.screen, &mut deltas);
+                    }
+                    _ = ticker.tick() => self.screen.tick_working(),
+                    out = &mut stream => break out,
+                }
+            };
+            drain_deltas(&mut self.screen, &mut deltas);
+            result
         };
         self.streaming = false;
         // On a transport failure the streamed preview is discarded, so the transcript does
@@ -925,9 +955,10 @@ impl Agent {
             let output = match block_on(self.gate.check(id, name, arguments, &cwd)) {
                 Ok(()) => {
                     // Approved: the wait is now the command's own, so the running line goes
-                    // back up before it starts.
+                    // back up before it starts, and the spinner keeps turning for as long as
+                    // it takes.
                     self.screen.set_running(running);
-                    let result = block_on(tools::execute(name, arguments, &cwd));
+                    let result = block_on_spinning(&mut self.screen, tools::execute(name, arguments, &cwd));
                     self.gate.finish(id);
                     result
                 }
@@ -995,6 +1026,52 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
             .expect("a private runtime")
             .block_on(future)
     })
+}
+
+/// Drive a future to completion, advancing the spinner while it runs.
+///
+/// The future must not borrow the screen: the spinner needs it on every tick. That is the
+/// whole reason the delta sink goes through a channel instead of writing directly.
+fn block_on_spinning<T>(screen: &mut Screen, work: impl std::future::Future<Output = T>) -> T {
+    block_on(async {
+        tokio::pin!(work);
+        let mut ticker = ticker();
+        loop {
+            tokio::select! {
+                out = &mut work => break out,
+                _ = ticker.tick() => screen.tick_working(),
+            }
+        }
+    })
+}
+
+/// A ticker that fires every [`WORKING_INTERVAL`], starting one interval from now.
+///
+/// `interval` would fire its first tick immediately, which draws the second frame before
+/// the first has been seen. Missed ticks are delayed rather than burst: after a long block
+/// a burst of catch-up frames would animate nothing but the backlog.
+fn ticker() -> tokio::time::Interval {
+    let mut ticker = tokio::time::interval_at(
+        tokio::time::Instant::now() + WORKING_INTERVAL,
+        WORKING_INTERVAL,
+    );
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker
+}
+
+/// Show one delta, exactly as a direct sink would have.
+fn apply_delta(screen: &mut Screen, delta: Delta) {
+    match delta {
+        Delta::Text(text) => screen.push_text(&text),
+        Delta::Thinking(text) => screen.push_thinking(&text),
+    }
+}
+
+/// Move every delta the stream has produced so far into the screen.
+fn drain_deltas(screen: &mut Screen, deltas: &mut tokio::sync::mpsc::UnboundedReceiver<Delta>) {
+    while let Ok(delta) = deltas.try_recv() {
+        apply_delta(screen, delta);
+    }
 }
 
 /// Exposed for tests: the dialect mpi will hand to the policy.

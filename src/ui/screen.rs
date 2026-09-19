@@ -27,6 +27,17 @@ use crate::util;
 /// visible when a long output has scrolled the footer away.
 pub const APP_TITLE: &str = "π";
 
+/// What the spinner says while a turn is in flight. pi's word, kept as-is: it is the
+/// label the user already recognises, and it is not translated.
+pub const WORKING_LABEL: &str = "Working";
+
+/// The spinner frames, and how long each is shown.
+///
+/// Braille, so every frame is exactly one cell: a set mixing widths would make the label to
+/// its right jitter. The interval is pi's.
+const WORKING_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+pub const WORKING_INTERVAL: std::time::Duration = std::time::Duration::from_millis(80);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Style {
     pub fg: Color,
@@ -380,6 +391,15 @@ pub struct Screen {
     /// Streaming preview: thinking tail plus the answer so far.
     streaming_thinking: Option<String>,
     streaming_answer: Option<String>,
+    /// The spinner's label while a turn is in flight, and which frame of the animation it
+    /// is on.
+    ///
+    /// This is pi's indicator: it sits at the top left of the input area and keeps moving
+    /// for as long as the turn lasts. A model response and a command can both take minutes
+    /// with nothing else to draw, and a spinner that does not move is indistinguishable
+    /// from a hung process — which is the one thing the user needs to be able to tell.
+    working: Option<String>,
+    working_frame: usize,
     /// The tool call in flight, as one line: `● $ sleep 30`.
     ///
     /// A tool can take minutes, and without it the screen would sit unchanged with no sign
@@ -437,6 +457,8 @@ impl Screen {
             history: Vec::new(),
             history_index: None,
             streaming_thinking: None,
+            working: None,
+            working_frame: 0,
             running_call: None,
             streaming_answer: None,
             interactive,
@@ -556,6 +578,7 @@ impl Screen {
         self.streaming_answer = None;
         self.streaming_thinking = None;
         self.running_call = None;
+        self.working = None;
         self.editing = None;
         self.erase_live();
         if self.interactive {
@@ -575,6 +598,36 @@ impl Screen {
     /// Caller must [`Screen::render`] afterwards to put the region back.
     pub fn suspend_live(&mut self) {
         self.erase_live();
+    }
+
+    /// Start the working spinner with `label`.
+    ///
+    /// Called once per turn, not per tool call: the spinner covers the whole time the
+    /// model or a command has the upper hand, and only the label's neighbours change in
+    /// between.
+    pub fn set_working(&mut self, label: &str) {
+        self.working = Some(label.to_string());
+        self.working_frame = 0;
+        self.render();
+    }
+
+    /// Stop the spinner. The row disappears with the next redraw.
+    pub fn clear_working(&mut self) {
+        if self.working.take().is_some() {
+            self.render();
+        }
+    }
+
+    /// Advance the spinner and redraw.
+    ///
+    /// Driven by timers around whatever is blocking, because that is exactly when nothing
+    /// else would draw: a command that prints nothing for a minute still has to look alive.
+    pub fn tick_working(&mut self) {
+        if self.working.is_none() {
+            return;
+        }
+        self.working_frame = (self.working_frame + 1) % WORKING_FRAMES.len();
+        self.render();
     }
 
     /// Show the tool call that is now running, as a single live line.
@@ -672,6 +725,16 @@ impl Screen {
             lines.extend(wrap_line(&Line::spans(spans.clone()), self.width));
             lines.push(Line::blank());
             self.trim_live(&mut lines);
+        }
+        // The spinner sits directly above the input, at its left, the way pi draws it at the
+        // top of the editor. It is part of the live region, so it disappears with it.
+        if let Some(label) = &self.working {
+            let frame = WORKING_FRAMES[self.working_frame % WORKING_FRAMES.len()];
+            lines.push(Line::spans(vec![
+                Span::new(frame, Style::new(Color::Cyan)),
+                Span::plain(" "),
+                Span::new(label.clone(), Style::new(Color::Dim)),
+            ]));
         }
         if let Some(editing) = &self.editing {
             // The buffer wraps onto as many rows as it needs, so a long line stays fully
@@ -1448,6 +1511,52 @@ mod tests {
         let mut screen = screen();
         screen.set_commands(crate::agent::r#loop::COMMANDS);
         screen
+    }
+
+    #[test]
+    fn the_working_spinner_sits_above_the_input_and_moves() {
+        // pi's indicator: a frame that advances, at the left of the input area. Its whole
+        // job is to be *moving* — a still mark cannot be told apart from a hung process, so
+        // the frames are asserted to differ rather than merely to exist.
+        let mut screen = screen_with_commands();
+        screen.editing = Some(String::new());
+        screen.set_footer(vec![Line::plain("dir"), Line::plain("stats")]);
+        screen.working = Some(WORKING_LABEL.to_string());
+
+        let (lines, _) = screen.compose_live();
+        let input = lines.iter().position(|line| line.text().starts_with('›')).unwrap();
+        let text: Vec<String> = lines.iter().map(Line::text).collect();
+        assert_eq!(input, 1, "the spinner is one row: {text:?}");
+        assert_eq!(lines[0].text(), format!("{} {}", WORKING_FRAMES[0], WORKING_LABEL));
+
+        // Each tick advances by exactly one frame and wraps, so the animation has no jump.
+        screen.working_frame = WORKING_FRAMES.len() - 1;
+        screen.tick_working();
+        let (lines, _) = screen.compose_live();
+        assert_eq!(lines[0].text(), format!("{} {}", WORKING_FRAMES[0], WORKING_LABEL));
+        screen.tick_working();
+        let (lines, _) = screen.compose_live();
+        assert_eq!(lines[0].text(), format!("{} {}", WORKING_FRAMES[1], WORKING_LABEL));
+    }
+
+    #[test]
+    fn the_spinner_is_gone_once_the_turn_ends() {
+        let mut screen = screen_with_commands();
+        screen.editing = Some(String::new());
+        screen.working = Some(WORKING_LABEL.to_string());
+        screen.clear_working();
+        let (lines, _) = screen.compose_live();
+        let text: Vec<String> = lines.iter().map(Line::text).collect();
+        assert!(lines[0].text().starts_with('›'), "the input is the first row again: {text:?}");
+    }
+
+    #[test]
+    fn every_spinner_frame_is_one_column_wide() {
+        // The label sits to the right of the frame, so a frame of a different width would
+        // make it shift sideways on every tick.
+        for frame in WORKING_FRAMES {
+            assert_eq!(util::width(frame), 1, "frame {frame:?} is not one column");
+        }
     }
 
     #[test]
