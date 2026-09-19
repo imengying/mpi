@@ -62,10 +62,10 @@ install -m755 target/release/mpi ~/.local/bin/mpi
   "shell": { "path": "/usr/bin/zsh" },
   "providers": [
     {
-      "name": "work",
+      "name": "name",
       "api": "openai-completions",
-      "base_url": "http://192.168.1.16:1221/v1",
-      "api_key_env": "WORK_API_KEY",
+      "base_url": "url",
+      "api_key_env": "NAME_API_KEY",
       "models": [
         {
           "id": "deepseek-v4.1-flash",
@@ -78,7 +78,7 @@ install -m755 target/release/mpi ~/.local/bin/mpi
       ]
     }
   ],
-  "default_model": "work/deepseek-v4.1-flash"
+  "default_model": "name/deepseek-v4.1-flash"
 }
 ```
 
@@ -128,6 +128,30 @@ mpi              # 新会话
 mpi resume       # 继续最近一次会话（等价于 /resume）
 mpi check        # 只检查配置与环境，不进交互
 mpi update       # 更新到最新 Release
+```
+
+## 系统提示词
+
+**mpi 不内置任何提示词。** 模型收到的 system 消息完全来自工作目录里的
+`AGENTS.md`：
+
+- 从当前目录逐级向上找 `AGENTS.md`，全部读入；越靠近当前目录的文件越靠后，
+  也就是优先级越高（内层可以覆盖外层）。
+- 一份都没找到时**不发送 system 消息**，而不是发一条默认的。
+- 内容只读一次（开会话时），此后整个会话里逐字节一致 —— 这是提示词缓存的前缀；
+  改了文件要 `/new` 或重启才会生效。
+- 启动时会提示读了哪个文件、多少字。
+- 环境信息（工作目录、平台、shell、会话 id）走单独的环境块，不放进提示词，
+  否则每轮变动都会让缓存失效。
+
+想让 mpi 有固定的工作方式，自己在工作目录写一份即可：
+
+```markdown
+# AGENTS.md
+
+- 需要了解代码时先读文件再下结论，不要凭猜测修改。
+- 一次只做用户要求的事，不做多余的改动与重构。
+- 回答用中文，简洁直接，不要复述已经说过的内容。
 ```
 
 ## 发布

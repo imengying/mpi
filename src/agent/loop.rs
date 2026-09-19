@@ -6,6 +6,10 @@
 //!   model name, so it stays a stable cache prefix for the whole session. Everything that
 //!   describes the environment lives in a single session-stable block at the head of the
 //!   conversation (see [`environment_block`]).
+//! * **mpi ships no prompt of its own.** The system message is built from `AGENTS.md` and
+//!   nothing else, so a session without that file sends no system message at all. The
+//!   prompt is therefore the user's, and it is theirs to change at any time — it is read
+//!   once per session and travels with the session file.
 //! * **Every risky action goes through the gate.** Tool calls are assessed one at a time;
 //!   a refusal is handed back to the model as text with the reason attached, because a
 //!   refusal without a reason makes the model retry the same command forever.
@@ -26,26 +30,28 @@ use crate::ui::screen::{Action, Screen};
 use crate::ui::theme::Color;
 use crate::util;
 
-/// The system prompt. **Byte-for-byte identical on every request**: adding a timestamp, a
-/// path or a branch here would invalidate the cached prefix for the whole conversation.
-pub const SYSTEM_PROMPT: &str = "\
-你是 mpi，一个运行在用户终端里的编程助手。
-
-工作方式：
-- 需要了解代码时先读文件再下结论，不要凭猜测修改。
-- 一次只做用户要求的事，不做多余的改动与重构。
-- 修改文件用 edit 做精确替换，创建文件用 write。
-- 执行命令用 bash（zsh）。只读命令会自动执行，其它命令会先请求用户授权；
-  被拒绝时用户会看到原因，不要改写命令绕过授权，也不要重复同一条被拒的命令。
-- 回答用中文，简洁直接，不要复述已经说过的内容。";
+/// The system message for a session, built from `AGENTS.md` and nothing else.
+///
+/// mpi deliberately ships no prompt of its own: the instructions a model follows are the
+/// user's, written down in a file they can edit and version. When no such file exists the
+/// return value is `None` and no system message is sent — an empty one would be a wasted
+/// cache entry and a lie about where the instructions came from.
+///
+/// The value is computed once per session and kept in [`Agent`], so it is byte-identical on
+/// every request of that session: a stable cache prefix, exactly like the constant it
+/// replaces.
+fn system_prompt_from(cwd: &Path) -> Option<String> {
+    load_agents_md(cwd).map(|(_, text)| text)
+}
 
 /// A per-session environment snapshot. It is stored as the head of the conversation rather
 /// than in the system prompt, and it does not change while the session lives — a mutable
 /// clock in here would break the cache on every turn.
 pub fn environment_block(cwd: &Path, session_id: &str, shell: &str) -> String {
+    // Data only. mpi does not append advice here either: the block exists so the model can
+    // see the facts, and telling it what to do with them would be a prompt by another name.
     format!(
-        "<environment>\n工作目录: {}\n平台: {}\nshell: {}\n会话开始: {}\n会话 id: {}\n</environment>\n\n\
-         如果你需要确认当前状态，用工具查看，不要假设上面的信息仍然有效。",
+        "<environment>\n工作目录: {}\n平台: {}\nshell: {}\n会话开始: {}\n会话 id: {}\n</environment>",
         cwd.display(),
         std::env::consts::OS,
         shell,
@@ -90,6 +96,11 @@ pub struct Agent {
     retry: RetryBudget,
     /// Set while a turn is streaming, so `/compact` can refuse instead of corrupting it.
     streaming: bool,
+    /// The session's system message, read from `AGENTS.md` when the session started.
+    ///
+    /// `None` means "send no system message". Held rather than re-read so the prefix stays
+    /// byte-identical for the life of the session even if the file changes underneath.
+    system_prompt: Option<String>,
 }
 
 impl Agent {
@@ -112,8 +123,16 @@ impl Agent {
             &format!("mpi · 会话 {}", &session.header().id[..8]),
             crate::ui::screen::Style::new(Color::Dim),
         ));
-        // The environment block becomes the head of the conversation, immediately after the
-        // system prompt, and is persisted with the session.
+        // No `AGENTS.md` means no system message at all: mpi has no prompt of its own.
+        let system_prompt = system_prompt_from(&cwd);
+        if let Some((path, text)) = load_agents_md(&cwd) {
+            screen.push_lines(ui_compact::note_lines(
+                &format!("系统提示词：{}（{} 字）", util::shorten_home(&path, dirs::home_dir().as_deref()), text.chars().count()),
+                crate::ui::screen::Style::new(Color::Dim),
+            ));
+        }
+        // The environment block becomes the head of the conversation and is persisted with
+        // the session. It sits after the system message, which is prepended per request.
         let block = environment_block(&cwd, &session.header().id, &config.shell.path);
         let mut session = session;
         session.push_message(Message::user_text(block), None, None)?;
@@ -129,6 +148,7 @@ impl Agent {
             compaction: CompactionState::default(),
             retry: RetryBudget::default(),
             streaming: false,
+            system_prompt,
         })
     }
 
@@ -154,6 +174,9 @@ impl Agent {
         let dialect = policy::configured_dialect(&config.shell.path);
         let client = Client::new()?;
         let mut screen = Screen::new();
+        // Read from the directory the session is being resumed in: the instructions are
+        // about the code being worked on, and that is where the work happens now.
+        let system_prompt = system_prompt_from(&cwd);
         let name = session.name().unwrap_or_else(|| "未命名".into());
         screen.push_lines(ui_compact::note_lines(
             &format!("已恢复会话 {name}（{} 条消息）", session.context_messages().len()),
@@ -215,6 +238,7 @@ impl Agent {
             compaction: CompactionState::default(),
             retry: RetryBudget::default(),
             streaming: false,
+            system_prompt,
         })
     }
 
@@ -327,6 +351,7 @@ impl Agent {
     fn command_new(&mut self) -> anyhow::Result<()> {
         let model_spec = self.model_spec.clone();
         self.session = Session::create(&self.cwd, &model_spec)?;
+        self.system_prompt = system_prompt_from(&self.cwd);
         let block = environment_block(&self.cwd, &self.session.header().id, &self.config.shell.path);
         self.session.push_message(Message::user_text(block), None, None)?;
         self.gate.reset();
@@ -372,6 +397,9 @@ impl Agent {
                 self.session = session;
                 self.gate.reset();
                 self.screen.clear_transcript();
+                // The switched-to session may have started under a different `AGENTS.md`,
+                // so the prompt is re-read here too.
+                self.system_prompt = system_prompt_from(&self.cwd);
                 let name = self.session.name().unwrap_or_else(|| "未命名".into());
                 self.screen.push_lines(ui_compact::note_lines(
                     &format!("已切到会话「{name}」"),
@@ -532,7 +560,7 @@ impl Agent {
             &self.client,
             request,
             &messages,
-            SYSTEM_PROMPT,
+            self.system_prompt.as_deref().unwrap_or_default(),
             keep_recent,
             real_usage,
         )
@@ -617,7 +645,11 @@ impl Agent {
             let real_usage = self.session.last_usage.as_ref().map(|usage| {
                 usage.input + usage.output + usage.cache_read + usage.cache_write
             });
-            let used = compact::estimate_context(&messages, SYSTEM_PROMPT, real_usage);
+            let used = compact::estimate_context(
+                &messages,
+                self.system_prompt.as_deref().unwrap_or_default(),
+                real_usage,
+            );
             if used > limit {
                 self.screen.push_lines(ui_compact::note_lines(
                     &format!(
@@ -639,6 +671,12 @@ impl Agent {
         }
 
         let mut messages = self.session.context_messages();
+        // The system message is prepended per request rather than stored in the session:
+        // the file stays a record of the conversation itself, and the prompt can be
+        // changed on disk without rewriting history.
+        if let Some(prompt) = &self.system_prompt {
+            messages.insert(0, Message::System { content: prompt.clone() });
+        }
         // Some gateways reject a history that ends with a tool result.
         if compat.requires_assistant_after_tool_result
             && matches!(messages.last(), Some(Message::Tool { .. }))
@@ -850,18 +888,102 @@ pub fn describe_overflow(signal: &compact::OverflowSignal) -> String {
     }
 }
 
+/// `AGENTS.md` filenames, in the order pi looks for them.
+const AGENTS_FILES: &[&str] = &["AGENTS.md", "AGENTS.MD"];
+/// Read `AGENTS.md` from `cwd` and every directory above it.
+///
+/// Nearest file wins: a project's own instructions shadow the ones in a monorepo root or the
+/// home directory, which is what lets a nested checkout override shared guidance. Several
+/// matches are joined nearest-last so the closest file has the final word.
+///
+/// Nothing is read when no file exists — mpi has no built-in prompt, so the model gets a
+/// system message only if the user asked for one.
+pub fn load_agents_md(cwd: &Path) -> Option<(PathBuf, String)> {
+    let mut found: Vec<(PathBuf, String)> = Vec::new();
+    for dir in cwd.ancestors() {
+        for name in AGENTS_FILES {
+            let path = dir.join(name);
+            if !path.is_file() {
+                continue;
+            }
+            match std::fs::read_to_string(&path) {
+                Ok(text) if !text.trim().is_empty() => {
+                    found.push((path.clone(), text));
+                    break;
+                }
+                Ok(_) => break,
+                Err(err) => {
+                    eprintln!("mpi: 读取 {} 失败：{err}", path.display());
+                    break;
+                }
+            }
+        }
+    }
+    if found.is_empty() {
+        return None;
+    }
+    // `ancestors()` walks outward, so the list is nearest-first; the outer files go on top so
+    // the nearest one is read last and wins.
+    found.reverse();
+    let primary = found.last().map(|(path, _)| path.clone())?;
+    let text = found
+        .iter()
+        .map(|(path, text)| {
+            let label = path.display();
+            format!("<!-- {label} -->\n{}", text.trim_end())
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    Some((primary, text))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn the_system_prompt_has_no_volatile_content() {
-        // The prompt is the first cache breakpoint, so anything that changes between turns
-        // would invalidate the whole conversation's cache.
-        assert!(!SYSTEM_PROMPT.contains('/'), "a path would break the cache");
-        assert!(!SYSTEM_PROMPT.contains("20"), "a timestamp would break the cache");
-        assert!(SYSTEM_PROMPT.contains("mpi"));
-        assert!(SYSTEM_PROMPT.contains("授权"));
+    fn there_is_no_built_in_prompt() {
+        // mpi ships no prompt of its own: a directory without `AGENTS.md` sends no system
+        // message at all, rather than a default one nobody asked for.
+        let dir = std::env::temp_dir().join(format!("mpi-no-agents-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(load_agents_md(&dir).is_none());
+        assert!(system_prompt_from(&dir).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_nearer_agents_md_wins_over_an_outer_one() {
+        let root = std::env::temp_dir().join(format!("mpi-agents-{}", std::process::id()));
+        let inner = root.join("inner");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(root.join("AGENTS.md"), "外层规则").unwrap();
+        std::fs::write(inner.join("AGENTS.md"), "内层规则").unwrap();
+
+        let (path, text) = load_agents_md(&inner).expect("both files are found");
+        // The reported path is the nearest file — that is what the UI names and what the
+        // user would edit.
+        assert_eq!(path, inner.join("AGENTS.md"));
+        // Both are sent, nearest last, so the closest instruction is the last one read.
+        let outer_at = text.find("外层规则").expect("outer text is included");
+        let inner_at = text.find("内层规则").expect("inner text is included");
+        assert!(outer_at < inner_at, "{text:?}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_empty_agents_md_is_treated_as_absent() {
+        // A placeholder file must not produce an empty system message: it would be sent on
+        // every request and would say nothing.
+        let dir = std::env::temp_dir().join(format!("mpi-empty-agents-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("AGENTS.md"), "   \n\t\n").unwrap();
+        assert!(system_prompt_from(&dir).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

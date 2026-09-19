@@ -122,10 +122,10 @@ const SAMPLE_CONFIG: &str = r#"{
   "shell": { "path": "/usr/bin/zsh" },
   "providers": [
     {
-      "name": "work",
+      "name": "name",
       "api": "openai-completions",
-      "base_url": "http://192.168.1.16:1221/v1",
-      "api_key_env": "WORK_API_KEY",
+      "base_url": "url",
+      "api_key_env": "NAME_API_KEY",
       "models": [
         {
           "id": "deepseek-v4.1-flash",
@@ -138,5 +138,5 @@ const SAMPLE_CONFIG: &str = r#"{
       ]
     }
   ],
-  "default_model": "work/deepseek-v4.1-flash"
+  "default_model": "name/deepseek-v4.1-flash"
 }"#;

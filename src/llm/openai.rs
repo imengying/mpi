@@ -693,7 +693,7 @@ mod tests {
         )
         .unwrap();
         let provider: Provider = serde_json::from_str(
-            r#"{"name":"work","api":"openai-completions","base_url":"http://192.168.1.16:1221/v1"}"#,
+            r#"{"name":"name","api":"openai-completions","base_url":"url"}"#,
         )
         .unwrap();
         (model, provider)

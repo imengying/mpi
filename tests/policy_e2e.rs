@@ -118,20 +118,14 @@ fn headless_refuses_rather_than_approving() {
 }
 
 #[test]
-fn the_system_prompt_is_identical_across_turns() {
-    // A helper that only reads the constant proves nothing about the loop, so this asserts
-    // the property the loop depends on: no volatile substring anywhere in the prompt.
-    use mpi::agent::r#loop::SYSTEM_PROMPT;
-    for volatile in ["/", "20", ":", "~"] {
-        if volatile == ":" {
-            // The prompt has no colon-prefixed key, but full-width punctuation is fine.
-            continue;
-        }
-        assert!(
-            !SYSTEM_PROMPT.contains(volatile),
-            "the system prompt contains {volatile:?}, which would break the prompt cache"
-        );
-    }
+fn a_directory_without_agents_md_has_no_system_prompt() {
+    // mpi ships no prompt of its own, so the "no system message" case is a real, reachable
+    // state rather than a degenerate one — and it is the one a fresh directory hits.
+    let dir = std::env::temp_dir().join(format!("mpi-e2e-no-agents-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    assert!(mpi::agent::r#loop::load_agents_md(&dir).is_none());
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 fn futures_block<F: std::future::Future>(future: F) -> F::Output {

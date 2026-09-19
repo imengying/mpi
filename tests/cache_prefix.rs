@@ -11,9 +11,9 @@ fn fixtures() -> (ModelConfig, Provider) {
     let config: Config = serde_json::from_str(
         r#"{
           "providers": [{
-            "name": "work",
+            "name": "name",
             "api": "openai-completions",
-            "base_url": "http://192.168.1.16:1221/v1",
+            "base_url": "url",
             "models": [{
               "id": "deepseek-v4.1-flash",
               "name": "deepseek-v4.1-flash",
@@ -26,12 +26,15 @@ fn fixtures() -> (ModelConfig, Provider) {
         }"#,
     )
     .unwrap();
-    let (provider, model) = config.find("work/deepseek-v4.1-flash").unwrap();
+    let (provider, model) = config.find("name/deepseek-v4.1-flash").unwrap();
     (model.clone(), provider.clone())
 }
 
-/// The system prompt the agent actually sends, kept in one place for these tests.
-const SYSTEM: &str = mpi::agent::r#loop::SYSTEM_PROMPT;
+/// Stands for the system prompt of a session whose `AGENTS.md` says one thing.
+///
+/// The real value is read from disk once per session; what the cache depends on is that it
+/// is the same bytes on every request, which is what these tests exercise.
+const SYSTEM: &str = "<!-- AGENTS.md -->\n用 cargo test 跑测试。";
 
 fn tools() -> Vec<ToolSpec> {
     mpi::tools::specs()
@@ -145,31 +148,28 @@ fn the_tool_block_is_stable_and_ordered() {
 }
 
 #[test]
-fn the_system_prompt_holds_nothing_that_changes_per_turn() {
-    // A cache breakpoint sits on the system prompt, so anything in here has to be stable for
-    // the life of the binary. cwd (which differs per project), the clock, the git branch and
-    // the model name all live in the environment block instead, which is stored as the first
-    // conversation message where a change is visible but harmless.
-    let names_a_thing_that_moves = [
-        std::env::current_dir().unwrap().display().to_string(),
-        "2026-".to_string(),   // an ISO timestamp
-        "main".to_string(),    // a git branch
-        "deepseek".to_string(),// a model name
-        "T".to_string() ,      // the RFC 3339 separator
-    ];
-    for volatile in names_a_thing_that_moves {
-        if volatile == "T" {
-            continue; // too short to be meaningful
-        }
-        assert!(
-            !SYSTEM.contains(&volatile),
-            "the system prompt mentions {volatile:?}, which changes between sessions and \
-             would break the cache prefix"
-        );
+fn mpi_adds_nothing_of_its_own_to_the_system_prompt() {
+    // The prompt is the user's file and nothing else, so nothing mpi knows — cwd, the clock,
+    // the branch, the model name — can leak into the cache prefix. Anything volatile belongs
+    // in the environment block, which is a conversation message instead.
+    let dir = std::env::temp_dir().join(format!("mpi-prefix-agents-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let body = "# 项目约定\n- 注释写英文。\n";
+    std::fs::write(dir.join("AGENTS.md"), body).unwrap();
+
+    let (path, text) = mpi::agent::r#loop::load_agents_md(&dir).expect("the file is found");
+    assert_eq!(path, dir.join("AGENTS.md"));
+    // The file's own text is reproduced verbatim; the only thing added is a marker naming
+    // where it came from, which is stable for as long as the file does not move.
+    assert!(text.contains(body.trim_end()), "{text:?}");
+    for volatile in ["2026-", "main", "deepseek"] {
+        assert!(!text.contains(volatile), "mpi injected {volatile:?}: {text:?}");
     }
-    // The shell path is a per-machine setting, but it never changes while mpi runs, so it is
-    // deliberately *not* a cache risk; the environment block repeats it for the model anyway.
-    assert!(SYSTEM.contains("zsh"));
+    // Reading twice gives the same bytes, which is what makes it a usable prefix.
+    let (_, again) = mpi::agent::r#loop::load_agents_md(&dir).unwrap();
+    assert_eq!(text, again);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

@@ -188,7 +188,7 @@ mod tests {
 
     #[test]
     fn a_local_gateway_keeps_the_permissive_defaults() {
-        let compat = Compat::from_base_url("http://192.168.1.16:1221/v1", "openai-completions");
+        let compat = Compat::from_base_url("url", "openai-completions");
         assert_eq!(compat.max_tokens_field, "max_tokens");
         assert!(!compat.supports_developer_role);
         assert_eq!(compat.thinking_format, ThinkingFormat::Openai);
@@ -202,7 +202,7 @@ mod tests {
 
     #[test]
     fn config_patch_overrides_only_what_it_names() {
-        let mut compat = Compat::from_base_url("http://192.168.1.16:1221/v1", "openai-completions");
+        let mut compat = Compat::from_base_url("url", "openai-completions");
         let patch: CompatPatch = serde_json::from_str(
             r#"{"thinking_format":"deepseek","requires_reasoning_content_on_assistant":true}"#,
         )
