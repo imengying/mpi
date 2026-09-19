@@ -285,6 +285,20 @@ fn coalesce(row: Vec<(char, Style)>) -> Vec<Span> {
     spans
 }
 
+/// The longest prefix shared by every name, used to fill in as much as is unambiguous.
+fn common_prefix(names: &[&str]) -> String {
+    let Some(first) = names.first() else {
+        return String::new();
+    };
+    let mut prefix = first.to_string();
+    while !names.iter().all(|name| name.starts_with(&prefix)) {
+        // Drop one character at a time; the loop ends at the empty string, which every name
+        // has as a prefix.
+        prefix.pop();
+    }
+    prefix
+}
+
 /// Wrap a group of lines, flattening the result.
 pub fn wrap_all(lines: &[Line], width: usize) -> Vec<Line> {
     lines.iter().flat_map(|line| wrap_line(line, width)).collect()
@@ -326,9 +340,25 @@ pub struct Screen {
     /// What was last written as the window title, so an unchanged title is not rewritten on
     /// every frame.
     title: Option<String>,
+    /// Every slash command, for completion and the menu.
+    commands: Vec<(String, String)>,
+    /// The slash-command menu shown under the input line, and which entry is highlighted.
+    menu: Vec<(String, String)>,
+    menu_selected: usize,
 }
 
 impl Screen {
+    /// Register the commands the input area completes and the menu lists.
+    ///
+    /// Passed in rather than imported so the screen stays independent of the agent layer,
+    /// which is also what keeps it testable without a provider.
+    pub fn set_commands(&mut self, commands: &[(&str, &str)]) {
+        self.commands = commands
+            .iter()
+            .map(|(name, help)| ((*name).to_string(), (*help).to_string()))
+            .collect();
+    }
+
     pub fn new() -> Self {
         let theme = Theme::default();
         let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
@@ -348,6 +378,9 @@ impl Screen {
             streaming_answer: None,
             interactive,
             title: None,
+            commands: Vec::new(),
+            menu: Vec::new(),
+            menu_selected: 0,
         };
         screen.refresh_size();
         screen
@@ -502,8 +535,10 @@ impl Screen {
         (answer, thinking)
     }
 
-    /// Live rows: the prompt while editing, plus the streaming preview and the footer.
-    fn compose_live(&self) -> Vec<Line> {
+    /// Live rows: the prompt while editing, the command menu, and the footer — plus where
+    /// the terminal cursor belongs among them.
+    fn compose_live(&self) -> (Vec<Line>, Option<(usize, usize)>) {
+        let mut cursor = None;
         let mut lines: Vec<Line> = Vec::new();
         if let Some(thinking) = &self.streaming_thinking {
             let plain = util::sanitize(thinking);
@@ -524,9 +559,9 @@ impl Screen {
             self.trim_live(&mut lines);
         }
         if let Some(editing) = &self.editing {
-            // One row: prompt, the buffer, and a reverse-video cursor block. An input
-            // longer than the terminal is scrolled from the left so the caret stays
-            // visible, which is what a single-row editor has to do.
+            // One row: prompt, the buffer, then the caret. An input longer than the
+            // terminal is scrolled from the left so the caret stays visible, which is what
+            // a single-row editor has to do.
             let available = self.width.saturating_sub(4);
             let mut visible = editing.clone();
             while util::width(&visible) > available {
@@ -534,12 +569,120 @@ impl Screen {
             }
             lines.push(Line::spans(vec![
                 Span::new("› ", Style::new(Color::Cyan)),
-                Span::plain(visible),
-                Span::new(" ", Style { bg: Bg::Selected, ..Style::plain() }),
+                Span::plain(visible.clone()),
             ]));
+            // The caret sits after the buffer, on the row just pushed. The prompt is two
+            // columns wide, and the width is measured in cells so a CJK character counts
+            // as the two columns it occupies.
+            cursor = Some((lines.len() - 1, 2 + util::width(&visible)));
+        }
+        // The menu goes directly under the input line, above the footer.
+        if !self.menu.is_empty() {
+            for (index, (name, help)) in self.menu.iter().enumerate() {
+                let selected = index == self.menu_selected;
+                let marker = if selected { "› " } else { "  " };
+                let style = if selected {
+                    Style { bold: true, ..Style::new(Color::Cyan) }
+                } else {
+                    Style::new(Color::Dim)
+                };
+                lines.push(Line::spans(vec![
+                    Span::new(marker, style),
+                    Span::new(format!("/{name}"), style),
+                    Span::new("  ", Style::plain()),
+                    Span::new(util::truncate(help, self.width.saturating_sub(6).min(60), "…"), Style::new(Color::Dim)),
+                ]));
+            }
         }
         lines.extend(self.footer.iter().cloned());
-        lines
+        (lines, cursor)
+    }
+
+    /// The commands whose name starts with what has been typed after the `/`.
+    ///
+    /// An empty prefix (just `/`) matches everything, which is what makes the menu appear as
+    /// soon as the slash is typed. A slash anywhere but the first column is ordinary text —
+    /// `/` inside a sentence is not a command.
+    fn matching_commands(&self) -> Vec<(String, String)> {
+        let Some(rest) = self.editing.as_deref().and_then(|text| text.strip_prefix('/')) else {
+            return Vec::new();
+        };
+        // Once there is a space the command name is settled and the argument is being typed,
+        // so the menu has nothing left to offer.
+        if rest.contains(' ') {
+            return Vec::new();
+        }
+        let prefix = rest.trim();
+        self.commands
+            .iter()
+            .filter(|(name, _)| name.starts_with(prefix))
+            .cloned()
+            .collect()
+    }
+
+    /// Refresh the menu from the buffer. Called after every edit.
+    fn sync_menu(&mut self) {
+        let matches = self.matching_commands();
+        if matches.len() == self.menu.len() && matches.iter().zip(&self.menu).all(|(a, b)| a == b) {
+            // Same list: keep the highlight where the user put it.
+            return;
+        }
+        self.menu = matches;
+        self.menu_selected = 0;
+    }
+
+    /// Tab: complete the first candidate, or the highlighted one.
+    ///
+    /// A unique match is completed in full and a trailing space added, so the user can go
+    /// straight on to the argument. Several matches share the longest common prefix, which
+    /// is the behaviour a shell user expects; the menu stays open to pick from.
+    fn complete(&mut self) -> bool {
+        self.sync_menu();
+        let Some(text) = self.editing.clone() else {
+            return false;
+        };
+        let Some(rest) = text.strip_prefix('/') else {
+            return false;
+        };
+        if rest.contains(' ') || self.menu.is_empty() {
+            return false;
+        }
+        let names: Vec<&str> = self.menu.iter().map(|(name, _)| name.as_str()).collect();
+        let filled = if names.len() == 1 {
+            format!("/{} ", names[0])
+        } else {
+            let prefix = common_prefix(&names);
+            if prefix.len() <= rest.trim().len() {
+                // Nothing more to add; let Tab move through the menu instead.
+                self.menu_selected = (self.menu_selected + 1) % self.menu.len();
+                return true;
+            }
+            format!("/{prefix}")
+        };
+        self.editing = Some(filled);
+        self.sync_menu();
+        true
+    }
+
+    /// Move the highlight through the menu, wrapping at both ends.
+    fn move_menu(&mut self, delta: isize) -> bool {
+        if self.menu.is_empty() {
+            return false;
+        }
+        let len = self.menu.len() as isize;
+        self.menu_selected = ((self.menu_selected as isize + delta).rem_euclid(len)) as usize;
+        true
+    }
+
+    /// Replace the buffer with the highlighted command, ready for an argument.
+    fn accept_menu(&mut self) -> bool {
+        let Some((name, _)) = self.menu.get(self.menu_selected).cloned() else {
+            return false;
+        };
+        self.editing = Some(format!("/{name} "));
+        self.menu.clear();
+        self.menu_selected = 0;
+        true
     }
 
     /// Keep the live region smaller than the screen, dropping the oldest preview rows.
@@ -614,12 +757,22 @@ impl Screen {
         if !self.interactive {
             return;
         }
-        let lines = self.compose_live();
+        let (lines, cursor) = self.compose_live();
         self.erase_live();
         let mut buffer = String::new();
         for line in &lines {
             buffer.push_str(&self.paint(line, self.width));
             buffer.push_str("\r\n");
+        }
+        // Park the cursor inside the input row. Each row below it is one line up, and the
+        // column is where the buffer ends — the caret belongs with the text, not below the
+        // footer where the last drawn row left it.
+        if let Some((row, column)) = cursor {
+            let up = lines.len().saturating_sub(row + 1);
+            if up > 0 {
+                buffer.push_str(&format!("\u{1b}[{up}A"));
+            }
+            buffer.push_str(&format!("\u{1b}[{}G", column + 1));
         }
         let _ = write!(self.out, "{buffer}");
         let _ = self.out.flush();
@@ -774,6 +927,8 @@ impl Screen {
         let guard = RawGuard::enter()?;
         self.editing = Some(String::new());
         self.history_index = None;
+        self.menu.clear();
+        self.menu_selected = 0;
         self.render();
         let action = loop {
             let event = match event::read() {
@@ -794,6 +949,18 @@ impl Screen {
             match key.code {
                 KeyCode::Enter => {
                     let line = self.editing.clone().unwrap_or_default();
+                    // Enter accepts the highlighted command while the menu is open, so a
+                    // chosen command is never submitted half-typed. It only submits when
+                    // the buffer is an exact command already (`/exit`), which is the one
+                    // case where accepting would do nothing.
+                    if !self.menu.is_empty()
+                        && self.menu.get(self.menu_selected).map(|(name, _)| name.as_str())
+                            != line.strip_prefix('/').map(str::trim)
+                    {
+                        self.accept_menu();
+                        self.render();
+                        continue;
+                    }
                     break Action::Line(line);
                 }
                 KeyCode::Char('o') if ctrl => break Action::ToggleExpand,
@@ -833,6 +1000,23 @@ impl Screen {
                         text.pop();
                     }
                 }
+                KeyCode::Tab => {
+                    self.complete();
+                }
+                KeyCode::BackTab => {
+                    self.move_menu(-1);
+                }
+                KeyCode::Esc => {
+                    // Closing the menu must not drop what was typed.
+                    self.menu.clear();
+                    self.menu_selected = 0;
+                }
+                KeyCode::Up if !self.menu.is_empty() => {
+                    self.move_menu(-1);
+                }
+                KeyCode::Down if !self.menu.is_empty() => {
+                    self.move_menu(1);
+                }
                 KeyCode::Up => {
                     if !self.history.is_empty() {
                         let next = match self.history_index {
@@ -857,8 +1041,11 @@ impl Screen {
                 }
                 _ => {}
             }
+            self.sync_menu();
             self.render();
         };
+        self.menu.clear();
+        self.menu_selected = 0;
         // The buffer is echoed from `self.editing` while typing; nothing to do here.
         if let Action::Line(ref text) = action
             && !text.trim().is_empty()
@@ -978,6 +1165,149 @@ mod tests {
         let mut screen = screen();
         screen.set_title(Some("demo"), Path::new("/tmp/work"));
         assert!(screen.title.is_none());
+    }
+
+    fn screen_with_commands() -> Screen {
+        let mut screen = screen();
+        screen.set_commands(crate::agent::r#loop::COMMANDS);
+        screen
+    }
+
+    #[test]
+    fn a_slash_opens_the_menu_and_filters_as_more_is_typed() {
+        let mut screen = screen_with_commands();
+        screen.editing = Some("/".into());
+        screen.sync_menu();
+        assert_eq!(screen.menu.len(), crate::agent::r#loop::COMMANDS.len());
+        // The first entry is highlighted, so Enter has an unambiguous target.
+        assert_eq!(screen.menu[0].0, "model");
+
+        screen.editing = Some("/m".into());
+        screen.sync_menu();
+        // "m" matches /model and /compact: the match is on the name, not the description.
+        assert_eq!(screen.menu.len(), 1, "{:?}", screen.menu);
+        assert_eq!(screen.menu[0].0, "model");
+
+        screen.editing = Some("/na".into());
+        screen.sync_menu();
+        assert_eq!(screen.menu.len(), 1);
+        assert_eq!(screen.menu[0].0, "name");
+    }
+
+    #[test]
+    fn the_menu_stays_out_of_the_way_of_ordinary_text() {
+        let mut screen = screen_with_commands();
+        // A slash mid-sentence is not a command, and an argument is being typed once there
+        // is a space, so in both cases there is nothing to complete.
+        for text in ["你好/世界", "/name 我的会话", "no slash at all"] {
+            screen.editing = Some(text.into());
+            screen.sync_menu();
+            assert!(screen.menu.is_empty(), "{text:?} opened a menu");
+        }
+    }
+
+    #[test]
+    fn tab_completes_a_unique_command_along_with_a_space() {
+        let mut screen = screen_with_commands();
+        screen.editing = Some("/na".into());
+        assert!(screen.complete());
+        // The trailing space means the argument can be typed straight away.
+        assert_eq!(screen.editing.as_deref(), Some("/name "));
+        // The menu closes because the name is settled.
+        assert!(screen.menu.is_empty());
+    }
+
+    #[test]
+    fn tab_shares_a_prefix_before_cycling_through_the_menu() {
+        let mut screen = screen_with_commands();
+        // "co" matches only /compact, so that case is covered above; "c" also matches
+        // nothing else, so use two commands sharing a prefix via the real list.
+        screen.editing = Some("/".into());
+        assert!(screen.complete() || !screen.menu.is_empty());
+        // With several matches and no shared prefix to add, Tab walks the highlight.
+        let before = screen.menu_selected;
+        screen.complete();
+        assert_ne!(screen.menu_selected, before);
+    }
+
+    #[test]
+    fn tab_on_an_exact_command_does_nothing_destructive() {
+        let mut screen = screen_with_commands();
+        screen.editing = Some("/exit".into());
+        screen.sync_menu();
+        // /exit is the only match, so Tab would fill in the space; the point is that it
+        // must not lose what was typed.
+        screen.complete();
+        assert!(screen.editing.as_deref().unwrap().starts_with("/exit"));
+    }
+
+    #[test]
+    fn a_shared_prefix_is_filled_in_before_cycling() {
+        assert_eq!(common_prefix(&["model", "modify"]), "mod");
+        assert_eq!(common_prefix(&["name", "new"]), "n");
+        // No shared prefix: the empty string, which is always a prefix, and the caller
+        // then falls through to cycling the menu instead of typing anything.
+        assert_eq!(common_prefix(&["model", "exit"]), "");
+        assert_eq!(common_prefix(&["only"]), "only");
+        assert_eq!(common_prefix(&[]), "");
+    }
+
+    #[test]
+    fn accepting_the_menu_replaces_the_buffer_with_a_full_command() {
+        let mut screen = screen_with_commands();
+        screen.editing = Some("/re".into());
+        screen.sync_menu();
+        assert!(screen.accept_menu());
+        assert_eq!(screen.editing.as_deref(), Some("/resume "));
+        assert!(screen.menu.is_empty());
+    }
+
+    #[test]
+    fn the_menu_wraps_at_both_ends() {
+        let mut screen = screen_with_commands();
+        screen.editing = Some("/".into());
+        screen.sync_menu();
+        assert!(screen.move_menu(-1));
+        assert_eq!(screen.menu_selected, screen.menu.len() - 1);
+        assert!(screen.move_menu(1));
+        assert_eq!(screen.menu_selected, 0);
+    }
+
+    #[test]
+    fn the_cursor_lands_after_the_buffer_not_below_the_footer() {
+        // The live region is drawn as text; nothing moves the cursor unless the drawing
+        // code says where it goes. Without this the caret ends up under the footer.
+        let mut screen = screen_with_commands();
+        screen.editing = Some("/mo".into());
+        screen.sync_menu();
+        screen.set_footer(vec![Line::plain("dir"), Line::plain("stats")]);
+        let (lines, cursor) = screen.compose_live();
+        let (row, column) = cursor.expect("an editing screen has a cursor");
+        // The prompt is two columns, and the buffer is three characters.
+        assert_eq!(column, 2 + 3);
+        // The row holds the input line — not the footer, which is below it.
+        assert!(lines[row].text().starts_with("› /mo"), "{:?}", lines[row].text());
+        assert!(row + 1 < lines.len());
+        assert!(lines[row + 1].text().contains("/model"), "the menu goes under the input");
+    }
+
+    #[test]
+    fn a_cjk_buffer_puts_the_cursor_after_two_cells_per_character() {
+        // Column is a display column, not a character count: 你好 is four cells wide, so the
+        // caret belongs at 2 + 4, which is what makes it line up with the glyphs.
+        let mut screen = screen_with_commands();
+        screen.editing = Some("你好".into());
+        let (_, cursor) = screen.compose_live();
+        assert_eq!(cursor.unwrap().1, 2 + 4);
+    }
+
+    #[test]
+    fn no_cursor_is_reported_when_not_editing() {
+        // While a turn streams, the transcript owns the screen and the terminal caret has
+        // nowhere to sit.
+        let screen = screen_with_commands();
+        let (_, cursor) = screen.compose_live();
+        assert!(cursor.is_none());
     }
 
     #[test]
@@ -1116,7 +1446,7 @@ mod tests {
     fn the_thinking_preview_only_keeps_the_last_two_lines() {
         let mut screen = screen();
         screen.streaming_thinking = Some("a\nb\nc\nd\ne".repeat(1));
-        let live = screen.compose_live();
+        let (live, _) = screen.compose_live();
         assert!(live.len() <= 2, "{live:?}");
         assert!(live.iter().any(|line| line.text().contains('e')));
     }
@@ -1125,7 +1455,7 @@ mod tests {
     fn ansi_in_streamed_text_is_neutralised_before_display() {
         let mut screen = screen();
         screen.streaming_answer = Some("\u{1b}[31mred\u{1b}[0m".into());
-        let live = screen.compose_live();
+        let (live, _) = screen.compose_live();
         assert!(live.iter().all(|line| !line.text().contains('\u{1b}')));
     }
 }

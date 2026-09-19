@@ -30,6 +30,20 @@ use crate::ui::screen::{Action, Screen};
 use crate::ui::theme::Color;
 use crate::util;
 
+/// The slash commands mpi accepts, with the one-line description the menu shows.
+///
+/// One list, used three ways: the dispatcher matches against it, the input area completes
+/// against it, and the menu prints it. A command cannot be added to one and forgotten in the
+/// others.
+pub const COMMANDS: &[(&str, &str)] = &[
+    ("model", "选择模型（支持推理的会接着问思考级别）"),
+    ("name", "设置会话名；不带参数则清空"),
+    ("compact", "手动压缩上下文，可带一段自定义指示"),
+    ("new", "新会话"),
+    ("resume", "恢复历史会话"),
+    ("exit", "退出"),
+];
+
 /// The system message for a session, built from `AGENTS.md` and nothing else.
 ///
 /// mpi deliberately ships no prompt of its own: the instructions a model follows are the
@@ -119,6 +133,7 @@ impl Agent {
         let session = Session::create(&cwd, &model_spec)?;
         let client = Client::new()?;
         let mut screen = Screen::new();
+        screen.set_commands(COMMANDS);
         screen.push_lines(ui_compact::note_lines(
             &format!("mpi · 会话 {}", &session.header().id[..8]),
             crate::ui::screen::Style::new(Color::Dim),
@@ -174,6 +189,7 @@ impl Agent {
         let dialect = policy::configured_dialect(&config.shell.path);
         let client = Client::new()?;
         let mut screen = Screen::new();
+        screen.set_commands(COMMANDS);
         // Read from the directory the session is being resumed in: the instructions are
         // about the code being worked on, and that is where the work happens now.
         let system_prompt = system_prompt_from(&cwd);
@@ -323,8 +339,13 @@ impl Agent {
             "new" => self.command_new()?,
             "resume" => self.command_resume().await?,
             other => {
+                let available = COMMANDS
+                    .iter()
+                    .map(|(name, _)| format!("/{name}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
                 self.screen.push_lines(ui_compact::note_lines(
-                    &format!("未知命令：/{other}（可用：/model /name /compact /new /resume /exit）"),
+                    &format!("未知命令：/{other}（可用：{available}）"),
                     crate::ui::screen::Style::new(Color::Yellow),
                 ));
             }
