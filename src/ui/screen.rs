@@ -564,6 +564,11 @@ impl Screen {
     /// Erasing it means the cursor ends up back where the region started, on a line of its
     /// own, which is where the shell expects to find it.
     pub fn leave(&mut self) {
+        // Commit first: anything queued since the last draw is part of the transcript — the
+        // note naming the command that resumes this session, for one — and erasing without
+        // committing would silently throw it away. The note is written *after* the turn loop
+        // ends, which is why this cannot be left to a later draw that never comes.
+        self.commit();
         self.erase_live();
         if self.interactive {
             let _ = self.out.flush();
@@ -1062,10 +1067,34 @@ impl Screen {
         self.pick_at(title, items, 0)
     }
 
+    /// Like [`Screen::pick`], but the hint row says what Esc will do.
+    ///
+    /// The default hint promises "cancel", which is wrong where cancel *is* an action —
+    /// `/resume` starts a new session on Esc, and a menu that said "cancel" while doing that
+    /// would be lying about its own key.
+    pub fn pick_with_hint(
+        &mut self,
+        title: &str,
+        hint: &str,
+        items: &[String],
+    ) -> Option<usize> {
+        self.pick_hinted(title, items, 0, hint)
+    }
+
     /// Like [`Screen::pick`], with the initial highlight on `initial` (clamped into range).
     /// The menu for `/model` uses this so the current choice starts highlighted and Enter
     /// keeps it.
     pub fn pick_at(&mut self, title: &str, items: &[String], initial: usize) -> Option<usize> {
+        self.pick_hinted(title, items, initial, "↑↓ 选择 · Enter 确认 · Esc 取消")
+    }
+
+    fn pick_hinted(
+        &mut self,
+        title: &str,
+        items: &[String],
+        initial: usize,
+        hint: &str,
+    ) -> Option<usize> {
         if items.is_empty() {
             return None;
         }
@@ -1091,7 +1120,7 @@ impl Screen {
         self.erase_live();
         let result = loop {
             // The menu replaces the footer so it always sits in the same place.
-            self.footer = self.menu_lines(title, items, cursor);
+            self.footer = self.menu_lines(title, hint, items, cursor);
             self.draw_live();
             let event = match event::read() {
                 Ok(event) => event,
@@ -1138,7 +1167,7 @@ impl Screen {
         result
     }
 
-    fn menu_lines(&self, title: &str, items: &[String], cursor: usize) -> Vec<Line> {
+    fn menu_lines(&self, title: &str, hint: &str, items: &[String], cursor: usize) -> Vec<Line> {
         let mut lines = vec![Line::new(title, Style::bold(Color::Cyan))];
         for (index, item) in items.iter().enumerate() {
             let selected = index == cursor;
@@ -1151,10 +1180,7 @@ impl Screen {
             };
             lines.push(Line::new(util::pad(&text, self.width), style));
         }
-        lines.push(Line::new(
-            "↑↓ 选择 · Enter 确认 · Esc 取消",
-            Style::new(Color::Dim),
-        ));
+        lines.push(Line::new(hint, Style::new(Color::Dim)));
         lines
     }
 
@@ -1466,6 +1492,26 @@ mod tests {
         // state that keeps the shell's marker off the screen.
         assert_eq!(screen.live_rows, 0);
         assert_eq!(screen.cursor_row, None);
+    }
+
+    #[test]
+    fn leaving_commits_what_was_queued_but_not_yet_drawn() {
+        // The note telling the user how to come back is pushed *after* the turn loop ends,
+        // so no draw ever follows it. Erasing without committing threw it away silently: the
+        // last thing mpi is supposed to say was the one thing it never said.
+        let mut screen = screen();
+        screen.interactive = true;
+        screen.push_lines(vec![Line::plain("继续此会话：mpi resume abc")]);
+        assert!(!screen.blocks.is_empty(), "the note is queued");
+
+        screen.leave();
+
+        // `printed` catches up with `blocks` only if the queued row was written.
+        assert_eq!(
+            screen.printed,
+            screen.blocks.len(),
+            "a queued row must be written before the live region is taken down"
+        );
     }
 
     #[test]

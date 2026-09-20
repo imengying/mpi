@@ -420,8 +420,17 @@ impl Agent {
         }
         let removed = self.session.delete()?;
         self.deleted = true;
+        // The store's entry goes with the last session in it. Otherwise a directory stays
+        // listed for every project that was ever used, and the store stops being a list of
+        // where history *is* — which is the whole reason for grouping by directory.
+        let forgotten = crate::config::forget_dir_if_empty(&self.cwd);
         let note = if removed {
-            format!("已删除会话文件：{path}")
+            if forgotten {
+                format!("已删除会话文件：{path}")
+            } else {
+                // Other sessions remain here, so the directory stays.
+                format!("已删除会话文件：{path}（本目录还有其它会话）")
+            }
         } else {
             // A session that never said anything has no file: there was nothing to delete,
             // and reporting a path as deleted would be false.
@@ -445,6 +454,16 @@ impl Agent {
     }
 
     fn command_new(&mut self) -> anyhow::Result<()> {
+        // The id is not announced: it is printed on the way out, with the command that
+        // resumes it, which is the only place it is useful.
+        self.start_new_session("新会话开始。")
+    }
+
+    /// Replace the current session with a fresh one, keeping the working directory.
+    ///
+    /// The old session is not deleted: it is on disk and still reachable through `/resume`,
+    /// so "new" costs nothing and undo is a resume away.
+    fn start_new_session(&mut self, note: &str) -> anyhow::Result<()> {
         let model_spec = self.model_spec.clone();
         self.session = Session::create(&self.cwd, &model_spec)?;
         self.system_prompt = system_prompt_from(&self.cwd);
@@ -452,12 +471,8 @@ impl Agent {
         self.session.push_message(Message::user_text(block), None, None)?;
         self.gate.reset();
         self.screen.clear_transcript();
-        // The id is not announced: it is printed on the way out, with the command that
-        // resumes it, which is the only place it is useful.
-        self.screen.push_lines(ui_compact::note_lines(
-            "新会话开始。",
-            crate::ui::screen::Style::new(Color::Dim),
-        ));
+        self.screen
+            .push_lines(ui_compact::note_lines(note, crate::ui::screen::Style::new(Color::Dim)));
         Ok(())
     }
 
@@ -481,7 +496,18 @@ impl Agent {
                 )
             })
             .collect();
-        let Some(index) = self.screen.pick("恢复历史会话", &items) else {
+        // Esc cancels, and cancelling a "go somewhere else" prompt leaves the user at a
+        // blank line with no way to start over — the current session is still the one they
+        // were trying to leave. So cancelling *is* the new session here. When the current
+        // session has already said something it is kept (it stays in `/resume`), so nothing
+        // is lost; the confirmation exists because "I pressed Esc" does not obviously mean
+        // "discard the screen I am looking at".
+        let Some(index) = self.screen.pick_with_hint(
+            "恢复历史会话",
+            "↑↓ 选择 · Enter 确认 · Esc 开始新会话",
+            &items,
+        ) else {
+            self.start_new_session("已按 Esc：新会话开始。")?;
             return Ok(());
         };
         let target = summaries[index].path.clone();

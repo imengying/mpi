@@ -1074,6 +1074,31 @@ mod tests {
     }
 
     #[test]
+    fn deleting_the_last_session_takes_its_store_directory_with_it() {
+        // End to end through the store: create, say something, delete. The session's
+        // directory and its row in the table are both gone afterwards.
+        let root = std::env::temp_dir().join(format!("mpidel{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = root.join("store");
+        let project = root.join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let mut session = Session::create_in(&crate::config::sessions_dir_in(&store, &project), &project, "work/m")
+            .unwrap();
+        session.register_under = Some(store.clone());
+        session.push_message(Message::user_text("你好"), None, None).unwrap();
+        let dir = session.path().parent().unwrap().to_path_buf();
+        assert!(dir.is_dir());
+
+        session.delete().unwrap();
+        assert!(crate::config::forget_dir_if_empty_in(&store, &project));
+        assert!(!dir.exists());
+        assert!(list_in(&store).is_empty());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn a_deleted_session_disappears_from_the_resume_list() {
         let (mut session, dir) = temp_session_with_a_message("delete-list");
         session.set_name(Some("要删掉的会话")).unwrap();

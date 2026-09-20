@@ -575,6 +575,57 @@ fn write_dirs_index(root: &Path, index: &BTreeMap<String, String>) -> std::io::R
     std::fs::rename(&temporary, &path)
 }
 
+/// Drop `cwd`'s entry if its directory holds no sessions, and remove the directory.
+///
+/// Called after a session is deleted. Without it the store keeps a directory for every
+/// project that was ever used, and `ls ~/.mpi/sessions` stops being a list of the projects
+/// that have history — which is the one thing the short-id layout is for.
+///
+/// Only an *empty* directory is dropped: the entry names a real store as long as one session
+/// remains, and removing it then would orphan that session. The directory is removed before
+/// the entry, so a crash between the two leaves an empty directory with no entry — harmless,
+/// and the next session there registers a fresh id.
+pub fn forget_dir_if_empty(cwd: &Path) -> bool {
+    forget_dir_if_empty_in(&sessions_root(), cwd)
+}
+
+/// [`forget_dir_if_empty`] under a given store, so tests do not touch the real one.
+pub fn forget_dir_if_empty_in(root: &Path, cwd: &Path) -> bool {
+    let Some(id) = dir_id_in(root, cwd) else {
+        return false;
+    };
+    let dir = root.join(&id);
+    // A directory that cannot be read is treated as non-empty: forgetting an entry whose
+    // sessions might still be there would make them unreachable, which is worse than a
+    // stale row in a list nobody reads by hand.
+    let Ok(mut entries) = std::fs::read_dir(&dir) else {
+        return false;
+    };
+    if entries.next().is_some() {
+        return false;
+    }
+    let _ = std::fs::remove_dir(&dir);
+    remove_dir_from_index(root, &id)
+}
+
+/// Remove one entry, under the same lock and atomic rewrite as registration.
+fn remove_dir_from_index(root: &Path, id: &str) -> bool {
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(root.join("dirs.lock"))
+        .ok()
+        .and_then(|handle| handle.lock().ok().map(|()| handle));
+    let mut index = read_dirs_index(root);
+    let removed = index.remove(id).is_some();
+    if removed {
+        let _ = write_dirs_index(root, &index);
+    }
+    drop(lock);
+    removed
+}
+
 /// The table under a given store, for tests that assert on what was recorded.
 pub fn read_dirs_index_for_test(root: &Path) -> BTreeMap<String, String> {
     read_dirs_index(root)
@@ -649,6 +700,38 @@ mod tests {
             assert_eq!(id.len(), 8, "{id} is not a short id");
             assert!(id.chars().all(|c| c.is_ascii_hexdigit()), "{id} is not hex");
         }
+    }
+
+    #[test]
+    fn a_directory_leaves_the_table_once_its_last_session_is_gone() {
+        // The table is a list of where history *is*. Keeping a row for every project ever
+        // used would turn it into a log of where the user has been, which is exactly what
+        // the short-id layout exists to avoid.
+        let root = std::env::temp_dir().join(format!("mpiforget{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = root.join("store");
+        let project = root.join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let id = register_dir_in(&store, &project);
+        let dir = store.join(&id);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A session is still there: the entry and the directory both stay.
+        std::fs::write(dir.join("one.jsonl"), "{}").unwrap();
+        assert!(!forget_dir_if_empty_in(&store, &project));
+        assert!(dir.is_dir());
+        assert!(dir_id_in(&store, &project).is_some());
+
+        // The last one is gone: both go.
+        std::fs::remove_file(dir.join("one.jsonl")).unwrap();
+        assert!(forget_dir_if_empty_in(&store, &project));
+        assert!(!dir.exists());
+        assert!(dir_id_in(&store, &project).is_none(), "the id must not linger");
+        // Forgetting twice is not an error, just a no-op.
+        assert!(!forget_dir_if_empty_in(&store, &project));
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
