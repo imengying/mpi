@@ -167,6 +167,16 @@ enum Storage {
 pub struct Session {
     header: SessionHeader,
     path: PathBuf,
+    /// The directory the session belongs to, kept apart from `header.cwd`: the header
+    /// records where the session *started* and is never rewritten, while a resume in another
+    /// directory relocates the session — and the store follows where the work is now.
+    cwd: PathBuf,
+    /// The store this session registers itself in once it has something to store.
+    ///
+    /// `Some` for a session the user started (the directory id is minted on the first write),
+    /// `None` for one created at an explicit path, which is what the tests use — a test's
+    /// temporary directory must not acquire an entry in the real table.
+    register_under: Option<PathBuf>,
     storage: Storage,
     last_id: Option<String>,
     records: Vec<Record>,
@@ -190,14 +200,24 @@ pub enum SessionError {
 
 impl Session {
     /// Start a new session in the store for `cwd`.
+    ///
+    /// Registration happens here rather than on lookup: a session is what gives a directory
+    /// its entry in the table, so running mpi somewhere and leaving is not recorded.
     pub fn create(cwd: &Path, model: &str) -> Result<Self, SessionError> {
-        Self::create_in(&sessions_dir(cwd), cwd, model)
+        // The id is provisional until something is written: registering here would put every
+        // directory mpi is started in into the table, and the table is meant to say where
+        // sessions *are* (see [`Session::persist`]).
+        let mut session = Self::create_in(&sessions_dir(cwd), cwd, model)?;
+        session.register_under = Some(crate::config::sessions_root());
+        Ok(session)
     }
 
     /// Start a new session under `dir`. The directory is a parameter so tests do not have
     /// to mutate process-wide environment variables.
     pub fn create_in(dir: &Path, cwd: &Path, model: &str) -> Result<Self, SessionError> {
-        std::fs::create_dir_all(dir)?;
+        // The directory is not created here. A session that never says anything must leave
+        // no trace at all — not a file, and not an empty directory in the store either,
+        // which is what would otherwise happen to every directory mpi is run in.
         let id = uuid::Uuid::now_v7().to_string();
         let path = dir.join(format!("{id}.jsonl"));
         let header = SessionHeader {
@@ -212,6 +232,8 @@ impl Session {
         Ok(Session {
             header,
             path,
+            cwd: cwd.to_path_buf(),
+            register_under: None,
             storage: Storage::Buffered,
             last_id: Some(id),
             records: vec![record],
@@ -244,9 +266,14 @@ impl Session {
             })
             .ok_or_else(|| SessionError::Parse(format!("{} 缺少会话头", path.display())))?;
         let last_id = records.last().map(|record| record.id().to_string());
+        let cwd = PathBuf::from(&header.cwd);
         let mut session = Session {
             header,
             path: path.to_path_buf(),
+            cwd,
+            // A resumed session is a live one: if it is continued in another directory its
+            // file follows, the same as a session that was never interrupted.
+            register_under: Some(crate::config::sessions_root()),
             storage: Storage::Open(std::fs::OpenOptions::new().append(true).open(path)?),
             last_id,
             records,
@@ -365,6 +392,37 @@ impl Session {
         };
         self.append(record, id)?;
         self.header.cwd = cwd.to_string_lossy().to_string();
+        self.cwd = cwd.to_path_buf();
+        // The file moves with it. A session is about the directory it is being continued in,
+        // and the store says which directory that is — leaving the file behind would make it
+        // invisible to `/resume` where it now belongs, while still claiming, from its old
+        // home, to be a session about somewhere else. The new path is registered first; if
+        // that fails the session keeps its old one and stays findable there.
+        self.follow_cwd()?;
+        Ok(())
+    }
+
+    /// Move the file into the store of [`Session::cwd`], if it is not already there.
+    ///
+    /// The open handle keeps working across the rename — it names the file, not the path —
+    /// so later appends land in the moved file.
+    fn follow_cwd(&mut self) -> Result<(), SessionError> {
+        if self.register_under.is_none() {
+            return Ok(());
+        }
+        let root = crate::config::sessions_root();
+        let id = crate::config::register_dir_in(&root, &self.cwd);
+        let name = match self.path.file_name() {
+            Some(name) => name.to_owned(),
+            None => return Ok(()),
+        };
+        let target = root.join(id).join(name);
+        if target == self.path {
+            return Ok(());
+        }
+        std::fs::create_dir_all(target.parent().unwrap_or(&root))?;
+        std::fs::rename(&self.path, &target)?;
+        self.path = target;
         Ok(())
     }
 
@@ -572,6 +630,26 @@ impl Session {
 
     /// Create the file and write everything buffered so far, in order.
     fn persist(&mut self) -> Result<(), SessionError> {
+        // The directory is registered now, because this is the moment the store gains
+        // something to name. `create` only had a provisional id: registering there would
+        // record every directory mpi is ever started in, and the table is meant to answer
+        // "where are the sessions", not "where has the user been".
+        //
+        // The registered id can differ from the provisional one, so the path is rebuilt from
+        // it rather than reused. Both name the same directory; only the name changes, and it
+        // changes before the file exists, so nothing has to be moved.
+        if let Some(root) = self.register_under.clone() {
+            let registered = crate::config::register_dir_in(&root, &self.cwd);
+            let name = self
+                .path
+                .file_name()
+                .map(|name| name.to_owned())
+                .unwrap_or_default();
+            self.path = root.join(registered).join(name);
+        }
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -1177,45 +1255,76 @@ mod tests {
         // conversation would run its commands against the wrong tree.
         let root = std::env::temp_dir().join(format!("mpiscope{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
+        let store = root.join("store");
+        // The table lives beside the sessions it names, and only gains a directory when one
+        // of them actually stores something (see the registration tests below).
         let a = root.join("a");
         let b = root.join("b");
         std::fs::create_dir_all(&a).unwrap();
         std::fs::create_dir_all(&b).unwrap();
-        // The store follows the real cwd (that is the point), so a previous run's session
-        // for these paths has to go too — otherwise this test counts it as its own.
-        let _ = std::fs::remove_dir_all(crate::config::sessions_dir(&a));
-        let _ = std::fs::remove_dir_all(crate::config::sessions_dir(&b));
 
-        let mut in_a = Session::create_in(&crate::config::sessions_dir(&a), &a, "work/m").unwrap();
+        let dir_a = crate::config::sessions_dir_in(&store, &a);
+        let dir_b = crate::config::sessions_dir_in(&store, &b);
+        let mut in_a = Session::create_in(&dir_a, &a, "work/m").unwrap();
         in_a.push_message(Message::user_text("在 a 里"), None, None).unwrap();
 
         // The two directories are separate stores, so `b` cannot see `a`'s session.
-        assert_eq!(list_in(&crate::config::sessions_dir(&a)).len(), 1);
-        assert!(list_in(&crate::config::sessions_dir(&b)).is_empty());
+        assert_eq!(list_in(&dir_a).len(), 1);
+        assert!(list_in(&dir_b).is_empty());
         // And the id, if it does not match, is an error rather than a guess.
-        assert!(find_by_prefix_in(&crate::config::sessions_dir(&b), in_a.id()).is_err());
-        assert!(find_by_prefix_in(&crate::config::sessions_dir(&a), in_a.id()).is_ok());
+        assert!(find_by_prefix_in(&dir_b, in_a.id()).is_err());
+        assert!(find_by_prefix_in(&dir_a, in_a.id()).is_ok());
 
-        let _ = std::fs::remove_dir_all(crate::config::sessions_dir(&a));
-        let _ = std::fs::remove_dir_all(crate::config::sessions_dir(&b));
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
-    fn a_directory_name_encodes_the_whole_path() {
-        // The name has to keep the path readable — it is the only clue in the store about
-        // which project a subdirectory holds — and it must not contain a separator, or a
-        // path would create directories instead of naming one.
-        let encoded = crate::config::encode_cwd(Path::new("/home/user/文档/mpi"));
-        assert_eq!(encoded, "--home-user-文档-mpi--");
-        assert!(!encoded.contains('/'), "{encoded}");
-        // Distinct directories get distinct names.
-        assert_ne!(
-            crate::config::encode_cwd(Path::new("/a/b")),
-            crate::config::encode_cwd(Path::new("/a-b"))
+    fn the_same_directory_always_gets_the_same_id() {
+        // The id names a directory. Minting a new one per call would scatter one project's
+        // sessions across the store, and nothing would be able to find them again.
+        let root = std::env::temp_dir().join(format!("mpisdir{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = root.join("store");
+        let project = root.join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let first = crate::config::register_dir_in(&store, &project);
+        assert_eq!(crate::config::register_dir_in(&store, &project), first);
+        assert_eq!(crate::config::dir_id_in(&store, &project).as_deref(), Some(first.as_str()));
+        assert_eq!(
+            crate::config::sessions_dir_in(&store, &project).file_name().unwrap(),
+            first.as_str()
         );
-        // The root, which has nothing left after the leading separator is trimmed.
-        assert_eq!(crate::config::encode_cwd(Path::new("/")), "-----");
+        // A table written here is readable by the next process, which is the whole point.
+        let index = crate::config::read_dirs_index_for_test(&store);
+        assert_eq!(index.get(&first).map(String::as_str), Some(project.to_string_lossy().as_ref()));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn merely_looking_at_a_directory_does_not_register_it() {
+        // The table says where sessions are, so it must not become a log of everywhere mpi
+        // has been run. A directory that never produced a session stays out of it, and the
+        // id it would have used is not reserved either.
+        let root = std::env::temp_dir().join(format!("mpilook{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = root.join("store");
+        let project = root.join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+
+        assert!(crate::config::dir_id_in(&store, &project).is_none());
+        // Asking twice gives two ids, which is fine: neither names a real directory.
+        let _ = crate::config::sessions_dir_in(&store, &project);
+        let _ = crate::config::sessions_dir_in(&store, &project);
+        assert!(crate::config::read_dirs_index_for_test(&store).is_empty());
+        assert!(crate::config::dir_id_in(&store, &project).is_none());
+
+        // Creating a session is what registers it, and then the id is stable.
+        let id = crate::config::register_dir_in(&store, &project);
+        assert_eq!(crate::config::dir_id_in(&store, &project).as_deref(), Some(id.as_str()));
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

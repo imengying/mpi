@@ -262,7 +262,7 @@ printf echo true false cut tr du df uname rg grep find sort file sed git`），
 
 ## 会话
 
-线性 JSONL，一行一条记录，存在 `~/.mpi/sessions/<按工作目录编码的子目录>/`。
+线性 JSONL，一行一条记录，存在 `~/.mpi/sessions/<短 id>/`，`dirs.json` 记录 id 对应的绝对路径。
 
 记录分类型存放：会话头、对话项、每轮环境快照、事件（含 token 统计）、压缩检查点。
 环境快照与对话分开存，所以它不会污染上下文，也不会在压缩时被当成对话处理。

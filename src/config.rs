@@ -428,40 +428,164 @@ pub fn sessions_root() -> PathBuf {
     home_dir().join(Defaults::SESSIONS_DIR)
 }
 
-/// The directory holding the sessions of one working directory.
-///
-/// Sessions are grouped by where the work happened, the way pi groups them: a session is
-/// about one project, and listing every conversation the user ever had — in every other
-/// directory — buries the ones that belong to the project in front of them. `/resume`
-/// therefore shows the current directory's sessions and nothing else.
-pub fn sessions_dir(cwd: &Path) -> PathBuf {
-    sessions_root().join(encode_cwd(cwd))
+/// The file mapping a short directory id back to the path it stands for.
+pub fn dirs_index_path() -> PathBuf {
+    dirs_index_path_in(&sessions_root())
 }
 
-/// A working directory as one directory name: `~/文档/mpi` becomes `--home-user-文档-mpi--`.
+/// [`dirs_index_path`] under a given store, so tests do not touch the real table.
+fn dirs_index_path_in(root: &Path) -> PathBuf {
+    root.join("dirs.json")
+}
+
+/// The directory holding the sessions of one working directory.
 ///
-/// The leading and trailing `--` bound the name, and a separator becomes a single `-`.
+/// Sessions are grouped by where the work happened: a session is about one project, and
+/// listing every conversation the user ever had — in every other directory — buries the
+/// ones that belong to the project in front of them. `/resume` therefore shows the current
+/// directory's sessions and nothing else.
 ///
-/// A literal `-` in the path is doubled, which is what keeps the encoding *injective*:
-/// without it `/a/b` and `/a-b` would name the same directory, and two unrelated projects
-/// would share one session store. Reading it back is unambiguous — a double `-` is a real
-/// dash, a single one is a separator — so the name is a faithful label as well as a key.
-/// The name is never parsed back; only injectivity and readability are needed.
-pub fn encode_cwd(cwd: &Path) -> String {
-    let text = cwd.to_string_lossy();
-    let trimmed = text.trim_start_matches(['/', '\\']);
-    let mut encoded = String::with_capacity(trimmed.len() + 4);
-    for c in trimmed.chars() {
-        match c {
-            '/' | '\\' => encoded.push('-'),
-            '-' => encoded.push_str("--"),
-            other => encoded.push(other),
+/// The directory is named by a short id rather than by the path, and the mapping lives in
+/// `dirs.json`. Encoding the path into the name produced names like
+/// `--home-user-文档-mpi--`: long enough to wrap in a listing, and still not the path it
+/// stands for. An id is short and sortable, and the table is the one place that knows where
+/// a session came from — which is also what makes a *rename* of the project a non-event.
+pub fn sessions_dir(cwd: &Path) -> PathBuf {
+    sessions_dir_in(&sessions_root(), cwd)
+}
+
+/// [`sessions_dir`] under a given store, so tests do not touch the real one.
+pub fn sessions_dir_in(root: &Path, cwd: &Path) -> PathBuf {
+    root.join(match dir_id_in(root, cwd) {
+        Some(id) => id,
+        // Nothing recorded: the answer is an id that names no directory, which is exactly
+        // right — there is nothing to list. It is *not* written here, because merely asking
+        // where a directory's sessions would live must not add it to the table.
+        None => provisional_dir_id(),
+    })
+}
+
+/// An id for a directory that has no sessions yet.
+///
+/// Never written: the table is a list of directories that *have* sessions, and registering
+/// every directory mpi is merely run in would make it a log of where the user has been.
+fn provisional_dir_id() -> String {
+    short_id(&uuid::Uuid::now_v7().simple().to_string())
+}
+
+/// Register `cwd` and return the id its sessions go under, minting one if it is new.
+///
+/// Called when a session is created, so the table only ever gains directories that produced
+/// something.
+pub fn register_dir(cwd: &Path) -> String {
+    register_dir_in(&sessions_root(), cwd)
+}
+
+/// [`register_dir`] under a given store, so tests do not touch the real one.
+pub fn register_dir_in(root: &Path, cwd: &Path) -> String {
+    if let Some(id) = dir_id_in(root, cwd) {
+        return id;
+    }
+    // Not registered yet: take the lock, re-read (another process may have just added it),
+    // and write only if it is still missing.
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(root.join("dirs.lock"))
+        .ok()
+        .and_then(|handle| {
+            // A failure to lock is not fatal: the write below is atomic, so the worst case is
+            // a lost update, which the re-read on the next start repairs.
+            handle.lock().ok().map(|()| handle)
+        });
+    let mut index = read_dirs_index(root);
+    if let Some(id) = lookup_dir(&index, cwd) {
+        return id;
+    }
+    let id = fresh_dir_id(&index);
+    index.insert(id.clone(), cwd.to_string_lossy().to_string());
+    let _ = write_dirs_index(root, &index);
+    drop(lock);
+    id
+}
+
+/// The id recorded for `cwd`, if this directory has sessions.
+pub fn dir_id_in(root: &Path, cwd: &Path) -> Option<String> {
+    lookup_dir(&read_dirs_index(root), cwd)
+}
+
+/// The id recorded for `cwd`, if any. Matching is on the absolute path, so a symlinked
+/// route to the same directory is a different project — resolving symlinks here would make
+/// the same directory reachable under names that disagree with what the user typed.
+fn lookup_dir(index: &BTreeMap<String, String>, cwd: &Path) -> Option<String> {
+    let wanted = cwd.to_string_lossy();
+    index
+        .iter()
+        .find(|(_, path)| path.as_str() == wanted)
+        .map(|(id, _)| id.clone())
+}
+
+/// A short id not already in `index`.
+///
+/// A uuid rather than a counter: it costs no extra dependency (session ids already use one),
+/// and an id that is never reused matters more than being compact — an id dropped from the
+/// table must not be handed to a different project later, which would silently point old
+/// sessions at a new directory.
+///
+/// The **random tail** is what gets shortened, not the head. A v7 uuid leads with a
+/// millisecond timestamp, so its first characters are identical for everything created
+/// within the same ~65-second window; taking those would collide on every directory made in
+/// a burst, and the retry loop below would never find a free one.
+fn fresh_dir_id(index: &BTreeMap<String, String>) -> String {
+    loop {
+        let short = short_id(&uuid::Uuid::now_v7().simple().to_string());
+        if !index.contains_key(&short) {
+            return short;
         }
     }
-    if encoded.is_empty() {
-        encoded.push('-');
+}
+
+/// The last 8 hex characters of an id: the random tail, never the timestamp head.
+fn short_id(full: &str) -> String {
+    full[full.len() - 8..].to_string()
+}
+
+fn read_dirs_index(root: &Path) -> BTreeMap<String, String> {
+    std::fs::read_to_string(dirs_index_path_in(root))
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+/// Write the table through a temporary file and a rename.
+///
+/// `rename` replaces the target in one step, so a reader never sees a half-written table
+/// and a crash mid-write cannot destroy the mapping for every directory at once.
+fn write_dirs_index(root: &Path, index: &BTreeMap<String, String>) -> std::io::Result<()> {
+    let path = dirs_index_path_in(root);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
     }
-    format!("--{encoded}--")
+    let temporary = path.with_extension("json.tmp");
+    let mut text = serde_json::to_string_pretty(index)
+        .map_err(|err| std::io::Error::other(err.to_string()))?;
+    text.push('\n');
+    std::fs::write(&temporary, text)?;
+    std::fs::rename(&temporary, &path)
+}
+
+/// The table under a given store, for tests that assert on what was recorded.
+pub fn read_dirs_index_for_test(root: &Path) -> BTreeMap<String, String> {
+    read_dirs_index(root)
+}
+
+/// Every directory that has sessions, newest id first, as `(id, path)`.
+///
+/// Kept for diagnostics: nothing in the turn loop needs it, but a store whose table is
+/// wrong is otherwise impossible to inspect.
+pub fn known_dirs() -> Vec<(String, String)> {
+    read_dirs_index(&sessions_root()).into_iter().collect()
 }
 
 /// Environment-variable names that must never be read. Kept for completeness: mpi
@@ -509,14 +633,44 @@ mod tests {
     }
 
     #[test]
+    fn a_burst_of_new_directories_still_gets_distinct_ids() {
+        // The id is shortened from a v7 uuid, whose first characters are a timestamp shared
+        // by everything created in the same window. Shortening the *head* would make every
+        // directory registered in one burst collide, and the retry loop would spin forever
+        // looking for a free id. A handful of registrations in a row has to stay distinct.
+        let ids: std::collections::HashSet<String> = (0..50)
+            .map(|_| {
+                let index = std::collections::BTreeMap::new();
+                fresh_dir_id(&index)
+            })
+            .collect();
+        assert_eq!(ids.len(), 50, "ids collided within one burst");
+        for id in &ids {
+            assert_eq!(id.len(), 8, "{id} is not a short id");
+            assert!(id.chars().all(|c| c.is_ascii_hexdigit()), "{id} is not hex");
+        }
+    }
+
+    #[test]
     fn every_path_lives_under_the_mpi_directory() {
         // One directory for everything mpi owns, so the file to edit sits next to the
-        // sessions it produced.
+        // sessions it produced. Asserted on the *names* rather than by calling the
+        // resolvers: `sessions_dir` registers the directory it is asked about, and a test
+        // that calls it writes into the real table — which is how a stray `/tmp/x` entry
+        // ended up in a user's store.
         let home = home_dir();
         assert!(home.ends_with(".mpi"), "{}", home.display());
         assert_eq!(config_path(), home.join("config.json"));
         assert_eq!(sessions_root(), home.join("sessions"));
-        assert!(sessions_dir(Path::new("/tmp/x")).starts_with(sessions_root()));
+        assert_eq!(dirs_index_path(), home.join("sessions/dirs.json"));
+
+        // Under a store of its own, the grouping still holds.
+        let root = std::env::temp_dir().join(format!("mpipaths{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = sessions_dir_in(&root, Path::new("/tmp/somewhere"));
+        assert!(dir.starts_with(&root), "{}", dir.display());
+        assert_eq!(dir.parent(), Some(root.as_path()));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
