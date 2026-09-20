@@ -208,6 +208,126 @@ pub fn note_lines(text: &str, style: Style) -> Vec<Line> {
     out
 }
 
+/// Replay a stored conversation into transcript blocks.
+///
+/// Resuming used to echo only the user's own lines, which made a resumed session look like
+/// a list of questions with no answers: the assistant text, the commands and their output
+/// were all in the file but never drawn. What was on screen when the session ended is what
+/// has to come back.
+///
+/// Tool results are re-attached to the call they answer, because that is how they were
+/// shown: the pairing lives in the `tool_call_id`, and a result printed on its own would
+/// read as unexplained output. Stored messages carry no `duration`, so a resumed command
+/// shows its output without a time — inventing one would be worse than omitting it.
+pub fn replay_blocks(messages: &[crate::llm::Message]) -> Vec<crate::ui::screen::Block> {
+    use crate::llm::{Block as MsgBlock, Message};
+
+    // Tool results, keyed by the call they belong to.
+    let mut results: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    for message in messages {
+        if let Message::Tool { tool_call_id, content, .. } = message {
+            results.insert(tool_call_id.as_str(), content.as_str());
+        }
+    }
+
+    let mut out: Vec<crate::ui::screen::Block> = Vec::new();
+    for message in messages {
+        // The environment block is bookkeeping that happens to be a user message. Filtered
+        // here rather than by the caller so no replay path can forget and print it as
+        // something the user said.
+        if crate::agent::r#loop::is_environment_block(message) {
+            continue;
+        }
+        match message {
+            Message::User { content } => {
+                let text = message.text();
+                if text.trim().is_empty() && content.iter().all(|b| !matches!(b, MsgBlock::Text { .. })) {
+                    continue;
+                }
+                if !text.trim().is_empty() {
+                    push_lines(&mut out, user_lines(&text));
+                }
+                for block in content {
+                    if let MsgBlock::Image { .. } = block {
+                        push_lines(&mut out, note_lines("［图片］", Style::new(Color::Magenta)));
+                    }
+                }
+            }
+            Message::Assistant { content, .. } => {
+                let mut lines: Vec<Line> = Vec::new();
+                let had_thinking = content.iter().any(|b| matches!(b, MsgBlock::Thinking { .. }));
+                for block in content {
+                    match block {
+                        MsgBlock::Text { text } => {
+                            lines.extend(
+                                util::sanitize(text).lines().map(|l| Line::plain(l.to_string())),
+                            );
+                            lines.push(Line::blank());
+                        }
+                        MsgBlock::ToolCall { id, name, arguments } => {
+                            if !lines.is_empty() {
+                                push_lines(&mut out, std::mem::take(&mut lines));
+                            }
+                            let content = results.get(id.as_str()).copied().unwrap_or("");
+                            // A tool call keeps its own block, so the output is collapsed
+                            // on resume exactly as it was when it ran.
+                            out.push(tool_block(name, arguments, &stored_output(name, arguments, content)));
+                        }
+                        _ => {}
+                    }
+                }
+                if had_thinking {
+                    let mut prefix = thinking_done_lines();
+                    prefix.extend(lines);
+                    push_lines(&mut out, prefix);
+                } else if !lines.is_empty() {
+                    push_lines(&mut out, lines);
+                }
+            }
+            // Already folded into the call above.
+            Message::Tool { .. } | Message::System { .. } => {}
+        }
+    }
+    out
+}
+
+/// Append `lines` to the previous block, or start a new one with a blank separator.
+///
+/// One message's text and thinking belong together: emitting them as separate blocks would
+/// put a collapse note between two halves of the same reply.
+fn push_lines(out: &mut Vec<crate::ui::screen::Block>, lines: Vec<Line>) {
+    if lines.is_empty() {
+        return;
+    }
+    match out.last_mut() {
+        Some(crate::ui::screen::Block::Lines(previous)) => previous.extend(lines),
+        _ => out.push(crate::ui::screen::Block::lines(lines)),
+    }
+}
+
+/// A tool result as it comes back out of the session file.
+///
+/// Only the text survives storage, so the display is rebuilt from the tool name and
+/// arguments — the same payload [`crate::tools::ToolOutput::error_for`] builds for a
+/// refused call, which is exactly the shape of "a call with a known result and no extras".
+fn stored_output(name: &str, arguments: &serde_json::Value, content: &str) -> ToolOutput {
+    let mut output = ToolOutput::text(content);
+    output.display = match name {
+        "bash" => Display::Command { expanded: false, footer: Vec::new() },
+        "write" | "edit" | "read" | "grep" | "find" | "ls" => Display::File {
+            verb: crate::tools::verb_for(name),
+            path: arguments
+                .get("path")
+                .or_else(|| arguments.get("file_path"))
+                .and_then(|v| v.as_str())
+                .map(util::one_line)
+                .unwrap_or_else(|| "…".into()),
+        },
+        _ => Display::None,
+    };
+    output
+}
+
 /// The one-line marker that replaces the live thinking preview once a turn ends.
 pub fn thinking_done_lines() -> Vec<Line> {
     vec![Line::new("思考完成", Style::new(Color::Dim)), Line::blank()]
@@ -351,6 +471,69 @@ fn theme_path(arguments: &serde_json::Value) -> String {
 mod tests {
     use super::*;
     use crate::ui::plain;
+
+    #[test]
+    fn a_resumed_conversation_replays_the_answers_too() {
+        // The bug this pins: resume replayed only the user's lines, so a restored session
+        // looked like a list of questions with the answers missing — even though the file
+        // held the assistant text, the command and its output all along.
+        use crate::llm::{Block as MsgBlock, Message, StopReason};
+        let messages = vec![
+            Message::user_text("<environment>\n工作目录: /tmp\n</environment>"),
+            Message::user_text("跑一下 echo"),
+            Message::Assistant {
+                content: vec![
+                    MsgBlock::Thinking { thinking: "先跑命令".into(), signature: None },
+                    MsgBlock::ToolCall {
+                        id: "c1".into(),
+                        name: "bash".into(),
+                        arguments: serde_json::json!({"command": "echo hi"}),
+                    },
+                ],
+                stop_reason: Some(StopReason::ToolUse),
+            },
+            Message::Tool {
+                tool_call_id: "c1".into(),
+                name: "bash".into(),
+                content: "hi\n".into(),
+            },
+            Message::Assistant {
+                content: vec![MsgBlock::Text { text: "输出是 hi".into() }],
+                stop_reason: Some(StopReason::Stop),
+            },
+        ];
+        let blocks: Vec<Vec<String>> =
+            replay_blocks(&messages).iter().map(|block| plain(&block.render(80))).collect();
+        let text = blocks.join(&"".to_string()).join("\n");
+
+        assert!(text.contains("› 跑一下 echo"), "{text}");
+        assert!(text.contains("✓ $ echo hi"), "the command must come back: {text}");
+        assert!(text.contains("hi"), "the command's output must come back: {text}");
+        assert!(text.contains("输出是 hi"), "the answer must come back: {text}");
+        assert!(text.contains("思考完成"), "thinking stays collapsed: {text}");
+        // The environment block is bookkeeping, not something the user said.
+        assert!(!text.contains("<environment>"), "{text}");
+    }
+
+    #[test]
+    fn a_resumed_command_claims_no_duration() {
+        // The file stores the result, not how long it took. Printing a time would be
+        // inventing one, and `0.0s` reads as a measurement rather than as "unknown".
+        use crate::llm::{Block as MsgBlock, Message};
+        let messages = vec![Message::Assistant {
+            content: vec![MsgBlock::ToolCall {
+                id: "c1".into(),
+                name: "bash".into(),
+                arguments: serde_json::json!({"command": "sleep 5"}),
+            }],
+            stop_reason: None,
+        }];
+        let text: Vec<String> = replay_blocks(&messages)
+            .iter()
+            .flat_map(|block| plain(&block.render(80)))
+            .collect();
+        assert!(!text.iter().any(|line| line.contains("耗时")), "{text:?}");
+    }
 
     #[test]
     fn a_command_result_collapses_to_its_tail() {

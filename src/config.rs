@@ -4,7 +4,7 @@
 //! runtime settings menu and no reload: what the user writes here *is* the model list.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -121,10 +121,12 @@ impl ModelConfig {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    #[error("配置文件不存在：{0}\n请创建它，至少写出一个 provider 及其 models。")]
-    Missing(PathBuf),
+    #[error("已写出示例配置：{0}\n编辑它，至少写出一个 provider 及其 models，然后重新运行。")]
+    Created(PathBuf),
     #[error("配置文件读取失败：{0}")]
     Read(#[from] std::io::Error),
+    #[error("无法写出示例配置 {path}：{source}")]
+    Init { path: PathBuf, source: std::io::Error },
     #[error("配置文件解析失败：{0}")]
     Parse(#[from] serde_json::Error),
     #[error("配置缺少 providers：请在 {0} 里至少配置一个 provider")]
@@ -137,20 +139,84 @@ pub enum ConfigError {
     BadDefaultModel(String),
 }
 
+/// Where mpi keeps everything it owns: `~/.mpi`.
+///
+/// One directory rather than splitting config to `~/.config` and data to `~/.local/share`.
+/// The file the user has to edit is then next to the sessions it produced, which is what
+/// makes it findable — the two are always mentioned together.
+pub fn home_dir() -> PathBuf {
+    dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".mpi")
+}
+
 pub fn config_path() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("mpi")
-        .join("config.json")
+    home_dir().join("config.json")
+}
+
+/// What a fresh install is given: every field is a placeholder to edit.
+///
+/// The values are deliberately unusable. mpi stops after writing it rather than running
+/// against it, because a template that silently "works" would send requests to a host that
+/// does not exist and report that as a network failure.
+pub const TEMPLATE: &str = r#"{
+  "shell": { "path": "/usr/bin/zsh" },
+  "providers": [
+    {
+      "name": "provider-name",
+      "api": "openai-completions",
+      "base_url": "http://127.0.0.1:8000/v1",
+      "api_key_env": "PROVIDER_NAME_API_KEY",
+      "models": [
+        {
+          "id": "model-id",
+          "name": "model-id",
+          "context_window": 200000,
+          "max_tokens": 32000,
+          "reasoning": true,
+          "thinking_levels": ["low", "medium", "high", "xhigh", "max"]
+        }
+      ]
+    }
+  ],
+  "default_model": "provider-name/model-id"
+}"#;
+
+/// Write the template, creating `~/.mpi` if needed.
+///
+/// The file is created exclusively: two mpi processes starting at once must not have the
+/// second one overwrite the first one's edits. Losing that race is reported as a plain IO
+/// error, because from the caller's side the file it wanted to create is there now.
+fn init_config(path: &Path) -> Result<(), ConfigError> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)
+            .map_err(|source| ConfigError::Init { path: path.to_path_buf(), source })?;
+    }
+    let mut file = match std::fs::OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(file) => file,
+        // Another process wrote it between the `exists` check and here: use that one.
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+        Err(source) => return Err(ConfigError::Init { path: path.to_path_buf(), source }),
+    };
+    use std::io::Write as _;
+    file.write_all(TEMPLATE.as_bytes())
+        .map_err(|source| ConfigError::Init { path: path.to_path_buf(), source })
 }
 
 impl Config {
-    /// Read and validate the config. Missing/invalid input is a hard error: mpi never
-    /// falls back to a built-in model catalogue.
+    /// Read and validate the config, creating a template first if there is none.
+    ///
+    /// Writing the file rather than printing a sample to copy is the difference between a
+    /// tool that explains itself and one that makes the user transcribe JSON out of an
+    /// error message: the path is almost always where they expected, and the file is what
+    /// they were going to create anyway.
     pub fn load() -> Result<Config, ConfigError> {
         let path = config_path();
         if !path.exists() {
-            return Err(ConfigError::Missing(path));
+            init_config(&path)?;
+            // Stop here rather than carrying on with the placeholders. The template has to
+            // parse to be editable, so running it would send a request to a host that does
+            // not exist and report that as a network failure — a confusing way to say
+            // "you have not configured this yet".
+            return Err(ConfigError::Created(path));
         }
         let raw = std::fs::read_to_string(&path)?;
         let mut config: Config = serde_json::from_str(&raw)?;
@@ -357,11 +423,45 @@ impl Defaults {
     pub const SESSIONS_DIR: &'static str = "sessions";
 }
 
-pub fn sessions_dir() -> PathBuf {
-    dirs::data_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("mpi")
-        .join(Defaults::SESSIONS_DIR)
+/// The root of the session store: `~/.mpi/sessions`.
+pub fn sessions_root() -> PathBuf {
+    home_dir().join(Defaults::SESSIONS_DIR)
+}
+
+/// The directory holding the sessions of one working directory.
+///
+/// Sessions are grouped by where the work happened, the way pi groups them: a session is
+/// about one project, and listing every conversation the user ever had — in every other
+/// directory — buries the ones that belong to the project in front of them. `/resume`
+/// therefore shows the current directory's sessions and nothing else.
+pub fn sessions_dir(cwd: &Path) -> PathBuf {
+    sessions_root().join(encode_cwd(cwd))
+}
+
+/// A working directory as one directory name: `~/文档/mpi` becomes `--home-user-文档-mpi--`.
+///
+/// The leading and trailing `--` bound the name, and a separator becomes a single `-`.
+///
+/// A literal `-` in the path is doubled, which is what keeps the encoding *injective*:
+/// without it `/a/b` and `/a-b` would name the same directory, and two unrelated projects
+/// would share one session store. Reading it back is unambiguous — a double `-` is a real
+/// dash, a single one is a separator — so the name is a faithful label as well as a key.
+/// The name is never parsed back; only injectivity and readability are needed.
+pub fn encode_cwd(cwd: &Path) -> String {
+    let text = cwd.to_string_lossy();
+    let trimmed = text.trim_start_matches(['/', '\\']);
+    let mut encoded = String::with_capacity(trimmed.len() + 4);
+    for c in trimmed.chars() {
+        match c {
+            '/' | '\\' => encoded.push('-'),
+            '-' => encoded.push_str("--"),
+            other => encoded.push(other),
+        }
+    }
+    if encoded.is_empty() {
+        encoded.push('-');
+    }
+    format!("--{encoded}--")
 }
 
 /// Environment-variable names that must never be read. Kept for completeness: mpi
@@ -389,6 +489,34 @@ mod tests {
         let mut cfg: Config = serde_json::from_str(raw).unwrap();
         cfg.fill_defaults();
         cfg
+    }
+
+    #[test]
+    fn the_template_parses_and_is_not_usable_as_it_stands() {
+        // The template has to parse, or the user opens a file that mpi then rejects for a
+        // reason unrelated to what they are editing. It must not be *runnable* either: its
+        // host and key are placeholders, and a request sent there would fail as a network
+        // error rather than as "you have not configured this yet".
+        let config: Config = serde_json::from_str(TEMPLATE).expect("the template parses");
+        assert_eq!(config.providers.len(), 1);
+        let provider = &config.providers[0];
+        assert!(provider.base_url.contains("127.0.0.1"), "not a real host");
+        assert_eq!(provider.name, "provider-name");
+        assert!(
+            config.default_model.as_deref().unwrap_or_default().contains("provider-name"),
+            "the default model names the placeholder provider"
+        );
+    }
+
+    #[test]
+    fn every_path_lives_under_the_mpi_directory() {
+        // One directory for everything mpi owns, so the file to edit sits next to the
+        // sessions it produced.
+        let home = home_dir();
+        assert!(home.ends_with(".mpi"), "{}", home.display());
+        assert_eq!(config_path(), home.join("config.json"));
+        assert_eq!(sessions_root(), home.join("sessions"));
+        assert!(sessions_dir(Path::new("/tmp/x")).starts_with(sessions_root()));
     }
 
     #[test]

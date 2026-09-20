@@ -189,9 +189,9 @@ pub enum SessionError {
 }
 
 impl Session {
-    /// Start a new session in the default session directory.
+    /// Start a new session in the store for `cwd`.
     pub fn create(cwd: &Path, model: &str) -> Result<Self, SessionError> {
-        Self::create_in(&sessions_dir(), cwd, model)
+        Self::create_in(&sessions_dir(cwd), cwd, model)
     }
 
     /// Start a new session under `dir`. The directory is a parameter so tests do not have
@@ -262,7 +262,7 @@ impl Session {
         &self.header
     }
 
-    /// The session id, which is also the file stem: `~/.local/share/mpi/sessions/<id>.jsonl`.
+    /// The session id, which is also the file stem: `~/.mpi/sessions/<dir>/<id>.jsonl`.
     pub fn id(&self) -> &str {
         &self.header.id
     }
@@ -710,8 +710,8 @@ impl SessionSummary {
 /// to retype, and the first few characters are already unique in practice. An ambiguous
 /// prefix is an error rather than a guess — resuming the wrong conversation silently is
 /// worse than asking for more characters.
-pub fn find_by_prefix(prefix: &str) -> Result<PathBuf, String> {
-    find_by_prefix_in(&sessions_dir(), prefix)
+pub fn find_by_prefix(prefix: &str, cwd: &Path) -> Result<PathBuf, String> {
+    find_by_prefix_in(&sessions_dir(cwd), prefix)
 }
 
 /// [`find_by_prefix`] against a given directory, so tests do not touch the real one.
@@ -737,8 +737,12 @@ pub fn find_by_prefix_in(dir: &Path, prefix: &str) -> Result<PathBuf, String> {
     }
 }
 
-pub fn list() -> Vec<SessionSummary> {
-    list_in(&sessions_dir())
+/// Sessions recorded in `cwd`, newest first.
+///
+/// Only this directory's: a conversation belongs to the project it happened in, and
+/// `/resume` listing every other project's history would bury the relevant ones.
+pub fn list(cwd: &Path) -> Vec<SessionSummary> {
+    list_in(&sessions_dir(cwd))
 }
 
 /// List sessions under `dir`. A session that cannot be parsed is skipped rather than
@@ -1164,6 +1168,54 @@ mod tests {
         assert!(!summary.snippet.contains("<environment>"));
         assert_eq!(summary.label(40), "帮我重构 config.rs");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn sessions_are_stored_under_the_directory_they_belong_to() {
+        // A conversation belongs to the project it happened in. Listing every other
+        // project's history buries the relevant ones, and resuming the wrong project's
+        // conversation would run its commands against the wrong tree.
+        let root = std::env::temp_dir().join(format!("mpiscope{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let a = root.join("a");
+        let b = root.join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        // The store follows the real cwd (that is the point), so a previous run's session
+        // for these paths has to go too — otherwise this test counts it as its own.
+        let _ = std::fs::remove_dir_all(crate::config::sessions_dir(&a));
+        let _ = std::fs::remove_dir_all(crate::config::sessions_dir(&b));
+
+        let mut in_a = Session::create_in(&crate::config::sessions_dir(&a), &a, "work/m").unwrap();
+        in_a.push_message(Message::user_text("在 a 里"), None, None).unwrap();
+
+        // The two directories are separate stores, so `b` cannot see `a`'s session.
+        assert_eq!(list_in(&crate::config::sessions_dir(&a)).len(), 1);
+        assert!(list_in(&crate::config::sessions_dir(&b)).is_empty());
+        // And the id, if it does not match, is an error rather than a guess.
+        assert!(find_by_prefix_in(&crate::config::sessions_dir(&b), in_a.id()).is_err());
+        assert!(find_by_prefix_in(&crate::config::sessions_dir(&a), in_a.id()).is_ok());
+
+        let _ = std::fs::remove_dir_all(crate::config::sessions_dir(&a));
+        let _ = std::fs::remove_dir_all(crate::config::sessions_dir(&b));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_directory_name_encodes_the_whole_path() {
+        // The name has to keep the path readable — it is the only clue in the store about
+        // which project a subdirectory holds — and it must not contain a separator, or a
+        // path would create directories instead of naming one.
+        let encoded = crate::config::encode_cwd(Path::new("/home/user/文档/mpi"));
+        assert_eq!(encoded, "--home-user-文档-mpi--");
+        assert!(!encoded.contains('/'), "{encoded}");
+        // Distinct directories get distinct names.
+        assert_ne!(
+            crate::config::encode_cwd(Path::new("/a/b")),
+            crate::config::encode_cwd(Path::new("/a-b"))
+        );
+        // The root, which has nothing left after the leading separator is trimmed.
+        assert_eq!(crate::config::encode_cwd(Path::new("/")), "-----");
     }
 
     #[test]

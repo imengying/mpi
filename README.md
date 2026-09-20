@@ -55,7 +55,8 @@ install -m755 target/release/mpi ~/.local/bin/mpi
 
 ## 配置
 
-唯一的配置文件是 `~/.config/mpi/config.json`，启动时读一次，没有热重载。
+配置在 `~/.mpi/config.json`，启动时读一次，没有热重载。
+**第一次运行会自动写出模板**，然后停下并打印路径：填好 provider 与模型再运行。
 
 ```json
 {
@@ -261,7 +262,7 @@ printf echo true false cut tr du df uname rg grep find sort file sed git`），
 
 ## 会话
 
-线性 JSONL，一行一条记录，存在 `~/.local/share/mpi/sessions/`。
+线性 JSONL，一行一条记录，存在 `~/.mpi/sessions/<按工作目录编码的子目录>/`。
 
 记录分类型存放：会话头、对话项、每轮环境快照、事件（含 token 统计）、压缩检查点。
 环境快照与对话分开存，所以它不会污染上下文，也不会在压缩时被当成对话处理。

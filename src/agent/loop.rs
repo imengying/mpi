@@ -200,17 +200,13 @@ impl Agent {
             &format!("已恢复会话 {name}（{} 条消息）", session.context_messages().len()),
             crate::ui::screen::Style::new(Color::Dim),
         ));
-        // Replay the transcript so the user can see where the work stopped. Only the tail
-        // is shown: the full history is already in the context.
-        let messages = session.context_messages();
-        let tail = messages.len().saturating_sub(6);
-        for message in &messages[tail..] {
-            if is_environment_block(message) {
-                continue;
-            }
-            if matches!(message, Message::User { .. }) {
-                screen.push_lines(ui_compact::user_lines(&message.text()));
-            }
+        // Replay the transcript so the user can see where the work stopped. The whole
+        // conversation is replayed, not just the user's lines: a resume that showed only the
+        // questions would look like the answers were lost. Environment blocks are skipped —
+        // they are bookkeeping, and the newest one is written back below if the directory
+        // changed.
+        for block in ui_compact::replay_blocks(&session.context_messages()) {
+            screen.push(block);
         }
         // The working directory travels with the session: the newest environment block names
         // it, so running the tools somewhere else would make the transcript lie about where
@@ -466,7 +462,7 @@ impl Agent {
     }
 
     async fn command_resume(&mut self) -> anyhow::Result<()> {
-        let summaries = crate::agent::session::list();
+        let summaries = crate::agent::session::list(&self.cwd);
         if summaries.is_empty() {
             self.screen.push_lines(ui_compact::note_lines(
                 "还没有可恢复的会话。",
@@ -510,12 +506,10 @@ impl Agent {
                 if self.config.find(&model_spec).is_some() {
                     self.model_spec = model_spec;
                 }
-                let messages = self.session.context_messages();
-                let tail = messages.len().saturating_sub(6);
-                for message in &messages[tail..] {
-                    if matches!(message, Message::User { .. }) {
-                        self.screen.push_lines(ui_compact::user_lines(&message.text()));
-                    }
+                // Same replay as a start-up resume: the switched-to session has to look
+                // like the session it is, answers included.
+                for block in ui_compact::replay_blocks(&self.session.context_messages()) {
+                    self.screen.push(block);
                 }
             }
             Err(err) => {

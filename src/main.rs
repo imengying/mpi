@@ -37,12 +37,19 @@ fn run(cli: Cli) -> anyhow::Result<()> {
     let config = match Config::load() {
         Ok(config) => config,
         Err(err) => {
-            eprintln!("mpi: {err}");
-            eprintln!(
-                "\n配置文件示例（{}）：\n{}",
-                mpi::config::config_path().display(),
-                SAMPLE_CONFIG
-            );
+            // The "write a example config" message already carries the path and what to do
+            // next, so it is printed as-is rather than prefixed with `mpi:`.
+            match &err {
+                mpi::config::ConfigError::Created(path) => {
+                    eprintln!("已写出示例配置：{}
+编辑它，至少写出一个 provider 及其 models，然后重新运行。", path.display());
+                }
+                mpi::config::ConfigError::NoProviders(path) => {
+                    eprintln!("mpi: {err}");
+                    eprintln!("编辑 {path}，至少写出一个 provider 及其 models。", path = path.display());
+                }
+                _ => eprintln!("mpi: {err}"),
+            }
             std::process::exit(1);
         }
     };
@@ -53,12 +60,12 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             // An id that matches nothing is an error, not a silent fresh session: the user
             // asked for a specific conversation and getting a blank one would hide the
             // mistake until they noticed the missing history.
-            match mpi::agent::session::find_by_prefix(id) {
+            match mpi::agent::session::find_by_prefix(id, &cwd) {
                 Ok(path) => Agent::resume(config, cwd, &path, interactive)?,
                 Err(err) => anyhow::bail!("{err}（用 /resume 或 mpi resume 查看会话列表）"),
             }
         }
-        Some(Command::Resume { id: None }) => match most_recent_session() {
+        Some(Command::Resume { id: None }) => match most_recent_session(&cwd) {
             Some(path) => Agent::resume(config, cwd, &path, interactive)?,
             None => Agent::new(config, cwd, interactive)?,
         },
@@ -134,8 +141,8 @@ fn run(cli: Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn most_recent_session() -> Option<std::path::PathBuf> {
-    mpi::agent::session::list().first().map(|summary| summary.path.clone())
+fn most_recent_session(cwd: &std::path::Path) -> Option<std::path::PathBuf> {
+    mpi::agent::session::list(cwd).first().map(|summary| summary.path.clone())
 }
 
 /// Drive an async agent call from the synchronous turn loop.
@@ -147,27 +154,3 @@ fn futures_block<F: std::future::Future>(future: F) -> F::Output {
         .block_on(future)
 }
 
-/// Printed when the config is missing or unreadable. There is no built-in model list: the
-/// user has to say which models exist, and this is the shape to say it in.
-const SAMPLE_CONFIG: &str = r#"{
-  "shell": { "path": "/usr/bin/zsh" },
-  "providers": [
-    {
-      "name": "name",
-      "api": "openai-completions",
-      "base_url": "url",
-      "api_key_env": "NAME_API_KEY",
-      "models": [
-        {
-          "id": "deepseek-v4.1-flash",
-          "name": "deepseek-v4.1-flash",
-          "context_window": 1000000,
-          "max_tokens": 64000,
-          "reasoning": true,
-          "thinking_levels": ["low", "high", "max"]
-        }
-      ]
-    }
-  ],
-  "default_model": "name/deepseek-v4.1-flash"
-}"#;
