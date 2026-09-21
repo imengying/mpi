@@ -172,10 +172,15 @@ impl Agent {
     /// Resume an existing session file.
     pub fn resume(config: Config, cwd: PathBuf, path: &Path, interactive: bool) -> anyhow::Result<Self> {
         let mut session = Session::open(path)?;
-        let model_spec = session
-            .header()
-            .model
-            .clone();
+        // The model and level come from the newest turn the session recorded, falling back to
+        // the header for a session old enough to predate turn contexts. Taking the header
+        // always would silently undo `/model`: the choice was made in the conversation and
+        // the conversation has to remember it.
+        let (recorded_model, recorded_level) = session.current_model().unwrap_or_default();
+        let model_spec = match recorded_model {
+            spec if !spec.is_empty() => spec,
+            _ => session.header().model.clone(),
+        };
         let model_spec = if config.find(&model_spec).is_some() {
             model_spec
         } else {
@@ -184,9 +189,16 @@ impl Agent {
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("配置里没有可用的模型"))?
         };
+        // The level is only meaningful for the model it was recorded with, and a config edit
+        // can remove it; clamping against the model being resumed keeps a level that no
+        // longer exists from being sent.
         let level = {
             let (_, model) = config.find(&model_spec).unwrap();
-            model.levels().first().cloned().unwrap_or_default()
+            if recorded_level.is_empty() {
+                model.levels().first().cloned().unwrap_or_default()
+            } else {
+                crate::llm::clamp_level(model, &recorded_level).0
+            }
         };
         let dialect = policy::configured_dialect(&config.shell.path);
         let client = Client::new()?;
@@ -240,7 +252,7 @@ impl Agent {
             session.relocate(&cwd)?;
         }
         screen.flush();
-        Ok(Agent {
+        let mut agent = Agent {
             config,
             client,
             screen,
@@ -254,7 +266,13 @@ impl Agent {
             streaming: false,
             system_prompt,
             deleted: false,
-        })
+        };
+        // Draw the footer now rather than waiting for the first prompt. It is the row that
+        // says which model and level the session came back with, and until the first
+        // `read_input` it would otherwise sit empty — the one thing a user checking "did my
+        // model stick?" looks at would be the one thing not on screen.
+        agent.render_footer(None);
+        Ok(agent)
     }
 
     pub fn model_spec(&self) -> &str {
@@ -759,6 +777,12 @@ impl Agent {
         content.extend(images.iter().map(crate::image_input::PastedImage::block));
         self.session
             .push_message(Message::User { content }, None, None)?;
+        // Record the model and level this turn is about to run with, so resuming the session
+        // continues with the model the user chose rather than the one the session happened to
+        // be created with. It is written per turn because the choice can change between them:
+        // `/model` mid-conversation has to be remembered, and the newest record is the one
+        // that answers "what was this session using".
+        self.session.push_turn_context(&self.cwd, &self.model_spec, &self.level)?;
         self.retry.reset();
         // The spinner covers the whole turn, not one request: the model may think for a
         // while before its first token, and a command may run for minutes. Both are times

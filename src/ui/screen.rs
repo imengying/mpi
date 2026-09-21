@@ -1188,6 +1188,12 @@ impl Screen {
     /// walk returns to the bottom. Pressing Up at the oldest entry does nothing rather than
     /// wrapping to the newest: wrapping makes it impossible to tell the top of the history
     /// from the bottom, and a stray key press would then land on a different entry entirely.
+    ///
+    /// A recalled line is marked as recalled, so the command menu stays shut for it. Without
+    /// that, recalling a `/command` pops the menu open — and the menu wants the arrows, which
+    /// are the only way back out of the history. The user pressed Up for a previous *line*,
+    /// not to be shown a list of commands they did not ask about; the menu returns as soon as
+    /// they type, because then it is about something they *are* writing.
     fn history_up(&mut self) {
         if self.history.is_empty() {
             return;
@@ -1202,6 +1208,7 @@ impl Screen {
         };
         self.history_index = Some(next);
         self.editing = Some(Editor::from_text(&self.history[next]));
+        self.menu_dismissed = self.editing.as_ref().map(Editor::text);
     }
 
     /// Down: one entry towards the newest, and past the newest back to the draft.
@@ -1210,6 +1217,10 @@ impl Screen {
     /// again, and not on nothing at all. Waiting at the newest entry means the user has to
     /// guess how many entries there are; a blank line is the unambiguous "this is the line
     /// you are writing".
+    ///
+    /// Recalled entries keep the menu shut, like [`Screen::history_up`] does. The one
+    /// exception is the draft: it is the user's own line, so if it opens a menu, that menu
+    /// comes back with it.
     fn history_down(&mut self) {
         let Some(index) = self.history_index else {
             return;
@@ -1217,11 +1228,13 @@ impl Screen {
         if index + 1 < self.history.len() {
             self.history_index = Some(index + 1);
             self.editing = Some(Editor::from_text(&self.history[index + 1]));
+            self.menu_dismissed = self.editing.as_ref().map(Editor::text);
             return;
         }
         // Past the newest entry: back to what was being typed before the walk began.
         self.history_index = None;
         self.editing = Some(self.history_draft.take().unwrap_or_default());
+        self.menu_dismissed = None;
     }
 
     /// Keep the live region smaller than the screen, dropping the oldest preview rows.
@@ -1819,13 +1832,20 @@ impl Screen {
                 self.menu.clear();
                 self.menu_selected = 0;
             }
-            // The arrows walk the input history, and only that. Putting a recalled
-            // entry back needs Down to keep working while the entry happens to be a
-            // slash command — which is exactly when the menu is up, and exactly when
-            // handing the arrows to the menu would strand the user inside a recalled
-            // line with no way back to open space. Tab and Shift+Tab drive the
-            // highlight instead, and the history is never further away than the arrow
-            // that got them there.
+            // The arrows drive the menu when it is up, and the input history otherwise.
+            //
+            // This is the arrangement the user asked for twice, from both sides: the menu has
+            // to be selectable with the arrows, and Down at the end of the history has to
+            // reach a blank line. They only conflict because recalling a `/command` used to
+            // pop the menu open on it, and then the arrows belonged to a list the user never
+            // asked for. The recall is what suppresses the menu (see `history_up`), so a
+            // refreshed list here means the user opened it by typing.
+            KeyCode::Up if !self.menu.is_empty() => {
+                self.move_menu(-1);
+            }
+            KeyCode::Down if !self.menu.is_empty() => {
+                self.move_menu(1);
+            }
             KeyCode::Up => {
                 self.history_up();
             }
@@ -2391,22 +2411,45 @@ mod tests {
     }
 
     #[test]
-    fn the_menu_does_not_take_the_arrow_keys_from_the_history() {
-        // The user's complaint: recall an entry, press Down, and the recalled line stays put.
-        // It is a slash command, so the menu opened on it and ate the arrow. Down has to stay
-        // the way back out of the history — that is the whole point of having it.
+    fn a_recalled_command_does_not_open_the_menu_over_the_arrows() {
+        // The two requirements pull in opposite directions and this is where they meet: the
+        // menu must be selectable with the arrows, and Down at the end of the history must
+        // reach a blank line. They conflicted because recalling a `/command` popped the menu
+        // open on it, and the arrows then belonged to a list nobody asked for. A recall is not
+        // typing, so it does not open the menu — which leaves the arrows free for the history.
         let mut screen = screen_with_commands();
         screen.history = vec!["/name".into(), "hello".into()];
         set_input(&mut screen, "");
         screen.history_index = Some(0);
-        set_input(&mut screen, "/name");
-        screen.sync_menu();
-        assert!(!screen.menu.is_empty(), "the recalled command opens the menu");
 
-        screen.history_down();
-        assert_eq!(input(&screen), "hello", "Down must leave the recalled command behind");
-        screen.history_down();
+        screen.absorb_event(Event::Key(KeyEvent::from(KeyCode::Up)));
+        assert_eq!(input(&screen), "/name", "Up recalls the previous line");
+        assert!(screen.menu.is_empty(), "recalling a command must not open the menu");
+
+        // Down is the way back out of the history, and it still works.
+        screen.absorb_event(Event::Key(KeyEvent::from(KeyCode::Down)));
+        assert_eq!(input(&screen), "hello", "Down leaves the recalled command behind");
+        screen.absorb_event(Event::Key(KeyEvent::from(KeyCode::Down)));
         assert_eq!(input(&screen), "", "and the last Down reaches the blank line");
+    }
+
+    #[test]
+    fn the_arrows_select_from_the_menu_while_it_is_open() {
+        // Typing `/` opens the menu, and the arrows have to move through it: that is how a
+        // menu is used everywhere else, and the highlight is the only thing that says which
+        // entry Enter would run.
+        let mut screen = screen_with_commands();
+        screen.begin_line();
+        screen.absorb_event(Event::Key(KeyEvent::from(KeyCode::Char('/'))));
+        assert!(screen.menu.len() > 1, "the menu lists the commands");
+        assert_eq!(screen.menu_selected, 0);
+
+        screen.absorb_event(Event::Key(KeyEvent::from(KeyCode::Down)));
+        assert_eq!(screen.menu_selected, 1, "Down moves the highlight");
+        assert_eq!(input(&screen), "/", "and leaves the buffer alone");
+
+        screen.absorb_event(Event::Key(KeyEvent::from(KeyCode::Up)));
+        assert_eq!(screen.menu_selected, 0, "Up moves it back");
     }
 
     #[test]

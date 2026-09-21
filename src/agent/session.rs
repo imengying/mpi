@@ -366,10 +366,27 @@ impl Session {
         })
     }
 
+    /// The model and thinking level of the newest recorded turn.
+    ///
+    /// `header.model` is what the session was *created* with and never changes; `/model`
+    /// afterward would be forgotten on the next resume, and the session would quietly go back
+    /// to a model the user had moved off. The turn contexts record what each turn actually
+    /// ran with, so the newest one is the answer.
+    ///
+    /// `None` for a session whose turns predate this record, or that never got past its first
+    /// message — the caller falls back to the header, which is then the honest answer.
+    pub fn current_model(&self) -> Option<(String, String)> {
+        self.records.iter().rev().find_map(|record| match record {
+            Record::TurnContext { model, level, .. } if !model.is_empty() => {
+                Some((model.clone(), level.clone()))
+            }
+            _ => None,
+        })
+    }
+
     /// Point the session header at `cwd`. The header line itself is never rewritten: the
     /// update is appended as a `session_info` record, like the session name.
-    pub fn relocate(&mut self, cwd: &Path) -> Result<(), SessionError> {
-        if self.header.cwd == cwd.to_string_lossy() {
+    pub fn relocate(&mut self, cwd: &Path) -> Result<(), SessionError> {        if self.header.cwd == cwd.to_string_lossy() {
             return Ok(());
         }
         let id = self.next_id();
@@ -1157,6 +1174,45 @@ mod tests {
         assert!(reopened.records().iter().any(|r| matches!(r, Record::TurnContext { .. })));
         assert_eq!(reopened.totals.input, 10);
         assert_eq!(reopened.last_usage.unwrap().output, 3);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_newest_turn_context_names_the_model_in_use() {
+        // `/model` changes the model for the rest of the conversation. The header is written
+        // once, at creation, and never rewritten — so remembering the choice means reading it
+        // back from the turn contexts, and the newest one is the answer.
+        let (mut session, dir) = temp_session("model-switch");
+        let path = session.path().to_path_buf();
+        session.push_message(Message::user_text("hello"), None, None).unwrap();
+        session.push_turn_context(&dir, "work/first", "low").unwrap();
+        session.push_message(Message::user_text("again"), None, None).unwrap();
+        session.push_turn_context(&dir, "work/second", "max").unwrap();
+        drop(session);
+
+        let reopened = Session::open(&path).unwrap();
+        assert_eq!(
+            reopened.current_model(),
+            Some(("work/second".to_string(), "max".to_string())),
+            "the newest recorded turn wins"
+        );
+        // And it does not leak into the conversation.
+        assert_eq!(reopened.context_messages().len(), 2);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_session_with_no_turn_context_has_no_recorded_model() {
+        // Sessions written before turn contexts existed still have to open, and the caller
+        // falls back to the header for them rather than getting an empty model.
+        let (mut session, dir) = temp_session("no-turn-context");
+        let path = session.path().to_path_buf();
+        session.push_message(Message::user_text("hello"), None, None).unwrap();
+        drop(session);
+
+        let reopened = Session::open(&path).unwrap();
+        assert_eq!(reopened.current_model(), None);
+        assert!(!reopened.header().model.is_empty(), "the header still names one");
         let _ = std::fs::remove_dir_all(dir);
     }
 
