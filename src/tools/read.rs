@@ -5,7 +5,6 @@ use std::path::Path;
 
 use crate::llm::ToolSpec;
 use crate::tools::ToolOutput;
-use crate::util;
 
 pub fn spec() -> ToolSpec {
     ToolSpec {
@@ -51,19 +50,12 @@ pub async fn execute(arguments: &serde_json::Value, cwd: &Path) -> Result<ToolOu
         let number = offset + index;
         out.push_str(&format!("{:>width$}\t{line}\n", number, width = width));
     }
-    if end < total {
-        out.push_str(&format!(
-            "\n[仅显示第 {offset}–{end} 行，共 {total} 行；继续读取请用 offset={}]\n",
-            end + 1
-        ));
-    }
-    let _ = util::estimate_tokens(&out);
     Ok(ToolOutput {
         content: out,
         display: crate::tools::Display::File { verb: "读取", path: path.to_string() },
         is_error: false,
-duration: None,
-})
+        duration: None,
+    })
 }
 
 #[cfg(test)]
@@ -79,7 +71,12 @@ mod tests {
 
 
     #[test]
-    fn reads_with_line_numbers_and_reports_the_window() {
+    fn reads_with_line_numbers_and_no_trailing_note() {
+        // The window is described by the tool's own arguments (offset / limit) and by the
+        // line numbers on every row, so a note announcing it was a line the user had to read
+        // on every windowed read to be told something the output already showed. It was also
+        // the row that survived collapsing — the block keeps its last rows — so a long read
+        // showed nothing *but* the note.
         let dir = temp_dir();
         let file = dir.join("sample.txt");
         std::fs::write(&file, "a\nb\nc\nd\ne\n").unwrap();
@@ -91,7 +88,10 @@ mod tests {
         assert!(out.content.contains("2\tb"));
         assert!(out.content.contains("3\tc"));
         assert!(!out.content.contains("1\ta"));
-        assert!(out.content.contains("offset=4"));
+        assert!(!out.content.contains("仅显示"), "no window note: {:?}", out.content);
+        assert!(!out.content.contains("offset="), "no follow-up advice: {:?}", out.content);
+        // The rows are the output: nothing before them, nothing after them.
+        assert_eq!(out.content.lines().count(), 2, "{:?}", out.content);
     }
 
     #[test]

@@ -1,10 +1,16 @@
 //! Red/green diffs for `edit` and `write`.
 //!
 //! The diff is presentation only: the model gets a one-line summary, the user gets the
-//! change. Rows keep a line number, and a big change is shown as an **excerpt of itself**
-//! — the interesting part, taken from the real diff. It is never replaced by a sentence
-//! saying a diff exists and has been left out: that is a row spent telling the user that
-//! they were not shown the thing they asked for.
+//! change. Rows carry one line number each — the row's place in the file as it now stands —
+//! and a big change is shown as an **excerpt of itself**, never replaced by a sentence saying
+//! a diff exists and has been left out: that is a row spent telling the user that they were
+//! not shown the thing they asked for.
+//!
+//! What bounds the work is the *change*, not the file. Unchanged runs are trimmed to a few
+//! lines of context, so a one-line edit in a large file produces a handful of rows rather
+//! than one row per line of the file — which matters twice over, because the block that draws
+//! them keeps only its head and its tail when collapsed, and a payload the size of the file
+//! would hide the change in the middle it drops.
 
 use similar::{ChangeTag, TextDiff};
 
@@ -30,8 +36,18 @@ const WINDOW_LINES: usize = 400;
 #[derive(Debug, Clone)]
 pub struct DiffRow {
     pub kind: Kind,
-    pub old_line: Option<usize>,
-    pub new_line: Option<usize>,
+    /// The line number this row shows, in one column.
+    ///
+    /// One number, not `git diff`'s two. A row belongs to one side of the change, so it has
+    /// exactly one number worth showing, and the other column was blank on every single row:
+    /// two columns spent the width twice and put the numbers on opposite sides from row to
+    /// row, so reading down a hunk meant chasing them across the screen.
+    ///
+    /// The number is the row's line in the file as it stands *now* — that is what the reader
+    /// is locating themselves in. Context and added rows carry their new line. A removed line
+    /// is not in the file any more, so it keeps the number it had, which is where the reader
+    /// last saw it; that is why a removal can name a line above the addition that replaced it.
+    pub line: Option<usize>,
     pub text: String,
 }
 
@@ -64,35 +80,75 @@ fn build(before: &str, after: &str) -> Display {
         // that actually differs.
         return build_window(before, after);
     }
-    let diff = TextDiff::from_lines(before, after);
-    let mut added = 0usize;
-    let mut removed = 0usize;
-    let mut rows: Vec<DiffRow> = Vec::new();
-    for change in diff.iter_all_changes() {
-        let kind = match change.tag() {
-            ChangeTag::Insert => {
-                added += 1;
-                Kind::Added
-            }
-            ChangeTag::Delete => {
-                removed += 1;
-                Kind::Removed
-            }
-            ChangeTag::Equal => Kind::Context,
-        };
-        let text = change.value().trim_end_matches('\n').to_string();
-        rows.push(DiffRow {
-            kind,
-            old_line: change.old_index().map(|i| i + 1),
-            new_line: change.new_index().map(|i| i + 1),
-            text,
-        });
-    }
+    let before_lines = lines_with_endings(before);
+    let after_lines = lines_with_endings(after);
+    let rows = diff_rows(&before_lines, &after_lines, 0, 0);
+    let added = rows.iter().filter(|row| row.kind == Kind::Added).count();
+    let removed = rows.iter().filter(|row| row.kind == Kind::Removed).count();
     Display::Diff { diff: body_of(&rows), added, removed }
 }
 
+/// A file's lines *with* their newline terminators.
+///
+/// The terminator has to travel with the line: a diff of `"a\nb"` against `"a\nb\n"` is a
+/// change to the last line, and a diff of the same two texts reconstructed by joining
+/// newline-stripped lines is not — joining loses the difference, and the renderer then shows
+/// an unchanged line as both removed and added. Keeping each line's own terminator means the
+/// slices can be concatenated back into exactly the text they came from, so what the diff
+/// sees is what is on disk.
+fn lines_with_endings(text: &str) -> Vec<&str> {
+    text.split_inclusive('\n').collect()
+}
+
+/// Rows of unchanged text to keep before and after each change.
+///
+/// Enough to read the change in its surroundings, and no more. The whole file used to be
+/// kept as context, which is what a diff *is* — but it also means a one-line edit in a
+/// 400-line file produces a 401-row payload, and the collapsed preview only draws the top
+/// and the bottom of it. The edit that the block exists to show was the one row that never
+/// made it to the screen. Three lines is the convention every diff tool converged on, and
+/// with a bounded run the payload is proportional to the change rather than to the file.
+const CONTEXT_LINES: usize = 3;
+
+/// Flush the pending run of unchanged rows, keeping the ends that are worth reading.
+///
+/// The run is held back rather than emitted as it arrives because how much of it is worth
+/// keeping depends on what comes next. A run that leads into a change keeps its *last*
+/// [`CONTEXT_LINES`] rows — the lines immediately above the change are its context, and the
+/// lines above those are the rest of the file. A run that sits between two changes is both
+/// the"after" of the first and the "before" of the second, so it keeps its first and last
+/// [`CONTEXT_LINES`] rows and drops the middle: those are the rows next to each change, and
+/// the rows in the middle of a long gap are the ones nobody is reading.
+fn push_context(rows: &mut Vec<DiffRow>, context: &mut Vec<DiffRow>) {
+    if context.is_empty() {
+        return;
+    }
+    if rows.is_empty() {
+        // Nothing stands before this run, so it is the top of the file leading into a change.
+        let keep = context.len().saturating_sub(CONTEXT_LINES);
+        context.drain(..keep);
+    } else if context.len() > CONTEXT_LINES * 2 {
+        // Between two changes: keep the rows against each one, drop the gap in between.
+        context.drain(CONTEXT_LINES..context.len() - CONTEXT_LINES);
+    }
+    rows.append(context);
+}
+
+/// The single number a row shows, from the indices the diff reports.
+///
+/// Context and added rows live in the file as it now stands, so they show the new number. A
+/// removed row does not exist there any more, so it shows the old one — the line the reader
+/// last saw it on. Both sides are 0-based here and 1-based on screen.
+fn row_line(kind: Kind, old: Option<usize>, new: Option<usize>) -> Option<usize> {
+    let picked = match kind {
+        Kind::Removed => old.or(new),
+        Kind::Added | Kind::Context => new.or(old),
+    };
+    picked.map(|index| index + 1)
+}
+
 /// Render rows to the plain string that travels with the tool result. The UI only has to
-/// colourise it.
+/// colourise it. The number is already chosen per row (see [`DiffRow::line`]).
 fn body_of(rows: &[DiffRow]) -> String {
     rows.iter()
         .map(|row| {
@@ -101,7 +157,7 @@ fn body_of(rows: &[DiffRow]) -> String {
                 Kind::Removed => '-',
                 Kind::Context => ' ',
             };
-            format!("{marker}{:>5} {:>5} │ {}", num(row.old_line), num(row.new_line), row.text)
+            format!("{marker}{:>5} │ {}", num(row.line), row.text)
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -124,8 +180,8 @@ fn body_of(rows: &[DiffRow]) -> String {
 /// in a header is the cost this limit exists to avoid, and for an excerpt the number of rows
 /// on screen is the honest one.
 fn build_window(before: &str, after: &str) -> Display {
-    let before_lines: Vec<&str> = before.lines().collect();
-    let after_lines: Vec<&str> = after.lines().collect();
+    let before_lines = lines_with_endings(before);
+    let after_lines = lines_with_endings(after);
     let (head, tail) = common_ends(&before_lines, &after_lines);
     let old_middle = &before_lines[head..before_lines.len() - tail];
     let new_middle = &after_lines[head..after_lines.len() - tail];
@@ -193,27 +249,51 @@ fn ranges(len: usize) -> Vec<(usize, usize)> {
 }
 
 /// Diff two slices, numbering rows from the offsets they have in the real file.
+///
+/// The slices carry their own line terminators (see [`lines_with_endings`]), so they are
+/// concatenated rather than re-joined: joining with a separator would add a terminator the
+/// text may not have had, and a final line without one would compare equal to a final line
+/// with one.
+///
+/// Runs of unchanged rows are trimmed to [`CONTEXT_LINES`] at each end, exactly as in
+/// [`build`]: the same rule applies whether the sides diffed are two files or two windows
+/// taken out of large ones, and a window that kept all of its context would reinstate the
+/// problem the trim exists to solve.
 fn diff_rows(old: &[&str], new: &[&str], old_start: usize, new_start: usize) -> Vec<DiffRow> {
     // The joined sides are named bindings rather than inline temporaries: the diff borrows
     // them, and a temporary would be dropped at the end of the `let diff` statement.
-    let old_text = old.join("\n");
-    let new_text = new.join("\n");
+    let old_text = old.concat();
+    let new_text = new.concat();
     let diff = TextDiff::from_lines(&old_text, &new_text);
-    diff.iter_all_changes()
-        .map(|change| {
-            let kind = match change.tag() {
-                ChangeTag::Insert => Kind::Added,
-                ChangeTag::Delete => Kind::Removed,
-                ChangeTag::Equal => Kind::Context,
-            };
-            DiffRow {
+    let mut rows: Vec<DiffRow> = Vec::new();
+    let mut context: Vec<DiffRow> = Vec::new();
+    for change in diff.iter_all_changes() {
+        let kind = match change.tag() {
+            ChangeTag::Insert => Kind::Added,
+            ChangeTag::Delete => Kind::Removed,
+            ChangeTag::Equal => Kind::Context,
+        };
+        let row = DiffRow {
+            kind,
+            line: row_line(
                 kind,
-                old_line: change.old_index().map(|i| old_start + i + 1),
-                new_line: change.new_index().map(|i| new_start + i + 1),
-                text: change.value().trim_end_matches('\n').to_string(),
-            }
-        })
-        .collect()
+                change.old_index().map(|i| old_start + i),
+                change.new_index().map(|i| new_start + i),
+            ),
+            text: change.value().trim_end_matches('\n').to_string(),
+        };
+        if kind == Kind::Context {
+            context.push(row);
+        } else {
+            push_context(&mut rows, &mut context);
+            rows.push(row);
+        }
+    }
+    if !rows.is_empty() {
+        context.truncate(CONTEXT_LINES);
+        rows.append(&mut context);
+    }
+    rows
 }
 
 fn num(value: Option<usize>) -> String {
@@ -276,18 +356,135 @@ mod tests {
         let display = for_edit("a\nb\nc\n", "a\nB\nc\n");
         assert_eq!(counts(&display), (1, 1));
         let rendered = rows(&display);
-        // Both the old and the new line survive, each with its own line number, and the
-        // context rows line up on both sides.
-        assert!(rendered.contains(&"     1     1 │ a".to_string()), "{rendered:?}");
-        assert!(rendered.contains(&"-    2       │ b".to_string()), "{rendered:?}");
-        assert!(rendered.contains(&"+          2 │ B".to_string()), "{rendered:?}");
-        assert!(rendered.contains(&"     3     3 │ c".to_string()), "{rendered:?}");
+        // Both the old and the new line survive, with one line number each — the number the
+        // row has in the file as it now stands, so the column reads straight down the screen.
+        assert!(rendered.contains(&"     1 │ a".to_string()), "{rendered:?}");
+        assert!(rendered.contains(&"-    2 │ b".to_string()), "{rendered:?}");
+        assert!(rendered.contains(&"+    2 │ B".to_string()), "{rendered:?}");
+        assert!(rendered.contains(&"     3 │ c".to_string()), "{rendered:?}");
+    }
+
+    #[test]
+    fn every_row_carries_exactly_one_number_in_one_column() {
+        // The layout this replaces was `git diff`'s: an old-number column and a new-number
+        // column, one of which is blank on every single row. On a narrow terminal that spent
+        // the width twice and made the numbers alternate sides down a hunk. There is one
+        // column now, and every row puts its number in it.
+        let display = for_edit("a\nb\nc\nd\n", "a\nB\nc\nD\n");
+        let rendered = rows(&display);
+        for row in &rendered {
+            let (marker, rest) = row.split_at(1);
+            assert!(matches!(marker, "+" | "-" | " "), "unknown marker: {row:?}");
+            let (number, tail) = rest
+                .split_once(" │")
+                .unwrap_or_else(|| panic!("no column: {row:?}"));
+            assert_eq!(number.len(), 5, "the column is a fixed width: {row:?}");
+            let value: usize = number
+                .trim()
+                .parse()
+                .unwrap_or_else(|_| panic!("not a number: {row:?}"));
+            assert!(value >= 1, "line numbers start at 1: {row:?}");
+            assert!(tail.starts_with(' '), "the text is past the column: {row:?}");
+        }
+        assert!(rendered.len() >= 4, "{rendered:?}");
+    }
+
+    #[test]
+    fn the_column_reads_straight_down_the_rows_that_are_in_the_file() {
+        // What makes one column worth reading is that the numbers mean one thing: where this
+        // row is in the file *now*. Rows that are in the file — context and additions — must
+        // therefore increase down the screen. Removals are the deliberate exception: they
+        // name a line that is gone, so they keep the number it had, which can sit above the
+        // number of the addition that replaced it (delete 2414–2417, add 2414 again).
+        let before: String = (1..=10).map(|i| format!("line {i}\n")).collect();
+        let after = "line 1\nline 2\nline 3\nline 4\nREPLACEMENT\nline 9\nline 10\n";
+        let rendered = rows(&for_edit(&before, after));
+
+        let mut last = 0usize;
+        for row in &rendered {
+            let in_file = !row.starts_with('-');
+            let number: usize = row[1..6].trim().parse().unwrap();
+            if in_file {
+                assert!(number > last, "a row in the file moves forward: {row:?}");
+                last = number;
+            }
+        }
+        // The removals still name the real lines they were, and the replacement names the
+        // line it took over.
+        assert!(rendered.contains(&"-    5 │ line 5".to_string()), "{rendered:?}");
+        assert!(rendered.contains(&"-    8 │ line 8".to_string()), "{rendered:?}");
+        assert!(rendered.contains(&"+    5 │ REPLACEMENT".to_string()), "{rendered:?}");
     }
 
     #[test]
     fn a_new_file_is_all_additions() {
         let display = for_new_file("one\ntwo\n");
         assert_eq!(counts(&display), (2, 0));
+    }
+
+    #[test]
+    fn unchanged_lines_around_a_change_are_trimmed_not_kept_whole() {
+        // The payload used to be the whole file with one line changed — 401 rows for a
+        // 400-line file. The block that draws it keeps a head and a tail, so the one row that
+        // mattered, the edit, was the row that fell in the hidden middle: the block showed the
+        // top of the file and the bottom of the file and nothing about the change at all.
+        // Trimming the unchanged runs is what makes the payload proportional to the change,
+        // and what puts the change on screen.
+        let mut before: Vec<String> = (1..=400).map(|i| format!("line {i}\n")).collect();
+        let mut after = before.clone();
+        before[250] = "OLD LINE 251\n".into();
+        after[250] = "NEW LINE 251\n".into();
+        let display = for_edit(&before.concat(), &after.concat());
+        let rendered = rows(&display);
+
+        assert_eq!(counts(&display), (1, 1));
+        assert!(
+            rendered.iter().any(|row| row.contains("OLD LINE 251")),
+            "the change is in the payload: {rendered:?}"
+        );
+        // Three rows of context on each side of the one-line change, so ten rows in all: the
+        // change is nowhere near a screenful, whatever the file's size.
+        assert_eq!(rendered.len(), CONTEXT_LINES * 2 + 2, "{rendered:?}");
+        assert!(!rendered.iter().any(|row| row.ends_with("line 1")), "{rendered:?}");
+    }
+
+    #[test]
+    fn a_gap_between_two_changes_keeps_the_rows_next_to_each_one() {
+        // Both changes have to survive, so the rows against each of them are kept and the
+        // empty middle of the gap is dropped. Keeping the head of the gap and cutting its
+        // tail would leave the second change with no context at all.
+        let mut before: Vec<String> = (1..=200).map(|i| format!("line {i}\n")).collect();
+        let mut after = before.clone();
+        before[10] = "OLD A\n".into();
+        after[10] = "NEW A\n".into();
+        before[150] = "OLD B\n".into();
+        after[150] = "NEW B\n".into();
+        let rendered = rows(&for_edit(&before.concat(), &after.concat()));
+
+        assert!(rendered.iter().any(|row| row.contains("OLD A")), "{rendered:?}");
+        assert!(rendered.iter().any(|row| row.contains("OLD B")), "{rendered:?}");
+        assert!(rendered.iter().any(|row| row.ends_with("line 10")), "context above A");
+        assert!(rendered.iter().any(|row| row.ends_with("line 12")), "context below A");
+        assert!(rendered.iter().any(|row| row.ends_with("line 149")), "context above B");
+        assert!(rendered.iter().any(|row| row.ends_with("line 153")), "context below B");
+    }
+
+    #[test]
+    fn the_context_at_the_top_of_a_file_is_what_led_into_the_change() {
+        // Nothing precedes the run, so it is the file's opening: the lines that lead into the
+        // change are its tail, and it is the head of a long opening that is dropped.
+        let mut before: Vec<String> = (1..=50).map(|i| format!("line {i}\n")).collect();
+        let mut after = before.clone();
+        before[40] = "OLD\n".into();
+        after[40] = "NEW\n".into();
+        let rendered = rows(&for_edit(&before.concat(), &after.concat()));
+
+        assert!(rendered.iter().any(|row| row.contains("OLD")), "{rendered:?}");
+        assert!(rendered.iter().any(|row| row.ends_with("line 38")), "the lead-in survives");
+        assert!(
+            !rendered.iter().any(|row| row.contains("line 1\n")),
+            "the top of the file is not context for anything: {rendered:?}"
+        );
     }
 
     #[test]
@@ -340,12 +537,25 @@ mod tests {
     fn an_appended_line_at_the_very_end_is_shown() {
         // An append is the common shape of a large write, and the changed region is the last
         // line — which a window counted from the start would miss entirely.
-        let before: Vec<String> = (0..MAX_DIFF_LINES + 1000).map(|i| format!("line {i}")).collect();
-        let mut after = before.clone();
-        after.push("APPENDED".to_string());
-        let display = for_edit(&before.join("\n"), &after.join("\n"));
+        let before: String = (0..MAX_DIFF_LINES + 1000).map(|i| format!("line {i}\n")).collect();
+        let after = format!("{before}APPENDED\n");
+        let display = for_edit(&before, &after);
         assert_eq!(counts(&display), (1, 0));
         assert!(rows(&display).iter().any(|row| row.contains("APPENDED")), "{:?}", rows(&display));
+    }
+
+    #[test]
+    fn a_last_line_that_lost_its_newline_is_a_change() {
+        // Text with no terminator on its final line differs from text that has one, and the
+        // user can see the difference in an editor. Rebuilding each side by joining
+        // newline-stripped lines discarded it, and the line that only differed in its ending
+        // came out as both removed and added — the same text on two tinted rows. Keeping each
+        // line's terminator with it is what makes these two texts compare as they read.
+        let joined = for_edit("a\nb", "a\nb\n");
+        assert_eq!(counts(&joined), (1, 1), "the final line changed: {:?}", rows(&joined));
+
+        let same = for_edit("a\nb\n", "a\nb\n");
+        assert_eq!(counts(&same), (0, 0), "identical files differ in nothing");
     }
 
     #[test]

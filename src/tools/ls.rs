@@ -72,16 +72,13 @@ pub async fn execute(arguments: &serde_json::Value, cwd: &Path) -> Result<ToolOu
         });
     }
     let body = stdout.trim_end();
-    let count = body.lines().count().saturating_sub(1);
-    let mut content = body.to_string();
-    content.push('\n');
-    content.push_str(&format!("[{count} 项]\n"));
+    let content = format!("{body}\n");
     Ok(ToolOutput {
         content,
         display: Display::File { verb: "列出", path: target.to_string() },
         is_error: false,
-duration: None,
-})
+        duration: None,
+    })
 }
 
 #[cfg(test)]
@@ -99,12 +96,22 @@ mod tests {
     }
 
     #[test]
-    fn lists_entries_without_terminal_colour() {
+    fn lists_entries_without_terminal_colour_or_a_count_note() {
+        // The listing is the answer; a trailing `[N 项]` only repeated what the rows already
+        // showed, and because a `File` block keeps its *last* rows when collapsed, that note
+        // was the row guaranteed to survive — a long listing showed nothing else.
         let dir = fixture();
         let out = block(execute(&serde_json::json!({}), &dir)).unwrap();
         assert!(out.content.contains("visible.txt"));
         assert!(!out.content.contains('\u{1b}'));
-        assert!(out.content.contains("项]"));
+        assert!(!out.content.contains("项]"), "{:?}", out.content);
+        // Nothing but the rows: no note above them and none below.
+        assert!(
+            out.content.lines().filter(|l| !l.trim().is_empty()).count() >= 1,
+            "{:?}",
+            out.content
+        );
+        assert!(!out.content.trim_end().lines().last().unwrap().contains('['));
     }
 
     #[test]

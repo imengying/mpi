@@ -139,19 +139,20 @@ pub async fn execute(arguments: &serde_json::Value, cwd: &Path) -> Result<ToolOu
 duration: None,
 });
     }
-    let count = lines.len();
     let mut content = lines.join("\n");
     content.push('\n');
-    content.push_str(&format!(
-        "[共 {count} 个结果{}]\n",
-        if truncated { "，已截断" } else { "" }
-    ));
+    if truncated {
+        // The one thing the rows cannot say for themselves: this is a capped list, not the
+        // whole answer. A note repeating the count was removed — anyone reading can count
+        // the lines — but silently returning a prefix would read as "there is nothing else".
+        content.push_str(&format!("[已截断，仅列出前 {} 个]\n", lines.len()));
+    }
     Ok(ToolOutput {
         content,
         display: Display::File { verb: "查找", path: target.to_string() },
         is_error: false,
-duration: None,
-})
+        duration: None,
+    })
 }
 
 #[cfg(test)]
@@ -177,7 +178,21 @@ mod tests {
         assert!(out.content.contains("top.rs"));
         assert!(out.content.contains("sub/deep.rs"));
         assert!(!out.content.contains("note.txt"));
-        assert!(out.content.contains("共 2 个结果"));
+        // No count trailer on a complete result: the rows are the answer.
+        assert!(!out.content.contains("结果"), "{:?}", out.content);
+    }
+
+    #[test]
+    fn a_capped_result_says_it_was_capped() {
+        // The count is not worth a row, but *this is a prefix* is: without it a capped list
+        // reads as the whole answer, and the model would stop looking for what it did not see.
+        let dir = fixture();
+        let out = block(execute(
+            &serde_json::json!({"pattern": "*", "max_results": 2}),
+            &dir,
+        ))
+        .unwrap();
+        assert!(out.content.contains("已截断"), "{:?}", out.content);
     }
 
     #[test]

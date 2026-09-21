@@ -113,7 +113,6 @@ pub async fn execute(arguments: &serde_json::Value, cwd: &Path) -> Result<ToolOu
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let body = util::sanitize(&stdout);
-    let matched = body.lines().count();
     if body.trim().is_empty() {
         let mut content = "没有找到匹配。".to_string();
         if !stderr.trim().is_empty() {
@@ -124,20 +123,20 @@ pub async fn execute(arguments: &serde_json::Value, cwd: &Path) -> Result<ToolOu
             content,
             display: Display::File { verb: "搜索", path: target.to_string() },
             is_error: false,
-duration: None,
-});
+            duration: None,
+        });
     }
     let mut content = body.clone();
-    content.push_str(&format!("\n[共 {matched} 行匹配]\n"));
     if !stderr.trim().is_empty() {
+        content.push('\n');
         content.push_str(&util::sanitize(&stderr));
     }
     Ok(ToolOutput {
         content,
         display: Display::File { verb: "搜索", path: target.to_string() },
         is_error: false,
-duration: None,
-})
+        duration: None,
+    })
 }
 
 #[cfg(test)]
@@ -162,7 +161,9 @@ mod tests {
         assert!(out.content.contains("a.txt"));
         assert!(out.content.contains("b.txt"));
         assert!(out.content.contains("2:beta") || out.content.contains("2:beta"));
-        assert!(out.content.contains("共 2 行匹配"));
+        // No `[共 N 行匹配]` trailer: the matches are the answer, and the block keeps its
+        // last rows when collapsed, so the note outlived the matches it was counting.
+        assert!(!out.content.contains("行匹配"), "{:?}", out.content);
     }
 
     #[test]

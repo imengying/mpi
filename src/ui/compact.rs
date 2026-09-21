@@ -677,7 +677,7 @@ mod tests {
         assert!(collapsed[1].contains("+1") && collapsed[1].contains("−1"), "{collapsed:?}");
         // A diff this small fits the preview, so nothing is hidden and there is no note.
         assert!(!collapsed.iter().any(|line| line.contains("已收起")), "{collapsed:?}");
-        // Rows carry the codex tints. The row text is ` - 2 │ two`, so match on the payload.
+        // Rows carry the codex tints. The row text is `-    2 │ two`, so match on the payload.
         let painted = block.render(80);
         let removed = painted
             .iter()
