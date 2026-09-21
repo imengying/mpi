@@ -1,4 +1,4 @@
-//! mpi: a minimal terminal coding agent.
+//! pi: a minimal terminal coding agent.
 //!
 //! The binary is a thin shell around [`agent::loop::Agent`]: read config, open (or resume) a
 //! session, then alternate between reading a line and running a turn. Slash commands are
@@ -19,14 +19,14 @@ fn main() {
     teardown();
     mpi::ui::screen::clear_title();
     if let Err(err) = result {
-        eprintln!("mpi: {err:#}");
+        eprintln!("pi: {err:#}");
         std::process::exit(1);
     }
 }
 
 fn run(cli: Cli) -> anyhow::Result<()> {
     // Update does not touch the config or the session store, so it runs before the
-    // config load — `mpi update` has to work on a machine where the config is missing
+    // config load — `pi update` has to work on a machine where the config is missing
     // or broken too.
     if cli.command == Some(Command::Update) {
         mpi::update::run()?;
@@ -38,17 +38,17 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         Ok(config) => config,
         Err(err) => {
             // The "write a example config" message already carries the path and what to do
-            // next, so it is printed as-is rather than prefixed with `mpi:`.
+            // next, so it is printed as-is rather than prefixed with `pi:`.
             match &err {
                 mpi::config::ConfigError::Created(path) => {
                     eprintln!("已写出示例配置：{}
 编辑它，至少写出一个 provider 及其 models，然后重新运行。", path.display());
                 }
                 mpi::config::ConfigError::NoProviders(path) => {
-                    eprintln!("mpi: {err}");
+                    eprintln!("pi: {err}");
                     eprintln!("编辑 {path}，至少写出一个 provider 及其 models。", path = path.display());
                 }
-                _ => eprintln!("mpi: {err}"),
+                _ => eprintln!("pi: {err}"),
             }
             std::process::exit(1);
         }
@@ -62,7 +62,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             // mistake until they noticed the missing history.
             match mpi::agent::session::find_by_prefix(id, &cwd) {
                 Ok(path) => Agent::resume(config, cwd, &path, interactive)?,
-                Err(err) => anyhow::bail!("{err}（用 /resume 或 mpi resume 查看会话列表）"),
+                Err(err) => anyhow::bail!("{err}（用 /resume 或 pi resume 查看会话列表）"),
             }
         }
         Some(Command::Resume { id: None }) => match most_recent_session(&cwd) {
@@ -73,6 +73,11 @@ fn run(cli: Cli) -> anyhow::Result<()> {
     };
 
     // The turn loop: read a line, dispatch a slash command or run a turn.
+    //
+    // A turn can be handed more work while it runs — the user types into the input line and
+    // Enter queues the message — so each turn is followed by whatever was queued behind it,
+    // in the order it was typed. That is a loop rather than an `if`, because answering one
+    // queued message can take long enough to collect another.
     loop {
         match agent.read_input() {
             Action::Line(line) => {
@@ -84,27 +89,21 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     if !futures_block(agent.command(line))? {
                         break;
                     }
-                } else if let Err(err) = futures_block(agent.run_turn(line)) {
-                    agent.screen.push_lines(ui_compact::note_lines(
-                        &format!("本轮失败：{err:#}"),
-                        mpi::ui::screen::Style::new(Color::Red),
-                    ));
+                } else if !run_turn_and_drain(&mut agent, line, Vec::new())? {
+                    break;
                 }
             }
             Action::LineWithImages(line, images) => {
                 let line = line.trim().to_string();
                 // Slash commands are text-only: a command with an image attached is not
-                // something mpi defines, so the images are dropped rather than silently
+                // something pi defines, so the images are dropped rather than silently
                 // sent as a turn.
                 if line.starts_with('/') {
                     if !futures_block(agent.command(&line))? {
                         break;
                     }
-                } else if let Err(err) = futures_block(agent.run_turn_with_images(&line, images)) {
-                    agent.screen.push_lines(ui_compact::note_lines(
-                        &format!("本轮失败：{err:#}"),
-                        mpi::ui::screen::Style::new(Color::Red),
-                    ));
+                } else if !run_turn_and_drain(&mut agent, &line, images)? {
+                    break;
                 }
             }
             Action::ToggleExpand => {
@@ -131,7 +130,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
     if !agent.session_deleted() && agent.session().is_saved() {
         let id = agent.session().id();
         agent.screen.push_lines(ui_compact::note_lines(
-            &format!("继续此会话：mpi resume {id}"),
+            &format!("继续此会话：pi resume {id}"),
             mpi::ui::screen::Style::new(Color::Dim),
         ));
     }
@@ -139,6 +138,50 @@ fn run(cli: Cli) -> anyhow::Result<()> {
     // part of the transcript, and leaving it behind hands the shell a cursor parked mid-row.
     agent.screen.leave();
     Ok(())
+}
+
+/// Run one turn, then act on everything that was queued behind it.
+///
+/// The queue comes from the input line staying live during the turn: Enter there could not
+/// start a second turn underneath the one in flight, so the line was held instead. A queued
+/// message becomes a turn of its own; a queued command runs; both in the order they were
+/// typed, because that is the order the user wrote them in. The loop ends when a turn
+/// finishes with an empty queue — an answer can take long enough to collect more while it
+/// runs.
+fn run_turn_and_drain(
+    agent: &mut Agent,
+    line: &str,
+    images: Vec<mpi::image_input::PastedImage>,
+) -> anyhow::Result<bool> {
+    use mpi::ui::screen::Queued;
+    let mut queue: std::collections::VecDeque<Queued> = [Queued::Message(line.to_string(), images)]
+        .into();
+    while let Some(item) = queue.pop_front() {
+        match item {
+            Queued::Command(command) => {
+                // A command can end the session (`/exit`, `/delete`), and that decision was
+                // made by the user before this turn even finished — it is carried out as
+                // given rather than being dropped on the floor.
+                if !futures_block(agent.command(&command))? {
+                    return Ok(false);
+                }
+            }
+            Queued::Message(text, images) => {
+                if let Err(err) = futures_block(agent.run_turn_with_images(&text, images)) {
+                    // A failed turn is reported and the session carries on: the conversation
+                    // is still perfectly usable, and ending the program over one bad request
+                    // would throw it away. Whatever was queued behind it is still acted on,
+                    // because it was typed and the user is waiting to see it run.
+                    agent.screen.push_lines(ui_compact::note_lines(
+                        &format!("本轮失败：{err:#}"),
+                        mpi::ui::screen::Style::new(Color::Red),
+                    ));
+                }
+            }
+        }
+        queue.extend(agent.screen.take_queued());
+    }
+    Ok(true)
 }
 
 fn most_recent_session(cwd: &std::path::Path) -> Option<std::path::PathBuf> {

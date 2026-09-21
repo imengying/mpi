@@ -148,11 +148,11 @@ fn the_tool_block_is_stable_and_ordered() {
 }
 
 #[test]
-fn mpi_adds_nothing_of_its_own_to_the_system_prompt() {
-    // The prompt is the user's file and nothing else, so nothing mpi knows — cwd, the clock,
+fn pi_adds_nothing_of_its_own_to_the_system_prompt() {
+    // The prompt is the user's file and nothing else, so nothing pi knows — cwd, the clock,
     // the branch, the model name — can leak into the cache prefix. Anything volatile belongs
     // in the environment block, which is a conversation message instead.
-    let dir = std::env::temp_dir().join(format!("mpi-prefix-agents-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("pi-prefix-agents-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let body = "# 项目约定\n- 注释写英文。\n";
@@ -164,7 +164,7 @@ fn mpi_adds_nothing_of_its_own_to_the_system_prompt() {
     // where it came from, which is stable for as long as the file does not move.
     assert!(text.contains(body.trim_end()), "{text:?}");
     for volatile in ["2026-", "main", "deepseek"] {
-        assert!(!text.contains(volatile), "mpi injected {volatile:?}: {text:?}");
+        assert!(!text.contains(volatile), "pi injected {volatile:?}: {text:?}");
     }
     // Reading twice gives the same bytes, which is what makes it a usable prefix.
     let (_, again) = mpi::agent::r#loop::load_agents_md(&dir).unwrap();
@@ -270,7 +270,7 @@ fn anthropic_puts_breakpoints_on_system_tools_and_the_last_block() {
         cache_hints: true,
     };
     let body = serde_json::to_value(anthropic::build_request(&request)).unwrap();
-    // Anthropic allows four breakpoints; mpi uses three, and they must be the stable ones.
+    // Anthropic allows four breakpoints; pi uses three, and they must be the stable ones.
     assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
     let tool_array = body["tools"].as_array().unwrap();
     assert!(tool_array[0]["cache_control"].is_null());

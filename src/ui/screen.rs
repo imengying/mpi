@@ -2,17 +2,17 @@
 //!
 //! The transcript is kept in memory as *unstyled* lines and re-rendered on every change,
 //! so collapse/expand and terminal resizes simply rebuild the visible tail. Only the rows
-//! mpi owns are redrawn — the cursor moves up over them and the rest of the scrollback is
+//! pi owns are redrawn — the cursor moves up over them and the rest of the scrollback is
 //! left alone, which is what keeps "the chat scrolls up" behaviour working.
 //!
 //! Input is read in raw mode because Ctrl+O (expand/collapse) never reaches the process in
 //! canonical mode. What the line editor offers is deliberately small: editing, history and
-//! the few control keys mpi defines.
+//! the few control keys pi defines.
 
 use std::io::{IsTerminal, Write};
 use std::path::Path;
 
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::{cursor, terminal};
 use unicode_width::UnicodeWidthChar;
 
@@ -151,7 +151,13 @@ impl Line {
     }
 }
 
-/// A run of lines that can be collapsed to its tail.
+/// A run of lines that can be collapsed to an excerpt of itself.
+///
+/// Collapsed, the block shows its head, the tail end of what is left out, and its tail —
+/// and says nothing about it. A row announcing "N lines collapsed, press Ctrl+O" is a line
+/// the user has to read on every single tool call to be told something they already know
+/// (they pressed Ctrl+O before), and it pushes the transcript around for no content. The
+/// excerpt is visibly an excerpt: the rows simply stop.
 #[derive(Debug, Clone)]
 pub struct Collapsible {
     pub lines: Vec<Line>,
@@ -161,11 +167,15 @@ pub struct Collapsible {
     /// Rows that stay visible at the end in both states: an exit code or a
     /// "full output: …" note. Losing those while collapsed would hide the outcome.
     pub tail: usize,
-    /// How many of the remaining rows are shown while collapsed.
+    /// How many rows from the *start* of the middle are shown while collapsed.
+    ///
+    /// Zero for command output, where the interesting part is the tail: a log is read from
+    /// its end. A diff sets it, because a change is read from both ends — the first removed
+    /// line says what was taken away, and the first added line says what replaced it.
+    pub middle_head: usize,
+    /// How many rows from the *end* of the middle are shown while collapsed.
     pub preview: usize,
     pub expanded: bool,
-    /// The note shown when collapsed.
-    pub note_style: Style,
 }
 
 /// A logical group of transcript lines.
@@ -197,10 +207,22 @@ impl Block {
             lines,
             head,
             tail,
+            middle_head: 0,
             preview,
             expanded: false,
-            note_style: Style::new(Color::Dim),
         })
+    }
+
+    /// Like [`Block::collapsible`], but the collapsed form also keeps `middle_head` rows
+    /// from the start of the middle. Used by diffs, which are read from both ends.
+    pub fn collapsible_excerpted(
+        lines: Vec<Line>,
+        head: usize,
+        tail: usize,
+        middle_head: usize,
+        preview: usize,
+    ) -> Self {
+        Block::Collapsible(Collapsible { lines, head, tail, middle_head, preview, expanded: false })
     }
 
     pub fn render(&self, width: usize) -> Vec<Line> {
@@ -213,16 +235,16 @@ impl Block {
                     return wrapped;
                 }
                 let (head, tail) = block.split(total);
-                if total <= head + tail + block.preview {
+                if total <= head + tail + block.middle_head + block.preview {
                     return wrapped;
                 }
-                let hidden = total - head - tail - block.preview;
+                let hidden = total - head - tail - block.middle_head - block.preview;
                 let mut out = wrapped[..head].to_vec();
-                out.push(Line::new(
-                    format!("… 已收起 {hidden} 行 · 按 Ctrl+O 展开"),
-                    block.note_style,
-                ));
-                out.extend(wrapped[head + hidden..head + hidden + block.preview].iter().cloned());
+                // The start of the middle, then the end of it, then the always-visible tail.
+                out.extend(
+                    wrapped[head..head + block.middle_head].iter().cloned(),
+                );
+                out.extend(wrapped[head + hidden + block.middle_head..total - tail].iter().cloned());
                 out.extend(wrapped[total - tail..].iter().cloned());
                 out
             }
@@ -297,6 +319,23 @@ fn coalesce(row: Vec<(char, Style)>) -> Vec<Span> {
     spans
 }
 
+/// One row of the input area: the prompt prefix, the text on that row, and the index into
+/// the buffer (in characters) of the first character the row shows.
+///
+/// The start index is what makes a caret possible: `caret` is a character index into the
+/// buffer, and this is what turns it into a row and a column.
+struct InputRow {
+    prefix: String,
+    text: String,
+    start: usize,
+}
+
+impl InputRow {
+    fn chars(&self) -> usize {
+        self.text.chars().count()
+    }
+}
+
 /// Split the input buffer into display rows, each tagged with its prompt prefix.
 ///
 /// Wrapping is done on the buffer as a whole with the prompt width subtracted, then the
@@ -307,34 +346,71 @@ fn coalesce(row: Vec<(char, Style)>) -> Vec<Span> {
 ///
 /// The break is by character width, not by word: an input line is not prose, and moving a
 /// partly-typed path or command onto its own row would make the caret jump around.
-fn input_rows(text: &str, width: usize, prompt_width: usize) -> Vec<(String, String)> {
-    let mut rows: Vec<(String, String)> = Vec::new();
+fn input_layout(text: &str, width: usize, prompt_width: usize) -> Vec<InputRow> {
+    let mut rows: Vec<InputRow> = Vec::new();
     let mut current = String::new();
+    // Character index of the first character of `current`, and of the next one to place.
+    let mut start = 0usize;
     let mut used = 0usize;
     // Every row, continuation included, carries a two-column prefix so the text lines up
     // under itself; the usable width is therefore the same on all of them.
     let room = width.saturating_sub(prompt_width).max(1);
-    for c in text.chars() {
+    for (index, c) in text.chars().enumerate() {
         let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
         if used + cw > room && used > 0 {
-            rows.push((String::new(), std::mem::take(&mut current)));
+            rows.push(InputRow {
+                prefix: String::new(),
+                text: std::mem::take(&mut current),
+                start,
+            });
+            start = index;
             used = 0;
         }
         current.push(c);
         used += cw;
     }
-    rows.push((String::new(), current));
+    rows.push(InputRow { prefix: String::new(), text: current, start });
+    // A row filled to the last cell needs one more for the caret to sit on. The caret marks
+    // where the next character goes, and there is no cell left on this row to draw it in:
+    // asking the terminal for a column past the right edge is clamped to the last cell at
+    // best, and clamps are exactly what a caret must not depend on. An empty row is where
+    // readline puts the cursor in the same situation.
+    if rows.last().is_some_and(|row| util::width(&row.text) == room) {
+        let start = text.chars().count();
+        rows.push(InputRow { prefix: String::new(), text: String::new(), start });
+    }
     // Tag the prefixes now that the row count is known.
-    rows.into_iter()
-        .enumerate()
-        .map(|(index, (_, text))| {
-            let prefix = if index == 0 {
-                "› ".to_string()
-            } else {
-                " ".repeat(prompt_width)
-            };
-            (prefix, text)
-        })
+    for (index, row) in rows.iter_mut().enumerate() {
+        row.prefix = if index == 0 {
+            "› ".to_string()
+        } else {
+            " ".repeat(prompt_width)
+        };
+    }
+    rows
+}
+
+/// Where the caret belongs, as `(row, columns into the text)`, for a character index into
+/// the buffer.
+///
+/// The row is the last one that starts at or before the caret, which puts a caret landing
+/// exactly on a wrap boundary at the start of the row below — where a terminal would put it
+/// after writing the last cell of a full line. The column is a *display* width, measured
+/// over the characters before the caret, so a CJK character counts as the two cells it
+/// occupies.
+fn input_caret(rows: &[InputRow], caret: usize) -> (usize, usize) {
+    let row = rows.iter().rposition(|row| row.start <= caret).unwrap_or(0);
+    let offset = caret.saturating_sub(rows[row].start).min(rows[row].chars());
+    let shown: String = rows[row].text.chars().take(offset).collect();
+    (row, util::width(&shown))
+}
+
+/// The rows of the input buffer as `(prefix, text)` pairs, as the tests assert on them.
+#[cfg(test)]
+fn input_rows(text: &str, width: usize, prompt_width: usize) -> Vec<(String, String)> {
+    input_layout(text, width, prompt_width)
+        .into_iter()
+        .map(|row| (row.prefix, row.text))
         .collect()
 }
 
@@ -357,6 +433,117 @@ pub fn wrap_all(lines: &[Line], width: usize) -> Vec<Line> {
     lines.iter().flat_map(|line| wrap_line(line, width)).collect()
 }
 
+/// The line editor's state: what has been typed and where the caret sits in it.
+///
+/// The caret is a **character** index, not a byte offset and not a column: bytes would split
+/// a CJK character, and columns would make a horizontal move depend on how wide the
+/// characters happen to be. Every edit goes through this struct, so an index can never be
+/// left pointing into the middle of a character or past the end of the buffer.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Editor {
+    chars: Vec<char>,
+    /// Where the next character typed goes, as an index into `chars`.
+    caret: usize,
+}
+
+impl Editor {
+    pub fn new() -> Self {
+        Editor::default()
+    }
+
+    pub fn from_text(text: &str) -> Self {
+        let chars: Vec<char> = text.chars().collect();
+        let caret = chars.len();
+        Editor { chars, caret }
+    }
+
+    pub fn text(&self) -> String {
+        self.chars.iter().collect()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.chars.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.chars.len()
+    }
+
+    pub fn caret(&self) -> usize {
+        self.caret
+    }
+
+    /// Move the caret `delta` characters left or right, stopping at both ends.
+    ///
+    /// Clamping rather than wrapping is what makes the key safe to hold down: a caret that
+    /// jumped from one end of the line to the other would make correcting a typo a guessing
+    /// game about where it is going to land.
+    pub fn move_caret(&mut self, delta: isize) {
+        self.caret = (self.caret as isize + delta).clamp(0, self.chars.len() as isize) as usize;
+    }
+
+    pub fn home(&mut self) {
+        self.caret = 0;
+    }
+
+    pub fn end(&mut self) {
+        self.caret = self.chars.len();
+    }
+
+    /// Insert at the caret, which then sits after the text just typed.
+    pub fn insert(&mut self, text: &str) {
+        for (offset, c) in text.chars().enumerate() {
+            self.chars.insert(self.caret + offset, c);
+        }
+        self.caret += text.chars().count();
+    }
+
+    /// Backspace: remove the character *before* the caret, if there is one.
+    pub fn backspace(&mut self) {
+        if self.caret > 0 {
+            self.caret -= 1;
+            self.chars.remove(self.caret);
+        }
+    }
+
+    /// Delete: remove the character *under* the caret, leaving the caret where it is.
+    pub fn delete(&mut self) {
+        if self.caret < self.chars.len() {
+            self.chars.remove(self.caret);
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.chars.clear();
+        self.caret = 0;
+    }
+
+    /// Delete back to the start of the current word, as Ctrl+W does everywhere else.
+    ///
+    /// The caret decides what "the current word" is: it means the text before the caret, so
+    /// pressing Ctrl+W in the middle of a line removes the word to the left rather than the
+    /// tail of the line.
+    pub fn delete_word(&mut self) {
+        while self.caret > 0 && self.chars[self.caret - 1] == ' ' {
+            self.backspace();
+        }
+        while self.caret > 0 && self.chars[self.caret - 1] != ' ' {
+            self.backspace();
+        }
+    }
+
+    /// Delete from the caret back to the start of the line.
+    pub fn delete_to_start(&mut self) {
+        self.chars.drain(..self.caret);
+        self.caret = 0;
+    }
+
+    /// Delete from the caret to the end of the line.
+    pub fn delete_to_end(&mut self) {
+        self.chars.truncate(self.caret);
+    }
+}
+
 /// What the user did at the prompt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
@@ -368,6 +555,34 @@ pub enum Action {
     /// Ctrl+C on an empty line, or Ctrl+D.
     Interrupt,
     Eof,
+}
+
+/// A line the user submitted while a turn was running.
+///
+/// It cannot be acted on where it was typed: a turn is in flight, and starting a second one
+/// (or running `/new`, or a picker) underneath it would interleave two conversations. So it
+/// waits for the turn it interrupted to finish.
+///
+/// It waits as *what it is*, not as text. Both kinds look the same in the input line, but
+/// they part ways the moment the turn ends: a command has to be dispatched as a command, and
+/// a message has to carry the images that were submitted with it. Held as one kind of thing,
+/// the two would swap roles on the way out — a queued `/model` handed to the model as prose,
+/// and a queued screenshot silently dropped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Queued {
+    /// A message: sent as the next turn, with whatever images came with it.
+    Message(String, Vec<PastedImage>),
+    /// A slash command: run once the turn in flight is over.
+    Command(String),
+}
+
+impl Queued {
+    /// The line as the user typed it, for the row that shows what is waiting.
+    pub fn text(&self) -> &str {
+        match self {
+            Queued::Message(text, _) | Queued::Command(text) => text,
+        }
+    }
 }
 
 pub struct Screen {
@@ -385,9 +600,18 @@ pub struct Screen {
     /// which is what makes the history scrollable with the terminal's own keys.
     live_rows: usize,
     /// The line editor's current text, echoed in the live region.
-    editing: Option<String>,
+    editing: Option<Editor>,
     history: Vec<String>,
+    /// Where the walk through the history currently is: `None` means "not in the history",
+    /// so the buffer is the user's own text.
     history_index: Option<usize>,
+    /// The text that was in the buffer when the walk into the history began.
+    ///
+    /// Kept so that walking back down past the newest entry — which is what Down on the last
+    /// entry does — restores what was being typed instead of an empty line. Without it, a
+    /// half-written message is destroyed by a glance at the history, and the user has no way
+    /// to tell that it happened.
+    history_draft: Option<Editor>,
     /// Streaming preview: thinking tail plus the answer so far.
     streaming_thinking: Option<String>,
     streaming_answer: Option<String>,
@@ -409,6 +633,9 @@ pub struct Screen {
     running_call: Option<Vec<Span>>,
     /// Whether stdout is a terminal at all.
     interactive: bool,
+    /// Whether the terminal cursor is currently shown, so an unchanged state is not written
+    /// again on every frame.
+    cursor_shown: Option<bool>,
     /// What was last written as the window title, so an unchanged title is not rewritten on
     /// every frame.
     title: Option<String>,
@@ -417,6 +644,11 @@ pub struct Screen {
     cursor_row: Option<usize>,
     /// A one-off line shown under the input, e.g. a failed paste. Cleared on the next edit.
     notice: Option<String>,
+    /// Lines submitted while a turn was running, shown above the input until they are sent.
+    /// They are *live* rows rather than transcript rows on purpose: the line has not been
+    /// acted on yet, so writing it into the transcript would put it above the answer that is
+    /// still being written and get the order wrong.
+    pending: Vec<Queued>,
     /// Images pasted during the current edit, waiting to be sent with the line.
     ///
     /// Kept out of `editing` because a buffer is text; the image is attached to the message
@@ -427,6 +659,14 @@ pub struct Screen {
     /// The slash-command menu shown under the input line, and which entry is highlighted.
     menu: Vec<(String, String)>,
     menu_selected: usize,
+    /// The buffer Esc dismissed the menu for, if any.
+    ///
+    /// The menu is rebuilt from the buffer on every keystroke, so without recording the
+    /// dismissal there is no way to ask for it to go away: `Esc` was undone by the redraw
+    /// that every keypress ends with. It is the *text* rather than a flag so that typing on
+    /// brings the menu back — the dismissal is about the command name on screen at that
+    /// moment, not about the rest of the line.
+    menu_dismissed: Option<String>,
 }
 
 impl Screen {
@@ -456,19 +696,23 @@ impl Screen {
             editing: None,
             history: Vec::new(),
             history_index: None,
+            history_draft: None,
             streaming_thinking: None,
             working: None,
             working_frame: 0,
             running_call: None,
             streaming_answer: None,
             interactive,
+            cursor_shown: None,
             title: None,
             cursor_row: None,
             notice: None,
+            pending: Vec::new(),
             pending_images: Vec::new(),
             commands: Vec::new(),
             menu: Vec::new(),
             menu_selected: 0,
+            menu_dismissed: None,
         };
         screen.refresh_size();
         screen
@@ -559,7 +803,7 @@ impl Screen {
     /// The region is not part of the transcript: it is the prompt and the footer, redrawn on
     /// every keystroke. Leaving it on screen makes the shell inherit a terminal whose cursor
     /// sits in the middle of a row, and zsh — which marks a partial line with `PROMPT_SP` —
-    /// then prints a `%` right after it, so the mpi prompt appears to survive as `› /%`.
+    /// then prints a `%` right after it, so the pi prompt appears to survive as `› /%`.
     ///
     /// Erasing it means the cursor ends up back where the region started, on a line of its
     /// own, which is where the shell expects to find it.
@@ -748,9 +992,9 @@ impl Screen {
             // the first row only.
             let prompt_width = 2;
             let width = self.width.max(prompt_width + 1);
-            let rows = input_rows(editing, width, prompt_width);
-            let last = rows.len().saturating_sub(1);
-            for (index, (prefix, text)) in rows.iter().enumerate() {
+            let rows = input_layout(&editing.text(), width, prompt_width);
+            let base = lines.len();
+            for (index, row) in rows.iter().enumerate() {
                 // The prefix is drawn on every row: on continuation rows it is spaces, and
                 // skipping it would lose the alignment that makes the wrap readable.
                 let style = if index == 0 {
@@ -759,14 +1003,24 @@ impl Screen {
                     Style::plain()
                 };
                 lines.push(Line::spans(vec![
-                    Span::new(prefix.clone(), style),
-                    Span::plain(text.clone()),
+                    Span::new(row.prefix.clone(), style),
+                    Span::plain(row.text.clone()),
                 ]));
             }
-            // The caret is at the end of the last row. Both numbers are display columns, so
-            // a CJK character counts as the two cells it occupies.
-            let (prefix, text) = &rows[last];
-            cursor = Some((lines.len() - 1, util::width(prefix) + util::width(text)));
+            // The caret is wherever the buffer left it, not necessarily at the end: the whole
+            // point of Left/Right is to put it in the middle and type there. The column is a
+            // display column, so a CJK character counts as the two cells it occupies.
+            let (row, column) = input_caret(&rows, editing.caret());
+            cursor = Some((base + row, prompt_width + column));
+        }
+        // Lines waiting for the turn in flight. They sit directly above the input line, where
+        // the user just typed them, so it is obvious they were taken and are queued rather
+        // than lost.
+        for queued in &self.pending {
+            lines.push(Line::spans(vec![
+                Span::new("… ", Style::new(Color::Dim)),
+                Span::new(util::one_line(queued.text()), Style::new(Color::Dim)),
+            ]));
         }
         // Pending images and one-off notices sit between the input and the menu: they are
         // about what is being composed, so they belong next to it.
@@ -808,9 +1062,19 @@ impl Screen {
     /// soon as the slash is typed. A slash anywhere but the first column is ordinary text —
     /// `/` inside a sentence is not a command.
     fn matching_commands(&self) -> Vec<(String, String)> {
-        let Some(rest) = self.editing.as_deref().and_then(|text| text.strip_prefix('/')) else {
+        let Some(text) = self.editing.as_ref().map(Editor::text) else {
             return Vec::new();
         };
+        let Some(rest) = text.strip_prefix('/') else {
+            return Vec::new();
+        };
+        // The menu describes the command name, which is only being typed while the caret is
+        // still inside it. Once the caret moves past the slash into ordinary text, offering
+        // to complete a command would hijack the arrow keys for a menu about something the
+        // user is no longer writing.
+        if !self.caret_in_command_name() {
+            return Vec::new();
+        }
         // Once there is a space the command name is settled and the argument is being typed,
         // so the menu has nothing left to offer.
         if rest.contains(' ') {
@@ -824,8 +1088,29 @@ impl Screen {
             .collect()
     }
 
+    /// Is the caret still in the command name (before the first space)?
+    fn caret_in_command_name(&self) -> bool {
+        let Some(editing) = &self.editing else {
+            return false;
+        };
+        let before: String = editing.text().chars().take(editing.caret()).collect();
+        !before.contains(' ')
+    }
+
     /// Refresh the menu from the buffer. Called after every edit.
     fn sync_menu(&mut self) {
+        let text = self.editing.as_ref().map(Editor::text).unwrap_or_default();
+        if let Some(dismissed) = &self.menu_dismissed {
+            if *dismissed == text {
+                // Still the buffer Esc dismissed: leave the list hidden. Without this, the
+                // redraw at the end of every keypress would put it straight back.
+                self.menu.clear();
+                self.menu_selected = 0;
+                return;
+            }
+            // The buffer moved on, so the dismissal no longer applies.
+            self.menu_dismissed = None;
+        }
         let matches = self.matching_commands();
         if matches.len() == self.menu.len() && matches.iter().zip(&self.menu).all(|(a, b)| a == b) {
             // Same list: keep the highlight where the user put it.
@@ -842,9 +1127,10 @@ impl Screen {
     /// is the behaviour a shell user expects; the menu stays open to pick from.
     fn complete(&mut self) -> bool {
         self.sync_menu();
-        let Some(text) = self.editing.clone() else {
+        let Some(editing) = self.editing.clone() else {
             return false;
         };
+        let text = editing.text();
         let Some(rest) = text.strip_prefix('/') else {
             return false;
         };
@@ -863,7 +1149,10 @@ impl Screen {
             }
             format!("/{prefix}")
         };
-        self.editing = Some(filled);
+        // The completion replaces the whole buffer, and the caret goes to the end of what
+        // was inserted — completing is not the place to leave the caret behind in the middle
+        // of a word the user did not type.
+        self.editing = Some(Editor::from_text(&filled));
         self.sync_menu();
         true
     }
@@ -889,6 +1178,50 @@ impl Screen {
         self.menu
             .get(self.menu_selected)
             .map(|(name, _)| format!("/{name}"))
+    }
+
+    // -- history ------------------------------------------------------------
+
+    /// Up: one entry further back, or the oldest entry when the walk begins.
+    ///
+    /// The first press stashes the buffer, so whatever was half-typed comes back when the
+    /// walk returns to the bottom. Pressing Up at the oldest entry does nothing rather than
+    /// wrapping to the newest: wrapping makes it impossible to tell the top of the history
+    /// from the bottom, and a stray key press would then land on a different entry entirely.
+    fn history_up(&mut self) {
+        if self.history.is_empty() {
+            return;
+        }
+        let next = match self.history_index {
+            Some(0) => 0,
+            Some(index) => index - 1,
+            None => {
+                self.history_draft = self.editing.clone();
+                self.history.len() - 1
+            }
+        };
+        self.history_index = Some(next);
+        self.editing = Some(Editor::from_text(&self.history[next]));
+    }
+
+    /// Down: one entry towards the newest, and past the newest back to the draft.
+    ///
+    /// The last press lands on a **blank** line holding the draft — not on the newest entry
+    /// again, and not on nothing at all. Waiting at the newest entry means the user has to
+    /// guess how many entries there are; a blank line is the unambiguous "this is the line
+    /// you are writing".
+    fn history_down(&mut self) {
+        let Some(index) = self.history_index else {
+            return;
+        };
+        if index + 1 < self.history.len() {
+            self.history_index = Some(index + 1);
+            self.editing = Some(Editor::from_text(&self.history[index + 1]));
+            return;
+        }
+        // Past the newest entry: back to what was being typed before the walk began.
+        self.history_index = None;
+        self.editing = Some(self.history_draft.take().unwrap_or_default());
     }
 
     /// Keep the live region smaller than the screen, dropping the oldest preview rows.
@@ -977,6 +1310,20 @@ impl Screen {
         self.draw_live();
     }
 
+    /// Show or hide the terminal cursor, remembering the state so a redraw that does not
+    /// change it does not write the escape again.
+    fn set_cursor_visible(&mut self, visible: bool) {
+        if !self.interactive || self.cursor_shown == Some(visible) {
+            return;
+        }
+        if visible {
+            let _ = crossterm::execute!(self.out, cursor::Show);
+        } else {
+            let _ = crossterm::execute!(self.out, cursor::Hide);
+        }
+        self.cursor_shown = Some(visible);
+    }
+
     fn draw_live(&mut self) {
         // Commit first, so new rows appear above the live region rather than inside it.
         self.commit();
@@ -1012,6 +1359,15 @@ impl Screen {
             }
             buffer.push_str(&format!("\u{1b}[{}G", column + 1));
         }
+        // The caret is shown only where it marks something: the position the next character
+        // of the input line will go. That is true for the whole session now — the composer
+        // stays armed through a turn, so the caret is there to type into while the answer
+        // streams — and false only when there is no input line at all, as between a command
+        // tearing the transcript down and the next prompt arming it. A terminal cursor left
+        // over from the last write sits at the bottom of the region blinking at nothing, and
+        // "waiting for you" versus "waiting for the model" is the one thing the screen has to
+        // make obvious.
+        self.set_cursor_visible(cursor.is_some());
         let _ = write!(self.out, "{buffer}");
         let _ = self.out.flush();
         self.live_rows = lines.len();
@@ -1196,202 +1552,364 @@ impl Screen {
             }
             return Ok(Action::Line(buffer.trim_end_matches('\n').to_string()));
         }
-        let guard = RawGuard::enter()?;
-        self.editing = Some(String::new());
-        self.history_index = None;
-        self.notice = None;
-        self.pending_images.clear();
-        self.menu.clear();
-        self.menu_selected = 0;
-        self.render();
-        let action = loop {
+        // Raw mode is taken here and released only at teardown, so it stays on across the
+        // turn that follows: the input line has to keep receiving keys while the model is
+        // answering, and a terminal switched back to cooked mode would hold them in the line
+        // discipline until the next prompt.
+        let _guard = RawGuard::enter()?;
+        self.begin_line();
+        loop {
             let event = match event::read() {
                 Ok(event) => event,
-                Err(_) => break Action::Eof,
+                Err(_) => return Ok(Action::Eof),
             };
-            let Event::Key(key) = event else {
-                if matches!(event, Event::Resize(_, _)) {
-                    self.refresh_size();
-                    self.render();
-                }
-                continue;
-            };
-            if key.kind == KeyEventKind::Release {
-                continue;
-            }
-            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-            match key.code {
-                KeyCode::Enter => {
-                    let mut line = self.editing.clone().unwrap_or_default();
-                    // The line is on its way out, so clear the buffer now: the caller commits
-                    // it to the transcript and redraws, and a buffer that still holds the
-                    // submitted text would be drawn again as a fresh prompt.
-                    self.editing = Some(String::new());
-                    // Enter runs the highlighted command. When the buffer already spells
-                    // that command out (`/exit` typed by hand, or a `/model` argument in
-                    // progress), it is taken as written so an argument survives.
-                    if let Some(accepted) = self.accepted_command() {
-                        let typed = line.strip_prefix('/').map(str::trim).unwrap_or_default();
-                        let has_argument = typed.contains(' ');
-                        if !has_argument {
-                            line = accepted;
-                        }
-                    }
-                    // Images travel with the line, and an image with no text at all is a
-                    // valid message: the user may only want to show a screenshot.
-                    if !self.pending_images.is_empty() {
-                        let images = std::mem::take(&mut self.pending_images);
-                        break Action::LineWithImages(line, images);
-                    }
-                    break Action::Line(line);
-                }
-                KeyCode::Char('o') if ctrl => break Action::ToggleExpand,
-                KeyCode::Char('c') if ctrl => {
-                    let empty = self.editing.as_deref().unwrap_or("").is_empty()
-                        && self.pending_images.is_empty();
-                    if empty {
-                        break Action::Interrupt;
-                    }
-                    self.editing = Some(String::new());
-                    self.pending_images.clear();
-                }
-                KeyCode::Char('d') if ctrl => {
-                    if self.editing.as_deref().unwrap_or("").is_empty() {
-                        break Action::Eof;
-                    }
-                }
-                KeyCode::Char('v') if ctrl => {
-                    // An image on the clipboard wins over text: a screenshot tool usually
-                    // leaves both, and the user pressing Ctrl+V after a screenshot means
-                    // the picture. Text paste is the consolation path.
-                    match image_input::read_clipboard_image() {
-                        Ok(image) => {
-                            self.pending_images.push(image);
-                        }
-                        Err(image_input::ImageError::NoImage) => {
-                            if let Ok(text) = image_input::read_clipboard_text()
-                                && let Some(buffer) = &mut self.editing
-                            {
-                                // One line at a time: the editor has no multiline buffer,
-                                // and a raw newline would break the layout.
-                                buffer.push_str(&text.replace(['\n', '\r'], " "));
-                            }
-                        }
-                        Err(err) => {
-                            self.notice = Some(format!("粘贴失败：{err}"));
-                        }
-                    }
-                }
-                KeyCode::Char('u') if ctrl => self.editing = Some(String::new()),
-                KeyCode::Char('w') if ctrl => {
-                    if let Some(text) = &mut self.editing {
-                        while text.ends_with(' ') {
-                            text.pop();
-                        }
-                        while let Some(last) = text.chars().last() {
-                            if last == ' ' {
-                                break;
-                            }
-                            text.pop();
-                        }
-                    }
-                }
-                KeyCode::Char(c) if !ctrl => {
-                    if let Some(text) = &mut self.editing {
-                        text.push(c);
-                    }
-                }
-                KeyCode::Backspace => {
-                    if let Some(text) = &mut self.editing {
-                        text.pop();
-                    }
-                }
-                KeyCode::Tab => {
-                    self.complete();
-                }
-                KeyCode::BackTab => {
-                    self.move_menu(-1);
-                }
-                KeyCode::Esc => {
-                    // Closing the menu must not drop what was typed.
-                    self.menu.clear();
-                    self.menu_selected = 0;
-                }
-                KeyCode::Up if !self.menu.is_empty() => {
-                    self.move_menu(-1);
-                }
-                KeyCode::Down if !self.menu.is_empty() => {
-                    self.move_menu(1);
-                }
-                KeyCode::Up => {
-                    if !self.history.is_empty() {
-                        let next = match self.history_index {
-                            Some(0) => 0,
-                            Some(index) => index - 1,
-                            None => self.history.len() - 1,
-                        };
-                        self.history_index = Some(next);
-                        self.editing = Some(self.history[next].clone());
-                    }
-                }
-                KeyCode::Down => {
-                    if let Some(index) = self.history_index {
-                        if index + 1 < self.history.len() {
-                            self.history_index = Some(index + 1);
-                            self.editing = Some(self.history[index + 1].clone());
-                        } else {
-                            self.history_index = None;
-                            self.editing = Some(String::new());
-                        }
-                    }
-                }
-                _ => {}
-            }
-            // A notice describes the last keystroke, so it does not outlive it.
-            self.notice = None;
-            self.sync_menu();
-            self.render();
-        };
-        self.menu.clear();
-        self.menu_selected = 0;
-        // Redraw once without the submitted line. The buffer is cleared when the line is
-        // taken, but the terminal is still showing the frame from the last keystroke, so
-        // without this the text sits in the input row until something else repaints —
-        // which, while the model is being waited on, can be seconds.
-        self.render();
-        let history_text = match &action {
-            Action::Line(text) | Action::LineWithImages(text, _) => Some(text.clone()),
-            _ => None,
-        };
-        if let Some(text) = history_text
-            && !text.trim().is_empty()
-        {
-            self.history.push(text);
-            if self.history.len() > 200 {
-                self.history.remove(0);
+            match self.absorb_event(event) {
+                Some(action) => return Ok(action),
+                None => continue,
             }
         }
-        drop(guard);
-        Ok(action)
+    }
+
+    /// Arm the input line, keeping whatever draft is already in it.
+    ///
+    /// The composer is armed for the whole session — a turn is a time when the user is very
+    /// likely to want to type, so the line they type into has to exist then too. That means
+    /// this is called on a buffer that may already hold text the user began writing while the
+    /// model was answering, and starting to read the next line must not throw that away: it
+    /// is the user's half-written message, and losing it silently is the same bug as losing
+    /// keys, one turn later.
+    ///
+    /// Only the furniture around the line is reset. The buffer is emptied when a line is
+    /// submitted (see `handle_key`), which is the one moment it is meant to be emptied.
+    pub fn begin_line(&mut self) {
+        self.editing.get_or_insert_with(Editor::new);
+        self.menu.clear();
+        self.menu_selected = 0;
+        self.menu_dismissed = None;
+        self.render();
+    }
+
+    /// Take any typing that has already arrived, without waiting for more.
+    ///
+    /// This is what keeps the input line alive while the model is answering: the turn loop
+    /// calls it between deltas, so a keypress lands in the composer as it is pressed. The
+    /// alternative — reading input only when the turn is over — is why typing during a turn
+    /// did nothing at all: the bytes sat in the terminal buffer until the next prompt.
+    ///
+    /// Only already-buffered events are taken, so this never stalls the turn.
+    ///
+    /// *Every* buffered event is taken, not just one. One per call would tie the input rate
+    /// to how often the caller comes round — with nothing but the spinner ticking, that is
+    /// one key per frame, and pasting a line would take seconds to appear.
+    pub fn poll_input(&mut self) -> Option<Action> {
+        if !self.interactive {
+            return None;
+        }
+        let mut pending: Option<Action> = None;
+        // The first action ends the drain: it is a submitted line or a Ctrl+O, and the
+        // caller acts on it before any more typing is read.
+        while pending.is_none() && event::poll(std::time::Duration::ZERO).unwrap_or(false) {
+            match event::read() {
+                Ok(event) => pending = self.absorb_event(event),
+                Err(_) => break,
+            }
+        }
+        pending
+    }
+
+    /// Take one terminal event.
+    ///
+    /// Returns `Some(action)` when the line was submitted, when the user asked to interrupt
+    /// or to expand something, and `None` when the event only changed what is on screen. The
+    /// caller decides what a submitted line means: at the prompt it is the next turn, and
+    /// during a turn it is a message queued behind the one in flight.
+    pub fn absorb_event(&mut self, event: Event) -> Option<Action> {
+        if let Event::Resize(_, _) = event {
+            self.refresh_size();
+            self.render();
+            return None;
+        }
+        let Event::Key(key) = event else {
+            return None;
+        };
+        if key.kind == KeyEventKind::Release {
+            return None;
+        }
+        // A notice describes the *previous* keystroke, so it is cleared before this one is
+        // handled rather than after: a notice the handler sets (a failed paste, say) is about
+        // what just happened and has to survive the redraw that shows it. Clearing it after
+        // the handler wiped the notice in the very same keystroke that raised it, so it was
+        // never on screen at all.
+        self.notice = None;
+        let action = self.handle_key(key);
+        if action.is_some() {
+            // The line is on its way out: clear the composer and redraw once without it. The
+            // buffer is cleared when the line is taken, but the terminal still shows the
+            // frame from the last keystroke, so without this the submitted text sits in the
+            // input row until something else repaints.
+            self.menu.clear();
+            self.menu_selected = 0;
+            self.menu_dismissed = None;
+            self.render();
+            return action;
+        }
+        self.sync_menu();
+        self.render();
+        None
+    }
+
+    /// Turn one keystroke into an edit, or into the action it stands for.
+    ///
+    /// This is the whole line editor, and there is exactly one copy of it: the prompt and the
+    /// turn loop both feed keys through here, so a key that edits works while the model is
+    /// still answering. A second implementation for "typing while busy" would be a second set
+    /// of bugs.
+    fn handle_key(&mut self, key: KeyEvent) -> Option<Action> {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        match key.code {
+            KeyCode::Enter => {
+                let mut line = self.editing.as_ref().map(Editor::text).unwrap_or_default();
+                // The line is on its way out, so clear the buffer now: the caller commits
+                // it to the transcript and redraws, and a buffer that still holds the
+                // submitted text would be drawn again as a fresh prompt.
+                self.editing = Some(Editor::new());
+                // The walk through the history ends with the line it produced. Leaving the
+                // index pointing at a recalled entry would make the next Down continue the
+                // walk from there instead of doing nothing on a fresh, empty line.
+                self.history_index = None;
+                self.history_draft = None;
+                // Enter runs the highlighted command. When the buffer already spells
+                // that command out (`/exit` typed by hand, or a `/model` argument in
+                // progress), it is taken as written so an argument survives.
+                if let Some(accepted) = self.accepted_command() {
+                    let typed = line.strip_prefix('/').map(str::trim).unwrap_or_default();
+                    let has_argument = typed.contains(' ');
+                    if !has_argument {
+                        line = accepted;
+                    }
+                }
+                self.remember(&line);
+                // Images travel with the line, and an image with no text at all is a
+                // valid message: the user may only want to show a screenshot.
+                if !self.pending_images.is_empty() {
+                    let images = std::mem::take(&mut self.pending_images);
+                    return Some(Action::LineWithImages(line, images));
+                }
+                return Some(Action::Line(line));
+            }
+            KeyCode::Char('o') if ctrl => return Some(Action::ToggleExpand),
+            KeyCode::Char('c') if ctrl => {
+                let empty = self.editing.as_ref().is_none_or(Editor::is_empty)
+                    && self.pending_images.is_empty();
+                if empty {
+                    return Some(Action::Interrupt);
+                }
+                self.editing = Some(Editor::new());
+                self.pending_images.clear();
+            }
+            KeyCode::Char('d') if ctrl => {
+                if self.editing.as_ref().is_none_or(Editor::is_empty) {
+                    return Some(Action::Eof);
+                }
+                // Like Ctrl+C, this leaves a non-empty line alone: Ctrl+D means "close
+                // the stream", and the buffer is not part of that.
+            }
+            KeyCode::Char('v') if ctrl => {
+                // An image on the clipboard wins over text: a screenshot tool usually
+                // leaves both, and the user pressing Ctrl+V after a screenshot means
+                // the picture. Text paste is the consolation path.
+                match image_input::read_clipboard_image() {
+                    Ok(image) => {
+                        self.pending_images.push(image);
+                    }
+                    Err(image_input::ImageError::NoImage) => {
+                        if let Ok(text) = image_input::read_clipboard_text()
+                            && let Some(editor) = &mut self.editing
+                        {
+                            // One line at a time: the editor has no multiline buffer,
+                            // and a raw newline would break the layout.
+                            editor.insert(&text.replace(['\n', '\r'], " "));
+                        }
+                    }
+                    Err(err) => {
+                        self.notice = Some(format!("粘贴失败：{err}"));
+                    }
+                }
+            }
+            KeyCode::Char('u') if ctrl => {
+                if let Some(editor) = &mut self.editing {
+                    editor.delete_to_start();
+                }
+            }
+            KeyCode::Char('k') if ctrl => {
+                if let Some(editor) = &mut self.editing {
+                    editor.delete_to_end();
+                }
+            }
+            KeyCode::Char('w') if ctrl => {
+                if let Some(editor) = &mut self.editing {
+                    editor.delete_word();
+                }
+            }
+            KeyCode::Char('a') if ctrl => {
+                if let Some(editor) = &mut self.editing {
+                    editor.home();
+                }
+            }
+            KeyCode::Char('e') if ctrl => {
+                if let Some(editor) = &mut self.editing {
+                    editor.end();
+                }
+            }
+            // Left/Right move the caret in characters, so the units match the buffer
+            // rather than the screen: a CJK character is one step, not two.
+            KeyCode::Left if alt => {
+                if let Some(editor) = &mut self.editing {
+                    editor.delete_word();
+                }
+            }
+            KeyCode::Left => {
+                if let Some(editor) = &mut self.editing {
+                    editor.move_caret(-1);
+                }
+            }
+            KeyCode::Right => {
+                if let Some(editor) = &mut self.editing {
+                    editor.move_caret(1);
+                }
+            }
+            KeyCode::Home => {
+                if let Some(editor) = &mut self.editing {
+                    editor.home();
+                }
+            }
+            KeyCode::End => {
+                if let Some(editor) = &mut self.editing {
+                    editor.end();
+                }
+            }
+            KeyCode::Delete => {
+                if let Some(editor) = &mut self.editing {
+                    editor.delete();
+                }
+            }
+            KeyCode::Char(c) if !ctrl && !alt => {
+                if let Some(editor) = &mut self.editing {
+                    editor.insert(&c.to_string());
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(editor) = &mut self.editing {
+                    editor.backspace();
+                }
+            }
+            KeyCode::Tab => {
+                self.complete();
+            }
+            KeyCode::BackTab => {
+                self.move_menu(-1);
+            }
+            KeyCode::Esc => {
+                // Closing the menu must not drop what was typed, and it has to *stay*
+                // closed: the redraw at the end of this very keypress would otherwise put
+                // the list straight back. Typing on starts a fresh command name, so the
+                // menu comes back then.
+                self.menu_dismissed = self.editing.as_ref().map(Editor::text);
+                self.menu.clear();
+                self.menu_selected = 0;
+            }
+            // The arrows walk the input history, and only that. Putting a recalled
+            // entry back needs Down to keep working while the entry happens to be a
+            // slash command — which is exactly when the menu is up, and exactly when
+            // handing the arrows to the menu would strand the user inside a recalled
+            // line with no way back to open space. Tab and Shift+Tab drive the
+            // highlight instead, and the history is never further away than the arrow
+            // that got them there.
+            KeyCode::Up => {
+                self.history_up();
+            }
+            KeyCode::Down => {
+                self.history_down();
+            }
+            _ => {}
+        }
+        None
+    }
+
+    /// Note a line that was submitted while a turn was running.
+    ///
+    /// The kind is preserved as given: see [`Queued`] for why the two are not both text.
+    pub fn queue(&mut self, item: Queued) {
+        self.pending.push(item);
+        self.render();
+    }
+
+    /// Take what was submitted while the turn was running, in order.
+    ///
+    /// Taking them is what makes them real: the caller acts on them, and until then they
+    /// were only rows on screen.
+    ///
+    /// Images are not touched here. They belong to the *line being written*, not to the
+    /// queue: Enter hands them over with the line (see `handle_key`), and a paste that has
+    /// not been submitted yet is part of the draft the user is still assembling. Sweeping
+    /// them into the queue would send a screenshot the user was still composing, and leave
+    /// the message it belonged to without it.
+    pub fn take_queued(&mut self) -> Vec<Queued> {
+        let queued = std::mem::take(&mut self.pending);
+        if !queued.is_empty() {
+            self.render();
+        }
+        queued
+    }
+
+    /// Add a submitted line to the history, so Up recalls it later.
+    fn remember(&mut self, line: &str) {
+        if line.trim().is_empty() {
+            return;
+        }
+        self.history.push(line.to_string());
+        if self.history.len() > 200 {
+            self.history.remove(0);
+        }
     }
 }
 
-struct RawGuard;
+/// Raw mode, held by every part of the UI that needs it.
+///
+/// The count is the whole point. The prompt needs raw mode; so do the pickers and the
+/// authorization panel, and those run *inside* a turn. With a plain guard each of them would
+/// switch raw mode off on the way out, and the prompt would then be reading a terminal that
+/// echoes and line-buffers — which is why typing during a turn used to go nowhere: the bytes
+/// were swallowed by the line discipline until the next prompt asked for a line.
+///
+/// So the mode belongs to the program, not to the read: it goes on at the first request and
+/// off when the process tears down. The count exists so the nesting is not a lie.
+pub(crate) struct RawGuard;
+
+static RAW_HOLDERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 impl RawGuard {
-    fn enter() -> std::io::Result<Self> {
-        terminal::enable_raw_mode()?;
+    pub(crate) fn enter() -> std::io::Result<Self> {
+        if RAW_HOLDERS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            if let Err(err) = terminal::enable_raw_mode() {
+                RAW_HOLDERS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                return Err(err);
+            }
+        }
         Ok(RawGuard)
     }
 }
 
 impl Drop for RawGuard {
     fn drop(&mut self) {
-        let _ = terminal::disable_raw_mode();
+        // The mode is not switched off here: see `RawGuard` above. It is released once, at
+        // teardown, so a picker closing does not take the prompt's raw mode with it.
+        RAW_HOLDERS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
-/// Leave the terminal clean when mpi exits. Piped output gets no escape sequences.
+/// Leave the terminal clean when pi exits. Piped output gets no escape sequences.
 pub fn teardown() {
     let _ = terminal::disable_raw_mode();
     if !std::io::stdout().is_terminal() {
@@ -1464,11 +1982,29 @@ mod tests {
         screen
     }
 
+    /// Set the input buffer the way a test means it: text, with the caret at the end.
+    fn set_input(screen: &mut Screen, text: &str) {
+        screen.editing = Some(Editor::from_text(text));
+    }
+
+    /// The input buffer as a string.
+    fn input(screen: &Screen) -> String {
+        screen.editing.as_ref().map(Editor::text).unwrap_or_default()
+    }
+
+    /// Put the caret `back` characters from the end of the buffer.
+    fn caret_back(screen: &mut Screen, back: usize) {
+        if let Some(editor) = &mut screen.editing {
+            editor.home();
+            editor.move_caret((editor.len() - back.min(editor.len())) as isize);
+        }
+    }
+
     #[test]
     fn leaving_takes_the_live_region_down() {
         // The live region is the prompt and the footer, not part of the transcript. If it is
         // left on screen the shell inherits a cursor parked mid-row, and zsh marks a partial
-        // line with `%` — so mpi's prompt appears to survive as `› /%`.
+        // line with `%` — so pi's prompt appears to survive as `› /%`.
         //
         // The draw and erase steps are tested above; what this pins is that the exit path
         // actually erases, because the residue only shows up in a real shell.
@@ -1477,7 +2013,7 @@ mod tests {
         // `erase_live` is a no-op there by design.
         let mut screen = screen();
         screen.interactive = true;
-        screen.editing = Some("/".into());
+        set_input(&mut screen, "/");
         screen.set_footer(vec![Line::plain("dir"), Line::plain("stats")]);
 
         // Draw once, as the input loop does, so there is a region to take down.
@@ -1498,10 +2034,10 @@ mod tests {
     fn leaving_commits_what_was_queued_but_not_yet_drawn() {
         // The note telling the user how to come back is pushed *after* the turn loop ends,
         // so no draw ever follows it. Erasing without committing threw it away silently: the
-        // last thing mpi is supposed to say was the one thing it never said.
+        // last thing pi is supposed to say was the one thing it never said.
         let mut screen = screen();
         screen.interactive = true;
-        screen.push_lines(vec![Line::plain("继续此会话：mpi resume abc")]);
+        screen.push_lines(vec![Line::plain("继续此会话：pi resume abc")]);
         assert!(!screen.blocks.is_empty(), "the note is queued");
 
         screen.leave();
@@ -1565,7 +2101,7 @@ mod tests {
         // job is to be *moving* — a still mark cannot be told apart from a hung process, so
         // the frames are asserted to differ rather than merely to exist.
         let mut screen = screen_with_commands();
-        screen.editing = Some(String::new());
+        set_input(&mut screen, "");
         screen.set_footer(vec![Line::plain("dir"), Line::plain("stats")]);
         screen.working = Some(WORKING_LABEL.to_string());
 
@@ -1588,7 +2124,7 @@ mod tests {
     #[test]
     fn the_spinner_is_gone_once_the_turn_ends() {
         let mut screen = screen_with_commands();
-        screen.editing = Some(String::new());
+        set_input(&mut screen, "");
         screen.working = Some(WORKING_LABEL.to_string());
         screen.clear_working();
         let (lines, _) = screen.compose_live();
@@ -1608,19 +2144,19 @@ mod tests {
     #[test]
     fn a_slash_opens_the_menu_and_filters_as_more_is_typed() {
         let mut screen = screen_with_commands();
-        screen.editing = Some("/".into());
+        set_input(&mut screen, "/");
         screen.sync_menu();
         assert_eq!(screen.menu.len(), crate::agent::r#loop::COMMANDS.len());
         // The first entry is highlighted, so Enter has an unambiguous target.
         assert_eq!(screen.menu[0].0, "model");
 
-        screen.editing = Some("/m".into());
+        set_input(&mut screen, "/m");
         screen.sync_menu();
         // "m" matches /model and /compact: the match is on the name, not the description.
         assert_eq!(screen.menu.len(), 1, "{:?}", screen.menu);
         assert_eq!(screen.menu[0].0, "model");
 
-        screen.editing = Some("/na".into());
+        set_input(&mut screen, "/na");
         screen.sync_menu();
         assert_eq!(screen.menu.len(), 1);
         assert_eq!(screen.menu[0].0, "name");
@@ -1632,7 +2168,7 @@ mod tests {
         // A slash mid-sentence is not a command, and an argument is being typed once there
         // is a space, so in both cases there is nothing to complete.
         for text in ["你好/世界", "/name 我的会话", "no slash at all"] {
-            screen.editing = Some(text.into());
+            set_input(&mut screen, text);
             screen.sync_menu();
             assert!(screen.menu.is_empty(), "{text:?} opened a menu");
         }
@@ -1641,10 +2177,10 @@ mod tests {
     #[test]
     fn tab_completes_a_unique_command_along_with_a_space() {
         let mut screen = screen_with_commands();
-        screen.editing = Some("/na".into());
+        set_input(&mut screen, "/na");
         assert!(screen.complete());
         // The trailing space means the argument can be typed straight away.
-        assert_eq!(screen.editing.as_deref(), Some("/name "));
+        assert_eq!(input(&screen), "/name ");
         // The menu closes because the name is settled.
         assert!(screen.menu.is_empty());
     }
@@ -1654,7 +2190,7 @@ mod tests {
         let mut screen = screen_with_commands();
         // "co" matches only /compact, so that case is covered above; "c" also matches
         // nothing else, so use two commands sharing a prefix via the real list.
-        screen.editing = Some("/".into());
+        set_input(&mut screen, "/");
         assert!(screen.complete() || !screen.menu.is_empty());
         // With several matches and no shared prefix to add, Tab walks the highlight.
         let before = screen.menu_selected;
@@ -1665,12 +2201,12 @@ mod tests {
     #[test]
     fn tab_on_an_exact_command_does_nothing_destructive() {
         let mut screen = screen_with_commands();
-        screen.editing = Some("/exit".into());
+        set_input(&mut screen, "/exit");
         screen.sync_menu();
         // /exit is the only match, so Tab would fill in the space; the point is that it
         // must not lose what was typed.
         screen.complete();
-        assert!(screen.editing.as_deref().unwrap().starts_with("/exit"));
+        assert!(input(&screen).starts_with("/exit"));
     }
 
     #[test]
@@ -1687,7 +2223,7 @@ mod tests {
     #[test]
     fn a_menu_selection_is_the_command_that_runs() {
         let mut screen = screen_with_commands();
-        screen.editing = Some("/re".into());
+        set_input(&mut screen, "/re");
         screen.sync_menu();
         // Enter takes the highlighted entry as a whole command: the menu is there to save
         // typing, so picking from it must not require a second Enter to submit.
@@ -1695,14 +2231,14 @@ mod tests {
         assert_eq!(screen.menu.len(), 1, "the filter left only the match");
 
         // Moving the highlight moves what Enter would run.
-        screen.editing = Some("/".into());
+        set_input(&mut screen, "/");
         screen.sync_menu();
         screen.move_menu(1);
         assert_eq!(screen.accepted_command(), Some("/name".into()));
 
         // With no menu open there is nothing to accept, and the buffer is submitted as
         // typed.
-        screen.editing = Some("你好".into());
+        set_input(&mut screen, "你好");
         screen.sync_menu();
         assert_eq!(screen.accepted_command(), None);
     }
@@ -1710,7 +2246,7 @@ mod tests {
     #[test]
     fn the_menu_wraps_at_both_ends() {
         let mut screen = screen_with_commands();
-        screen.editing = Some("/".into());
+        set_input(&mut screen, "/");
         screen.sync_menu();
         assert!(screen.move_menu(-1));
         assert_eq!(screen.menu_selected, screen.menu.len() - 1);
@@ -1723,7 +2259,7 @@ mod tests {
         // The live region is drawn as text; nothing moves the cursor unless the drawing
         // code says where it goes. Without this the caret ends up under the footer.
         let mut screen = screen_with_commands();
-        screen.editing = Some("/mo".into());
+        set_input(&mut screen, "/mo");
         screen.sync_menu();
         screen.set_footer(vec![Line::plain("dir"), Line::plain("stats")]);
         let (lines, cursor) = screen.compose_live();
@@ -1737,6 +2273,343 @@ mod tests {
     }
 
     #[test]
+    fn the_caret_sits_where_the_buffer_put_it() {
+        // The caret is part of the editor, not a property of the end of the line. Without
+        // this the only place a correction can be typed is the end, which is what "you can't
+        // go back and fix a typo" means from the user's side.
+        let mut screen = screen_with_commands();
+        set_input(&mut screen, "helo world");
+        // `helo world` is ten characters; six steps back puts the caret after `helo`.
+        caret_back(&mut screen, 6);
+        let (lines, cursor) = screen.compose_live();
+        let (row, column) = cursor.unwrap();
+        assert_eq!(lines[row].text(), "› helo world");
+        assert_eq!(column, 2 + 4, "the caret is inside the word, not at its end");
+    }
+
+    #[test]
+    fn left_and_right_step_by_character_and_stop_at_both_ends() {
+        let mut editor = Editor::from_text("abc");
+        assert_eq!(editor.caret(), 3);
+        editor.move_caret(-2);
+        assert_eq!(editor.caret(), 1);
+        editor.move_caret(1);
+        assert_eq!(editor.caret(), 2);
+        // Held at either end rather than wrapping: a caret that jumped to the other end
+        // would make correcting a typo a guess about where it landed.
+        editor.move_caret(10);
+        assert_eq!(editor.caret(), 3);
+        editor.move_caret(-10);
+        assert_eq!(editor.caret(), 0);
+    }
+
+    #[test]
+    fn a_wide_character_is_one_step_and_two_columns() {
+        // Stepping by character rather than by column is what keeps the caret from landing
+        // in the middle of a CJK glyph, where there is no position to draw it.
+        let mut screen = screen_with_commands();
+        set_input(&mut screen, "你好");
+        caret_back(&mut screen, 1);
+        let (lines, cursor) = screen.compose_live();
+        let (row, column) = cursor.unwrap();
+        assert_eq!(lines[row].text(), "› 你好");
+        assert_eq!(column, 2 + 2, "one character back is two display columns");
+    }
+
+    #[test]
+    fn typing_in_the_middle_inserts_at_the_caret() {
+        let mut editor = Editor::from_text("helo");
+        editor.move_caret(-1);
+        editor.insert("l");
+        assert_eq!(editor.text(), "hello");
+        assert_eq!(editor.caret(), 4, "the caret follows what was typed");
+    }
+
+    #[test]
+    fn backspace_and_delete_remove_on_opposite_sides_of_the_caret() {
+        // Backspace takes the character before the caret and moves it; Delete takes the one
+        // under it and leaves it where it is. Swapping them silently edits the wrong
+        // character, which is worse than not supporting the key at all.
+        let mut editor = Editor::from_text("abc");
+        editor.move_caret(-1);
+        editor.backspace();
+        assert_eq!(editor.text(), "ac");
+        assert_eq!(editor.caret(), 1);
+        editor.delete();
+        assert_eq!(editor.text(), "a");
+        assert_eq!(editor.caret(), 1);
+        // Neither one can run off either end.
+        editor.delete();
+        assert_eq!(editor.text(), "a");
+        editor.backspace();
+        assert_eq!(editor.text(), "");
+        editor.backspace();
+        assert_eq!(editor.text(), "");
+    }
+
+    #[test]
+    fn the_kill_keys_act_around_the_caret() {
+        let mut editor = Editor::from_text("one two three");
+        editor.move_caret(-6);
+        // Ctrl+W takes the word *before* the caret, wherever the caret is. The space that
+        // separated it is not part of the word, so it stays — the same thing readline does.
+        editor.delete_word();
+        assert_eq!(editor.text(), "one  three");
+        // Ctrl+U takes everything before it, Ctrl+K everything after.
+        editor.delete_to_start();
+        assert_eq!(editor.text(), " three");
+        assert_eq!(editor.caret(), 0);
+        editor.delete_to_end();
+        assert_eq!(editor.text(), "");
+        // Ctrl+W on an empty buffer is a no-op rather than a panic.
+        editor.delete_word();
+        assert_eq!(editor.text(), "");
+    }
+
+    #[test]
+    fn ctrl_w_eats_the_spaces_before_the_word_too() {
+        let mut editor = Editor::from_text("git commit ");
+        editor.delete_word();
+        assert_eq!(editor.text(), "git ");
+        editor.delete_word();
+        assert_eq!(editor.text(), "");
+    }
+
+    #[test]
+    fn the_wrapped_caret_follows_the_text_to_the_next_row() {
+        // A caret just before a wrap boundary belongs on the row below, at its first column:
+        // putting it on the row above would place it one cell past the terminal's edge.
+        let mut screen = screen_with_commands();
+        // 12 columns, 2 for the prompt: 10 characters fill the first row exactly.
+        screen.width = 12;
+        set_input(&mut screen, "abcdefghijklm");
+        caret_back(&mut screen, 3); // the caret is exactly on the wrap boundary
+        let (lines, cursor) = screen.compose_live();
+        let (row, column) = cursor.unwrap();
+        assert_eq!(lines[row].text(), "  klm", "a full row puts the caret on the next one");
+        assert_eq!(column, 2, "at the first text column, not one past the screen edge");
+    }
+
+    #[test]
+    fn the_menu_does_not_take_the_arrow_keys_from_the_history() {
+        // The user's complaint: recall an entry, press Down, and the recalled line stays put.
+        // It is a slash command, so the menu opened on it and ate the arrow. Down has to stay
+        // the way back out of the history — that is the whole point of having it.
+        let mut screen = screen_with_commands();
+        screen.history = vec!["/name".into(), "hello".into()];
+        set_input(&mut screen, "");
+        screen.history_index = Some(0);
+        set_input(&mut screen, "/name");
+        screen.sync_menu();
+        assert!(!screen.menu.is_empty(), "the recalled command opens the menu");
+
+        screen.history_down();
+        assert_eq!(input(&screen), "hello", "Down must leave the recalled command behind");
+        screen.history_down();
+        assert_eq!(input(&screen), "", "and the last Down reaches the blank line");
+    }
+
+    #[test]
+    fn esc_closes_the_menu_and_it_stays_closed() {
+        // Esc had no effect at all before: the redraw at the end of the same keypress put the
+        // list straight back. It is the buffer the user dismissed, so typing on brings the
+        // menu back — a dismissal that survived to the end of the line would make it feel
+        // broken in the other direction.
+        let mut screen = screen_with_commands();
+        set_input(&mut screen, "/mo");
+        screen.sync_menu();
+        assert!(!screen.menu.is_empty());
+
+        // What the Esc key does.
+        screen.menu_dismissed = screen.editing.as_ref().map(Editor::text);
+        screen.menu.clear();
+        screen.sync_menu();
+        assert!(screen.menu.is_empty(), "the redraw must not bring it back");
+
+        // The buffer moves on, so the dismissal no longer describes what is on screen.
+        set_input(&mut screen, "/mod");
+        screen.sync_menu();
+        assert!(!screen.menu.is_empty(), "a new command name gets its menu back");
+        assert!(screen.menu_dismissed.is_none());
+    }
+
+    #[test]
+    fn a_line_submitted_mid_turn_is_held_as_what_it_is() {
+        // A command typed while a turn is running cannot run then, but it also must not be
+        // sent to the model as prose: `/model` is not something the user said. It waits as a
+        // command, and a message waits as a message with its images — the two part ways the
+        // moment the turn ends.
+        let mut screen = screen_with_commands();
+        screen.interactive = false;
+
+        crate::agent::r#loop::queue_mid_turn(&mut screen, "/model".to_string(), Vec::new());
+        crate::agent::r#loop::queue_mid_turn(&mut screen, "hello".to_string(), Vec::new());
+        crate::agent::r#loop::queue_mid_turn(&mut screen, "   ".to_string(), Vec::new());
+
+        let queued = screen.take_queued();
+        assert_eq!(queued.len(), 2, "a blank line is not queued: {queued:?}");
+        assert_eq!(queued[0], Queued::Command("/model".to_string()));
+        assert_eq!(queued[1], Queued::Message("hello".to_string(), Vec::new()));
+
+        // Taking them empties the queue, so the next turn does not re-send them.
+        assert!(screen.take_queued().is_empty());
+    }
+
+    #[test]
+    fn a_queued_line_is_trimmed_the_way_the_prompt_trims_it() {
+        // A line has to reach the conversation the same way whether it was typed at the
+        // prompt or during a turn. The prompt trims, so queueing does too — otherwise
+        // " /model" would go to the model as a message while the same text typed at the
+        // prompt would be rejected as an unknown command.
+        let mut screen = screen_with_commands();
+        crate::agent::r#loop::queue_mid_turn(&mut screen, "  /model  ".to_string(), Vec::new());
+        crate::agent::r#loop::queue_mid_turn(&mut screen, "  hello  ".to_string(), Vec::new());
+
+        let queued = screen.take_queued();
+        assert_eq!(queued[0], Queued::Command("/model".to_string()));
+        assert_eq!(queued[1], Queued::Message("hello".to_string(), Vec::new()));
+    }
+
+    #[test]
+    fn a_command_queued_mid_turn_never_becomes_a_message() {
+        // The bug this pins: the command used to be queued as a *message* with a note welded
+        // into the text ("/model　（回合结束后执行）"), so the model received the text of a
+        // command as something the user had said, and the command itself never ran.
+        let mut screen = screen_with_commands();
+        crate::agent::r#loop::queue_mid_turn(&mut screen, "/name x".to_string(), Vec::new());
+        let queued = screen.take_queued();
+        assert!(
+            queued.iter().all(|item| !matches!(item, Queued::Message(..))),
+            "a command must not be queued as a message: {queued:?}"
+        );
+    }
+
+    #[test]
+    fn a_paste_that_was_never_submitted_stays_with_the_draft() {
+        // `take_queued` used to sweep `pending_images` into the queue, which sent a
+        // screenshot the user was still composing and left the message it belonged to
+        // without it. Images travel with the line on Enter, so the queue never owns them.
+        let mut screen = screen_with_commands();
+        screen.pending_images.push(crate::image_input::PastedImage {
+            width: 4,
+            height: 4,
+            data: "AAAA".into(),
+            bytes: 3,
+        });
+        crate::agent::r#loop::queue_mid_turn(&mut screen, "queued message".to_string(), Vec::new());
+
+        let queued = screen.take_queued();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(
+            screen.pending_images.len(),
+            1,
+            "the unsubmitted paste still belongs to the line being written"
+        );
+        assert!(matches!(&queued[0], Queued::Message(text, images)
+            if text == "queued message" && images.is_empty()));
+    }
+
+    #[test]
+    fn arming_the_next_line_keeps_the_draft() {
+        // The composer is armed again after every turn, and the user may have started
+        // writing during the turn that just ended. `begin_line` used to blank the buffer,
+        // which threw that message away one turn later than the keystroke bug it fixed.
+        let mut screen = screen_with_commands();
+        set_input(&mut screen, "half-written");
+        screen.begin_line();
+        assert_eq!(input(&screen), "half-written");
+    }
+
+    #[test]
+    fn submitting_a_line_ends_the_history_walk() {
+        // Enter takes the recalled line and empties the buffer. The walk has to end there
+        // too: an index still pointing into the history makes the next Down continue the
+        // walk from a line that is no longer on screen.
+        let mut screen = screen_with_commands();
+        screen.history = vec!["first".into(), "second".into()];
+        set_input(&mut screen, "");
+        screen.history_up();
+        assert_eq!(input(&screen), "second");
+        assert!(screen.history_index.is_some());
+
+        screen.handle_key(KeyEvent::from(KeyCode::Enter));
+
+        assert_eq!(input(&screen), "", "the line is on its way out");
+        assert!(screen.history_index.is_none(), "the walk is over");
+        assert!(screen.history_draft.is_none());
+    }
+
+    #[test]
+    fn walking_back_down_past_the_newest_entry_restores_the_draft() {        // Up is a look at the history, not a commitment: a half-written message must survive
+        // the glance. Without the stash, the last Down would blank the line and the user's
+        // text would be gone with no sign that it had ever been there.
+        let mut screen = screen_with_commands();
+        screen.history = vec!["first".into(), "second".into()];
+        set_input(&mut screen, "my draft");
+
+        screen.history_up();
+        assert_eq!(input(&screen), "second");
+        screen.history_up();
+        assert_eq!(input(&screen), "first");
+        screen.history_down();
+        assert_eq!(input(&screen), "second");
+        screen.history_down();
+        assert_eq!(input(&screen), "my draft", "the draft comes back, not a blank line");
+        assert!(screen.history_index.is_none(), "the walk is over");
+    }
+
+    #[test]
+    fn down_without_a_walk_in_progress_does_nothing() {
+        // Down belongs to the menu-less prompt as the "blank line" key only while walking;
+        // on a fresh buffer it must not clear what is being typed.
+        let mut screen = screen_with_commands();
+        screen.history = vec!["first".into()];
+        set_input(&mut screen, "typing away");
+        screen.history_down();
+        assert_eq!(input(&screen), "typing away");
+    }
+
+    #[test]
+    fn up_at_the_oldest_entry_stays_there() {
+        // No wrap-around: with one, a repeated key press silently changes which entry is on
+        // screen and the top of the history is indistinguishable from the bottom.
+        let mut screen = screen_with_commands();
+        screen.history = vec!["only".into()];
+        screen.history_up();
+        screen.history_up();
+        assert_eq!(input(&screen), "only");
+        assert_eq!(screen.history_index, Some(0));
+    }
+
+    #[test]
+    fn a_row_filled_to_the_edge_gets_a_row_for_the_caret() {
+        // 10 text columns, filled exactly. The caret marks where the next character goes,
+        // and there is no cell left on that row to draw it in — asking for column 13 of a
+        // 12-column terminal gets clamped by the terminal, and a caret that depends on a
+        // clamp is a caret that is sometimes somewhere else.
+        let mut screen = screen_with_commands();
+        screen.width = 12;
+        set_input(&mut screen, "abcdefghij");
+        let (lines, cursor) = screen.compose_live();
+        let (row, column) = cursor.unwrap();
+        assert_eq!(lines[row].text(), "  ", "the caret sits on its own row below");
+        assert_eq!(column, 2);
+        assert_eq!(row, 1, "not on the row that is full");
+    }
+
+    #[test]
+    fn the_caret_of_a_recalled_entry_lands_at_the_end() {
+        // Recalling a line is for running or amending it, so the caret belongs where the
+        // typing stopped — not at the start, where the next keystroke would be an insertion
+        // into the middle of a command.
+        let mut screen = screen_with_commands();
+        screen.history = vec!["/name x".into()];
+        set_input(&mut screen, "");
+        screen.history_up();
+        assert_eq!(screen.editing.as_ref().unwrap().caret(), 7);
+    }
+
+    #[test]
     fn the_erase_step_lands_on_the_first_live_row() {
         // Both halves of this arithmetic were wrong at different times, and both failures
         // look like "the screen creeps upward": one row of committed transcript is cleared
@@ -1745,7 +2618,7 @@ mod tests {
         // While editing, the cursor is parked on the input row, which is the *first* live
         // row — so erasing from there needs no upward move at all.
         let mut screen = screen_with_commands();
-        screen.editing = Some("hi".into());
+        set_input(&mut screen, "hi");
         screen.set_footer(vec![Line::plain("dir"), Line::plain("stats")]);
         let (lines, cursor) = screen.compose_live();
         let (row, _) = cursor.unwrap();
@@ -1856,7 +2729,7 @@ mod tests {
     #[test]
     fn the_cursor_follows_the_last_wrapped_row() {
         let mut screen = screen_with_commands();
-        screen.editing = Some(('a'..='z').collect());
+        set_input(&mut screen, &('a'..='z').collect::<String>());
         screen.width = 12;
         let (lines, cursor) = screen.compose_live();
         let (row, column) = cursor.unwrap();
@@ -1872,7 +2745,7 @@ mod tests {
         // Column is a display column, not a character count: 你好 is four cells wide, so the
         // caret belongs at 2 + 4, which is what makes it line up with the glyphs.
         let mut screen = screen_with_commands();
-        screen.editing = Some("你好".into());
+        set_input(&mut screen, "你好");
         let (_, cursor) = screen.compose_live();
         assert_eq!(cursor.unwrap().1, 2 + 4);
     }
@@ -1887,17 +2760,20 @@ mod tests {
     }
 
     #[test]
-    fn a_collapsible_block_keeps_only_its_tail() {        let lines: Vec<Line> = (0..10).map(|i| Line::plain(format!("line {i}"))).collect();
+    fn a_collapsible_block_keeps_only_its_excerpt() {
+        let lines: Vec<Line> = (0..10).map(|i| Line::plain(format!("line {i}"))).collect();
         let block = Block::collapsible(lines, 0, 0, 5);
         let rendered = block.render(40);
-        assert_eq!(rendered.len(), 6);
-        assert!(rendered[0].text().contains("已收起 5 行"));
-        assert_eq!(rendered[1].text(), "line 5");
-        assert_eq!(rendered[5].text(), "line 9");
+        // Five rows out of ten, shown as an excerpt of the last five — and no row spent
+        // saying so. The user reads this on every tool call; a note is not information.
+        assert_eq!(rendered.len(), 5);
+        assert_eq!(rendered[0].text(), "line 5");
+        assert_eq!(rendered[4].text(), "line 9");
+        assert!(!rendered.iter().any(|line| line.text().contains("收起")));
     }
 
     #[test]
-    fn expanding_shows_everything_and_short_blocks_get_no_note() {
+    fn expanding_shows_everything_and_short_blocks_are_left_alone() {
         let mut block = Block::collapsible(
             (0..4).map(|i| Line::plain(format!("l{i}"))).collect(),
             0,
@@ -1909,7 +2785,7 @@ mod tests {
             collapsible.expanded = true;
         }
         assert_eq!(block.render(40).len(), 4);
-        assert!(!block.render(40)[0].text().contains("已收起"));
+        assert!(!block.render(40).iter().any(|line| line.text().contains("收起")));
     }
 
     #[test]
@@ -1953,11 +2829,12 @@ mod tests {
         let lines: Vec<Line> = (0..12).map(|i| Line::plain(format!("row {i}"))).collect();
         let block = Block::collapsible(lines, 2, 0, 3);
         let rendered = block.render(40);
-        assert_eq!(rendered.len(), 2 + 1 + 3);
+        assert_eq!(rendered.len(), 2 + 3);
         assert_eq!(rendered[0].text(), "row 0");
         assert_eq!(rendered[1].text(), "row 1");
-        assert!(rendered[2].text().contains("已收起 7 行"));
-        assert_eq!(rendered[5].text(), "row 11");
+        // The excerpt is the tail of what is left after the head.
+        assert_eq!(rendered[2].text(), "row 9");
+        assert_eq!(rendered[4].text(), "row 11");
     }
 
     #[test]
@@ -1968,8 +2845,7 @@ mod tests {
         let rendered = block.render(40);
         let text: Vec<String> = rendered.iter().map(|l| l.text()).collect();
         assert_eq!(text[0], "row 0");
-        assert!(text[1].contains("已收起 9 行"), "{text:?}");
-        assert_eq!(text.len(), 1 + 1 + 2 + 1);
+        assert_eq!(text.len(), 1 + 2 + 1, "head, excerpt, tail — no note row");
         assert!(text.last().unwrap().contains("退出码 3"), "{text:?}");
     }
 

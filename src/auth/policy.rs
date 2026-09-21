@@ -4,7 +4,7 @@
 //!
 //! 1. **Parsing.** [`parse_literal_commands`] recognises a small literal-shell subset.
 //!    Anything it does not understand — expansions, redirects, background jobs, globs,
-//!    control characters — is refused, not guessed at. A command mpi cannot read is a
+//!    control characters — is refused, not guessed at. A command pi cannot read is a
 //!    command it asks about.
 //! 2. **Vetting.** Every word of every segment is resolved: to a trusted absolute
 //!    executable, to a concrete path, or to a refusal. Path arguments are checked
@@ -63,7 +63,7 @@ pub enum Dialect {
 }
 
 impl Dialect {
-    /// mpi always runs zsh; the bash branch exists for tests and future shells.
+    /// pi always runs zsh; the bash branch exists for tests and future shells.
     pub fn for_shell_path(path: &str) -> Dialect {
         let name = path.rsplit('/').next().unwrap_or(path);
         let name = name.strip_suffix(".exe").unwrap_or(name);
@@ -82,7 +82,7 @@ impl Dialect {
     }
 }
 
-/// The dialect mpi will actually use, derived from the configured shell.
+/// The dialect pi will actually use, derived from the configured shell.
 pub fn configured_dialect(shell_path: &str) -> Dialect {
     Dialect::for_shell_path(if shell_path.is_empty() { DEFAULT_SHELL } else { shell_path })
 }
@@ -208,8 +208,10 @@ fn basename(path: &Path) -> String {
 /// only mean credentials, and a false prompt is cheaper than a leaked key.
 const SENSITIVE_DIRS: &[&str] = &[".ssh", ".gnupg", ".aws", ".kube", ".docker", ".azure", ".gcloud"];
 /// Multi-segment credential locations, relative to the home directory. The agent harnesses
-/// are listed too: pi keeps provider keys in `~/.pi/agent/auth.json` and `models.json`, and
-/// codex/Claude/Gemini keep the same kind of live secret.
+/// are listed too: pi keeps provider keys in `~/.pi/config.json` and its sessions next to
+/// them, and codex/Claude/Gemini keep the same kind of live secret. `~/.pi` is this tool's
+/// own store — the config holds the provider key in clear text, so a command that reads it
+/// is worth a question.
 const HOME_PATHS: &[&str] = &[
     ".config/gh", ".config/gcloud", ".config/glab-cli", ".config/hub", ".config/doctl",
     ".pi", ".codex", ".claude", ".gemini", ".continue", ".aider", ".local/share/keyrings",
@@ -529,7 +531,7 @@ pub fn parse_literal_commands(command: &str) -> Result<Vec<Segment>, String> {
                             "|"
                         }
                     }
-                    // A single `&` backgrounds the command, which mpi never auto-approves.
+                    // A single `&` backgrounds the command, which pi never auto-approves.
                     _ => {
                         if chars.get(index + 1) == Some(&'&') {
                             index += 1;
@@ -1201,7 +1203,7 @@ mod tests {
     use super::*;
 
     fn cwd() -> PathBuf {
-        std::env::temp_dir().join("mpi-policy-cwd")
+        std::env::temp_dir().join("pi-policy-cwd")
     }
 
     fn allows(command: &str) -> bool {
@@ -1235,7 +1237,8 @@ mod tests {
         assert!(reason("cat /etc/shadow").contains("凭据"));
         assert!(reason("cat .env").contains("凭据"));
         assert!(reason("cat server.key").contains("凭据"));
-        assert!(!allows("cat ~/.pi/agent/auth.json"));
+        // `~/.pi` is this tool's own store, and its config holds the provider key.
+        assert!(!allows("cat ~/.pi/config.json"));
         assert!(!allows("cat ~/.codex/config.toml"));
         assert!(!allows("grep -r . .ssh"));
     }

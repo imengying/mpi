@@ -62,7 +62,7 @@ pub struct ModelConfig {
     pub compat: Option<CompatPatch>,
 }
 
-/// Every thinking level mpi knows about. `off` and `minimal` are deliberately absent:
+/// Every thinking level pi knows about. `off` and `minimal` are deliberately absent:
 /// `reasoning = false` already means "no reasoning".
 pub const LEVELS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 
@@ -139,14 +139,21 @@ pub enum ConfigError {
     BadDefaultModel(String),
 }
 
-/// Where mpi keeps everything it owns: `~/.mpi`.
+/// Where pi keeps everything it owns: `~/.pi`.
 ///
 /// One directory rather than splitting config to `~/.config` and data to `~/.local/share`.
 /// The file the user has to edit is then next to the sessions it produced, which is what
 /// makes it findable — the two are always mentioned together.
+///
+/// The project is `mpi`, but the store is named after the binary: what the user runs is
+/// `pi`, and a directory they have to find by hand is far more likely to be looked for
+/// under the name of the command than under the name of the repository.
 pub fn home_dir() -> PathBuf {
-    dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".mpi")
+    dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join(NEW_HOME)
 }
+
+/// The directory name the store lives under.
+pub const NEW_HOME: &str = ".pi";
 
 pub fn config_path() -> PathBuf {
     home_dir().join("config.json")
@@ -154,7 +161,7 @@ pub fn config_path() -> PathBuf {
 
 /// What a fresh install is given: every field is a placeholder to edit.
 ///
-/// The values are deliberately unusable. mpi stops after writing it rather than running
+/// The values are deliberately unusable. pi stops after writing it rather than running
 /// against it, because a template that silently "works" would send requests to a host that
 /// does not exist and report that as a network failure.
 pub const TEMPLATE: &str = r#"{
@@ -180,9 +187,9 @@ pub const TEMPLATE: &str = r#"{
   "default_model": "provider-name/model-id"
 }"#;
 
-/// Write the template, creating `~/.mpi` if needed.
+/// Write the template, creating `~/.pi` if needed.
 ///
-/// The file is created exclusively: two mpi processes starting at once must not have the
+/// The file is created exclusively: two pi processes starting at once must not have the
 /// second one overwrite the first one's edits. Losing that race is reported as a plain IO
 /// error, because from the caller's side the file it wanted to create is there now.
 fn init_config(path: &Path) -> Result<(), ConfigError> {
@@ -423,7 +430,7 @@ impl Defaults {
     pub const SESSIONS_DIR: &'static str = "sessions";
 }
 
-/// The root of the session store: `~/.mpi/sessions`.
+/// The root of the session store: `~/.pi/sessions`.
 pub fn sessions_root() -> PathBuf {
     home_dir().join(Defaults::SESSIONS_DIR)
 }
@@ -468,7 +475,7 @@ pub fn sessions_dir_in(root: &Path, cwd: &Path) -> PathBuf {
 /// An id for a directory that has no sessions yet.
 ///
 /// Never written: the table is a list of directories that *have* sessions, and registering
-/// every directory mpi is merely run in would make it a log of where the user has been.
+/// every directory pi is merely run in would make it a log of where the user has been.
 fn provisional_dir_id() -> String {
     short_id(&uuid::Uuid::now_v7().simple().to_string())
 }
@@ -578,7 +585,7 @@ fn write_dirs_index(root: &Path, index: &BTreeMap<String, String>) -> std::io::R
 /// Drop `cwd`'s entry if its directory holds no sessions, and remove the directory.
 ///
 /// Called after a session is deleted. Without it the store keeps a directory for every
-/// project that was ever used, and `ls ~/.mpi/sessions` stops being a list of the projects
+/// project that was ever used, and `ls ~/.pi/sessions` stops being a list of the projects
 /// that have history — which is the one thing the short-id layout is for.
 ///
 /// Only an *empty* directory is dropped: the entry names a real store as long as one session
@@ -639,7 +646,7 @@ pub fn known_dirs() -> Vec<(String, String)> {
     read_dirs_index(&sessions_root()).into_iter().collect()
 }
 
-/// Environment-variable names that must never be read. Kept for completeness: mpi
+/// Environment-variable names that must never be read. Kept for completeness: pi
 /// never reads process env values into the transcript on its own.
 pub fn is_secret_env(name: &str) -> bool {
     let upper = name.to_uppercase();
@@ -668,7 +675,7 @@ mod tests {
 
     #[test]
     fn the_template_parses_and_is_not_usable_as_it_stands() {
-        // The template has to parse, or the user opens a file that mpi then rejects for a
+        // The template has to parse, or the user opens a file that pi then rejects for a
         // reason unrelated to what they are editing. It must not be *runnable* either: its
         // host and key are placeholders, and a request sent there would fail as a network
         // error rather than as "you have not configured this yet".
@@ -707,7 +714,7 @@ mod tests {
         // The table is a list of where history *is*. Keeping a row for every project ever
         // used would turn it into a log of where the user has been, which is exactly what
         // the short-id layout exists to avoid.
-        let root = std::env::temp_dir().join(format!("mpiforget{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("piforget{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let store = root.join("store");
         let project = root.join("proj");
@@ -735,20 +742,20 @@ mod tests {
     }
 
     #[test]
-    fn every_path_lives_under_the_mpi_directory() {
-        // One directory for everything mpi owns, so the file to edit sits next to the
+    fn every_path_lives_under_the_pi_directory() {
+        // One directory for everything pi owns, so the file to edit sits next to the
         // sessions it produced. Asserted on the *names* rather than by calling the
         // resolvers: `sessions_dir` registers the directory it is asked about, and a test
         // that calls it writes into the real table — which is how a stray `/tmp/x` entry
         // ended up in a user's store.
         let home = home_dir();
-        assert!(home.ends_with(".mpi"), "{}", home.display());
+        assert!(home.ends_with(".pi"), "{}", home.display());
         assert_eq!(config_path(), home.join("config.json"));
         assert_eq!(sessions_root(), home.join("sessions"));
         assert_eq!(dirs_index_path(), home.join("sessions/dirs.json"));
 
         // Under a store of its own, the grouping still holds.
-        let root = std::env::temp_dir().join(format!("mpipaths{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("pipaths{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let dir = sessions_dir_in(&root, Path::new("/tmp/somewhere"));
         assert!(dir.starts_with(&root), "{}", dir.display());

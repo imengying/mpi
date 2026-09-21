@@ -120,12 +120,11 @@ pub enum Display {
         expanded: bool,
         footer: Vec<String>,
     },
-    /// A diff for `edit` / `write`.
+    /// A diff for `edit` / `write`, as the rows to show and the change counts.
     Diff {
         diff: String,
         added: usize,
         removed: usize,
-        omitted: bool,
     },
     /// A plain file header line.
     File {

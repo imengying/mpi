@@ -40,13 +40,21 @@ pub fn ask(request: PanelRequest) -> Decision {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         return Decision::Deny;
     }
-    let guard = match RawModeGuard::enter() {
+    // The shared guard, not a private one: this runs *inside* a turn, and switching raw mode
+    // off on the way out would hand the prompt back a line-buffering terminal — which is
+    // what used to swallow every keystroke typed while a turn was running.
+    let guard = match crate::ui::screen::RawGuard::enter() {
         Ok(guard) => guard,
         Err(_) => return Decision::Deny,
     };
     let theme = Theme::default();
     let mut state = PanelState::new(&request.body);
     let mut out = std::io::stdout();
+    // Nothing on the panel is a text position: the cursor has no place to sit while the
+    // question is up. Leaving it visible parks it on the last drawn row — under the choices,
+    // at the very bottom of the screen — where it blinks as if it were waiting for typing,
+    // which is exactly the wrong reading of "waiting for your decision".
+    let _ = crossterm::execute!(out, cursor::Hide);
     let decision = loop {
         if state.draw(&mut out, &theme).is_err() {
             break Decision::Deny;
@@ -62,24 +70,10 @@ pub fn ask(request: PanelRequest) -> Decision {
         }
     };
     state.clear(&mut out);
+    let _ = crossterm::execute!(out, cursor::Show);
     let _ = out.flush();
     drop(guard);
     decision
-}
-
-struct RawModeGuard;
-
-impl RawModeGuard {
-    fn enter() -> std::io::Result<Self> {
-        terminal::enable_raw_mode()?;
-        Ok(RawModeGuard)
-    }
-}
-
-impl Drop for RawModeGuard {
-    fn drop(&mut self) {
-        let _ = terminal::disable_raw_mode();
-    }
 }
 
 struct PanelState {

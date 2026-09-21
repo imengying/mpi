@@ -2,6 +2,9 @@
 
 极简终端 AI 编程代理。单个二进制，无插件、无会话树、无账号体系。
 
+项目名 `mpi`，**产物与配置目录叫 `pi`**：仓库和库仍叫 `mpi`（`mpi::` 路径不变），
+但你要敲的命令、装出来的二进制、配置与数据目录是 `pi` / `~/.pi`。
+
 ```
 ~/文档/mpi (main) • 重构配置层
 ↑ 173k   ↓ 173k   󱘲 99.5%   17.3k/1M                     deepseek-v4.1-flash • high
@@ -24,7 +27,7 @@ curl -fsSL https://raw.githubusercontent.com/imengying/mpi/main/install.sh | sh
 curl -fsSL https://raw.githubusercontent.com/imengying/mpi/main/install.sh | sh -s -- v0.1.3 --dir /usr/local/bin
 ```
 
-装好后的升级不用重新跑脚本，`mpi update` 就地自更新：下载最新 Release、
+装好后的升级不用重新跑脚本，`pi update` 就地自更新：下载最新 Release、
 按 GitHub 提供的 sha256 校验、原子替换自身。
 
 脚本只依赖 POSIX sh、curl（或 wget）、tar。产物覆盖 Linux / macOS 的
@@ -32,30 +35,30 @@ x86_64 / aarch64；Linux 产物要求 glibc ≥ 2.39（ubuntu-24.04 构建），
 再下载，musl（Alpine 等）暂无产物。需要代理时设 `https_proxy` 环境变量即可，
 curl / wget 会自己认。
 
-mpi 用 zsh 执行命令（默认 `/usr/bin/zsh`），系统里得有它。
+pi 用 zsh 执行命令（默认 `/usr/bin/zsh`），系统里得有它。
 
 ### 手动安装
 
 到 [Releases](https://github.com/imengying/mpi/releases) 下载对应 target 的
-`mpi-<版本>-<target>.tar.gz`（targets 见[发布](#发布)），解压后放进 PATH：
+`pi-<版本>-<target>.tar.gz`（targets 见[发布](#发布)），解压后放进 PATH：
 
 ```sh
-tar -xzf mpi-*-*.tar.gz --strip-components=1
-install -m755 mpi ~/.local/bin/
+tar -xzf pi-*-*.tar.gz --strip-components=1
+install -m755 pi ~/.local/bin/
 ```
 
 ### 从源码构建
 
 ```sh
 cargo build --release
-install -m755 target/release/mpi ~/.local/bin/mpi
+install -m755 target/release/pi ~/.local/bin/pi
 ```
 
 要求 rustc 1.98+（edition 2024）。
 
 ## 配置
 
-配置在 `~/.mpi/config.json`，启动时读一次，没有热重载。
+配置在 `~/.pi/config.json`，启动时读一次，没有热重载。
 **第一次运行会自动写出模板**，然后停下并打印路径：填好 provider 与模型再运行。
 
 ```json
@@ -84,7 +87,7 @@ install -m755 target/release/mpi ~/.local/bin/mpi
 ```
 
 `providers` 是必填的，其余都有默认值。**配置里写了几个模型，`/model` 就只列几个** ——
-mpi 没有内置模型目录，也不会去猜。没配置 providers 会直接报错退出。
+pi 没有内置模型目录，也不会去猜。没配置 providers 会直接报错退出。
 
 | 字段 | 说明 |
 |---|---|
@@ -103,7 +106,7 @@ mpi 没有内置模型目录，也不会去猜。没配置 providers 会直接�
 
 ### 兼容开关
 
-不同网关对「OpenAI 兼容」的理解不一样。mpi 按 `base_url` 自动探测一组开关，
+不同网关对「OpenAI 兼容」的理解不一样。pi 按 `base_url` 自动探测一组开关，
 配置里只写例外（`compat` 可以是 provider 级或 model 级，model 级优先）：
 
 ```json
@@ -125,15 +128,15 @@ mpi 没有内置模型目录，也不会去猜。没配置 providers 会直接�
 ## 启动
 
 ```sh
-mpi              # 新会话
-mpi resume       # 继续最近一次会话（等价于 /resume）
-mpi resume <id>  # 继续指定会话，id 或其前缀（退出时会打印这条命令）
-mpi update       # 更新到最新 Release
+pi              # 新会话
+pi resume       # 继续最近一次会话（等价于 /resume）
+pi resume <id>  # 继续指定会话，id 或其前缀（退出时会打印这条命令）
+pi update       # 更新到最新 Release
 ```
 
 ## 系统提示词
 
-**mpi 不内置任何提示词。** 模型收到的 system 消息完全来自项目里的 `AGENTS.md`：
+**pi 不内置任何提示词。** 模型收到的 system 消息完全来自项目里的 `AGENTS.md`：
 
 - 只读**项目根目录**那一份。项目根 = 从当前目录向上找到的最近一个含 `.git` 的目录；
   不在 git 项目里时，就是当前目录本身。
@@ -146,7 +149,7 @@ mpi update       # 更新到最新 Release
 - 环境信息（工作目录、平台、shell、会话 id）走单独的环境块，不放进提示词，
   否则每轮变动都会让缓存失效。
 
-想让 mpi 有固定的工作方式，在项目根目录写一份即可：
+想让 pi 有固定的工作方式，在项目根目录写一份即可：
 
 ```markdown
 # AGENTS.md
@@ -165,7 +168,7 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
-产物为 `mpi-<版本>-<target>.tar.gz`（内含二进制、README、LICENSE）；校验和由 GitHub 在 Release 页面自行提供。Release 标题就是 tag 本身（如 `v0.1.3`）。
+产物为 `pi-<版本>-<target>.tar.gz`（内含二进制、README、LICENSE）；校验和由 GitHub 在 Release 页面自行提供。Release 标题就是 tag 本身（如 `v0.1.3`）。
 targets：
 
 | target | runner |
@@ -178,8 +181,8 @@ targets：
 Linux 二进制依赖 runner 自带的 glibc（当前 2.39），构建摘要里会列出它实际引用到的
 最高 `GLIBC_x.y` 符号版本，方便确认需要多新的系统。
 
-`--version` 取的是 tag：工作流把 tag 以 `MPI_BUILD_VERSION` 传入构建（`build.rs` 把它
-声明为 rerun 触发条件，避免缓存留下旧值），并在打包前校验 `mpi --version` 与 tag 一致，
+`--version` 取的是 tag：工作流把 tag 以 `PI_BUILD_VERSION` 传入构建（`build.rs` 把它
+声明为 rerun 触发条件，避免缓存留下旧值），并在打包前校验 `pi --version` 与 tag 一致，
 不一致直接报错退出。本地构建没有这个变量，回退到 `Cargo.toml` 里的版本。
 
 构建用 `--locked`，即按 `Cargo.lock` 里锁定的版本编译；依赖更新走
@@ -202,17 +205,30 @@ Linux 二进制依赖 runner 自带的 glibc（当前 2.39），构建摘要里�
 不能靠默认选择拿主意。
 
 输入 `/` 会弹出命令菜单，继续输入即按前缀过滤。`Tab` 补全：唯一匹配补全并加一个空格，
-多个匹配先补到公共前缀、补无可补时在菜单里往下走；`Shift+Tab` 往回。菜单打开时
-`↑`/`↓` 移动高亮、`Enter` 选中（只填入命令、不提交，再按一次 `Enter` 才执行）、`Esc` 关闭。
+多个匹配先补到公共前缀、补无可补时在菜单里往下走；`Shift+Tab` 往回。菜单打开时 `Enter`
+选中并执行（`Tab`/`Shift+Tab` 移动高亮）、`Esc` 关闭——关掉之后不会自己再弹出来，
+继续打字（缓冲区变了）才重新出现。
+
+`↑`/`↓` 是输入历史，**始终如此**，即使菜单正开着：否则恢复一条命令名进来就再也退不出去。
+往回走到头就停住；往下走过最后一条之后回到**空白行**，并且把你漫游前正在写的那半句还给你。
+
+`←`/`→` 在输入行里移动光标（按字符，中文算一个），在中间打字、退格都改在光标处；
+`Home`/`Ctrl+A` 到行首，`End`/`Ctrl+E` 到行尾，`Ctrl+K` 删到行尾，`Delete` 删光标处的字符。
 
 输入超过一行时**折行显示**（续行缩进到正文之下），不横向滚动，所以开头始终看得见。
+光标跟着文字走，落在它该在的那一行的那个字符上。
+
+**回合进行中输入行照常可用**：模型在答、命令在跑的时候照样能打字、粘贴图片、
+按 `Ctrl+O` 展开输出、输入 `/` 看菜单。此时按 `Enter` 提交的行会排在当前这一轮后面，
+显示在输入行上方（`… <内容>`），这一轮结束后按提交顺序处理 —— 以 `/` 开头的是命令，
+原样当命令执行；其余是消息，连同图片一起发给模型。等待授权时面板上不显示光标。
 
 `Ctrl+V` 粘贴剪贴板里的图片（截图直接可用），图片显示为 `[图片 1280×720, 84 KB]`
 挂在输入行下方；也可以只粘图片不带文字。图片随该条消息一起发出去，存在会话文件里，
 `/resume` 之后仍在。剪贴板没有图片时 `Ctrl+V` 退化为粘贴文本。
 
 其余快捷键：`Ctrl+O` 展开/收起最近一块工具输出，`Ctrl+C` 清空当前输入行（空行时退出），
-`Ctrl+U` / `Ctrl+W` 删到行首 / 删一个词，`↑`/`↓` 在菜单关闭时翻输入历史。
+`Ctrl+U` / `Ctrl+W` 删到行首 / 删一个词，`Ctrl+K` 删到行尾。
 
 ## 工具
 
@@ -223,6 +239,10 @@ Linux 二进制依赖 runner 自带的 glibc（当前 2.39），构建摘要里�
 
 工具输出最多保留 2000 行或 50KB，超出时**保留末尾**并把完整输出写进临时文件，
 在结果里给出路径。
+
+长输出折叠时**直接显示摘录，不提示「已收起 N 行」**——那一行每次工具调用都要占一行位置，
+而截断本身从内容就看得出来。文件修改同理：过大的改动不会只留一句「预览已省略」，
+而是先把两侧相同的首尾行剪掉、只对改动区域做 diff，所以「大文件里改一行」照样看得见那一行。
 
 ## 授权
 
@@ -262,7 +282,7 @@ printf echo true false cut tr du df uname rg grep find sort file sed git`），
 
 ## 会话
 
-线性 JSONL，一行一条记录，存在 `~/.mpi/sessions/<短 id>/`，`dirs.json` 记录 id 对应的绝对路径。
+线性 JSONL，一行一条记录，存在 `~/.pi/sessions/<短 id>/`，`dirs.json` 记录 id 对应的绝对路径。
 
 记录分类型存放：会话头、对话项、每轮环境快照、事件（含 token 统计）、压缩检查点。
 环境快照与对话分开存，所以它不会污染上下文，也不会在压缩时被当成对话处理。

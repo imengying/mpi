@@ -85,7 +85,7 @@ mod tests {
 
 
     fn temp_dir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("mpi-edit-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("pi-edit-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }

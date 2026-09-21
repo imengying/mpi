@@ -1,4 +1,4 @@
-//! `mpi update`: replace the running binary with the latest GitHub Release build.
+//! `pi update`: replace the running binary with the latest GitHub Release build.
 //!
 //! The flow mirrors `install.sh` — query the API for the latest tag, pick the asset for
 //! the running target, verify GitHub's own sha256 digest of the download, then swap the
@@ -33,7 +33,7 @@ async fn update() -> Result<()> {
     let http = reqwest::Client::builder()
         // GitHub's API rejects requests without a User-Agent with 403, and reqwest sends
         // none by default.
-        .user_agent(format!("mpi/{}", cli::version()))
+        .user_agent(format!("pi/{}", cli::version()))
         .connect_timeout(Duration::from_secs(20))
         .read_timeout(Duration::from_secs(300))
         .build()?;
@@ -54,20 +54,20 @@ async fn update() -> Result<()> {
         .trim_start_matches('v')
         .to_string();
     if latest == current {
-        println!("已是最新版本：mpi {latest}");
+        println!("已是最新版本：pi {latest}");
         return Ok(());
     }
     // A source build, or a build from a tag that has no Release yet, can report something
     // newer than the latest Release. Replacing it would quietly move the user backwards.
     if newer_than(current, &latest) {
-        println!("本地 mpi {current} 比最新 Release {latest} 更新，保持不变。");
+        println!("本地 pi {current} 比最新 Release {latest} 更新，保持不变。");
         println!("要强制安装 Release 版，请运行 install.sh。");
         return Ok(());
     }
 
     // A release always carries all four targets, so a miss here means the asset naming
     // changed — say so instead of downloading something guessed at.
-    let asset_name = format!("mpi-{latest}-{triple}.tar.gz");
+    let asset_name = format!("pi-{latest}-{triple}.tar.gz");
     let asset = release["assets"]
         .as_array()
         .context("Release 信息里没有资产列表")?
@@ -84,7 +84,7 @@ async fn update() -> Result<()> {
         .context("Release 信息里没有下载地址")?
         .to_string();
 
-    println!("==> mpi {current} → {latest}（{triple}）");
+    println!("==> pi {current} → {latest}（{triple}）");
     let tarball = http
         .get(url)
         .send()
@@ -95,7 +95,7 @@ async fn update() -> Result<()> {
         .bytes()
         .await?;
 
-    let work = std::env::temp_dir().join(format!("mpi-update-{}", std::process::id()));
+    let work = std::env::temp_dir().join(format!("pi-update-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&work);
     std::fs::create_dir_all(&work)?;
     let archive = work.join(&asset_name);
@@ -109,19 +109,19 @@ async fn update() -> Result<()> {
     println!("==> sha256 校验通过");
 
     extract_binary(&archive, &work)?;
-    let downloaded = work.join("mpi");
+    let downloaded = work.join("pi");
     let reported = std::process::Command::new(&downloaded)
         .arg("--version")
         .output()
         .context("无法运行下载的二进制")?;
     ensure!(
         reported.status.success()
-            && String::from_utf8_lossy(&reported.stdout).trim() == format!("mpi {latest}"),
-        "下载的二进制没有报告 mpi {latest}"
+            && String::from_utf8_lossy(&reported.stdout).trim() == format!("pi {latest}"),
+        "下载的二进制没有报告 pi {latest}"
     );
 
     replace_current_exe(&downloaded, &current_exe()?)?;
-    println!("==> 已更新到 mpi {latest}");
+    println!("==> 已更新到 pi {latest}");
     let _ = std::fs::remove_dir_all(&work);
     Ok(())
 }
@@ -174,7 +174,7 @@ fn sha256_hex(path: &Path) -> Result<String> {
         .to_lowercase())
 }
 
-/// Unwrap `mpi-<版本>-<target>/mpi` out of the release archive with the system tar.
+/// Unwrap `pi-<版本>-<target>/pi` out of the release archive with the system tar.
 fn extract_binary(archive: &Path, dir: &Path) -> Result<()> {
     let status = std::process::Command::new("tar")
         .arg("-xzf")
@@ -185,7 +185,7 @@ fn extract_binary(archive: &Path, dir: &Path) -> Result<()> {
         .status()
         .context("找不到 tar")?;
     ensure!(status.success(), "解压 {archive:?} 失败");
-    ensure!(dir.join("mpi").is_file(), "压缩包里没有 mpi 二进制");
+    ensure!(dir.join("pi").is_file(), "压缩包里没有 pi 二进制");
     Ok(())
 }
 
@@ -196,7 +196,7 @@ fn current_exe() -> Result<PathBuf> {
 /// Swap the binary under the running process: stage next to it (same filesystem, so the
 /// rename is atomic) and rename over. `fs::copy` carries the permission bits over.
 fn replace_current_exe(new_binary: &Path, exe: &Path) -> Result<()> {
-    let staged = exe.with_file_name(".mpi.new");
+    let staged = exe.with_file_name(".pi.new");
     std::fs::copy(new_binary, &staged)
         .with_context(|| format!("写入 {} 失败（目录可写吗？）", staged.display()))?;
     std::fs::rename(staged, exe).with_context(|| format!("替换 {} 失败", exe.display()))?;

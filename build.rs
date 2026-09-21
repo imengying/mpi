@@ -21,14 +21,14 @@ fn normalise(raw: String) -> String {
 }
 
 fn main() {
-    println!("cargo:rerun-if-env-changed=MPI_BUILD_VERSION");
+    println!("cargo:rerun-if-env-changed=PI_BUILD_VERSION");
     println!("cargo:rerun-if-changed=build.rs");
 
-    if let Ok(raw) = env::var("MPI_BUILD_VERSION") {
+    if let Ok(raw) = env::var("PI_BUILD_VERSION") {
         let version = normalise(raw);
         // Keep the exact bytes the binary will report, so the workflow's check compares
         // like with like even if the tag had surprising characters in it.
-        println!("cargo:rustc-env=MPI_BUILD_VERSION={version}");
+        println!("cargo:rustc-env=PI_BUILD_VERSION={version}");
     }
 
     // CI verifies the binary against the tag. Saying so here puts the failure next to the
@@ -37,10 +37,10 @@ fn main() {
     let is_tag_push = env::var("GITHUB_REF_TYPE").is_ok_and(|t| t == "tag");
     if is_tag_push && !tag.is_empty() {
         let expected = normalise(tag);
-        if let Some(binary) = env::var("MPI_BUILD_VERSION").ok().map(normalise)
+        if let Some(binary) = env::var("PI_BUILD_VERSION").ok().map(normalise)
             && binary != expected
         {
-            panic!("MPI_BUILD_VERSION ({binary}) 与 tag ({expected}) 不一致");
+            panic!("PI_BUILD_VERSION ({binary}) 与 tag ({expected}) 不一致");
         }
     }
 }

@@ -1,5 +1,5 @@
 //! The single dark theme. Colours are codex's semantics, hard-coded on purpose:
-//! mpi has no theme switcher.
+//! pi has no theme switcher.
 
 /// `truecolor` vs 256-colour fallback is decided once per process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -148,7 +148,7 @@ mod tests {
 
 
     fn fixture() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("mpi-grep-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("pi-grep-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("a.txt"), "alpha\nbeta\n").unwrap();
         std::fs::write(dir.join("b.txt"), "gamma\nbeta\n").unwrap();

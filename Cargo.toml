@@ -5,6 +5,13 @@ edition = "2024"
 description = "极简终端 AI 编程代理"
 license = "MIT"
 
+# The project keeps the name `mpi`, so the library and its `mpi::` paths are unchanged;
+# what the user runs is `pi`. The binary is what every user-facing name follows — the
+# release archive, the updater, the resume hint — so it is renamed here, once.
+[[bin]]
+name = "pi"
+path = "src/main.rs"
+
 [dependencies]
 # `time` is for the working spinner: it advances the frame while a request or a command
 # blocks, which is exactly when no other event arrives to redraw on.

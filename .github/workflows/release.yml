@@ -1,7 +1,7 @@
 name: release
 
 # Pushing a tag is the release trigger, and the tag itself is the version: `v1.2.3`
-# builds `mpi-1.2.3-<target>`. Nothing else in the repo carries a version that has to be
+# builds `pi-1.2.3-<target>`. Nothing else in the repo carries a version that has to be
 # kept in sync.
 on:
   push:
@@ -29,7 +29,7 @@ jobs:
       # quote the same string. This is set for the whole job because `cargo test --release`
       # also builds the binary; a step-scoped value would let that rebuild it without the
       # version.
-      MPI_BUILD_VERSION: ${{ github.ref_name }}
+      PI_BUILD_VERSION: ${{ github.ref_name }}
     strategy:
       fail-fast: false
       matrix:
@@ -70,18 +70,18 @@ jobs:
           zsh --version
 
       - name: Build
-        # `build.rs` declares MPI_BUILD_VERSION as a rerun trigger, so a cached build cannot
+        # `build.rs` declares PI_BUILD_VERSION as a rerun trigger, so a cached build cannot
         # keep a stale value when the tag changes.
         run: |
           set -euo pipefail
           cargo build --release --locked --target ${{ matrix.target }}
           # Verify the version is the tag, so a mismatch fails here rather than shipping.
-          REPORTED="$("target/${{ matrix.target }}/release/mpi" --version | awk '{print $NF}')"
+          REPORTED="$("target/${{ matrix.target }}/release/pi" --version | awk '{print $NF}')"
           test "$REPORTED" = "${GITHUB_REF_NAME#v}" || {
             echo "::error::binary reports ${REPORTED}, tag says ${GITHUB_REF_NAME#v}"
             exit 1
           }
-          echo "binary reports mpi ${REPORTED}"
+          echo "binary reports pi ${REPORTED}"
 
       - name: Test
         # The host toolchain runs the tests; nothing here is target-specific.
@@ -94,9 +94,9 @@ jobs:
           set -euo pipefail
           # The tag is the version, so the artifact names carry it.
           VERSION="${GITHUB_REF_NAME#v}"
-          NAME="mpi-${VERSION}-${{ matrix.target }}"
+          NAME="pi-${VERSION}-${{ matrix.target }}"
           mkdir -p "dist/$NAME"
-          cp "target/${{ matrix.target }}/release/mpi" "dist/$NAME/"
+          cp "target/${{ matrix.target }}/release/pi" "dist/$NAME/"
           cp README.md "dist/$NAME/"
           # The licence text travels with the binary that is published under it.
           cargo metadata --format-version 1 --no-deps \
@@ -111,7 +111,7 @@ jobs:
         run: |
           # Record the floor in the run summary, so an unexpectedly high requirement is
           # visible instead of shipping silently.
-          FLOOR="$(objdump -T target/x86_64-unknown-linux-gnu/release/mpi \
+          FLOOR="$(objdump -T target/x86_64-unknown-linux-gnu/release/pi \
             | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)"
           {
             echo "### glibc requirement"
@@ -124,7 +124,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: mpi-${{ matrix.target }}
+          name: pi-${{ matrix.target }}
           path: dist/*.tar.gz
           if-no-files-found: error
 
@@ -142,7 +142,7 @@ jobs:
 
       - uses: actions/download-artifact@v8
         with:
-          pattern: mpi-*
+          pattern: pi-*
           path: artifacts
           merge-multiple: true
 

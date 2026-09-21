@@ -1,9 +1,9 @@
 #!/bin/sh
-# mpi 安装脚本：从 GitHub Release 下载（默认最新版）并安装到本机。
+# pi 安装脚本：从 GitHub Release 下载（默认最新版）并安装到本机。
 #
 #   sh install.sh                       # 最新版 → ~/.local/bin
 #   sh install.sh v0.1.3                # 指定版本（不带 v 也行）
-#   sh install.sh --dir /usr/local/bin  # 指定目录（或环境变量 MPI_INSTALL_DIR）
+#   sh install.sh --dir /usr/local/bin  # 指定目录（或环境变量 PI_INSTALL_DIR）
 #   curl -fsSL <raw>/install.sh | sh    # 一键安装
 #
 # 校验和不用单独的 .sha256 附件：GitHub API 对每个资产自带 sha256 digest
@@ -22,16 +22,16 @@ usage() {
 用法：sh install.sh [版本] [--dir <目录>]
 
   版本       要安装的 Release（如 v0.1.3 或 0.1.3，latest 表示最新），默认最新
-  --dir      安装目录，默认 ~/.local/bin（可用环境变量 MPI_INSTALL_DIR 覆盖）
+  --dir      安装目录，默认 ~/.local/bin（可用环境变量 PI_INSTALL_DIR 覆盖）
 EOF
 }
 
 # ---------------------------------------------------------------- 参数
 
 VERSION_ARG=''
-DIR="${MPI_INSTALL_DIR:-}"
+DIR="${PI_INSTALL_DIR:-}"
 [ -n "$DIR" ] || [ -n "${HOME:-}" ] \
-  || die '需要 HOME 环境变量（或用 --dir / MPI_INSTALL_DIR 指定目录）'
+  || die '需要 HOME 环境变量（或用 --dir / PI_INSTALL_DIR 指定目录）'
 : "${DIR:=$HOME/.local/bin}"
 
 while [ $# -gt 0 ]; do
@@ -122,7 +122,7 @@ fetch "$API_URL" "$TMP/release.json" \
 TAG=$(sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' "$TMP/release.json" | head -n 1)
 [ -n "$TAG" ] || die 'Release 信息里读不到 tag_name（可能是限流，稍后再试）'
 VERSION=${TAG#v}
-ASSET="mpi-${VERSION}-${TARGET}.tar.gz"
+ASSET="pi-${VERSION}-${TARGET}.tar.gz"
 URL="https://github.com/$REPO/releases/download/$TAG/$ASSET"
 
 # JSON 压成单行后：先定位精确的资产名（带前后引号，避免误配 .sha256 附件），
@@ -140,7 +140,7 @@ DIGEST=$(tr -d '\n' < "$TMP/release.json" \
 
 # ---------------------------------------------------------------- 下载安装
 
-printf '==> 安装 mpi %s（%s）\n' "$VERSION" "$TARGET"
+printf '==> 安装 pi %s（%s）\n' "$VERSION" "$TARGET"
 fetch "$URL" "$TMP/$ASSET" || die "下载失败：$URL（该 Release 可能没有 $TARGET 产物）"
 
 if [ -n "$DIGEST" ]; then
@@ -160,20 +160,20 @@ else
 fi
 
 tar -xzf "$TMP/$ASSET" -C "$TMP" --strip-components=1
-[ -f "$TMP/mpi" ] || die '压缩包里没有 mpi 二进制'
+[ -f "$TMP/pi" ] || die '压缩包里没有 pi 二进制'
 
 mkdir -p "$DIR" || die "创建目录失败：$DIR"
 DIR_ABS=$(cd "$DIR" && pwd) || die "进不去目录：$DIR"
 if have install; then
-  install -m 755 "$TMP/mpi" "$DIR_ABS/mpi"
+  install -m 755 "$TMP/pi" "$DIR_ABS/pi"
 else
-  cp "$TMP/mpi" "$DIR_ABS/mpi" && chmod 755 "$DIR_ABS/mpi"
+  cp "$TMP/pi" "$DIR_ABS/pi" && chmod 755 "$DIR_ABS/pi"
 fi
 
-INSTALLED=$("$DIR_ABS/mpi" --version 2>/dev/null || true)
-[ "$INSTALLED" = "mpi $VERSION" ] \
-  || warn "安装的二进制报告版本为「${INSTALLED:-空}」，预期 mpi $VERSION"
-printf '==> 已安装 %s/mpi（%s）\n' "$DIR_ABS" "${INSTALLED:-版本未知}"
+INSTALLED=$("$DIR_ABS/pi" --version 2>/dev/null || true)
+[ "$INSTALLED" = "pi $VERSION" ] \
+  || warn "安装的二进制报告版本为「${INSTALLED:-空}」，预期 pi $VERSION"
+printf '==> 已安装 %s/pi（%s）\n' "$DIR_ABS" "${INSTALLED:-版本未知}"
 
 case ":$PATH:" in
   *":$DIR_ABS:"*) ;;

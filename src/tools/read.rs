@@ -72,7 +72,7 @@ mod tests {
     use crate::tools::block;
 
     fn temp_dir() -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("mpi-read-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("pi-read-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }

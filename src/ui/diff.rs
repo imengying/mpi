@@ -1,21 +1,31 @@
 //! Red/green diffs for `edit` and `write`.
 //!
 //! The diff is presentation only: the model gets a one-line summary, the user gets the
-//! change. Rows keep a line number and the preview is capped, with a note saying how
-//! many rows are hidden. Very large writes skip the computation entirely rather than
-//! stalling the turn.
+//! change. Rows keep a line number, and a big change is shown as an **excerpt of itself**
+//! — the interesting part, taken from the real diff. It is never replaced by a sentence
+//! saying a diff exists and has been left out: that is a row spent telling the user that
+//! they were not shown the thing they asked for.
 
 use similar::{ChangeTag, TextDiff};
 
-use crate::config::Defaults;
 use crate::tools::Display;
 use crate::ui::screen::{Bg, Line, Span, Style};
 use crate::ui::theme::{Color, Theme};
 use crate::util;
 
-/// Beyond these limits the diff is not worth the rows or the time.
+/// Beyond these limits the diff is not worth the time it takes to compute, so the excerpt
+/// is taken from the changed region only instead of from a diff of the whole thing. The
+/// window is generous: it has to be big enough that the excerpt still shows real content.
 const MAX_DIFF_BYTES: usize = 128 * 1024;
 const MAX_DIFF_LINES: usize = 2000;
+
+/// How much of a change too large to diff whole is actually diffed.
+///
+/// Both sides of the changed region are bounded by this, so the work stays proportional to
+/// the excerpt rather than to the file. It is applied *after* the unchanged ends have been
+/// trimmed away, so in the ordinary case — one edit in a big file — the region being diffed
+/// is the edit itself, however large the file is.
+const WINDOW_LINES: usize = 400;
 
 #[derive(Debug, Clone)]
 pub struct DiffRow {
@@ -34,23 +44,25 @@ pub enum Kind {
 
 /// Build the display payload for a replacement.
 pub fn for_edit(before: &str, after: &str) -> Display {
-    build(before, after, false)
+    build(before, after)
 }
 
 pub fn for_write(before: &str, after: &str) -> Display {
-    build(before, after, false)
+    build(before, after)
 }
 
 /// A brand-new file has no "before", so every line is an addition.
 pub fn for_new_file(content: &str) -> Display {
-    build("", content, true)
+    build("", content)
 }
 
-fn build(before: &str, after: &str, _is_new: bool) -> Display {
+fn build(before: &str, after: &str) -> Display {
     if before.len() + after.len() > MAX_DIFF_BYTES
         || before.lines().count() + after.lines().count() > MAX_DIFF_LINES
     {
-        return Display::Diff { diff: String::new(), added: 0, removed: 0, omitted: true };
+        // Too big to diff as a whole, not too big to show: the excerpt comes from the part
+        // that actually differs.
+        return build_window(before, after);
     }
     let diff = TextDiff::from_lines(before, after);
     let mut added = 0usize;
@@ -76,10 +88,13 @@ fn build(before: &str, after: &str, _is_new: bool) -> Display {
             text,
         });
     }
-    // Render eagerly to a plain string: the payload travels with the tool result and the
-    // UI only has to colourise it.
-    let body = rows
-        .iter()
+    Display::Diff { diff: body_of(&rows), added, removed }
+}
+
+/// Render rows to the plain string that travels with the tool result. The UI only has to
+/// colourise it.
+fn body_of(rows: &[DiffRow]) -> String {
+    rows.iter()
         .map(|row| {
             let marker = match row.kind {
                 Kind::Added => '+',
@@ -89,24 +104,130 @@ fn build(before: &str, after: &str, _is_new: bool) -> Display {
             format!("{marker}{:>5} {:>5} │ {}", num(row.old_line), num(row.new_line), row.text)
         })
         .collect::<Vec<_>>()
-        .join("\n");
-    Display::Diff { diff: body, added, removed, omitted: false }
+        .join("\n")
+}
+
+/// Show an excerpt of a change too large to diff whole.
+///
+/// The excerpt comes from the region that actually differs, found by trimming the common
+/// lines off both ends first. That trim is a linear scan of the two sides, not a diff, and it
+/// is what makes the excerpt land on the change: for the ordinary case — one edit in a huge
+/// file — the region left after trimming *is* the edit, however large the file around it is.
+/// Sampling the head and the tail of the file instead would show two slices of unchanged
+/// text, report `+0 −0`, and say nothing at all about what changed.
+///
+/// When even the changed region is too large to show — a file rewritten end to end — the
+/// first and last part of it are diffed, which is how a large rewrite is read: what was
+/// taken away at the top, what replaced it at the bottom.
+///
+/// The counts are of what is shown. Walking a two-million-line file to put an exact number
+/// in a header is the cost this limit exists to avoid, and for an excerpt the number of rows
+/// on screen is the honest one.
+fn build_window(before: &str, after: &str) -> Display {
+    let before_lines: Vec<&str> = before.lines().collect();
+    let after_lines: Vec<&str> = after.lines().collect();
+    let (head, tail) = common_ends(&before_lines, &after_lines);
+    let old_middle = &before_lines[head..before_lines.len() - tail];
+    let new_middle = &after_lines[head..after_lines.len() - tail];
+    let mut rows: Vec<DiffRow> = Vec::new();
+    for (old_start, new_start, old, new) in windows(old_middle, new_middle, head) {
+        rows.extend(diff_rows(old, new, old_start, new_start));
+    }
+    let added = rows.iter().filter(|row| row.kind == Kind::Added).count();
+    let removed = rows.iter().filter(|row| row.kind == Kind::Removed).count();
+    Display::Diff { diff: body_of(&rows), added, removed }
+}
+
+/// How many lines at each end of the two files are identical, counted from that end.
+///
+/// The shared run is clipped to the shorter file so a file that is a prefix of the other
+/// cannot make the two counts overlap and "trim" lines that are not shared.
+fn common_ends(before: &[&str], after: &[&str]) -> (usize, usize) {
+    let mut head = 0usize;
+    while head < before.len() && head < after.len() && before[head] == after[head] {
+        head += 1;
+    }
+    let most = before.len().min(after.len()) - head;
+    let mut tail = 0usize;
+    while tail < most && before[before.len() - 1 - tail] == after[after.len() - 1 - tail] {
+        tail += 1;
+    }
+    (head, tail)
+}
+
+/// The parts of each side to diff, as `(old_start, new_start, old, new)` with the starts
+/// already offset back to line numbers in the real file.
+fn windows<'s, 'a>(
+    old: &'s [&'a str],
+    new: &'s [&'a str],
+    offset: usize,
+) -> Vec<(usize, usize, &'s [&'a str], &'s [&'a str])> {
+    let old_ranges = ranges(old.len());
+    let new_ranges = ranges(new.len());
+    let count = old_ranges.len().max(new_ranges.len());
+    (0..count)
+        .map(|index| {
+            // A side with nothing left to split off contributes an empty slice at its end,
+            // so its lines are not shown twice.
+            let (old_from, old_to) =
+                old_ranges.get(index).copied().unwrap_or((old.len(), old.len()));
+            let (new_from, new_to) =
+                new_ranges.get(index).copied().unwrap_or((new.len(), new.len()));
+            (
+                offset + old_from,
+                offset + new_from,
+                &old[old_from..old_to],
+                &new[new_from..new_to],
+            )
+        })
+        .collect()
+}
+
+/// Which line ranges of a side to show: all of it, or its two ends when it does not fit.
+fn ranges(len: usize) -> Vec<(usize, usize)> {
+    if len <= WINDOW_LINES {
+        return vec![(0, len)];
+    }
+    let half = WINDOW_LINES / 2;
+    vec![(0, half), (len - half, len)]
+}
+
+/// Diff two slices, numbering rows from the offsets they have in the real file.
+fn diff_rows(old: &[&str], new: &[&str], old_start: usize, new_start: usize) -> Vec<DiffRow> {
+    // The joined sides are named bindings rather than inline temporaries: the diff borrows
+    // them, and a temporary would be dropped at the end of the `let diff` statement.
+    let old_text = old.join("\n");
+    let new_text = new.join("\n");
+    let diff = TextDiff::from_lines(&old_text, &new_text);
+    diff.iter_all_changes()
+        .map(|change| {
+            let kind = match change.tag() {
+                ChangeTag::Insert => Kind::Added,
+                ChangeTag::Delete => Kind::Removed,
+                ChangeTag::Equal => Kind::Context,
+            };
+            DiffRow {
+                kind,
+                old_line: change.old_index().map(|i| old_start + i + 1),
+                new_line: change.new_index().map(|i| new_start + i + 1),
+                text: change.value().trim_end_matches('\n').to_string(),
+            }
+        })
+        .collect()
 }
 
 fn num(value: Option<usize>) -> String {
     value.map(|n| n.to_string()).unwrap_or_default()
 }
 
-/// Turn a diff payload into styled lines: summary, the preview rows, and the hidden-rows
-/// note. Widths are measured in display columns, so the background tint reaches the edge
-/// of the terminal no matter what the diff contains.
+/// Turn a diff payload into styled lines: the counts row and the excerpt under it.
+///
+/// Widths are measured in display columns, so the background tint reaches the edge of the
+/// terminal no matter what the diff contains.
 pub fn render(theme: &Theme, display: &Display, width: usize) -> Vec<Line> {
-    let Display::Diff { diff, added, removed, omitted } = display else {
+    let Display::Diff { diff, added, removed, .. } = display else {
         return Vec::new();
     };
-    if *omitted {
-        return vec![Line::new("  文件较大，差异预览已省略。", Style::new(Color::Dim))];
-    }
     let mut out = Vec::new();
     out.push(Line::spans(vec![
         Span::plain("  "),
@@ -115,8 +236,7 @@ pub fn render(theme: &Theme, display: &Display, width: usize) -> Vec<Line> {
         Span::new(format!("−{removed}"), Style::new(Color::DiffRemovedText)),
     ]));
     let rows: Vec<&str> = diff.split('\n').collect();
-    let (visible, hidden) = select(&rows);
-    for row in visible {
+    for row in &rows {
         let marker = row.chars().next();
         // No padding here: the screen pads to the terminal width with the row's background,
         // which keeps the tint a solid bar without making the text any longer than it is.
@@ -128,47 +248,8 @@ pub fn render(theme: &Theme, display: &Display, width: usize) -> Vec<Line> {
         };
         out.push(Line::spans(vec![Span::with_fill(text, style, fill)]));
     }
-    if hidden > 0 {
-        out.push(Line::new(
-            format!("  … 已收起 {hidden} 行 · 按 Ctrl+O 展开"),
-            Style::new(Color::Dim),
-        ));
-    }
     let _ = theme;
     out
-}
-
-/// Choose the preview rows. A large rewrite shows both sides; a purely additive change
-/// starts just before the first interesting row.
-fn select<'a>(rows: &[&'a str]) -> (Vec<&'a str>, usize) {
-    if rows.len() <= Defaults::DIFF_PREVIEW_LINES {
-        return (rows.to_vec(), 0);
-    }
-    let removed: Vec<&&str> = rows.iter().filter(|row| row.starts_with('-')).collect();
-    let added: Vec<&&str> = rows.iter().filter(|row| row.starts_with('+')).collect();
-    if !removed.is_empty() && !added.is_empty() {
-        let half = Defaults::DIFF_PREVIEW_LINES / 2;
-        let mut chosen: Vec<&str> = Vec::new();
-        chosen.extend(removed.iter().take(half).map(|row| **row));
-        chosen.extend(added.iter().take(half).map(|row| **row));
-        let hidden = rows.len() - chosen.len();
-        return (chosen, hidden);
-    }
-    let start = rows
-        .iter()
-        .position(|row| !row.starts_with(' '))
-        .map(|index| index.saturating_sub(2))
-        .unwrap_or(0);
-    let end = (start + Defaults::DIFF_PREVIEW_LINES).min(rows.len());
-    (rows[start..end].to_vec(), rows.len() - (end - start))
-}
-
-/// The one-line summary used by the transcript header.
-pub fn summary(display: &Display) -> Option<(usize, usize, bool)> {
-    match display {
-        Display::Diff { added, removed, omitted, .. } => Some((*added, *removed, *omitted)),
-        _ => None,
-    }
 }
 
 #[cfg(test)]
@@ -182,11 +263,18 @@ mod tests {
         }
     }
 
+    /// The counts carried alongside the rows.
+    fn counts(display: &Display) -> (usize, usize) {
+        match display {
+            Display::Diff { added, removed, .. } => (*added, *removed),
+            _ => (0, 0),
+        }
+    }
+
     #[test]
     fn a_small_change_keeps_both_sides() {
         let display = for_edit("a\nb\nc\n", "a\nB\nc\n");
-        let (added, removed, omitted) = summary(&display).unwrap();
-        assert_eq!((added, removed, omitted), (1, 1, false));
+        assert_eq!(counts(&display), (1, 1));
         let rendered = rows(&display);
         // Both the old and the new line survive, each with its own line number, and the
         // context rows line up on both sides.
@@ -199,32 +287,98 @@ mod tests {
     #[test]
     fn a_new_file_is_all_additions() {
         let display = for_new_file("one\ntwo\n");
-        let (added, removed, _) = summary(&display).unwrap();
-        assert_eq!((added, removed), (2, 0));
+        assert_eq!(counts(&display), (2, 0));
     }
 
     #[test]
-    fn a_large_change_is_summarised_rather_than_computed() {
-        let before = "x\n".repeat(MAX_DIFF_LINES);
-        let after = "y\n".repeat(MAX_DIFF_LINES);
+    fn a_change_too_big_to_diff_whole_still_produces_rows() {
+        // The old behaviour replaced the whole diff with a sentence saying a diff existed.
+        // The user asked for the change; being told they were not shown it is not an answer.
+        // The payload now carries real rows from the changed region, with the line numbers of
+        // the real file.
+        let before: String = (0..MAX_DIFF_LINES).map(|i| format!("old {i}\n")).collect();
+        let after: String = (0..MAX_DIFF_LINES).map(|i| format!("new {i}\n")).collect();
         let display = for_edit(&before, &after);
-        assert!(summary(&display).unwrap().2, "the preview should be omitted");
-        let theme = Theme { mode: crate::ui::theme::ColorMode::Ansi256 };
-        let lines = render(&theme, &display, 80);
-        assert!(lines[0].text().contains("已省略"));
+        let rendered = rows(&display);
+        assert!(rendered.iter().any(|row| row.contains("old 0")), "{}", rendered.len());
+        assert!(rendered.iter().any(|row| row.contains("new 1999")), "{}", rendered.len());
+        // The window bounds the work: at most both windows, and each changed line on both
+        // sides of it.
+        assert!(rendered.len() <= WINDOW_LINES * 4, "the window bounds the work: {}", rendered.len());
+        // The counts describe the rows that are actually there, since the whole file was not
+        // walked to produce an exact total for an excerpt.
+        assert_eq!(counts(&display), (WINDOW_LINES, WINDOW_LINES));
+        // Nothing says the preview was skipped.
+        assert!(!rendered.iter().any(|row| row.contains("省略")), "{}", rendered.len());
     }
 
     #[test]
-    fn the_preview_is_capped_and_says_how_much_is_hidden() {
-        let before: String = (0..100).map(|i| format!("old {i}\n")).collect();
-        let after: String = (0..100).map(|i| format!("new {i}\n")).collect();
-        let display = for_edit(&before, &after);
-        let theme = Theme { mode: crate::ui::theme::ColorMode::Ansi256 };
-        let lines = render(&theme, &display, 80);
-        let plain: Vec<String> = lines.iter().map(Line::text).collect();
-        assert!(plain.iter().any(|line| line.contains("已收起")), "{plain:?}");
-        // summary row + preview rows + the hidden note
-        assert!(plain.len() <= Defaults::DIFF_PREVIEW_LINES + 2);
+    fn one_edited_line_in_a_huge_file_is_the_excerpt() {
+        // The case the two-end window got wrong: an edit in the middle of a big file showed
+        // two slices of *unchanged* text, reported `+0 −0`, and said nothing about the edit
+        // at all. Trimming the shared ends first makes the excerpt be the change itself.
+        let mut before: Vec<String> = (0..MAX_DIFF_LINES + 1000).map(|i| format!("line {i}")).collect();
+        let mut after = before.clone();
+        let middle = before.len() / 2;
+        before[middle] = "OLD MIDDLE".to_string();
+        after[middle] = "NEW MIDDLE".to_string();
+        let display = for_edit(&before.join("\n"), &after.join("\n"));
+
+        assert_eq!(counts(&display), (1, 1), "one line changed on each side");
+        let rendered = rows(&display);
+        assert!(rendered.iter().any(|row| row.contains("OLD MIDDLE")), "{rendered:?}");
+        assert!(rendered.iter().any(|row| row.contains("NEW MIDDLE")), "{rendered:?}");
+        // The line numbers still point where the rows came from in the real file.
+        let expected = middle + 1;
+        assert!(
+            rendered.iter().any(|row| row.contains(&format!("{expected}"))),
+            "line {expected} is the one that changed: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn an_appended_line_at_the_very_end_is_shown() {
+        // An append is the common shape of a large write, and the changed region is the last
+        // line — which a window counted from the start would miss entirely.
+        let before: Vec<String> = (0..MAX_DIFF_LINES + 1000).map(|i| format!("line {i}")).collect();
+        let mut after = before.clone();
+        after.push("APPENDED".to_string());
+        let display = for_edit(&before.join("\n"), &after.join("\n"));
+        assert_eq!(counts(&display), (1, 0));
+        assert!(rows(&display).iter().any(|row| row.contains("APPENDED")), "{:?}", rows(&display));
+    }
+
+    #[test]
+    fn a_file_that_gained_a_prefix_shows_the_first_line() {
+        // The mirror image: the change is at the very top, and everything below it moved.
+        let body: Vec<String> = (0..MAX_DIFF_LINES + 1000).map(|i| format!("line {i}")).collect();
+        let mut after = vec!["HEADER".to_string()];
+        after.extend(body.clone());
+        let display = for_edit(&body.join("\n"), &after.join("\n"));
+        assert_eq!(counts(&display), (1, 0));
+        let rendered = rows(&display);
+        assert!(rendered.iter().any(|row| row.contains("HEADER")), "{rendered:?}");
+    }
+
+    #[test]
+    fn the_excerpt_of_a_whole_file_rewrite_shows_both_ends() {
+        // When the changed region is the whole file there is no trim to do, and the excerpt
+        // is the head and the tail of the rewrite: what was taken away at the top, what
+        // replaced it at the bottom.
+        let before: String = (0..MAX_DIFF_LINES).map(|i| format!("old {i}\n")).collect();
+        let after: String = (0..MAX_DIFF_LINES).map(|i| format!("new {i}\n")).collect();
+        let rendered = rows(&for_edit(&before, &after));
+        assert!(rendered.iter().any(|row| row.contains("old 0")), "the first removal: {rendered:?}");
+        assert!(
+            rendered.iter().any(|row| row.contains("new 1999")),
+            "the last addition: {rendered:?}"
+        );
+        // And the line numbers are the real ones, not the excerpt's own offsets.
+        assert!(rendered.iter().any(|row| row.starts_with("-    1")), "{rendered:?}");
+        assert!(
+            rendered.iter().any(|row| row.contains(&format!("{:>5} │ new 1999", MAX_DIFF_LINES))),
+            "the last addition keeps its line number: {rendered:?}"
+        );
     }
 
     #[test]

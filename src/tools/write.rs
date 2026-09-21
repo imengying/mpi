@@ -39,15 +39,7 @@ pub async fn execute(arguments: &serde_json::Value, cwd: &Path) -> Result<ToolOu
         Some(before) => diff::for_write(before, content),
         None => diff::for_new_file(content),
     };
-    // A diff that was skipped for size says so in the note instead of guessing.
-    let omitted = diff::summary(&display).map(|(_, _, omitted)| omitted).unwrap_or(false);
-    let action = if omitted {
-        "已写入"
-    } else if existed {
-        "已覆盖"
-    } else {
-        "已创建"
-    };
+    let action = if existed { "已覆盖" } else { "已创建" };
     Ok(ToolOutput {
         content: format!("{action} {path}（{} 字节）", content.len()),
         display,
@@ -64,7 +56,7 @@ mod tests {
 
 
     fn temp_dir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("mpi-write-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("pi-write-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }

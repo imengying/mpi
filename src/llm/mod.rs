@@ -228,9 +228,9 @@ pub struct Request<'a> {
     pub cache_hints: bool,
 }
 
-/// Map an mpi level to the concrete knobs a provider wants.
+/// Map a pi level to the concrete knobs a provider wants.
 ///
-/// The three-step mapping is: mpi level → this struct → provider-specific field.
+/// The three-step mapping is: pi level → this struct → provider-specific field.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThinkingPlan {
     pub effort: Option<String>,
@@ -278,7 +278,7 @@ pub fn clamp_level(model: &ModelConfig, level: &str) -> (String, bool) {
     (clamped, true)
 }
 
-/// True when the level names sort in mpi's canonical order.
+/// True when the level names sort in pi's canonical order.
 pub fn levels_sorted(levels: &[String]) -> bool {
     levels
         .windows(2)

@@ -121,6 +121,12 @@ fn tool_block_with(
                 head = 2;
             }
             lines.extend(rows);
+            // A change is read from both ends: what was taken away at the top, what replaced
+            // it at the bottom. Command output is read from its tail only, which is why this
+            // is a different block shape rather than a different preview length.
+            let budget = Defaults::DIFF_PREVIEW_LINES;
+            let half = budget / 2;
+            return Block::collapsible_excerpted(lines, head, tail, half, budget - half);
         }
         Display::File { verb, path } => {
             lines.push(Line::spans(vec![
@@ -548,7 +554,9 @@ mod tests {
         let text = plain(&block.render(80));
         assert!(text[0].starts_with("✓ "), "{text:?}");
         assert!(text[0].contains("$ ls -l"), "{text:?}");
-        assert!(text.iter().any(|line| line.contains("已收起")), "{text:?}");
+        // No row says "collapsed": the excerpt is the tail of the output, and the reader
+        // does not need to be told that an excerpt is an excerpt on every tool call.
+        assert!(!text.iter().any(|line| line.contains("收起")), "{text:?}");
         assert!(text.iter().any(|line| line.contains("row 19")), "{text:?}");
         // The footer note is the last row, visible even when collapsed.
         assert!(text.last().unwrap().contains("耗时 0.4s"), "{text:?}");
@@ -686,7 +694,7 @@ mod tests {
     }
 
     #[test]
-    fn a_diff_taller_than_the_preview_gets_a_collapse_note() {
+    fn a_diff_taller_than_the_preview_shows_an_excerpt_of_itself() {
         let before: String = (0..40).map(|i| format!("old {i}\n")).collect();
         let after: String = (0..40).map(|i| format!("new {i}\n")).collect();
         let output = ToolOutput {
@@ -696,10 +704,13 @@ mod tests {
             duration: None,
         };
         let text = plain(&tool_block("edit", &serde_json::json!({"path": "big.rs"}), &output).render(80));
-        assert!(text.iter().any(|line| line.contains("已收起")), "{text:?}");
-        // The header and the counts are still the first two rows.
+        // The header and the counts are the first two rows, and real changed rows follow —
+        // not a sentence standing in for them.
         assert!(text[0].contains("修改 big.rs"), "{text:?}");
         assert!(text[1].contains("+40") && text[1].contains("−40"), "{text:?}");
+        assert!(text[2..].iter().any(|line| line.contains("old 0")), "{text:?}");
+        assert!(text[2..].iter().any(|line| line.contains("new 39")), "{text:?}");
+        assert!(!text.iter().any(|line| line.contains("收起")), "{text:?}");
     }
 
     #[test]
@@ -712,8 +723,9 @@ mod tests {
         };
         let text = plain(&tool_block("ls", &serde_json::json!({}), &output).render(120));
         assert!(text.iter().any(|line| line.contains("列出 src")), "{text:?}");
-        assert!(text.iter().any(|line| line.contains("已收起")), "{text:?}");
-        assert!(!text[0].contains("已收起"));
+        // The tail of the listing is what survives, with nothing announcing the cut.
+        assert!(text.iter().any(|line| line.contains("entry 19")), "{text:?}");
+        assert!(!text.iter().any(|line| line.contains("收起")), "{text:?}");
     }
 
     #[test]

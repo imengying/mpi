@@ -5,7 +5,7 @@ use mpi::auth::policy::{assess_command, assess_tool, Dialect};
 use std::path::Path;
 
 fn cwd() -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("mpi-e2e-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("pi-e2e-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
@@ -121,9 +121,9 @@ fn headless_refuses_rather_than_approving() {
 
 #[test]
 fn a_directory_without_agents_md_has_no_system_prompt() {
-    // mpi ships no prompt of its own, so the "no system message" case is a real, reachable
+    // pi ships no prompt of its own, so the "no system message" case is a real, reachable
     // state rather than a degenerate one — and it is the one a fresh directory hits.
-    let dir = std::env::temp_dir().join(format!("mpi-e2e-no-agents-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("pi-e2e-no-agents-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     assert!(mpi::agent::r#loop::load_agents_md(&dir).is_none());

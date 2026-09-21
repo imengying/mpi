@@ -202,10 +202,10 @@ impl Session {
     /// Start a new session in the store for `cwd`.
     ///
     /// Registration happens here rather than on lookup: a session is what gives a directory
-    /// its entry in the table, so running mpi somewhere and leaving is not recorded.
+    /// its entry in the table, so running pi somewhere and leaving is not recorded.
     pub fn create(cwd: &Path, model: &str) -> Result<Self, SessionError> {
         // The id is provisional until something is written: registering here would put every
-        // directory mpi is started in into the table, and the table is meant to say where
+        // directory pi is started in into the table, and the table is meant to say where
         // sessions *are* (see [`Session::persist`]).
         let mut session = Self::create_in(&sessions_dir(cwd), cwd, model)?;
         session.register_under = Some(crate::config::sessions_root());
@@ -217,7 +217,7 @@ impl Session {
     pub fn create_in(dir: &Path, cwd: &Path, model: &str) -> Result<Self, SessionError> {
         // The directory is not created here. A session that never says anything must leave
         // no trace at all — not a file, and not an empty directory in the store either,
-        // which is what would otherwise happen to every directory mpi is run in.
+        // which is what would otherwise happen to every directory pi is run in.
         let id = uuid::Uuid::now_v7().to_string();
         let path = dir.join(format!("{id}.jsonl"));
         let header = SessionHeader {
@@ -227,7 +227,7 @@ impl Session {
             model: model.to_string(),
         };
         // Nothing is written here. A file appears with the first record that makes this a
-        // conversation, so launching mpi and leaving does not add a session to the list.
+        // conversation, so launching pi and leaving does not add a session to the list.
         let record = Record::SessionMeta { format: FORMAT, header: header.clone() };
         Ok(Session {
             header,
@@ -289,7 +289,7 @@ impl Session {
         &self.header
     }
 
-    /// The session id, which is also the file stem: `~/.mpi/sessions/<dir>/<id>.jsonl`.
+    /// The session id, which is also the file stem: `~/.pi/sessions/<dir>/<id>.jsonl`.
     pub fn id(&self) -> &str {
         &self.header.id
     }
@@ -632,7 +632,7 @@ impl Session {
     fn persist(&mut self) -> Result<(), SessionError> {
         // The directory is registered now, because this is the moment the store gains
         // something to name. `create` only had a provisional id: registering there would
-        // record every directory mpi is ever started in, and the table is meant to answer
+        // record every directory pi is ever started in, and the table is meant to answer
         // "where are the sessions", not "where has the user been".
         //
         // The registered id can differ from the provisional one, so the path is rebuilt from
@@ -899,7 +899,7 @@ mod tests {
     use super::*;
 
     fn temp_session(name: &str) -> (Session, PathBuf) {
-        let dir = std::env::temp_dir().join(format!("mpi-session-{}-{}", std::process::id(), name));
+        let dir = std::env::temp_dir().join(format!("pi-session-{}-{}", std::process::id(), name));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let session = Session::create_in(&dir, &dir, "work/m").unwrap();
@@ -938,7 +938,7 @@ mod tests {
 
     #[test]
     fn an_ambiguous_prefix_is_refused_rather_than_guessed() {
-        let dir = std::env::temp_dir().join(format!("mpi-ambig-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("pi-ambig-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         // Two sessions, so a short prefix can match both. uuids are time-ordered (v7), so
@@ -1077,7 +1077,7 @@ mod tests {
     fn deleting_the_last_session_takes_its_store_directory_with_it() {
         // End to end through the store: create, say something, delete. The session's
         // directory and its row in the table are both gone afterwards.
-        let root = std::env::temp_dir().join(format!("mpidel{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("pidel{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let store = root.join("store");
         let project = root.join("proj");
@@ -1278,7 +1278,7 @@ mod tests {
         // A conversation belongs to the project it happened in. Listing every other
         // project's history buries the relevant ones, and resuming the wrong project's
         // conversation would run its commands against the wrong tree.
-        let root = std::env::temp_dir().join(format!("mpiscope{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("piscope{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let store = root.join("store");
         // The table lives beside the sessions it names, and only gains a directory when one
@@ -1307,7 +1307,7 @@ mod tests {
     fn the_same_directory_always_gets_the_same_id() {
         // The id names a directory. Minting a new one per call would scatter one project's
         // sessions across the store, and nothing would be able to find them again.
-        let root = std::env::temp_dir().join(format!("mpisdir{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("pisdir{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let store = root.join("store");
         let project = root.join("proj");
@@ -1329,10 +1329,10 @@ mod tests {
 
     #[test]
     fn merely_looking_at_a_directory_does_not_register_it() {
-        // The table says where sessions are, so it must not become a log of everywhere mpi
+        // The table says where sessions are, so it must not become a log of everywhere pi
         // has been run. A directory that never produced a session stays out of it, and the
         // id it would have used is not reserved either.
-        let root = std::env::temp_dir().join(format!("mpilook{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("pilook{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let store = root.join("store");
         let project = root.join("proj");
@@ -1355,7 +1355,7 @@ mod tests {
     #[test]
     fn an_empty_session_never_reaches_the_disk() {
         let (mut session, dir) = temp_session("empty");
-        // Starting mpi and leaving must not add a session to the list, so nothing is
+        // Starting pi and leaving must not add a session to the list, so nothing is
         // written until there is something to remember.
         assert!(!session.path().exists(), "no file before the first message");
         assert!(list_in(&dir).is_empty());
@@ -1413,7 +1413,7 @@ mod tests {
         // where it is happening now. Resuming in another directory must append a block and
         // update the header, so a second resume does not think it moved again.
         let (mut session, dir) = temp_session("relocate");
-        let elsewhere = std::env::temp_dir().join("mpi-relocate-target");
+        let elsewhere = std::env::temp_dir().join("pi-relocate-target");
         std::fs::create_dir_all(&elsewhere).unwrap();
 
         assert!(session.current_cwd().is_none(), "no block yet");

@@ -297,7 +297,7 @@ mod tests {
 
     #[test]
     fn the_branch_is_read_from_head_without_running_git() {
-        let dir = std::env::temp_dir().join(format!("mpi-footer-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("pi-footer-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         std::fs::write(dir.join(".git/HEAD"), "ref: refs/heads/feature/x\n").unwrap();

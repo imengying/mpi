@@ -6,7 +6,7 @@
 //!   model name, so it stays a stable cache prefix for the whole session. Everything that
 //!   describes the environment lives in a single session-stable block at the head of the
 //!   conversation (see [`environment_block`]).
-//! * **mpi ships no prompt of its own.** The system message is built from `AGENTS.md` and
+//! * **pi ships no prompt of its own.** The system message is built from `AGENTS.md` and
 //!   nothing else, so a session without that file sends no system message at all. The
 //!   prompt is therefore the user's, and it is theirs to change at any time — it is read
 //!   once per session and travels with the session file.
@@ -30,7 +30,7 @@ use crate::ui::screen::{Action, Screen, WORKING_INTERVAL, WORKING_LABEL};
 use crate::ui::theme::Color;
 use crate::util;
 
-/// The slash commands mpi accepts, with the one-line description the menu shows.
+/// The slash commands pi accepts, with the one-line description the menu shows.
 ///
 /// One list, used three ways: the dispatcher matches against it, the input area completes
 /// against it, and the menu prints it. A command cannot be added to one and forgotten in the
@@ -47,7 +47,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
 
 /// The system message for a session, built from `AGENTS.md` and nothing else.
 ///
-/// mpi deliberately ships no prompt of its own: the instructions a model follows are the
+/// pi deliberately ships no prompt of its own: the instructions a model follows are the
 /// user's, written down in a file they can edit and version. When no such file exists the
 /// return value is `None` and no system message is sent — an empty one would be a wasted
 /// cache entry and a lie about where the instructions came from.
@@ -63,7 +63,7 @@ fn system_prompt_from(cwd: &Path) -> Option<String> {
 /// than in the system prompt, and it does not change while the session lives — a mutable
 /// clock in here would break the cache on every turn.
 pub fn environment_block(cwd: &Path, session_id: &str, shell: &str) -> String {
-    // Data only. mpi does not append advice here either: the block exists so the model can
+    // Data only. pi does not append advice here either: the block exists so the model can
     // see the facts, and telling it what to do with them would be a prompt by another name.
     format!(
         "<environment>\n工作目录: {}\n平台: {}\nshell: {}\n会话开始: {}\n会话 id: {}\n</environment>",
@@ -139,7 +139,7 @@ impl Agent {
         screen.set_commands(COMMANDS);
         // The session id is deliberately *not* announced here: it is printed on the way out,
         // as part of the command that resumes it, which is the only time it is useful.
-        // No `AGENTS.md` means no system message at all: mpi has no prompt of its own.
+        // No `AGENTS.md` means no system message at all: pi has no prompt of its own.
         let system_prompt = system_prompt_from(&cwd);
         if let Some((path, text)) = load_agents_md(&cwd) {
             screen.push_lines(ui_compact::note_lines(
@@ -397,7 +397,7 @@ impl Agent {
         }
         // A destructive action needs an explicit yes, and the non-interactive path has no
         // way to give one: `pick` answers with the highlighted entry there, and that would
-        // turn `echo /delete | mpi` into an unattended delete. Refuse instead, and say how
+        // turn `echo /delete | pi` into an unattended delete. Refuse instead, and say how
         // to do it deliberately.
         if !self.screen.interactive() {
             self.screen.push_lines(ui_compact::note_lines(
@@ -867,6 +867,13 @@ impl Agent {
             tokio::pin!(stream);
             let mut ticker = ticker();
             let result = loop {
+                // Keep the input line alive while the answer arrives. The user types into
+                // the composer as they read; Enter there queues the message rather than
+                // dropping it, because a turn cannot be interrupted mid-request without
+                // throwing away what the model is halfway through saying.
+                if let Some(action) = self.screen.poll_input() {
+                    on_turn_action(&mut self.screen, action);
+                }
                 tokio::select! {
                     // A token outranks the spinner: text has to appear as it arrives, not on
                     // the next frame. Everything already queued is drained with it, so a burst
@@ -1032,6 +1039,62 @@ impl Agent {
     }
 }
 
+/// Handle what the user did while a turn was running.
+///
+/// Only a few things make sense mid-turn. A submitted line is *queued*, not run: the model is
+/// answering the previous message, and starting a second turn underneath it would interleave
+/// two conversations. Typing is taken by the composer and never reaches here.
+fn on_turn_action(screen: &mut Screen, action: crate::ui::screen::Action) {
+    use crate::ui::screen::Action;
+    match action {
+        Action::Line(text) => queue_mid_turn(screen, text, Vec::new()),
+        Action::LineWithImages(text, images) => queue_mid_turn(screen, text, images),
+        // Ctrl+O is exactly what a user does while a long tool call is on screen.
+        Action::ToggleExpand => {
+            if !screen.toggle_last_collapsible() {
+                screen.push_lines(ui_compact::note_lines(
+                    "没有可展开的内容。",
+                    crate::ui::screen::Style::new(Color::Dim),
+                ));
+            }
+        }
+        // Ctrl+C / Ctrl+D during a turn do nothing: the only thing they could stop is the
+        // request, and throwing away a half-written answer loses more than it saves.
+        Action::Interrupt | Action::Eof => {}
+    }
+}
+
+/// Hold a submitted line until the turn in flight is over.
+///
+/// A line starting with `/` is a command, and commands are dispatched as commands, never as
+/// messages: `/model` is not something the user said to the model. It is the same rule the
+/// prompt applies — a slash command is text-only, so any image submitted with it is dropped
+/// rather than smuggled into the conversation as prose.
+///
+/// Everything else is a message and waits as one, keeping its images: the pictures were
+/// pasted for that message, and the model has to see them with it.
+pub(crate) fn queue_mid_turn(
+    screen: &mut Screen,
+    text: String,
+    images: Vec<crate::image_input::PastedImage>,
+) {
+    use crate::ui::screen::Queued;
+    // Trimmed, because the prompt trims: a line goes into the conversation the same way
+    // whether it was typed at the prompt or during a turn, and a leading space is not part
+    // of what the user meant to say.
+    let text = text.trim();
+    if text.is_empty() && images.is_empty() {
+        return;
+    }
+    // A leading `/` makes it a command, exactly as at the prompt: ` /model` with a space in
+    // front is not a command there either.
+    if text.starts_with('/') {
+        screen.queue(Queued::Command(text.to_string()));
+    } else {
+        screen.queue(Queued::Message(text.to_string(), images));
+    }
+}
+
 /// Drive a future to completion on a private current-thread runtime.
 ///
 /// Tool execution is synchronous by nature (spawn a process, read a file) while the agent
@@ -1057,6 +1120,12 @@ fn block_on_spinning<T>(screen: &mut Screen, work: impl std::future::Future<Outp
         tokio::pin!(work);
         let mut ticker = ticker();
         loop {
+            // A command can run for minutes, which is when the input line has to stay
+            // usable: a directory that takes a minute to list is a minute the user would
+            // otherwise spend watching it.
+            if let Some(action) = screen.poll_input() {
+                on_turn_action(screen, action);
+            }
             tokio::select! {
                 out = &mut work => break out,
                 _ = ticker.tick() => screen.tick_working(),
@@ -1094,7 +1163,7 @@ fn drain_deltas(screen: &mut Screen, deltas: &mut tokio::sync::mpsc::UnboundedRe
     }
 }
 
-/// Exposed for tests: the dialect mpi will hand to the policy.
+/// Exposed for tests: the dialect pi will hand to the policy.
 pub fn dialect_for(config: &Config) -> Dialect {
     policy::configured_dialect(&config.shell.path)
 }
@@ -1136,7 +1205,7 @@ fn project_root(cwd: &Path) -> PathBuf {
 /// the project committed; conversely, a stray file in `/tmp` or in the parent of the project
 /// cannot inject instructions, which is what makes the lookup safe to do without asking.
 ///
-/// Nothing is read when the file does not exist: mpi has no built-in prompt, so the model
+/// Nothing is read when the file does not exist: pi has no built-in prompt, so the model
 /// gets a system message only if the project asked for one.
 pub fn load_agents_md(cwd: &Path) -> Option<(PathBuf, String)> {
     let root = project_root(cwd);
@@ -1154,7 +1223,7 @@ pub fn load_agents_md(cwd: &Path) -> Option<(PathBuf, String)> {
                 Some((path, format!("<!-- {label} -->\n{}", text.trim_end())))
             }
             Err(err) => {
-                eprintln!("mpi: 读取 {} 失败：{err}", path.display());
+                eprintln!("pi: 读取 {} 失败：{err}", path.display());
                 None
             }
         };
@@ -1168,9 +1237,9 @@ mod tests {
 
     #[test]
     fn there_is_no_built_in_prompt() {
-        // mpi ships no prompt of its own: a directory without `AGENTS.md` sends no system
+        // pi ships no prompt of its own: a directory without `AGENTS.md` sends no system
         // message at all, rather than a default one nobody asked for.
-        let dir = std::env::temp_dir().join(format!("mpi-no-agents-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("pi-no-agents-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         assert!(load_agents_md(&dir).is_none());
@@ -1182,7 +1251,7 @@ mod tests {
     fn the_project_root_supplies_the_prompt() {
         // Running from a subdirectory still picks up the project's own file, and a nested
         // file below the root is not consulted: the root is what was committed.
-        let root = std::env::temp_dir().join(format!("mpi-agents-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("pi-agents-{}", std::process::id()));
         let nested = root.join("crates/inner");
         let _ = std::fs::remove_dir_all(&root);
         // Only the project root is a checkout; the nested directory is a plain subdirectory,
@@ -1205,7 +1274,7 @@ mod tests {
         // The lookup stops at the root. Without that boundary, a directory the user does not
         // control — a shared `/tmp`, another user's home — could inject instructions into the
         // prompt of a project that never asked for them.
-        let outer = std::env::temp_dir().join(format!("mpi-outer-{}", std::process::id()));
+        let outer = std::env::temp_dir().join(format!("pi-outer-{}", std::process::id()));
         let project = outer.join("project");
         let _ = std::fs::remove_dir_all(&outer);
         std::fs::create_dir_all(&project).unwrap();
@@ -1226,7 +1295,7 @@ mod tests {
     fn a_project_without_a_git_directory_uses_the_working_directory() {
         // A plain directory is its own project, so its file is read — the rule is "the root
         // of what you are working on", not "only git checkouts".
-        let dir = std::env::temp_dir().join(format!("mpi-plain-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("pi-plain-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("AGENTS.md"), "规则").unwrap();
@@ -1238,7 +1307,7 @@ mod tests {
     fn an_empty_agents_md_is_treated_as_absent() {
         // A placeholder file must not produce an empty system message: it would be sent on
         // every request and would say nothing.
-        let dir = std::env::temp_dir().join(format!("mpi-empty-agents-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("pi-empty-agents-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("AGENTS.md"), "   \n\t\n").unwrap();
