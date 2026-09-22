@@ -146,8 +146,16 @@ mod tests {
     use std::path::PathBuf;
 
 
-    fn fixture() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("pi-grep-{}", std::process::id()));
+    /// A directory holding `a.txt` and `b.txt`, private to one test.
+    ///
+    /// Named per test rather than per process: the tests run in parallel, and a shared
+    /// directory means one test's `fs::write` truncates a file while another test's `rg`
+    /// is reading it — the search then reports no match and the failure looks like a bug
+    /// in the tool rather than a collision in the fixture.
+    fn fixture(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("pi-grep-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("a.txt"), "alpha\nbeta\n").unwrap();
         std::fs::write(dir.join("b.txt"), "gamma\nbeta\n").unwrap();
@@ -156,7 +164,7 @@ mod tests {
 
     #[test]
     fn finds_matches_with_file_and_line_numbers() {
-        let dir = fixture();
+        let dir = fixture("matches");
         let out = block(execute(&serde_json::json!({"pattern": "beta"}), &dir)).unwrap();
         assert!(out.content.contains("a.txt"));
         assert!(out.content.contains("b.txt"));
@@ -168,7 +176,7 @@ mod tests {
 
     #[test]
     fn reports_no_matches_without_failing() {
-        let dir = fixture();
+        let dir = fixture("no-matches");
         let out = block(execute(&serde_json::json!({"pattern": "nosuchthing"}), &dir)).unwrap();
         assert!(out.content.contains("没有找到匹配"));
         assert!(!out.is_error);
@@ -176,7 +184,7 @@ mod tests {
 
     #[test]
     fn case_insensitivity_and_globs_are_passed_through() {
-        let dir = fixture();
+        let dir = fixture("globs");
         let out = block(execute(
             &serde_json::json!({"pattern": "ALPHA", "ignore_case": true, "glob": "*.txt"}),
             &dir,
@@ -199,7 +207,7 @@ mod tests {
 
     #[test]
     fn an_empty_pattern_is_rejected() {
-        let dir = fixture();
+        let dir = fixture("empty");
         assert!(block(execute(&serde_json::json!({"pattern": ""}), &dir)).is_err());
     }
 }
