@@ -10,5 +10,6 @@ pub mod auth_panel;
 pub mod compact;
 pub mod diff;
 pub mod footer;
+pub mod markdown;
 pub mod screen;
 pub mod theme;

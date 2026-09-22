@@ -98,6 +98,7 @@ pi 没有内置模型目录，也不会去猜。没配置 providers 会直接报
 | `models[].context_window` | 底栏容量与告警阈值；缺失时显示 `?` |
 | `models[].max_tokens` | 单次回复上限，缺省 8192 |
 | `models[].reasoning` | 是否支持推理，决定 `/model` 选完要不要问级别 |
+| `models[].search` | 是否使用该接口的原生搜索，缺省 `false`。整段会话要么一直开要么一直关 |
 | `models[].thinking_levels` | 该模型支持的级别；`reasoning` 为真但缺失时表示五档全支持 |
 | `models[].compat` | 覆盖兼容开关，见下 |
 
@@ -124,6 +125,8 @@ pi 没有内置模型目录，也不会去猜。没配置 providers 会直接报
 `responses` 会以 `store: false` 发送，会话只在本地存一份，服务端不留档；
 推理摘要以 `encrypted_content` 原样回放，且只在**同一个 provider 与模型**下回放——
 中途 `/model` 换了模型，旧的推理块会被丢掉而不是发给不认识它的上游。
+模型自己跑的搜索也是这样：`web_search_call` 整段存下来、原样放回去，pi 不执行、
+也不另造一条工具结果。Anthropic 的 `pause_turn` 同样是把这条助手消息再提交一次。
 
 ### 兼容开关
 
@@ -147,7 +150,20 @@ pi 没有内置模型目录，也不会去猜。没配置 providers 会直接报
 `thinking_format`（`openai` / `deepseek` / `zai` / `qwen` / `llamacpp` / `anthropic` / `none`）、
 `requires_thinking_as_text`、`requires_reasoning_content_on_assistant`、
 `requires_assistant_after_tool_result`、`supports_usage_in_streaming`、`supports_strict_mode`、
-`supports_cache_control`、`send_session_affinity`、`supports_long_cache`。
+`supports_cache_control`、`send_session_affinity`、`supports_long_cache`、
+`search_format`（`web_search` / `web_and_x` / `anthropic` / `xai` / `qwen` / `zhipu` / `off`）。
+
+`search: true` 时按 `base_url` 选写法：Responses 追加 `web_search`（x.ai 再加 `x_search`），
+Messages 追加 `web_search_20250305`，Chat Completions 用 `search_parameters`（x.ai）、
+`enable_search`（通义）或智谱的 `web_search` 工具（`open.bigmodel.cn`、`z.ai`，并要回搜索结果）。
+探测不到、又没有 `search_format` 时启动失败，而不是发一个上游不认识的字段。
+
+**DeepSeek 官方接口不能原生搜索。** 对话补全没有搜索参数；Responses 接受 `web_search` 然后直接忽略，
+所以对 `api.deepseek.com` 打开 `search` 会在启动时报错，而不是假装搜过。GLM 可以：模型上
+`"search": true`，`base_url` 指向智谱或 Z.ai。
+
+搜索默认关闭，未开启时请求前缀与以前一致。摘要请求会强制关掉搜索。引用只出现在界面上，
+不写进发给模型的历史。
 
 ## 启动
 

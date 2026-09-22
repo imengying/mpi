@@ -263,12 +263,12 @@ pub fn replay_blocks(messages: &[crate::llm::Message]) -> Vec<crate::ui::screen:
                 let mut lines: Vec<Line> = Vec::new();
                 let had_thinking = content.iter().any(|b| matches!(b, MsgBlock::Thinking { .. }));
                 let stopped = *stop_reason == Some(crate::llm::StopReason::Aborted);
+                // Said once, on the first hosted call or citation, not once per result.
+                let mut announced_search = false;
                 for block in content {
                     match block {
                         MsgBlock::Text { text } => {
-                            lines.extend(
-                                util::sanitize(text).lines().map(|l| Line::plain(l.to_string())),
-                            );
+                            lines.extend(crate::ui::markdown::render(text));
                             lines.push(Line::blank());
                         }
                         MsgBlock::ToolCall { id, name, arguments } => {
@@ -279,6 +279,22 @@ pub fn replay_blocks(messages: &[crate::llm::Message]) -> Vec<crate::ui::screen:
                             // A tool call keeps its own block, so the output is collapsed
                             // on resume exactly as it was when it ran.
                             out.push(tool_block(name, arguments, &stored_output(name, arguments, content)));
+                        }
+                        MsgBlock::Hosted { .. } => {
+                            if !announced_search {
+                                announced_search = true;
+                                lines.push(Line::new("搜索了网页".to_string(), Style::new(Color::Dim)));
+                            }
+                        }
+                        MsgBlock::Citation { url, title } => {
+                            if !announced_search {
+                                announced_search = true;
+                                lines.push(Line::new("搜索了网页".to_string(), Style::new(Color::Dim)));
+                            }
+                            lines.push(Line::new(
+                                crate::llm::citation_line(title, url),
+                                Style::new(Color::Dim),
+                            ));
                         }
                         _ => {}
                     }

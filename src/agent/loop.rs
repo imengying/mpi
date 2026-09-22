@@ -1016,6 +1016,19 @@ impl Agent {
             return Ok(TurnEnd::Done);
         }
 
+        let citations = llm::citation_lines(&completion.message);
+        if !citations.is_empty() {
+            let mut lines = Vec::new();
+            for line in &citations {
+                lines.push(crate::ui::screen::Line::new(
+                    line.clone(),
+                    crate::ui::screen::Style::new(Color::Dim),
+                ));
+            }
+            lines.push(crate::ui::screen::Line::blank());
+            self.screen.push_lines(lines);
+        }
+
         self.session
             .push_message(completion.message.clone(), Some(completion.usage), Some(completion.stop_reason))?;
         self.session.push_token_count(completion.usage)?;
@@ -1065,6 +1078,11 @@ impl Agent {
     /// Decide what to do after a response that is not an overflow.
     fn after_completion(&mut self, completion: &llm::Completion) -> TurnEnd {
         let calls = completion.tool_calls();
+        // A hosted search that paused has to be sent back as-is. There is no local call
+        // to run; doing so would invent a tool result the server did not ask for.
+        if calls.is_empty() && completion.stop_reason == StopReason::Pause {
+            return TurnEnd::Continue;
+        }
         if calls.is_empty() {
             // A length stop with no tool calls means the answer was cut off; say so rather
             // than silently pretending it finished.
@@ -1336,6 +1354,13 @@ fn apply_delta(screen: &mut Screen, delta: Delta) {
     match delta {
         Delta::Text(text) => screen.push_text(&text),
         Delta::Thinking(text) => screen.push_thinking(&text),
+        Delta::Notice(text) => {
+            screen.push_lines(ui_compact::note_lines(
+                &text,
+                crate::ui::screen::Style::new(Color::Dim),
+            ));
+            screen.flush();
+        }
     }
 }
 

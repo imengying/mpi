@@ -6,8 +6,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::compat::{Compat, ThinkingFormat};
-use super::{Block, Completion, Delta, LlmError, Message, Request, StopReason, plan_thinking};
+use super::compat::{Compat, SearchFormat, ThinkingFormat};
+use super::{Block, Completion, Delta, LlmError, Message, Request, StopReason, hosted_search, plan_thinking};
 use crate::config::Usage;
 
 #[derive(Debug, Clone, Serialize)]
@@ -101,6 +101,53 @@ struct ToolDef {
     cache_control: Option<CacheControl>,
 }
 
+/// A function tool, or a hosted search tool. Untagged so a function tool keeps the
+/// bytes it had before search existed — the tool block is a cache prefix.
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+enum ToolEntry {
+    Function(ToolDef),
+    WebSearch {
+        #[serde(rename = "type")]
+        kind: &'static str,
+        web_search: WebSearchToggle,
+    },
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct WebSearchToggle {
+    enable: bool,
+    /// Ask Zhipu to attach the pages it opened. Without this the answer cites `ref_1`
+    /// and the transcript has nothing to show under it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    search_result: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SearchSource {
+    #[serde(rename = "type")]
+    kind: &'static str,
+}
+
+/// xAI Chat Completions live search. The model runs it; the citations come back on
+/// the response and are not a tool result we have to answer.
+#[derive(Debug, Clone, Serialize)]
+struct SearchParameters {
+    mode: &'static str,
+    return_citations: bool,
+    sources: Vec<SearchSource>,
+}
+
+impl SearchParameters {
+    fn xai() -> Self {
+        SearchParameters {
+            mode: "auto",
+            return_citations: true,
+            sources: vec![SearchSource { kind: "web" }, SearchSource { kind: "x" }],
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct ToolFunction {
     name: String,
@@ -154,7 +201,7 @@ pub struct ChatRequest {
     model: String,
     messages: Vec<ChatMessage>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    tools: Vec<ToolDef>,
+    tools: Vec<ToolEntry>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<&'static str>,
     stream: bool,
@@ -180,6 +227,12 @@ pub struct ChatRequest {
     prompt_cache_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     prompt_cache_retention: Option<String>,
+    /// xAI. Omitted everywhere else: an unknown field is a 400 on a strict gateway.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    search_parameters: Option<SearchParameters>,
+    /// Qwen-compatible gateways. Same rule: absent unless that format was selected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enable_search: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -268,28 +321,39 @@ pub fn build_request(req: &Request<'_>, stream: bool) -> ChatRequest {
         last.cache_control = Some(CacheControl::ephemeral(compat.supports_long_cache));
     }
 
-    let tools: Vec<ToolDef> = req
+    let mut tools: Vec<ToolEntry> = req
         .tools
         .iter()
         .enumerate()
-        .map(|(index, tool)| ToolDef {
-            kind: "function",
-            function: ToolFunction {
-                name: tool.name.clone(),
-                description: tool.description.clone(),
-                parameters: tool.parameters.clone(),
-                strict: compat.supports_strict_mode.then_some(true),
-            },
-            cache_control: (cache_marker && index + 1 == req.tools.len())
-                .then(|| CacheControl::ephemeral(compat.supports_long_cache)),
+        .map(|(index, tool)| {
+            ToolEntry::Function(ToolDef {
+                kind: "function",
+                function: ToolFunction {
+                    name: tool.name.clone(),
+                    description: tool.description.clone(),
+                    parameters: tool.parameters.clone(),
+                    strict: compat.supports_strict_mode.then_some(true),
+                },
+                cache_control: (cache_marker && index + 1 == req.tools.len())
+                    .then(|| CacheControl::ephemeral(compat.supports_long_cache)),
+            })
         })
         .collect();
+    let search = hosted_search(model, provider);
+    if search == Some(SearchFormat::Zhipu) {
+        // Appended after the function tools, so their bytes — the cache prefix — do not move.
+        tools.push(ToolEntry::WebSearch {
+            kind: "web_search",
+            web_search: WebSearchToggle { enable: true, search_result: Some(true) },
+        });
+    }
 
+    let tool_choice = (!tools.is_empty()).then_some("auto");
     let mut request = ChatRequest {
         model: model.id.clone(),
         messages,
         tools,
-        tool_choice: (!req.tools.is_empty()).then_some("auto"),
+        tool_choice,
         stream,
         stream_options: stream.then_some(StreamOptions { include_usage: compat.supports_usage_in_streaming }),
         max_tokens: None,
@@ -303,6 +367,8 @@ pub fn build_request(req: &Request<'_>, stream: bool) -> ChatRequest {
         prompt_cache_key: req.cache_hints.then(|| req.session_id.to_string()),
         prompt_cache_retention: (req.cache_hints && compat.supports_long_cache)
             .then(|| "24h".to_string()),
+        search_parameters: (search == Some(SearchFormat::Xai)).then(SearchParameters::xai),
+        enable_search: (search == Some(SearchFormat::Qwen)).then_some(true),
     };
 
     if compat.max_tokens_field == "max_completion_tokens" {
@@ -365,6 +431,7 @@ fn join_text(blocks: &[Block]) -> String {
             Block::Image { .. } => None,
             Block::Thinking { .. } => None,
             Block::ToolCall { .. } => None,
+            Block::Hosted { .. } | Block::Citation { .. } => None,
         })
         .collect::<Vec<_>>()
         .join("")
@@ -402,7 +469,7 @@ fn user_content(blocks: &[Block], last_block_hint: bool) -> ChatContent {
             Block::Image { media_type, data } => {
                 parts.push(ContentBlock::image(media_type, data));
             }
-            Block::Thinking { .. } | Block::ToolCall { .. } => {}
+            Block::Thinking { .. } | Block::ToolCall { .. } | Block::Hosted { .. } | Block::Citation { .. } => {}
         }
     }
     // The cache marker rides on the last part, which is what the prefix actually ends on.
@@ -435,6 +502,11 @@ pub struct StreamChunk {
     usage: Option<WireUsage>,
     #[serde(default)]
     error: Option<WireError>,
+    /// xAI puts the URLs here. Zhipu uses `web_search` instead. Other gateways omit both.
+    #[serde(default)]
+    citations: Vec<serde_json::Value>,
+    #[serde(default)]
+    web_search: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -443,6 +515,8 @@ struct StreamChoice {
     delta: StreamDelta,
     #[serde(default)]
     finish_reason: Option<String>,
+    #[serde(default)]
+    web_search: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -507,6 +581,8 @@ pub struct Assembler {
     text: String,
     thinking: String,
     calls: Vec<(String, String, String)>,
+    citations: Vec<(String, String)>,
+    announced: bool,
     usage: Usage,
     stop_reason: Option<String>,
     error: Option<String>,
@@ -571,6 +647,9 @@ impl Assembler {
         }
         if !self.text.is_empty() {
             content.push(Block::Text { text: std::mem::take(&mut self.text) });
+        }
+        for (url, title) in self.citations {
+            content.push(Block::Citation { url, title });
         }
         for (index, (id, name, args)) in self.calls.into_iter().enumerate() {
             if name.is_empty() {
@@ -644,7 +723,46 @@ impl StreamChunk {
                 assembler.stop_reason = Some(reason.clone());
             }
             assembler.push_delta(&choice.delta, on_delta);
+            assembler.add_citations(&choice.web_search, on_delta);
         }
+        assembler.add_citations(&self.citations, on_delta);
+        assembler.add_citations(&self.web_search, on_delta);
+    }
+}
+
+impl Assembler {
+    fn add_citations(&mut self, raw: &[serde_json::Value], on_delta: &mut dyn FnMut(Delta)) {
+        for value in raw {
+            let Some((url, title)) = citation_of(value) else { continue };
+            if self.citations.iter().any(|(have, _)| have == &url) {
+                continue;
+            }
+            if !self.announced {
+                self.announced = true;
+                on_delta(Delta::Notice("搜索了网页".into()));
+            }
+            self.citations.push((url, title));
+        }
+    }
+}
+
+fn citation_of(value: &serde_json::Value) -> Option<(String, String)> {
+    match value {
+        serde_json::Value::String(url) if !url.is_empty() => Some((url.clone(), String::new())),
+        serde_json::Value::Object(map) => {
+            let url = ["url", "link", "href"]
+                .iter()
+                .find_map(|key| map.get(*key).and_then(|item| item.as_str()))
+                .filter(|url| !url.is_empty())?;
+            let title = map
+                .get("title")
+                .or_else(|| map.get("name"))
+                .and_then(|item| item.as_str())
+                .unwrap_or("")
+                .to_string();
+            Some((url.to_string(), title))
+        }
+        _ => None,
     }
 }
 
@@ -655,6 +773,11 @@ pub struct FullResponse {
     choices: Vec<FullChoice>,
     #[serde(default)]
     usage: Option<WireUsage>,
+    #[serde(default)]
+    citations: Vec<serde_json::Value>,
+    /// Zhipu attaches the pages it opened here, or on the message.
+    #[serde(default)]
+    web_search: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -679,6 +802,8 @@ struct FullMessage {
     tool_calls: Vec<FullToolCall>,
     #[serde(default)]
     function_call: Option<FullFunctionCall>,
+    #[serde(default)]
+    web_search: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -711,6 +836,7 @@ impl FullResponse {
                 assembler.stop_reason = Some(reason);
             }
             let message = choice.message;
+            let found = message.web_search.clone();
             let thinking = message
                 .reasoning_content
                 .or(message.reasoning)
@@ -736,7 +862,10 @@ impl FullResponse {
                     .collect(),
             };
             assembler.push_delta(&delta, &mut sink);
+            assembler.add_citations(&found, &mut sink);
         }
+        assembler.add_citations(&self.citations, &mut sink);
+        assembler.add_citations(&self.web_search, &mut sink);
         assembler.finish()
     }
 }
@@ -844,7 +973,7 @@ mod tests {
         let mut text = String::new();
         let mut sink = |delta: Delta| match delta {
             Delta::Text(t) => text.push_str(&t),
-            Delta::Thinking(_) => {}
+            Delta::Thinking(_) | Delta::Notice(_) => {}
         };
         let frames = [
             r#"{"choices":[{"delta":{"reasoning_content":"hmm"}}]}"#,
@@ -887,5 +1016,87 @@ mod tests {
         assert_eq!(endpoint("http://x/v1"), "http://x/v1/chat/completions");
         assert_eq!(endpoint("http://x/v1/"), "http://x/v1/chat/completions");
         assert_eq!(endpoint("http://x/v1/chat/completions"), "http://x/v1/chat/completions");
+    }
+
+    #[test]
+    fn search_stays_off_the_request_until_the_model_asks() {
+        let (model, mut provider) = anthropic_style_model();
+        provider.base_url = "https://api.x.ai/v1".into();
+        let messages = vec![Message::user_text("hi")];
+        let body = serde_json::to_value(build_request(&request(&model, &provider, &messages), false)).unwrap();
+        assert!(body.get("search_parameters").is_none());
+        assert!(body.get("enable_search").is_none());
+    }
+
+    #[test]
+    fn each_completions_host_gets_its_own_search_shape() {
+        let messages = vec![Message::user_text("hi")];
+        let (mut model, mut provider) = anthropic_style_model();
+        model.search = true;
+
+        provider.base_url = "https://api.x.ai/v1".into();
+        let body = serde_json::to_value(build_request(&request(&model, &provider, &messages), false)).unwrap();
+        assert_eq!(body["search_parameters"]["mode"], "auto");
+        assert_eq!(body["search_parameters"]["return_citations"], true);
+        assert!(body.get("enable_search").is_none());
+
+        provider.base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1".into();
+        let body = serde_json::to_value(build_request(&request(&model, &provider, &messages), false)).unwrap();
+        assert_eq!(body["enable_search"], true);
+        assert!(body.get("search_parameters").is_none());
+
+        provider.base_url = "https://open.bigmodel.cn/api/paas/v4".into();
+        let body = serde_json::to_value(build_request(&request(&model, &provider, &messages), false)).unwrap();
+        let tools = body["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["type"], "web_search");
+        assert_eq!(tools[0]["web_search"]["enable"], true);
+        assert_eq!(tools[0]["web_search"]["search_result"], true);
+    }
+
+    #[test]
+    fn citations_are_kept_for_the_transcript_and_are_not_tool_calls() {
+        let mut assembler = Assembler::default();
+        let mut notices = Vec::new();
+        let mut sink = |delta: Delta| {
+            if let Delta::Notice(text) = delta {
+                notices.push(text);
+            }
+        };
+        let chunk = parse_frame(
+            r#"{"choices":[{"delta":{"content":"yes"},"finish_reason":"stop"}],"citations":["https://example.com"]}"#,
+        )
+        .unwrap()
+        .unwrap();
+        chunk.feed(&mut assembler, &mut sink);
+        let completion = assembler.finish();
+        assert_eq!(completion.text(), "yes");
+        assert!(completion.tool_calls().is_empty());
+        assert_eq!(notices, vec!["搜索了网页".to_string()]);
+        let Message::Assistant { content, .. } = &completion.message else { panic!() };
+        assert!(matches!(&content[1], Block::Citation { url, .. } if url == "https://example.com"));
+    }
+
+    #[test]
+    fn zhipu_search_results_become_citations() {
+        let mut assembler = Assembler::default();
+        let mut sink = |_: Delta| {};
+        let chunk = parse_frame(
+            r#"{"choices":[{"delta":{"content":"见 ref_1"},"finish_reason":"stop","web_search":[{"title":"财报","link":"https://news.example/a","content":"long"}]}],"web_search":[{"title":"另一条","url":"https://news.example/b"}]}"#,
+        )
+        .unwrap()
+        .unwrap();
+        chunk.feed(&mut assembler, &mut sink);
+        let completion = assembler.finish();
+        let Message::Assistant { content, .. } = &completion.message else { panic!() };
+        let urls: Vec<&str> = content
+            .iter()
+            .filter_map(|block| match block {
+                Block::Citation { url, .. } => Some(url.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(urls, vec!["https://news.example/a", "https://news.example/b"]);
+        assert!(matches!(&content[1], Block::Citation { title, .. } if title == "财报"));
     }
 }

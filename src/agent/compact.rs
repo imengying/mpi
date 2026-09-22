@@ -425,6 +425,8 @@ pub fn check_summary(completion: &Completion) -> Result<String, CompactError> {
         // A summary request is never driven by the turn loop, so it cannot be stopped by
         // Esc; treating it as an error keeps the variant from being silently accepted.
         StopReason::Aborted => Err(CompactError::Summarize("摘要被中断".into())),
+        // Search is forced off for this request. A pause here means that failed.
+        StopReason::Pause => Err(CompactError::Summarize("摘要请求不应触发搜索".into())),
         StopReason::Stop => {
             let text = completion.text();
             if text.trim().is_empty() {
@@ -466,8 +468,12 @@ pub async fn summarize(
         Message::user_text(prompt),
     ];
     let no_tools: Vec<ToolSpec> = Vec::new();
+    // The summary is not a turn of the conversation. Hosted search on it would spend a
+    // search on the summary itself, and the tool list would no longer match the session.
+    let mut model = request.model.clone();
+    model.search = false;
     let body = Request {
-        model: request.model,
+        model: &model,
         provider: request.provider,
         messages: &messages,
         tools: &no_tools,

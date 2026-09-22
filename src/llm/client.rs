@@ -106,6 +106,7 @@ impl Client {
         // be checked against the provider and model before being replayed, and this is the
         // only place that knows both.
         assemblers.responses.issued_by(&provider.base_url, &req.model.id);
+        assemblers.anthropic.issued_by(&provider.base_url, &req.model.id);
         let mut response = response;
         // `chunk()` is inherent on `Response`, so no extra stream-trait dependency is
         // needed just to read the body incrementally.
@@ -181,7 +182,7 @@ impl Client {
         };
         match api {
             Api::AnthropicMessages => serde_json::from_str::<anthropic::FullResponse>(&text)
-                .map(anthropic::FullResponse::assemble)
+                .map(|full| full.assemble(&provider.base_url, &req.model.id))
                 .map_err(decode),
             Api::OpenAiCompletions => serde_json::from_str::<openai::FullResponse>(&text)
                 .map(openai::FullResponse::assemble)

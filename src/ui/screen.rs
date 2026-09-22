@@ -13,7 +13,8 @@ use std::io::{IsTerminal, Write};
 use std::path::Path;
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use crossterm::{cursor, terminal};
+use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
+use crossterm::{cursor, queue, terminal};
 use unicode_width::UnicodeWidthChar;
 
 use crate::config::Defaults;
@@ -656,6 +657,13 @@ pub struct Screen {
     /// Where the cursor was left inside the live region, as a row index, or `None` when it
     /// was left just past the end. Needed to erase the region from the right place.
     cursor_row: Option<usize>,
+    /// The column the cursor was parked on, so a spinner tick can put it back without
+    /// redrawing the rows under the spinner.
+    cursor_col: usize,
+    /// The live lines last painted. A spinner tick compares against this and, when nothing
+    /// else moved, rewrites only the spinner row. Clearing the whole region on every frame
+    /// is what made the input line and the footer flicker.
+    last_live: Vec<Line>,
     /// A one-off line shown under the input, e.g. a failed paste. Cleared on the next edit.
     notice: Option<String>,
     /// Lines submitted while a turn was running, shown above the input until they are sent.
@@ -740,6 +748,8 @@ impl Screen {
             cursor_shown: None,
             title: None,
             cursor_row: None,
+            cursor_col: 0,
+            last_live: Vec::new(),
             notice: None,
             pending: Vec::new(),
             pending_images: Vec::new(),
@@ -881,6 +891,7 @@ impl Screen {
     /// Caller must [`Screen::render`] afterwards to put the region back.
     pub fn suspend_live(&mut self) {
         self.erase_live();
+        let _ = self.out.flush();
     }
 
     /// Start the working spinner with `label`.
@@ -910,7 +921,9 @@ impl Screen {
             return;
         }
         self.working_frame = (self.working_frame + 1) % WORKING_FRAMES.len();
-        self.render();
+        if !self.repaint_spinner() {
+            self.render();
+        }
     }
 
     /// Show the tool call that is now running, as a single live line.
@@ -955,6 +968,7 @@ impl Screen {
         self.streaming_answer = None;
         self.streaming_thinking = None;
         self.erase_live();
+        let _ = self.out.flush();
     }
 
     /// Finish the stream and commit the answer. The thinking block itself is not printed:
@@ -967,11 +981,7 @@ impl Screen {
             lines.extend(crate::ui::compact::thinking_done_lines());
         }
         if !answer.trim().is_empty() {
-            lines.extend(
-                util::sanitize(&answer)
-                    .lines()
-                    .map(|line| Line::plain(line.to_string())),
-            );
+            lines.extend(crate::ui::markdown::render(&answer));
             lines.push(Line::blank());
         }
         if !lines.is_empty() {
@@ -996,10 +1006,7 @@ impl Screen {
             self.trim_live(&mut lines);
         }
         if let Some(answer) = &self.streaming_answer {
-            let body: Vec<Line> = util::sanitize(answer)
-                .lines()
-                .map(|line| Line::plain(line.to_string()))
-                .collect();
+            let body = crate::ui::markdown::render(answer);
             let wrapped = wrap_all(&body, self.width);
             lines.extend(wrapped);
             self.trim_live(&mut lines);
@@ -1317,7 +1324,6 @@ impl Screen {
             buffer.push_str("\r\n");
         }
         let _ = write!(self.out, "{buffer}");
-        let _ = self.out.flush();
     }
 
     /// Remove the live region, leaving the cursor where the region started.
@@ -1327,6 +1333,10 @@ impl Screen {
     /// Getting this wrong is not merely cosmetic: erasing from the wrong row leaves the rest
     /// of the old frame on screen, and the next frame is then drawn below it, which pushes
     /// the transcript up by however many rows were missed — once per redraw.
+    ///
+    /// This only queues the clear. The caller flushes, so a redraw can send the clear and the
+    /// new frame together. Flushing the clear on its own is the blank frame that flickered
+    /// under the spinner.
     fn erase_live(&mut self) {
         if !self.interactive || self.live_rows == 0 {
             return;
@@ -1342,13 +1352,17 @@ impl Screen {
             None => self.live_rows.saturating_sub(1),
         };
         if up > 0 {
-            let _ = crossterm::execute!(self.out, cursor::MoveToPreviousLine(up as u16));
+            let _ = queue!(self.out, cursor::MoveToPreviousLine(up as u16));
         }
-        let _ = write!(self.out, "\r");
-        let _ = crossterm::execute!(self.out, terminal::Clear(terminal::ClearType::FromCursorDown));
-        let _ = self.out.flush();
+        let _ = queue!(
+            self.out,
+            cursor::MoveToColumn(0),
+            terminal::Clear(terminal::ClearType::FromCursorDown)
+        );
         self.live_rows = 0;
         self.cursor_row = None;
+        self.cursor_col = 0;
+        self.last_live.clear();
     }
 
     /// Re-render the live region: the streaming preview (if any), the prompt (if editing)
@@ -1363,22 +1377,30 @@ impl Screen {
         if !self.interactive || self.cursor_shown == Some(visible) {
             return;
         }
+        // Queued, not executed: `execute` flushes, and a flush here would reveal the cleared
+        // region before the new frame is written.
         if visible {
-            let _ = crossterm::execute!(self.out, cursor::Show);
+            let _ = queue!(self.out, cursor::Show);
         } else {
-            let _ = crossterm::execute!(self.out, cursor::Hide);
+            let _ = queue!(self.out, cursor::Hide);
         }
         self.cursor_shown = Some(visible);
     }
 
     fn draw_live(&mut self) {
-        // Commit first, so new rows appear above the live region rather than inside it.
-        self.commit();
         if !self.interactive {
+            self.commit();
             return;
         }
         let (lines, cursor) = self.compose_live();
-        self.erase_live();
+        // One frame: the clear and the replacement go out together. Terminals that understand
+        // synchronized updates hold the old picture until the frame ends, so the footer does
+        // not blink off between them.
+        let _ = queue!(self.out, BeginSynchronizedUpdate);
+        self.commit();
+        if self.live_rows > 0 {
+            self.erase_live();
+        }
         let mut buffer = String::new();
         // Separate rows with CRLF but do **not** end the last one with it. A trailing newline
         // leaves the cursor on a row that has nothing in it, and that empty row is the blank
@@ -1416,12 +1438,61 @@ impl Screen {
         // make obvious.
         self.set_cursor_visible(cursor.is_some());
         let _ = write!(self.out, "{buffer}");
+        let _ = queue!(self.out, EndSynchronizedUpdate);
         let _ = self.out.flush();
         self.live_rows = lines.len();
         // Where the cursor was left, so the next erase starts from the right row. With no
         // cursor target it rests on the last drawn row, which is `live_rows - 1` rows below
         // the top — `erase_live` derives that from `None` rather than storing it.
         self.cursor_row = cursor.map(|(row, _)| row);
+        self.cursor_col = cursor.map(|(_, column)| column).unwrap_or(0);
+        self.last_live = lines;
+    }
+
+    /// Rewrite only the spinner, when the rows under it have not changed.
+    ///
+    /// A turn ticks this every 80ms. Redrawing the input line and the footer on each tick
+    /// clears them and paints them again, which reads as flicker. The frame is one cell, so
+    /// replacing that one row leaves everything below it untouched.
+    fn repaint_spinner(&mut self) -> bool {
+        if !self.interactive || self.live_rows == 0 || self.last_live.is_empty() {
+            return false;
+        }
+        let label = self.working.clone().unwrap_or_default();
+        let (lines, cursor) = self.compose_live();
+        if lines.len() != self.live_rows || lines.len() != self.last_live.len() {
+            return false;
+        }
+        let Some(index) = spinner_row(&lines, &label) else {
+            return false;
+        };
+        if !spinner_only_change(&self.last_live, &lines, &label) {
+            return false;
+        }
+        let from = match self.cursor_row {
+            Some(row) if row >= index => row,
+            _ => return false,
+        };
+        let up = from - index;
+        let _ = queue!(self.out, BeginSynchronizedUpdate);
+        if up > 0 {
+            let _ = queue!(self.out, cursor::MoveToPreviousLine(up as u16));
+        }
+        let _ = queue!(
+            self.out,
+            cursor::MoveToColumn(0),
+            terminal::Clear(terminal::ClearType::UntilNewLine)
+        );
+        let _ = write!(self.out, "{}", self.paint(&lines[index], self.width));
+        if up > 0 {
+            let _ = queue!(self.out, cursor::MoveToNextLine(up as u16));
+        }
+        let column = cursor.map(|(_, column)| column).unwrap_or(self.cursor_col);
+        let _ = queue!(self.out, cursor::MoveToColumn(column as u16 + 1));
+        let _ = queue!(self.out, EndSynchronizedUpdate);
+        let _ = self.out.flush();
+        self.last_live = lines;
+        true
     }
 
     fn paint(&self, line: &Line, pad_to: usize) -> String {
@@ -1995,6 +2066,31 @@ pub fn teardown() {
 /// Control characters are flattened: a session name is user input, and a newline or an
 /// escape byte in it would break out of the OSC sequence and let the rest be interpreted
 /// as terminal commands.
+/// The row that is the working spinner, if this frame has one.
+fn spinner_row(lines: &[Line], label: &str) -> Option<usize> {
+    lines.iter().position(|line| {
+        let spans = &line.spans;
+        spans.len() >= 3
+            && WORKING_FRAMES.contains(&spans[0].text.as_str())
+            && spans[1].text == " "
+            && spans[2].text == label
+    })
+}
+
+/// True when `next` differs from `previous` only in the spinner's frame.
+///
+/// That is the only change a tick is allowed to paint in place. Anything else — a new
+/// answer line, a footer update — still takes the full redraw.
+fn spinner_only_change(previous: &[Line], next: &[Line], label: &str) -> bool {
+    if previous.len() != next.len() {
+        return false;
+    }
+    let Some(index) = spinner_row(next, label) else {
+        return false;
+    };
+    previous.iter().zip(next).enumerate().all(|(row, (old, new))| row == index || old == new)
+}
+
 pub fn window_title(name: Option<&str>, cwd: &Path) -> String {
     let mut title = String::from(APP_TITLE);
     let name = name.map(str::trim).filter(|name| !name.is_empty());
@@ -2183,6 +2279,26 @@ mod tests {
         screen.tick_working();
         let (lines, _) = screen.compose_live();
         assert_eq!(lines[0].text(), format!("{} {}", WORKING_FRAMES[1], WORKING_LABEL));
+    }
+
+    #[test]
+    fn a_spinner_tick_does_not_count_as_a_change_below_it() {
+        // The footer and the input sit under the spinner. A tick that had to redraw them
+        // is what flickered; the tick is allowed to touch only the frame.
+        let spinner = |frame: &str| {
+            Line::spans(vec![
+                Span::new(frame, Style::new(Color::Cyan)),
+                Span::plain(" "),
+                Span::new(WORKING_LABEL, Style::new(Color::Dim)),
+            ])
+        };
+        let input = Line::plain("› ");
+        let footer = Line::plain("dir");
+        let before = vec![spinner(WORKING_FRAMES[0]), input.clone(), footer.clone()];
+        let after = vec![spinner(WORKING_FRAMES[1]), input.clone(), footer.clone()];
+        assert!(spinner_only_change(&before, &after, WORKING_LABEL));
+        let moved = vec![spinner(WORKING_FRAMES[1]), input, Line::plain("other")];
+        assert!(!spinner_only_change(&before, &moved, WORKING_LABEL));
     }
 
     #[test]

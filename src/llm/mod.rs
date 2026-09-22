@@ -81,6 +81,21 @@ pub enum Block {
         name: String,
         arguments: serde_json::Value,
     },
+    /// A hosted-search item, replayed verbatim and never executed locally.
+    ///
+    /// `provider` and `model` are where it was issued. A `/model` switch drops it: the
+    /// payload is private to that upstream, the same way an encrypted reasoning item is.
+    Hosted {
+        provider: String,
+        model: String,
+        payload: serde_json::Value,
+    },
+    /// A citation from a hosted search. Display only — it is not sent back.
+    Citation {
+        url: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        title: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -172,6 +187,8 @@ impl Message {
                         Block::ToolCall { name, arguments, .. } => {
                             chars += name.len() + arguments.to_string().len()
                         }
+                        Block::Hosted { payload, .. } => chars += payload.to_string().len(),
+                        Block::Citation { url, title } => chars += url.len() + title.len(),
                         Block::Image { .. } => images += 1,
                     }
                 }
@@ -191,6 +208,9 @@ pub enum StopReason {
     /// The user stopped the turn with Esc. Kept distinct from `Error` so a resumed session
     /// and the transcript agree that the answer was cut short on purpose.
     Aborted,
+    /// The upstream paused a hosted tool (Anthropic `pause_turn`) and must be sent the
+    /// same assistant message again. Nothing is executed locally.
+    Pause,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -214,6 +234,8 @@ pub struct ToolSpec {
 pub enum Delta {
     Text(String),
     Thinking(String),
+    /// A one-line status that is not part of the answer, such as a hosted search starting.
+    Notice(String),
 }
 
 /// The outcome of one assistant turn.
@@ -272,6 +294,34 @@ pub struct Request<'a> {
     pub session_id: &'a str,
     /// Disable the compression/compaction hints for side requests (summaries).
     pub cache_hints: bool,
+}
+
+/// The hosted-search shape to send on this request, if the model asked for it and the
+/// provider has one that fits its protocol.
+pub fn hosted_search(model: &ModelConfig, provider: &Provider) -> Option<compat::SearchFormat> {
+    if !model.search {
+        return None;
+    }
+    let format = provider.compat(model).search_format?;
+    let api = provider.api().unwrap_or(Api::OpenAiCompletions);
+    format.fits(api).then_some(format)
+}
+
+/// One citation, the way it is shown under an answer.
+pub fn citation_line(title: &str, url: &str) -> String {
+    if title.is_empty() { url.to_string() } else { format!("{title}  {url}") }
+}
+
+/// Citation lines on an assistant message, in order, without the "searched" header.
+pub fn citation_lines(message: &Message) -> Vec<String> {
+    let Message::Assistant { content, .. } = message else { return Vec::new() };
+    content
+        .iter()
+        .filter_map(|block| match block {
+            Block::Citation { url, title } => Some(citation_line(title, url)),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Map a pi level to the concrete knobs a provider wants.

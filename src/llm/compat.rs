@@ -4,6 +4,42 @@
 
 use serde::{Deserialize, Serialize};
 
+/// How a provider's hosted search is turned on. The model runs it upstream; pi never
+/// executes the call. `off` is the config's way to clear a detected format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchFormat {
+    /// Responses API tool `{ "type": "web_search" }`.
+    WebSearch,
+    /// Grok on the Responses API: `web_search` and `x_search`.
+    WebAndX,
+    /// Anthropic server tool `web_search_20250305`.
+    Anthropic,
+    /// xAI Chat Completions `search_parameters`.
+    Xai,
+    /// Qwen-compatible `enable_search`.
+    Qwen,
+    /// Zhipu tool `{ "type": "web_search" }`.
+    Zhipu,
+    /// Explicitly no hosted search, even when the host would otherwise have one.
+    Off,
+}
+
+impl SearchFormat {
+    /// Whether this shape belongs on `api`. A completions flag sent to the Responses
+    /// endpoint is rejected, so a mismatch is not a search.
+    pub fn fits(self, api: crate::llm::Api) -> bool {
+        match self {
+            SearchFormat::Off => false,
+            SearchFormat::Anthropic => api == crate::llm::Api::AnthropicMessages,
+            SearchFormat::WebSearch | SearchFormat::WebAndX => api == crate::llm::Api::OpenAiResponses,
+            SearchFormat::Xai | SearchFormat::Qwen | SearchFormat::Zhipu => {
+                api == crate::llm::Api::OpenAiCompletions
+            }
+        }
+    }
+}
+
 /// How a provider expects thinking/reasoning to be turned on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -48,6 +84,9 @@ pub struct Compat {
     pub send_session_affinity: bool,
     /// Server keeps prompt caches longer than the default; enables the 1h/24h hints.
     pub supports_long_cache: bool,
+    /// Hosted search this provider can speak, when it has one. `None` means pi must not
+    /// invent a search field: an unknown flag is a 400, not a silent no-op.
+    pub search_format: Option<SearchFormat>,
 }
 
 impl Default for Compat {
@@ -65,6 +104,7 @@ impl Default for Compat {
             supports_cache_control: false,
             send_session_affinity: true,
             supports_long_cache: false,
+            search_format: None,
         }
     }
 }
@@ -76,7 +116,13 @@ impl Compat {
         if api == crate::llm::Api::AnthropicMessages {
             compat.thinking_format = ThinkingFormat::Anthropic;
             compat.send_session_affinity = true;
+            compat.search_format = Some(SearchFormat::Anthropic);
             return compat;
+        }
+        if api == crate::llm::Api::OpenAiResponses {
+            // The Responses tool is the same shape on every host. xAI's extra `x_search`
+            // is layered on below, where the host is known.
+            compat.search_format = Some(SearchFormat::WebSearch);
         }
         let host = url.split("//").nth(1).unwrap_or(&url);
         let host = host.split('/').next().unwrap_or(host);
@@ -89,13 +135,29 @@ impl Compat {
             compat.thinking_format = ThinkingFormat::Deepseek;
             compat.supports_reasoning_effort = false;
             compat.requires_reasoning_content_on_assistant = true;
+            // The official API does not run a search. Responses accepts `web_search` and
+            // then ignores it, which would look like a search that never happened. Chat
+            // completions has no search field at all. Leave the format unset so `search:
+            // true` fails at startup instead of sending a no-op.
+            compat.search_format = None;
         } else if host.contains("bigmodel") || host.contains("z.ai") || host.contains("zhipu") {
             compat.thinking_format = ThinkingFormat::Zai;
             compat.supports_reasoning_effort = false;
             compat.requires_reasoning_content_on_assistant = true;
+            if api == crate::llm::Api::OpenAiCompletions {
+                compat.search_format = Some(SearchFormat::Zhipu);
+            }
         } else if host.contains("dashscope") || host.contains("aliyuncs") || host.contains("qwen") {
             compat.thinking_format = ThinkingFormat::Qwen;
             compat.supports_reasoning_effort = false;
+            if api == crate::llm::Api::OpenAiCompletions {
+                compat.search_format = Some(SearchFormat::Qwen);
+            }
+        } else if host == "x.ai" || host.ends_with(".x.ai") {
+            compat.search_format = Some(match api {
+                crate::llm::Api::OpenAiResponses => SearchFormat::WebAndX,
+                _ => SearchFormat::Xai,
+            });
         } else if host.contains("moonshot") {
             compat.thinking_format = ThinkingFormat::Openai;
             compat.max_tokens_field = "max_completion_tokens";
@@ -153,6 +215,10 @@ impl Compat {
         if let Some(value) = patch.supports_long_cache {
             self.supports_long_cache = value;
         }
+        if let Some(value) = patch.search_format {
+            // `off` clears a format the host would otherwise have been given.
+            self.search_format = (value != SearchFormat::Off).then_some(value);
+        }
     }
 }
 
@@ -172,6 +238,7 @@ pub struct CompatPatch {
     pub supports_cache_control: Option<bool>,
     pub send_session_affinity: Option<bool>,
     pub supports_long_cache: Option<bool>,
+    pub search_format: Option<SearchFormat>,
 }
 
 #[cfg(test)]
@@ -213,5 +280,62 @@ mod tests {
         assert!(compat.requires_reasoning_content_on_assistant);
         // Untouched fields keep their detected values.
         assert_eq!(compat.max_tokens_field, "max_tokens");
+    }
+
+    #[test]
+    fn hosted_search_follows_the_host_and_the_protocol() {
+        use crate::llm::Api;
+        assert_eq!(
+            Compat::from_base_url("https://api.anthropic.com", Api::AnthropicMessages).search_format,
+            Some(SearchFormat::Anthropic)
+        );
+        assert_eq!(
+            Compat::from_base_url("https://api.openai.com/v1", Api::OpenAiResponses).search_format,
+            Some(SearchFormat::WebSearch)
+        );
+        assert_eq!(
+            Compat::from_base_url("https://api.x.ai/v1", Api::OpenAiResponses).search_format,
+            Some(SearchFormat::WebAndX)
+        );
+        assert_eq!(
+            Compat::from_base_url("https://api.x.ai/v1", Api::OpenAiCompletions).search_format,
+            Some(SearchFormat::Xai)
+        );
+        assert_eq!(
+            Compat::from_base_url("https://dashscope.aliyuncs.com/compatible-mode/v1", Api::OpenAiCompletions)
+                .search_format,
+            Some(SearchFormat::Qwen)
+        );
+        assert_eq!(
+            Compat::from_base_url("https://open.bigmodel.cn/api/paas/v4", Api::OpenAiCompletions).search_format,
+            Some(SearchFormat::Zhipu)
+        );
+        assert_eq!(
+            Compat::from_base_url("https://api.z.ai/api/paas/v4", Api::OpenAiCompletions).search_format,
+            Some(SearchFormat::Zhipu)
+        );
+        // DeepSeek documents `web_search` as ignored on Responses, and chat completions has
+        // no search parameter. Treating that as "no format" is what stops a silent no-op.
+        assert_eq!(
+            Compat::from_base_url("https://api.deepseek.com", Api::OpenAiResponses).search_format,
+            None
+        );
+        assert_eq!(
+            Compat::from_base_url("https://api.deepseek.com/v1", Api::OpenAiCompletions).search_format,
+            None
+        );
+        // An unknown completions gateway has no search field pi is willing to invent.
+        assert_eq!(
+            Compat::from_base_url("https://example.test/v1", Api::OpenAiCompletions).search_format,
+            None
+        );
+    }
+
+    #[test]
+    fn search_format_off_clears_a_detected_format() {
+        let mut compat = Compat::from_base_url("https://api.x.ai/v1", crate::llm::Api::OpenAiResponses);
+        let patch: CompatPatch = serde_json::from_str(r#"{"search_format":"off"}"#).unwrap();
+        compat.apply(&patch);
+        assert_eq!(compat.search_format, None);
     }
 }

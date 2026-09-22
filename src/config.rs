@@ -58,6 +58,9 @@ pub struct ModelConfig {
     pub reasoning: bool,
     /// Levels this model accepts. Absent + `reasoning` means all five.
     pub thinking_levels: Vec<String>,
+    /// Use the provider's hosted search. Off unless asked: most models cannot search, and
+    /// a tool that appears and disappears between turns breaks the cache prefix.
+    pub search: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compat: Option<CompatPatch>,
 }
@@ -139,6 +142,10 @@ pub enum ConfigError {
     UnknownField(String),
     #[error("default_model「{0}」不是「<provider>/<model>」形式，或指向了未配置的模型")]
     BadDefaultModel(String),
+    #[error(
+        "provider「{provider}」的模型「{model}」打开了 search，但这个接口没有可用的原生搜索写法。在 compat.search_format 里指定：responses 用 web_search 或 web_and_x，messages 用 anthropic，completions 用 xai、qwen 或 zhipu。DeepSeek 官方接口不能原生搜索，请把 search 设为 false"
+    )]
+    NoNativeSearch { provider: String, model: String },
 }
 
 /// Every field the config understands, per level.
@@ -153,16 +160,17 @@ mod fields {
     pub const SHELL: [&str; 1] = ["path"];
     pub const PROVIDER: [&str; 7] =
         ["name", "api", "base_url", "api_key_env", "api_key", "compat", "models"];
-    pub const MODEL: [&str; 7] = [
+    pub const MODEL: [&str; 8] = [
         "id",
         "name",
         "context_window",
         "max_tokens",
         "reasoning",
         "thinking_levels",
+        "search",
         "compat",
     ];
-    pub const COMPAT: [&str; 12] = [
+    pub const COMPAT: [&str; 13] = [
         "max_tokens_field",
         "supports_developer_role",
         "supports_reasoning_effort",
@@ -175,6 +183,7 @@ mod fields {
         "supports_cache_control",
         "send_session_affinity",
         "supports_long_cache",
+        "search_format",
     ];
 }
 
@@ -307,6 +316,7 @@ pub const TEMPLATE: &str = r#"{
           "context_window": 200000,
           "max_tokens": 32000,
           "reasoning": true,
+          "search": false,
           "thinking_levels": ["low", "medium", "high", "xhigh", "max"]
         }
       ]
@@ -382,6 +392,16 @@ impl Config {
                             provider: provider.name.clone(),
                             model: model.id.clone(),
                             level: level.clone(),
+                        });
+                    }
+                }
+                if model.search {
+                    let format = provider.compat(model).search_format;
+                    let api = provider.api().unwrap_or(crate::llm::Api::OpenAiCompletions);
+                    if format.is_none_or(|format| !format.fits(api)) {
+                        return Err(ConfigError::NoNativeSearch {
+                            provider: provider.name.clone(),
+                            model: model.id.clone(),
                         });
                     }
                 }

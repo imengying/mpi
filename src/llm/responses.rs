@@ -17,7 +17,9 @@
 use serde::{Deserialize, Serialize};
 
 use super::compat::Compat;
-use super::{Block, Completion, Delta, LlmError, Message, Request, StopReason, plan_thinking};
+use super::{
+    Block, Completion, Delta, LlmError, Message, Request, StopReason, hosted_search, plan_thinking,
+};
 use crate::config::Usage;
 
 /// The Responses API rejects `max_output_tokens` below 16.
@@ -54,8 +56,18 @@ impl ContentPart {
     }
 }
 
-/// One entry of the flat `input` list. `role` is absent on the item kinds that carry their
-/// own `type`, so the field is only serialised where it applies.
+/// One entry of the flat `input` list. A hosted-search item is replayed as the raw
+/// object the server sent; everything else is the struct below. Untagged so a normal
+/// item keeps the field order the cache prefix depends on.
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+enum InputEntry {
+    Raw(serde_json::Map<String, serde_json::Value>),
+    Item(InputItem),
+}
+
+/// `role` is absent on the item kinds that carry their own `type`, so the field is only
+/// serialised where it applies.
 #[derive(Debug, Clone, Serialize)]
 struct InputItem {
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
@@ -115,16 +127,24 @@ impl InputItem {
     }
 }
 
-/// A tool as the Responses API advertises it: flat, not nested under `function`.
+/// A function tool, or a hosted search tool that has no name or schema. Untagged so a
+/// function tool serialises exactly as it did before search was added.
 #[derive(Debug, Clone, Serialize)]
-struct ToolDef {
-    #[serde(rename = "type")]
-    kind: &'static str,
-    name: String,
-    description: String,
-    parameters: serde_json::Value,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    strict: Option<bool>,
+#[serde(untagged)]
+enum ToolDef {
+    Hosted {
+        #[serde(rename = "type")]
+        kind: &'static str,
+    },
+    Function {
+        #[serde(rename = "type")]
+        kind: &'static str,
+        name: String,
+        description: String,
+        parameters: serde_json::Value,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        strict: Option<bool>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -141,7 +161,7 @@ pub struct ResponsesRequest {
     model: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     instructions: Option<String>,
-    input: Vec<InputItem>,
+    input: Vec<InputEntry>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<ToolDef>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -171,7 +191,7 @@ pub fn build_request(req: &Request<'_>, stream: bool) -> ResponsesRequest {
     let plan = plan_thinking(model, req.level, max_tokens);
 
     let mut instructions = None;
-    let mut input: Vec<InputItem> = Vec::new();
+    let mut input: Vec<InputEntry> = Vec::new();
     for message in req.messages {
         match message {
             Message::System { content } => instructions = Some(content.clone()),
@@ -187,7 +207,7 @@ pub fn build_request(req: &Request<'_>, stream: bool) -> ResponsesRequest {
                     })
                     .collect();
                 if !parts.is_empty() {
-                    input.push(InputItem::message("user", parts));
+                    input.push(InputEntry::Item(InputItem::message("user", parts)));
                 }
             }
             Message::Assistant { content: blocks, .. } => {
@@ -202,55 +222,80 @@ pub fn build_request(req: &Request<'_>, stream: bool) -> ResponsesRequest {
                                 provider,
                                 model,
                             ) {
-                                input.push(item);
+                                input.push(InputEntry::Item(item));
                             }
                         }
                         Block::Text { text } => {
                             // An assistant message is an item of its own, and its part is
                             // an `output_text` rather than the `input_text` a user turn uses.
-                            input.push(InputItem::message(
+                            input.push(InputEntry::Item(InputItem::message(
                                 "assistant",
                                 vec![ContentPart::Text {
                                     kind: "output_text",
                                     text: text.clone(),
                                 }],
-                            ));
+                            )));
                         }
                         Block::ToolCall { id, name, arguments } => {
-                            input.push(InputItem {
+                            input.push(InputEntry::Item(InputItem {
                                 kind: Some("function_call"),
                                 call_id: Some(id.clone()),
                                 name: Some(name.clone()),
                                 arguments: Some(arguments.to_string()),
                                 ..InputItem::empty()
-                            });
+                            }));
                         }
-                        Block::Image { .. } => {}
+                        // Same rule as an encrypted reasoning item: only the provider and
+                        // model that issued the search item can be sent it back.
+                        Block::Hosted { provider: origin, model: origin_model, payload } => {
+                            if origin == &provider.base_url
+                                && origin_model == &model.id
+                                && let Some(object) = payload.as_object()
+                            {
+                                input.push(InputEntry::Raw(object.clone()));
+                            }
+                        }
+                        // Citations are for the transcript. The server already folded them
+                        // into the answer it produced.
+                        Block::Citation { .. } | Block::Image { .. } => {}
                     }
                 }
             }
             Message::Tool { tool_call_id, content, .. } => {
-                input.push(InputItem {
+                input.push(InputEntry::Item(InputItem {
                     kind: Some("function_call_output"),
                     call_id: Some(tool_call_id.clone()),
                     output: Some(content.clone()),
                     ..InputItem::empty()
-                });
+                }));
             }
         }
     }
 
-    let tools: Vec<ToolDef> = req
+    let mut tools: Vec<ToolDef> = req
         .tools
         .iter()
-        .map(|tool| ToolDef {
-            kind: "function",
-            name: tool.name.clone(),
-            description: tool.description.clone(),
-            parameters: tool.parameters.clone(),
-            strict: compat.supports_strict_mode.then_some(true),
+        .map(|tool| {
+            ToolDef::Function {
+                kind: "function",
+                name: tool.name.clone(),
+                description: tool.description.clone(),
+                parameters: tool.parameters.clone(),
+                strict: compat.supports_strict_mode.then_some(true),
+            }
         })
         .collect();
+    // After the function tools, so their bytes stay the cache prefix.
+    match hosted_search(model, provider) {
+        Some(super::compat::SearchFormat::WebSearch) => {
+            tools.push(ToolDef::Hosted { kind: "web_search" });
+        }
+        Some(super::compat::SearchFormat::WebAndX) => {
+            tools.push(ToolDef::Hosted { kind: "web_search" });
+            tools.push(ToolDef::Hosted { kind: "x_search" });
+        }
+        _ => {}
+    }
 
     let reasoning = plan.effort.map(|effort| Reasoning {
         effort,
@@ -262,7 +307,7 @@ pub fn build_request(req: &Request<'_>, stream: bool) -> ResponsesRequest {
         instructions,
         input,
         tools,
-        tool_choice: (!req.tools.is_empty()).then_some("auto"),
+        tool_choice: (!req.tools.is_empty() || hosted_search(model, provider).is_some()).then_some("auto"),
         max_output_tokens: Some(max_tokens.max(MIN_OUTPUT_TOKENS)),
         reasoning: reasoning.clone(),
         store: false,
@@ -375,7 +420,7 @@ pub struct StreamEvent {
     message: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Item {
     #[serde(default)]
     id: Option<String>,
@@ -395,9 +440,16 @@ struct Item {
     name: Option<String>,
     #[serde(default)]
     arguments: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    action: Option<serde_json::Value>,
+    /// Fields this client does not interpret, kept so a search item can be sent back whole.
+    #[serde(flatten, default)]
+    rest: serde_json::Map<String, serde_json::Value>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ItemContent {
     /// `output_text` or `refusal`. A refusal has no `text`, so the type is what says which
     /// of the two fields to read.
@@ -407,6 +459,31 @@ struct ItemContent {
     text: Option<String>,
     #[serde(default)]
     refusal: Option<String>,
+    #[serde(default)]
+    annotations: Vec<Annotation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Annotation {
+    #[serde(rename = "type", default)]
+    kind: String,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+}
+
+impl Annotation {
+    fn cite(&self) -> Option<(String, String)> {
+        if self.kind != "url_citation" && self.kind != "url" {
+            // xAI and OpenAI both use url_citation. Anything with a url is still a citation.
+            if self.url.is_none() {
+                return None;
+            }
+        }
+        let url = self.url.clone().filter(|url| !url.is_empty())?;
+        Some((url, self.title.clone().unwrap_or_default()))
+    }
 }
 
 impl ItemContent {
@@ -477,6 +554,7 @@ pub struct Assembler {
     incomplete: Option<String>,
     error: Option<String>,
     saw_terminal: bool,
+    announced: bool,
     /// Where the reasoning payloads were issued. Recorded so a signature can be checked
     /// against the provider and model replaying it.
     provider: String,
@@ -494,6 +572,11 @@ struct Slot {
     call_id: Option<String>,
     name: Option<String>,
     encrypted_content: Option<String>,
+    status: Option<String>,
+    action: Option<serde_json::Value>,
+    citations: Vec<(String, String)>,
+    /// The search item as the server sent it, so the next turn can hand it back unchanged.
+    raw: Option<serde_json::Value>,
     index: usize,
 }
 
@@ -522,13 +605,24 @@ impl Assembler {
             "response.output_item.added" => {
                 let index = event.output_index.unwrap_or(self.items.len());
                 if let Some(item) = event.item {
-                    let slot = self.slot(index);
-                    slot.kind = item.kind;
-                    slot.id = item.id;
-                    slot.call_id = item.call_id;
-                    slot.name = item.name;
-                    slot.arguments = item.arguments.unwrap_or_default();
-                    slot.encrypted_content = item.encrypted_content;
+                    let search = item.kind.as_deref().is_some_and(is_search_call);
+                    let action = item.action.clone();
+                    let raw = search.then(|| serde_json::to_value(&item).ok()).flatten();
+                    {
+                        let slot = self.slot(index);
+                        slot.kind = item.kind;
+                        slot.id = item.id;
+                        slot.call_id = item.call_id;
+                        slot.name = item.name;
+                        slot.arguments = item.arguments.unwrap_or_default();
+                        slot.encrypted_content = item.encrypted_content;
+                        slot.status = item.status;
+                        slot.action = item.action;
+                        slot.raw = raw.or(slot.raw.take());
+                    }
+                    if search {
+                        self.note_search(action.as_ref(), on_delta);
+                    }
                 }
             }
             "response.output_text.delta" | "response.refusal.delta" => {
@@ -588,6 +682,15 @@ impl Assembler {
             "response.output_item.done" => {
                 let index = event.output_index.unwrap_or(self.items.len());
                 if let Some(item) = event.item {
+                    let search = item.kind.as_deref().is_some_and(is_search_call);
+                    let action = item.action.clone();
+                    let raw = search.then(|| serde_json::to_value(&item).ok()).flatten();
+                    let mut citations = Vec::new();
+                    if let Some(content) = &item.content {
+                        for part in content {
+                            citations.extend(part.annotations.iter().filter_map(Annotation::cite));
+                        }
+                    }
                     let slot = self.slot(index);
                     slot.kind = item.kind.or(slot.kind.take());
                     slot.id = item.id.or(slot.id.take());
@@ -601,6 +704,18 @@ impl Assembler {
                     if let Some(encrypted) = item.encrypted_content {
                         slot.encrypted_content = Some(encrypted);
                     }
+                    if item.status.is_some() {
+                        slot.status = item.status;
+                    }
+                    if item.action.is_some() {
+                        slot.action = item.action;
+                    }
+                    if raw.is_some() {
+                        slot.raw = raw;
+                    }
+                    if !citations.is_empty() {
+                        slot.citations = citations;
+                    }
                     if let Some(summary) = item.summary {
                         let joined = summary
                             .iter()
@@ -612,13 +727,16 @@ impl Assembler {
                         }
                     }
                     if let Some(content) = item.content {
-                        let text: String =
-                            content.iter().filter_map(ItemContent::body).collect();
+                        let text: String = content.iter().filter_map(ItemContent::body).collect();
                         if !text.is_empty() {
                             slot.text = text;
                         }
                     }
+                    let announce = slot.kind.as_deref().is_some_and(is_search_call);
                     let _ = item.role;
+                    if announce {
+                        self.note_search(action.as_ref(), on_delta);
+                    }
                 }
             }
             "response.completed" | "response.incomplete" => {
@@ -714,6 +832,14 @@ impl Assembler {
         for slot in std::mem::take(&mut self.items) {
             let kind = slot.kind.as_deref().unwrap_or_default();
             match kind {
+                kind if is_search_call(kind) => {
+                    let payload = slot.raw.clone().unwrap_or_else(|| search_payload(&slot, kind));
+                    content.push(Block::Hosted {
+                        provider: self.provider.clone(),
+                        model: self.model.clone(),
+                        payload,
+                    });
+                }
                 "reasoning" => {
                     if slot.text.trim().is_empty() {
                         continue;
@@ -746,6 +872,9 @@ impl Assembler {
                 _ => {
                     if !slot.text.is_empty() {
                         content.push(Block::Text { text: slot.text });
+                    }
+                    for (url, title) in slot.citations {
+                        content.push(Block::Citation { url, title });
                     }
                 }
             }
@@ -786,6 +915,35 @@ fn parse_arguments(raw: &str) -> serde_json::Value {
         return serde_json::Value::Object(serde_json::Map::new());
     }
     serde_json::from_str(raw).unwrap_or_else(|_| serde_json::Value::String(raw.to_string()))
+}
+
+fn is_search_call(kind: &str) -> bool {
+    kind == "web_search_call" || kind == "x_search_call" || kind.ends_with("_search_call")
+}
+
+fn search_payload(slot: &Slot, kind: &str) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    map.insert("type".into(), kind.into());
+    if let Some(id) = &slot.id {
+        map.insert("id".into(), id.clone().into());
+    }
+    if let Some(status) = &slot.status {
+        map.insert("status".into(), status.clone().into());
+    }
+    if let Some(action) = &slot.action {
+        map.insert("action".into(), action.clone());
+    }
+    serde_json::Value::Object(map)
+}
+
+impl Assembler {
+    fn note_search(&mut self, _action: Option<&serde_json::Value>, on_delta: &mut dyn FnMut(Delta)) {
+        if self.announced {
+            return;
+        }
+        self.announced = true;
+        on_delta(Delta::Notice("搜索了网页".into()));
+    }
 }
 
 /// Parse one SSE payload; `None` for frames that carry no JSON (e.g. `[DONE]`).
@@ -1140,6 +1298,7 @@ mod tests {
             let mut sink = |delta: Delta| match delta {
                 Delta::Text(chunk) => text.push_str(&chunk),
                 Delta::Thinking(chunk) => thinking.push_str(&chunk),
+                Delta::Notice(_) => {}
             };
             for json in events {
                 let event = parse_frame(json).unwrap().expect("an event");
@@ -1269,5 +1428,68 @@ mod tests {
         ]);
         let Message::Assistant { content, .. } = &completion.message else { panic!() };
         assert!(matches!(&content[0], Block::Thinking { thinking, .. } if thinking == "one\n\ntwo"));
+    }
+
+    #[test]
+    fn hosted_search_is_declared_and_replayed_only_for_the_model_that_ran_it() {
+        let (mut model, provider) = fixtures();
+        model.search = true;
+        let messages = vec![
+            Message::user_text("hi"),
+            Message::Assistant {
+                content: vec![
+                    Block::Hosted {
+                        provider: provider.base_url.clone(),
+                        model: model.id.clone(),
+                        payload: serde_json::json!({
+                            "type": "web_search_call",
+                            "id": "ws_1",
+                            "status": "completed",
+                            "action": {"type": "search", "query": "pi"}
+                        }),
+                    },
+                    Block::Hosted {
+                        provider: "https://elsewhere.example".into(),
+                        model: model.id.clone(),
+                        payload: serde_json::json!({"type": "web_search_call", "id": "nope"}),
+                    },
+                    Block::Citation { title: "docs".into(), url: "https://example.com".into() },
+                    Block::Text { text: "answer".into() },
+                ],
+                stop_reason: Some(StopReason::Stop),
+            },
+        ];
+        let req = Request {
+            model: &model,
+            provider: &provider,
+            messages: &messages,
+            tools: &[],
+            level: "high",
+            session_id: "s",
+            cache_hints: false,
+        };
+        let body = serde_json::to_value(build_request(&req, false)).unwrap();
+        assert_eq!(body["tools"][0]["type"], "web_search");
+        let input = body["input"].as_array().unwrap();
+        assert!(input.iter().any(|item| item["id"] == "ws_1"));
+        assert!(!input.iter().any(|item| item["id"] == "nope"));
+        assert!(!body.to_string().contains("example.com"));
+    }
+
+    #[test]
+    fn a_search_call_is_stored_whole_and_is_not_a_local_tool() {
+        let completion = stream(&[
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"web_search_call","id":"ws_1","status":"in_progress","action":{"type":"search","query":"pi"}}}"#,
+            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"web_search_call","id":"ws_1","status":"completed","action":{"type":"search","query":"pi"}}}"#,
+            r#"{"type":"response.output_text.delta","output_index":1,"delta":"yes"}"#,
+            r#"{"type":"response.output_item.done","output_index":1,"item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"yes","annotations":[{"type":"url_citation","url":"https://example.com","title":"docs"}]}]}}"#,
+            r#"{"type":"response.completed","response":{"status":"completed"}}"#,
+        ]);
+        assert!(completion.tool_calls().is_empty());
+        assert_eq!(completion.stop_reason, StopReason::Stop);
+        let Message::Assistant { content, .. } = &completion.message else { panic!() };
+        assert!(matches!(&content[0], Block::Hosted { payload, .. } if payload["id"] == "ws_1" && payload["status"] == "completed"));
+        assert!(matches!(&content[1], Block::Text { text } if text == "yes"));
+        assert!(matches!(&content[2], Block::Citation { url, title } if url == "https://example.com" && title == "docs"));
     }
 }
