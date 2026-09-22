@@ -259,9 +259,10 @@ pub fn replay_blocks(messages: &[crate::llm::Message]) -> Vec<crate::ui::screen:
                     }
                 }
             }
-            Message::Assistant { content, .. } => {
+            Message::Assistant { content, stop_reason } => {
                 let mut lines: Vec<Line> = Vec::new();
                 let had_thinking = content.iter().any(|b| matches!(b, MsgBlock::Thinking { .. }));
+                let stopped = *stop_reason == Some(crate::llm::StopReason::Aborted);
                 for block in content {
                     match block {
                         MsgBlock::Text { text } => {
@@ -288,6 +289,15 @@ pub fn replay_blocks(messages: &[crate::llm::Message]) -> Vec<crate::ui::screen:
                     push_lines(&mut out, prefix);
                 } else if !lines.is_empty() {
                     push_lines(&mut out, lines);
+                }
+                // A resumed session has to say that the answer was cut short, or a stopped
+                // turn reads as a model that simply trailed off — and the user has no way to
+                // tell "I stopped this" from "it gave up".
+                if stopped {
+                    push_lines(
+                        &mut out,
+                        note_lines("（已停止）", Style::new(Color::Dim)),
+                    );
                 }
             }
             // Already folded into the call above.
@@ -477,6 +487,36 @@ fn theme_path(arguments: &serde_json::Value) -> String {
 mod tests {
     use super::*;
     use crate::ui::plain;
+
+    #[test]
+    fn a_stopped_answer_says_so_when_it_is_replayed() {
+        use crate::llm::{Block as MsgBlock, Message, StopReason};
+        // Without the marker a resumed session shows a truncated reply with nothing to
+        // explain it: the user cannot tell "I pressed Esc" from "the model trailed off".
+        let stopped = vec![Message::Assistant {
+            content: vec![MsgBlock::Text { text: "说到一半".into() }],
+            stop_reason: Some(StopReason::Aborted),
+        }];
+        let text: String = replay_blocks(&stopped)
+            .iter()
+            .flat_map(|block| plain(&block.render(80)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("说到一半"), "{text}");
+        assert!(text.contains("已停止"), "{text}");
+
+        // A normal answer carries no such note.
+        let finished = vec![Message::Assistant {
+            content: vec![MsgBlock::Text { text: "说完了".into() }],
+            stop_reason: Some(StopReason::Stop),
+        }];
+        let text: String = replay_blocks(&finished)
+            .iter()
+            .flat_map(|block| plain(&block.render(80)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!text.contains("已停止"), "{text}");
+    }
 
     #[test]
     fn a_resumed_conversation_replays_the_answers_too() {

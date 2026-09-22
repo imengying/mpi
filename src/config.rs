@@ -36,7 +36,7 @@ impl Default for ShellConfig {
 #[serde(default)]
 pub struct Provider {
     pub name: String,
-    /// `anthropic-messages` or `openai-completions`.
+    /// `anthropic-messages`, `openai-completions` or `openai-responses`.
     pub api: String,
     pub base_url: String,
     pub api_key_env: Option<String>,
@@ -133,10 +133,138 @@ pub enum ConfigError {
     NoProviders(PathBuf),
     #[error("provider「{provider}」的模型「{model}」思考级别「{level}」无效（可用：low、medium、high、xhigh、max）")]
     BadLevel { provider: String, model: String, level: String },
-    #[error("provider「{0}」的 api 必须是 anthropic-messages 或 openai-completions")]
+    #[error("provider「{0}」的 api 必须是 anthropic-messages、openai-completions 或 openai-responses")]
     BadApi(String),
+    #[error("{0}")]
+    UnknownField(String),
     #[error("default_model「{0}」不是「<provider>/<model>」形式，或指向了未配置的模型")]
     BadDefaultModel(String),
+}
+
+/// Every field the config understands, per level.
+///
+/// This exists because serde ignores what it does not recognise: a provider written with
+/// `baseUrl` instead of `base_url` parses fine, and the request then goes to the protocol's
+/// default host. That is not a cosmetic mistake — it sends the conversation and the API key
+/// to a host the user never named. So the raw JSON is checked against these lists before it
+/// is trusted, and a misspelling is a start-up error instead.
+mod fields {
+    pub const ROOT: [&str; 3] = ["shell", "providers", "default_model"];
+    pub const SHELL: [&str; 1] = ["path"];
+    pub const PROVIDER: [&str; 7] =
+        ["name", "api", "base_url", "api_key_env", "api_key", "compat", "models"];
+    pub const MODEL: [&str; 7] = [
+        "id",
+        "name",
+        "context_window",
+        "max_tokens",
+        "reasoning",
+        "thinking_levels",
+        "compat",
+    ];
+    pub const COMPAT: [&str; 12] = [
+        "max_tokens_field",
+        "supports_developer_role",
+        "supports_reasoning_effort",
+        "thinking_format",
+        "requires_thinking_as_text",
+        "requires_reasoning_content_on_assistant",
+        "requires_assistant_after_tool_result",
+        "supports_usage_in_streaming",
+        "supports_strict_mode",
+        "supports_cache_control",
+        "send_session_affinity",
+        "supports_long_cache",
+    ];
+}
+
+/// Report the first key in `object` that is not in `known`.
+fn unknown_key(object: &serde_json::Map<String, serde_json::Value>, known: &[&str]) -> Option<String> {
+    object
+        .keys()
+        .find(|key| !known.contains(&key.as_str()))
+        .map(|key| key.to_string())
+}
+
+/// Suggest the snake_case spelling of a camelCase key, when that is what it looks like.
+fn suggestion(key: &str) -> Option<String> {
+    if !key.chars().any(|c| c.is_ascii_uppercase()) {
+        return None;
+    }
+    let mut out = String::new();
+    for (index, c) in key.chars().enumerate() {
+        if c.is_ascii_uppercase() {
+            if index > 0 {
+                out.push('_');
+            }
+            out.extend(c.to_lowercase());
+        } else {
+            out.push(c);
+        }
+    }
+    Some(out)
+}
+
+fn unknown_field_error(location: &str, key: &str) -> ConfigError {
+    let hint = match suggestion(key) {
+        Some(snake) => format!("是不是想写「{snake}」？"),
+        None => "检查拼写。".to_string(),
+    };
+    ConfigError::UnknownField(format!(
+        "{location}里的「{key}」不是配置项，也不会生效（{hint}）\
+         配置字段一律 snake_case，且写错的键会被忽略而不是报错——\
+         与其让请求发到别处，不如在这里停下。"
+    ))
+}
+
+/// Walk the raw JSON and reject keys the structs would silently drop.
+fn check_unknown_fields(raw: &serde_json::Value) -> Result<(), ConfigError> {
+    let Some(root) = raw.as_object() else { return Ok(()) };
+    if let Some(key) = unknown_key(root, &fields::ROOT) {
+        return Err(unknown_field_error("配置", &key));
+    }
+    if let Some(shell) = root.get("shell").and_then(|value| value.as_object())
+        && let Some(key) = unknown_key(shell, &fields::SHELL)
+    {
+        return Err(unknown_field_error("shell", &key));
+    }
+    let Some(providers) = root.get("providers").and_then(|value| value.as_array()) else {
+        return Ok(());
+    };
+    for provider in providers {
+        let Some(provider) = provider.as_object() else { continue };
+        let name = provider.get("name").and_then(|value| value.as_str()).unwrap_or("?");
+        if let Some(key) = unknown_key(provider, &fields::PROVIDER) {
+            return Err(unknown_field_error(&format!("provider「{name}」"), &key));
+        }
+        if let Some(compat) = provider.get("compat").and_then(|value| value.as_object())
+            && let Some(key) = unknown_key(compat, &fields::COMPAT)
+        {
+            return Err(unknown_field_error(&format!("provider「{name}」的 compat"), &key));
+        }
+        let Some(models) = provider.get("models").and_then(|value| value.as_array()) else {
+            continue;
+        };
+        for model in models {
+            let Some(model) = model.as_object() else { continue };
+            let id = model.get("id").and_then(|value| value.as_str()).unwrap_or("?");
+            if let Some(key) = unknown_key(model, &fields::MODEL) {
+                return Err(unknown_field_error(
+                    &format!("provider「{name}」的模型「{id}」"),
+                    &key,
+                ));
+            }
+            if let Some(compat) = model.get("compat").and_then(|value| value.as_object())
+                && let Some(key) = unknown_key(compat, &fields::COMPAT)
+            {
+                return Err(unknown_field_error(
+                    &format!("provider「{name}」的模型「{id}」的 compat"),
+                    &key,
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Where pi keeps everything it owns: `~/.pi`.
@@ -226,6 +354,10 @@ impl Config {
             return Err(ConfigError::Created(path));
         }
         let raw = std::fs::read_to_string(&path)?;
+        let parsed: serde_json::Value = serde_json::from_str(&raw)?;
+        // Before the typed parse: a key serde does not know is dropped without a word, and
+        // the drop is invisible in the parsed value.
+        check_unknown_fields(&parsed)?;
         let mut config: Config = serde_json::from_str(&raw)?;
         config.validate(&path)?;
         config.fill_defaults();
@@ -237,7 +369,7 @@ impl Config {
             return Err(ConfigError::NoProviders(path.clone()));
         }
         for provider in &self.providers {
-            if provider.api != "anthropic-messages" && provider.api != "openai-completions" {
+            if crate::llm::Api::from_name(&provider.api).is_none() {
                 return Err(ConfigError::BadApi(provider.name.clone()));
             }
             if provider.models.is_empty() {
@@ -266,10 +398,10 @@ impl Config {
     fn fill_defaults(&mut self) {
         for provider in &mut self.providers {
             if provider.base_url.is_empty() {
-                provider.base_url = match provider.api.as_str() {
-                    "anthropic-messages" => "https://api.anthropic.com".into(),
-                    _ => "https://api.openai.com/v1".into(),
-                };
+                provider.base_url = crate::llm::Api::from_name(&provider.api)
+                    .map(crate::llm::Api::default_base_url)
+                    .unwrap_or_default()
+                    .to_string();
             }
             if provider.api_key_env.is_none() && provider.api_key.is_none() {
                 provider.api_key_env = Some(format!(
@@ -791,6 +923,121 @@ mod tests {
         let raw = r#"{"providers":[{"name":"p","api":"openai-completions","models":[{"id":"m","thinking_levels":["off"]}]}]}"#;
         let cfg: Config = serde_json::from_str(raw).unwrap();
         assert!(matches!(cfg.validate(&PathBuf::from("x")), Err(ConfigError::BadLevel { .. })));
+    }
+
+    #[test]
+    fn the_third_protocol_is_accepted_and_gets_its_own_default_host() {
+        let raw = r#"{"providers":[{"name":"p","api":"openai-responses","models":[{"id":"m"}]}]}"#;
+        let mut cfg: Config = serde_json::from_str(raw).unwrap();
+        cfg.validate(&PathBuf::from("x")).unwrap();
+        cfg.fill_defaults();
+        assert_eq!(cfg.providers[0].base_url, "https://api.openai.com/v1");
+    }
+
+    #[test]
+    fn an_api_that_is_not_a_protocol_is_rejected() {
+        let raw = r#"{"providers":[{"name":"p","api":"openai-respones","models":[{"id":"m"}]}]}"#;
+        let cfg: Config = serde_json::from_str(raw).unwrap();
+        assert!(matches!(cfg.validate(&PathBuf::from("x")), Err(ConfigError::BadApi(_))));
+    }
+
+    #[test]
+    fn a_misspelled_key_is_an_error_not_a_silent_default() {
+        // The bug this guards: `baseUrl` parses, is dropped, and the request goes to the
+        // protocol's default host with the user's key attached — which is how a working
+        // gateway turns into a 403 from a company the user never mentioned.
+        let raw = serde_json::json!({
+            "providers": [{
+                "name": "grok",
+                "api": "openai-completions",
+                "baseUrl": "https://api.example.org/v1",
+                "models": [{"id": "grok-4.7"}]
+            }]
+        });
+        let err = check_unknown_fields(&raw).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("baseUrl"), "{text}");
+        assert!(text.contains("base_url"), "the suggestion must name the right key: {text}");
+        assert!(text.contains("grok"), "{text}");
+    }
+
+    #[test]
+    fn misspellings_are_caught_at_every_level() {
+        let cases = [
+            // A provider field.
+            serde_json::json!({"providers":[{"name":"p","api":"openai-completions",
+                "key":"x","models":[{"id":"m"}]}]}),
+            // A model field.
+            serde_json::json!({"providers":[{"name":"p","api":"openai-completions",
+                "models":[{"id":"m","maxTokens":100}]}]}),
+            // A compat switch.
+            serde_json::json!({"providers":[{"name":"p","api":"openai-completions",
+                "compat":{"sendSessionAffinityHeaders":true},"models":[{"id":"m"}]}]}),
+            // The shell block.
+            serde_json::json!({"shell":{"shell":"/bin/zsh"},"providers":[{"name":"p",
+                "api":"openai-completions","models":[{"id":"m"}]}]}),
+            // The root itself.
+            serde_json::json!({"provider":[],"providers":[{"name":"p",
+                "api":"openai-completions","models":[{"id":"m"}]}]}),
+        ];
+        for case in cases {
+            let err = check_unknown_fields(&case)
+                .expect_err(&format!("this must be rejected: {case}"));
+            assert!(
+                err.to_string().contains("不是配置项"),
+                "the message must say what is wrong: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_correct_config_passes_the_field_check() {
+        // Every documented field, so the check cannot be passing by rejecting the docs.
+        let raw = serde_json::json!({
+            "shell": {"path": "/usr/bin/zsh"},
+            "providers": [{
+                "name": "p",
+                "api": "openai-responses",
+                "base_url": "https://api.example.org/v1",
+                "api_key_env": "P_API_KEY",
+                "api_key": "sk-x",
+                "compat": {
+                    "max_tokens_field": "max_completion_tokens",
+                    "supports_developer_role": false,
+                    "supports_reasoning_effort": true,
+                    "thinking_format": "none",
+                    "requires_thinking_as_text": false,
+                    "requires_reasoning_content_on_assistant": false,
+                    "requires_assistant_after_tool_result": false,
+                    "supports_usage_in_streaming": true,
+                    "supports_strict_mode": false,
+                    "supports_cache_control": false,
+                    "send_session_affinity": true,
+                    "supports_long_cache": false
+                },
+                "models": [{
+                    "id": "m",
+                    "name": "m",
+                    "context_window": 400000,
+                    "max_tokens": 32000,
+                    "reasoning": true,
+                    "thinking_levels": ["low", "high"],
+                    "compat": {"supports_strict_mode": true}
+                }]
+            }],
+            "default_model": "p/m"
+        });
+        check_unknown_fields(&raw).expect("the documented shape must be accepted");
+    }
+
+    #[test]
+    fn a_key_with_no_obvious_snake_case_form_is_still_reported() {
+        let raw = serde_json::json!({"providers":[{"name":"p","api":"openai-completions",
+            "models":[{"id":"m","contextwindo":1}]}]});
+        let text = check_unknown_fields(&raw).unwrap_err().to_string();
+        assert!(text.contains("contextwindo"), "{text}");
+        // Nothing to suggest, so the message must not invent one.
+        assert!(!text.contains("是不是想写"), "{text}");
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //! SSE framing is parsed by hand: both providers send `data:` lines that feed straight
 //! into the provider-specific assemblers.
 
-use super::{Delta, LlmError, Request, anthropic, openai};
+use super::{Api, Delta, LlmError, Request, anthropic, openai, responses};
 use crate::config::Provider;
 
 pub struct Client {
@@ -14,10 +14,22 @@ pub struct Client {
 enum Frame {
     Anthropic(Box<anthropic::StreamEvent>),
     OpenAi(Box<openai::StreamChunk>),
+    Responses(Box<responses::StreamEvent>),
 }
 
-struct AnthropicState(anthropic::Assembler);
-struct OpenAiState(openai::Assembler);
+#[derive(Default)]
+struct Assemblers {
+    anthropic: anthropic::Assembler,
+    openai: openai::Assembler,
+    responses: responses::Assembler,
+}
+
+/// Which body/parser pair a provider uses. Read once per request so the dispatch is a
+/// single match rather than a string comparison scattered through the call.
+fn api_of(provider: &Provider) -> Result<Api, LlmError> {
+    Api::from_name(&provider.api)
+        .ok_or_else(|| LlmError::UnknownApi(provider.name.clone(), provider.api.clone()))
+}
 
 impl Client {
     pub fn new() -> anyhow::Result<Self> {
@@ -43,9 +55,9 @@ impl Client {
         on_delta: &mut dyn FnMut(Delta),
     ) -> Result<super::Completion, LlmError> {
         let provider = req.provider;
+        let api = api_of(provider)?;
         let api_key = Self::api_key(provider)?;
-        let anthropic_style = provider.api == "anthropic-messages";
-        let mut request = if anthropic_style {
+        let mut request = if api == Api::AnthropicMessages {
             let body = anthropic::build_request(req);
             let mut request = self
                 .http
@@ -58,11 +70,18 @@ impl Client {
             }
             request
         } else {
-            let body = openai::build_request(req, true);
-            self.http
-                .post(openai::endpoint(&provider.base_url))
-                .bearer_auth(&api_key)
-                .json(&body)
+            let mut request = match api {
+                Api::OpenAiResponses => self
+                    .http
+                    .post(responses::endpoint(&provider.base_url))
+                    .json(&responses::build_request(req, true)),
+                _ => self
+                    .http
+                    .post(openai::endpoint(&provider.base_url))
+                    .json(&openai::build_request(req, true)),
+            };
+            request = request.bearer_auth(&api_key);
+            request
         };
         if provider.compat(req.model).send_session_affinity {
             // Only meaningful behind a load balancer, but harmless elsewhere, and it
@@ -81,8 +100,11 @@ impl Client {
             return Err(LlmError::Api { status: status.as_u16(), message: describe_error(&text) });
         }
         let mut buffer = String::new();
-        let mut anthropic_state = AnthropicState(anthropic::Assembler::default());
-        let mut openai_state = OpenAiState(openai::Assembler::default());
+        let mut assemblers = Assemblers::default();
+        // Where the reasoning payloads about to arrive were issued from. A signature has to
+        // be checked against the provider and model before being replayed, and this is the
+        // only place that knows both.
+        assemblers.responses.issued_by(&provider.base_url, &req.model.id);
         let mut response = response;
         // `chunk()` is inherent on `Response`, so no extra stream-trait dependency is
         // needed just to read the body incrementally.
@@ -95,16 +117,16 @@ impl Client {
             // Frames end at a blank line; the trailing partial frame stays buffered.
             while let Some(index) = buffer.find("\n\n") {
                 let frame: String = buffer.drain(..index + 2).collect();
-                dispatch(&frame, anthropic_style, &mut anthropic_state, &mut openai_state, on_delta)?;
+                dispatch(&frame, api, &mut assemblers, on_delta)?;
             }
         }
         if !buffer.trim().is_empty() {
-            dispatch(&buffer, anthropic_style, &mut anthropic_state, &mut openai_state, on_delta)?;
+            dispatch(&buffer, api, &mut assemblers, on_delta)?;
         }
-        Ok(if anthropic_style {
-            anthropic_state.0.finish()
-        } else {
-            openai_state.0.finish()
+        Ok(match api {
+            Api::AnthropicMessages => assemblers.anthropic.finish(),
+            Api::OpenAiCompletions => assemblers.openai.finish(),
+            Api::OpenAiResponses => assemblers.responses.finish(),
         })
     }
 
@@ -112,9 +134,9 @@ impl Client {
     /// token by token and must not burn cache writes.
     pub async fn complete(&self, req: &Request<'_>) -> Result<super::Completion, LlmError> {
         let provider = req.provider;
+        let api = api_of(provider)?;
         let api_key = Self::api_key(provider)?;
-        let anthropic_style = provider.api == "anthropic-messages";
-        let response = if anthropic_style {
+        let response = if api == Api::AnthropicMessages {
             let mut body = anthropic::build_request(req);
             body.stream = false;
             let mut request = self
@@ -128,14 +150,18 @@ impl Client {
             }
             request.send().await.map_err(|err| LlmError::Transport(err.to_string()))?
         } else {
-            let body = openai::build_request(req, false);
-            self.http
-                .post(openai::endpoint(&provider.base_url))
-                .bearer_auth(&api_key)
-                .json(&body)
-                .send()
-                .await
-                .map_err(|err| LlmError::Transport(err.to_string()))?
+            let mut request = match api {
+                Api::OpenAiResponses => self
+                    .http
+                    .post(responses::endpoint(&provider.base_url))
+                    .json(&responses::build_request(req, false)),
+                _ => self
+                    .http
+                    .post(openai::endpoint(&provider.base_url))
+                    .json(&openai::build_request(req, false)),
+            };
+            request = request.bearer_auth(&api_key);
+            request.send().await.map_err(|err| LlmError::Transport(err.to_string()))?
         };
         let status = response.status();
         let text = response.text().await.map_err(|err| LlmError::Transport(err.to_string()))?;
@@ -145,28 +171,34 @@ impl Client {
         let decode = |err: serde_json::Error| {
             LlmError::Decode(format!("{err}: {}", crate::util::truncate(&text, 300, "…")))
         };
-        if anthropic_style {
-            serde_json::from_str::<anthropic::FullResponse>(&text)
+        match api {
+            Api::AnthropicMessages => serde_json::from_str::<anthropic::FullResponse>(&text)
                 .map(anthropic::FullResponse::assemble)
-                .map_err(decode)
-        } else {
-            serde_json::from_str::<openai::FullResponse>(&text)
+                .map_err(decode),
+            Api::OpenAiCompletions => serde_json::from_str::<openai::FullResponse>(&text)
                 .map(openai::FullResponse::assemble)
-                .map_err(decode)
+                .map_err(decode),
+            Api::OpenAiResponses => {
+                let mut assembler = responses::Assembler::default();
+                assembler.issued_by(&provider.base_url, &req.model.id);
+                serde_json::from_str::<responses::FullResponse>(&text)
+                    .map(|full| full.assemble(assembler))
+                    .map_err(decode)
+            }
         }
     }
 }
 
 fn dispatch(
     frame: &str,
-    anthropic_style: bool,
-    anthropic_state: &mut AnthropicState,
-    openai_state: &mut OpenAiState,
+    api: Api,
+    assemblers: &mut Assemblers,
     on_delta: &mut dyn FnMut(Delta),
 ) -> Result<(), LlmError> {
-    match parse_sse_frame(frame, anthropic_style)? {
-        Some(Frame::Anthropic(event)) => anthropic_state.0.feed(*event, on_delta),
-        Some(Frame::OpenAi(chunk)) => chunk.feed(&mut openai_state.0, on_delta),
+    match parse_sse_frame(frame, api)? {
+        Some(Frame::Anthropic(event)) => assemblers.anthropic.feed(*event, on_delta),
+        Some(Frame::OpenAi(chunk)) => chunk.feed(&mut assemblers.openai, on_delta),
+        Some(Frame::Responses(event)) => event.feed(&mut assemblers.responses, on_delta),
         None => {}
     }
     Ok(())
@@ -189,7 +221,7 @@ pub fn describe_error(body: &str) -> String {
 }
 
 /// Split one SSE frame into its `event:` name and concatenated `data:` payload.
-fn parse_sse_frame(frame: &str, anthropic_style: bool) -> Result<Option<Frame>, LlmError> {
+fn parse_sse_frame(frame: &str, api: Api) -> Result<Option<Frame>, LlmError> {
     let mut event_name: Option<String> = None;
     let mut data = String::new();
     for line in frame.lines() {
@@ -206,11 +238,15 @@ fn parse_sse_frame(frame: &str, anthropic_style: bool) -> Result<Option<Frame>, 
     if data.trim().is_empty() || data.trim() == "[DONE]" {
         return Ok(None);
     }
-    if anthropic_style {
-        Ok(anthropic::parse_event(event_name.as_deref(), &data)?.map(|e| Frame::Anthropic(Box::new(e))))
-    } else {
-        Ok(openai::parse_frame(&data)?.map(|c| Frame::OpenAi(Box::new(c))))
-    }
+    Ok(match api {
+        Api::AnthropicMessages => {
+            anthropic::parse_event(event_name.as_deref(), &data)?.map(|e| Frame::Anthropic(Box::new(e)))
+        }
+        Api::OpenAiCompletions => openai::parse_frame(&data)?.map(|c| Frame::OpenAi(Box::new(c))),
+        Api::OpenAiResponses => {
+            responses::parse_frame(&data)?.map(|e| Frame::Responses(Box::new(e)))
+        }
+    })
 }
 
 #[cfg(test)]
@@ -230,16 +266,40 @@ mod tests {
     #[test]
     fn sse_frames_are_split_on_event_and_data_lines() {
         let frame = "event: content_block_delta\ndata: {\"index\":0,\"delta\":{\"text\":\"hi\"}}\n\n";
-        match parse_sse_frame(frame, true).unwrap() {
+        match parse_sse_frame(frame, Api::AnthropicMessages).unwrap() {
             Some(Frame::Anthropic(event)) => assert_eq!(event.kind, "content_block_delta"),
             _ => panic!("expected an anthropic event"),
         }
         let frame = "data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n";
-        match parse_sse_frame(frame, false).unwrap() {
+        match parse_sse_frame(frame, Api::OpenAiCompletions).unwrap() {
             Some(Frame::OpenAi(_)) => {}
             _ => panic!("expected an openai chunk"),
         }
-        assert!(parse_sse_frame("data: [DONE]\n\n", false).unwrap().is_none());
-        assert!(parse_sse_frame("\n", false).unwrap().is_none());
+        // The Responses API names the event twice — once as an SSE `event:` line and once
+        // inside the payload — and the payload is the copy that is trusted.
+        let frame = "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"x\"}\n\n";
+        match parse_sse_frame(frame, Api::OpenAiResponses).unwrap() {
+            Some(Frame::Responses(event)) => assert_eq!(event.kind, "response.output_text.delta"),
+            _ => panic!("expected a responses event"),
+        }
+        assert!(parse_sse_frame("data: [DONE]\n\n", Api::OpenAiCompletions).unwrap().is_none());
+        assert!(parse_sse_frame("\n", Api::OpenAiResponses).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_provider_with_an_unknown_api_is_reported_rather_than_misread() {
+        // The config validates the name at start-up, so this is the guard behind that: a
+        // hand-built provider must not silently fall through to another protocol.
+        let provider: Provider = serde_json::from_str(
+            r#"{"name":"weird","api":"openai-nonsense","base_url":"url","models":[]}"#,
+        )
+        .unwrap();
+        match api_of(&provider) {
+            Err(LlmError::UnknownApi(name, api)) => {
+                assert_eq!(name, "weird");
+                assert_eq!(api, "openai-nonsense");
+            }
+            other => panic!("expected an unknown-api error, got {other:?}"),
+        }
     }
 }

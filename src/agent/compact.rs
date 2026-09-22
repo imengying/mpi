@@ -422,6 +422,9 @@ pub fn check_summary(completion: &Completion) -> Result<String, CompactError> {
         )),
         StopReason::Length => Err(CompactError::Truncated),
         StopReason::ToolUse => Err(CompactError::ToolCallInSummary),
+        // A summary request is never driven by the turn loop, so it cannot be stopped by
+        // Esc; treating it as an error keeps the variant from being silently accepted.
+        StopReason::Aborted => Err(CompactError::Summarize("摘要被中断".into())),
         StopReason::Stop => {
             let text = completion.text();
             if text.trim().is_empty() {

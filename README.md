@@ -91,7 +91,7 @@ pi 没有内置模型目录，也不会去猜。没配置 providers 会直接报
 
 | 字段 | 说明 |
 |---|---|
-| `api` | `anthropic-messages` 或 `openai-completions` |
+| `api` | `anthropic-messages`、`openai-completions` 或 `openai-responses` |
 | `base_url` | 缺省按 `api` 取官方地址；任意 OpenAI 兼容网关直接写它即可 |
 | `api_key_env` | 读哪个环境变量取 key，缺省为 `<PROVIDER>_API_KEY` |
 | `api_key` | 直接写 key（不推荐）；两者都缺时请求会报错 |
@@ -104,10 +104,30 @@ pi 没有内置模型目录，也不会去猜。没配置 providers 会直接报
 思考级别的词汇表只有五档：`low`、`medium`、`high`、`xhigh`、`max`。
 写别的值会在启动时报错，不会静默忽略。
 
+**写错的字段名同样会在启动时报错。** 配置字段一律 snake_case，写成 `baseUrl`
+这样的驼峰名不会生效——而一个被悄悄忽略的 `base_url` 意味着请求发给的是协议默认的
+主机（比如 `api.openai.com`），带着你的 key 和整段对话。所以这类拼写错误会被点名
+拦下，并提示正确写法，而不是让请求发到别处。
+
+### 三个协议怎么选
+
+| `api` | 什么时候用 |
+|---|---|
+| `openai-completions` | 绝大多数网关与中转（DeepSeek、GLM、Kimi…）；先试这个 |
+| `openai-responses` | 只会说 Responses 的模型（GPT-5 系、Codex），或网关只对这个端点开通了某模型 |
+| `anthropic-messages` | Anthropic 官方或兼容 Messages 的服务 |
+
+`openai-responses` 会以 `store: false` 发送，会话只在本地存一份，服务端不留档；
+推理摘要以 `encrypted_content` 原样回放，且只在**同一个 provider 与模型**下回放——
+中途 `/model` 换了模型，旧的推理块会被丢掉而不是发给不认识它的上游。
+
 ### 兼容开关
 
 不同网关对「OpenAI 兼容」的理解不一样。pi 按 `base_url` 自动探测一组开关，
-配置里只写例外（`compat` 可以是 provider 级或 model 级，model 级优先）：
+配置里只写例外（`compat` 可以是 provider 级或 model 级，model 级优先）。
+`openai-responses` 只用到其中的 `supports_strict_mode`（工具定义上的 `strict`）
+与 `send_session_affinity`（会话粘性头），其余开关对它没有意义——
+它的思考参数、请求形状与缓存键都是这个协议固定的写法。
 
 ```json
 "compat": {
@@ -228,6 +248,11 @@ Linux 二进制依赖 runner 自带的 glibc（当前 2.39），构建摘要里�
 `Ctrl+V` 粘贴剪贴板里的图片（截图直接可用），图片显示为 `[图片 1280×720, 84 KB]`
 挂在输入行下方；也可以只粘图片不带文字。图片随该条消息一起发出去，存在会话文件里，
 `/resume` 之后仍在。剪贴板没有图片时 `Ctrl+V` 退化为粘贴文本。
+
+**`Esc` 停止正在跑的这一轮**：模型边答边按就停止生成，命令跑着按就杀掉那条命令，
+已经收到的内容留在转录里（记成「（已停止）」），接着说话即可继续。
+菜单开着时第一个 `Esc` 只关菜单——那是一个正在问你的列表，关掉它不该把答案也扔掉；
+再按一次才是停止。
 
 其余快捷键：`Ctrl+O` 展开/收起最近一块工具输出，`Ctrl+C` 清空当前输入行（空行时退出），
 `Ctrl+U` / `Ctrl+W` 删到行首 / 删一个词，`Ctrl+K` 删到行尾。

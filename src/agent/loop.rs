@@ -96,6 +96,23 @@ enum TurnEnd {
     Done,
     /// Tool results were produced; keep going.
     Continue,
+    /// The user stopped the turn with Esc while its tools were running.
+    Stopped,
+}
+
+/// What one streamed request produced.
+///
+/// Esc is not a dropped future but a recorded decision: the loop breaks on a stop with no
+/// completion to return, and the caller has to tell that apart from a request that failed.
+struct TurnOutcome {
+    result: Option<Result<llm::Completion, llm::LlmError>>,
+}
+
+impl TurnOutcome {
+    /// Whether the request was ended by Esc rather than by the server or by an error.
+    fn stopped(&self) -> bool {
+        self.result.is_none()
+    }
 }
 
 pub struct Agent {
@@ -803,6 +820,16 @@ impl Agent {
             match self.assistant_turn().await {
                 Ok(TurnEnd::Done) => break,
                 Ok(TurnEnd::Continue) => continue,
+                // Esc during a tool call: the results produced so far are already recorded,
+                // and the turn is over. Without the stop the loop would send them and ask the
+                // model for the next step — of the very turn that was just stopped.
+                Ok(TurnEnd::Stopped) => {
+                    self.screen.push_lines(ui_compact::note_lines(
+                        "已停止。可以接着说，或直接输入新的要求。",
+                        crate::ui::screen::Style::new(Color::Dim),
+                    ));
+                    break;
+                }
                 Err(err) => {
                     self.screen.push_lines(ui_compact::note_lines(
                         &format!("请求失败：{err}"),
@@ -892,20 +919,30 @@ impl Agent {
         // screen across the `select` below, and a model that has not produced its first
         // token yet is exactly when the spinner matters.
         let (sender, mut deltas) = tokio::sync::mpsc::unbounded_channel::<Delta>();
-        let completion = {
+        let outcome = {
             let mut sink = |delta: Delta| {
                 let _ = sender.send(delta);
             };
             let stream = self.client.stream(&request, &mut sink);
             tokio::pin!(stream);
             let mut ticker = ticker();
-            let result = loop {
+            // Esc ends the request by dropping the future, which closes the connection. The
+            // tokens already received stay on screen: the user asked for the turn to stop,
+            // not for what the model already said to be thrown away.
+            let mut stop_requested = false;
+            let mut result = None;
+            loop {
                 // Keep the input line alive while the answer arrives. The user types into
                 // the composer as they read; Enter there queues the message rather than
-                // dropping it, because a turn cannot be interrupted mid-request without
-                // throwing away what the model is halfway through saying.
-                if let Some(action) = self.screen.poll_input() {
-                    on_turn_action(&mut self.screen, action);
+                // dropping it, because starting a second turn underneath this one would
+                // interleave two conversations.
+                if let Some(action) = self.screen.poll_input()
+                    && on_turn_action(&mut self.screen, action)
+                {
+                    stop_requested = true;
+                }
+                if stop_requested {
+                    break;
                 }
                 tokio::select! {
                     // A token outranks the spinner: text has to appear as it arrives, not on
@@ -917,18 +954,26 @@ impl Agent {
                         drain_deltas(&mut self.screen, &mut deltas);
                     }
                     _ = ticker.tick() => self.screen.tick_working(),
-                    out = &mut stream => break out,
+                    out = &mut stream => {
+                        result = Some(out);
+                        break;
+                    }
                 }
-            };
+            }
             drain_deltas(&mut self.screen, &mut deltas);
-            result
+            TurnOutcome { result }
         };
         self.streaming = false;
-        // On a transport failure the streamed preview is discarded, so the transcript does
-        // not show a half-written answer that was never recorded.
-        let completion = match completion {
-            Ok(completion) => completion,
-            Err(err) => {
+        // A stop keeps the half-written answer, because it is a real answer the user chose to
+        // cut short; a failure discards it, because a half-written answer that was never
+        // recorded must not stay on screen.
+        let completion = match outcome.result {
+            None => {
+                debug_assert!(outcome.stopped(), "no completion means the stream was stopped");
+                return self.finish_stopped().map(|()| TurnEnd::Done);
+            }
+            Some(Ok(completion)) => completion,
+            Some(Err(err)) => {
                 // Nothing is committed, so the discarded preview leaves no trace.
                 self.screen.discard_stream();
                 if let Some(retried) = self.recover_overflow(&err.message()).await? {
@@ -973,6 +1018,36 @@ impl Agent {
         Ok(self.after_completion(&completion))
     }
 
+    /// Close out a turn the user stopped with Esc.
+    ///
+    /// The partial answer is kept, not discarded: it is real output the model produced, and
+    /// the next turn reads it as its own previous message — which is exactly what makes
+    /// "stop, then say what you actually meant" work. It is recorded with a marker so a
+    /// resumed session can tell "the user cut this off" from "the model finished here".
+    fn finish_stopped(&mut self) -> anyhow::Result<()> {
+        let (answer, thinking) = self.screen.end_stream();
+        let mut content: Vec<llm::Block> = Vec::new();
+        if !thinking.trim().is_empty() {
+            // The preview was rendered from the stream; reusing those bytes keeps the stored
+            // block identical to what the user saw.
+            content.push(llm::Block::Thinking { thinking, signature: None });
+        }
+        if !answer.trim().is_empty() {
+            content.push(llm::Block::Text { text: answer });
+        }
+        self.session.push_message(
+            Message::Assistant { content, stop_reason: Some(StopReason::Aborted) },
+            None,
+            Some(StopReason::Aborted),
+        )?;
+        self.screen.push_lines(ui_compact::note_lines(
+            "已停止。可以接着说，或直接输入新的要求。",
+            crate::ui::screen::Style::new(Color::Dim),
+        ));
+        self.render_footer(None);
+        Ok(())
+    }
+
     /// Decide what to do after a response that is not an overflow.
     fn after_completion(&mut self, completion: &llm::Completion) -> TurnEnd {
         let calls = completion.tool_calls();
@@ -987,8 +1062,13 @@ impl Agent {
             }
             return TurnEnd::Done;
         }
-        // Tool calls are executed inline; the next request carries their results.
-        self.execute_tools(&calls);
+        // Tool calls are executed inline; the next request carries their results. Esc during
+        // the calls ends the turn here: the results already produced are in the session, and
+        // carrying on would run the very thing the user just stopped.
+        let stopped = self.execute_tools(&calls);
+        if stopped {
+            return TurnEnd::Stopped;
+        }
         TurnEnd::Continue
     }
 
@@ -997,9 +1077,14 @@ impl Agent {
     /// A refused call still produces a result: the model receives the refusal text with
     /// the policy's reason, and the transcript shows the same failure. Skipping the tool
     /// result entirely would break the call/result pairing the providers expect.
-    fn execute_tools(&mut self, calls: &[(String, String, serde_json::Value)]) {
+    ///
+    /// Returns `true` when Esc asked for the turn to stop; the calls already run keep their
+    /// results, because the model has to see them as the results of the calls it made.
+    fn execute_tools(&mut self, calls: &[(String, String, serde_json::Value)]) -> bool {
         let cwd = self.cwd.clone();
-        for (id, name, arguments) in calls {
+        // Where the calls that never ran start, once Esc has stopped one of them.
+        let mut skipped_from = None;
+        for (index, (id, name, arguments)) in calls.iter().enumerate() {
             // The call is shown while it runs: a command can take minutes, and the screen
             // would otherwise sit unchanged with no sign that anything is happening. The
             // line is taken down just before the finished call is committed, so only one of
@@ -1018,8 +1103,11 @@ impl Agent {
                     // back up before it starts, and the spinner keeps turning for as long as
                     // it takes.
                     self.screen.set_running(running);
-                    let result = block_on_spinning(&mut self.screen, tools::execute(name, arguments, &cwd));
+                    let (result, stopped) = self.run_tool_until_stopped(name, arguments);
                     self.gate.finish(id);
+                    if stopped {
+                        skipped_from = Some(index + 1);
+                    }
                     result
                 }
                 Err(refusal) => {
@@ -1041,7 +1129,73 @@ impl Agent {
             );
             let block = ui_compact::tool_block(name, arguments, &output);
             self.screen.push(block);
+            // The stopped call's own result is recorded above, like any other; only the
+            // calls after it are skipped.
+            if skipped_from.is_some() {
+                break;
+            }
         }
+        let Some(next) = skipped_from else { return false };
+        // A call that never ran must still be answered: a tool call with no result makes the
+        // next request invalid, and every provider rejects it. "The user stopped the turn" is
+        // the honest reason to hand the model.
+        for (id, name, _) in &calls[next..] {
+            let _ = self.session.push_message(
+                Message::Tool {
+                    tool_call_id: id.clone(),
+                    name: name.clone(),
+                    content: "[用户停止了本轮，这个调用没有执行]".to_string(),
+                },
+                None,
+                None,
+            );
+        }
+        true
+    }
+
+    /// Run one approved tool call, watching for Esc.
+    ///
+    /// The command's process is killed when Esc arrives — `kill_on_drop` on the child does
+    /// it, because the future is dropped and with it the child — so a `sleep 300` does not
+    /// keep the turn alive after the user asked it to stop.
+    fn run_tool_until_stopped(
+        &mut self,
+        name: &str,
+        arguments: &serde_json::Value,
+    ) -> (ToolOutput, bool) {
+        let cwd = self.cwd.clone();
+        block_on(async {
+            let work = tools::execute(name, arguments, &cwd);
+            tokio::pin!(work);
+            let mut ticker = ticker();
+            let mut stop_requested = false;
+            let mut result = None;
+            loop {
+                if let Some(action) = self.screen.poll_input()
+                    && on_turn_action(&mut self.screen, action)
+                {
+                    stop_requested = true;
+                }
+                if stop_requested {
+                    break;
+                }
+                tokio::select! {
+                    out = &mut work => {
+                        result = Some(out);
+                        break;
+                    }
+                    _ = ticker.tick() => self.screen.tick_working(),
+                }
+            }
+            match result {
+                Some(output) => (output, false),
+                // The process is killed as the future is dropped here.
+                None => (
+                    ToolOutput::error("[用户停止了本轮，命令已被终止]").timed(std::time::Duration::ZERO),
+                    true,
+                ),
+            }
+        })
     }
 
     /// The single overflow recovery attempt for this turn. Returns `Some(..)` when the turn
@@ -1077,7 +1231,10 @@ impl Agent {
 /// Only a few things make sense mid-turn. A submitted line is *queued*, not run: the model is
 /// answering the previous message, and starting a second turn underneath it would interleave
 /// two conversations. Typing is taken by the composer and never reaches here.
-fn on_turn_action(screen: &mut Screen, action: crate::ui::screen::Action) {
+///
+/// Returns `true` when the caller must stop the turn: Esc is the one action that changes what
+/// the running turn is doing, and it has to be acted on by whoever owns the request.
+fn on_turn_action(screen: &mut Screen, action: crate::ui::screen::Action) -> bool {
     use crate::ui::screen::Action;
     match action {
         Action::Line(text) => queue_mid_turn(screen, text, Vec::new()),
@@ -1091,10 +1248,12 @@ fn on_turn_action(screen: &mut Screen, action: crate::ui::screen::Action) {
                 ));
             }
         }
-        // Ctrl+C / Ctrl+D during a turn do nothing: the only thing they could stop is the
-        // request, and throwing away a half-written answer loses more than it saves.
+        Action::Stop => return true,
+        // Ctrl+C / Ctrl+D during a turn do nothing: Ctrl+C clears the input line, and the
+        // request itself is stopped with Esc, which is the key that says what it wants.
         Action::Interrupt | Action::Eof => {}
     }
+    false
 }
 
 /// Hold a submitted line until the turn in flight is over.
@@ -1131,7 +1290,7 @@ pub(crate) fn queue_mid_turn(
 /// Drive a future to completion on a private current-thread runtime.
 ///
 /// Tool execution is synchronous by nature (spawn a process, read a file) while the agent
-/// loop is async. Rather than colour everything async, the two points where sync code has
+/// loop is async. Rather than colour everything async, the points where sync code has
 /// to wait on async work go through here — and both of them complete without ever yielding
 /// to the outer runtime, so blocking the thread is safe and predictable.
 fn block_on<F: std::future::Future>(future: F) -> F::Output {
@@ -1141,29 +1300,6 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
             .build()
             .expect("a private runtime")
             .block_on(future)
-    })
-}
-
-/// Drive a future to completion, advancing the spinner while it runs.
-///
-/// The future must not borrow the screen: the spinner needs it on every tick. That is the
-/// whole reason the delta sink goes through a channel instead of writing directly.
-fn block_on_spinning<T>(screen: &mut Screen, work: impl std::future::Future<Output = T>) -> T {
-    block_on(async {
-        tokio::pin!(work);
-        let mut ticker = ticker();
-        loop {
-            // A command can run for minutes, which is when the input line has to stay
-            // usable: a directory that takes a minute to list is a minute the user would
-            // otherwise spend watching it.
-            if let Some(action) = screen.poll_input() {
-                on_turn_action(screen, action);
-            }
-            tokio::select! {
-                out = &mut work => break out,
-                _ = ticker.tick() => screen.tick_working(),
-            }
-        }
     })
 }
 

@@ -554,6 +554,13 @@ pub enum Action {
     ToggleExpand,
     /// Ctrl+C on an empty line, or Ctrl+D.
     Interrupt,
+    /// Esc while a turn is in flight: stop it.
+    ///
+    /// The key is the same one that closes the command menu, and the two do not conflict:
+    /// with the menu open it is dismissed first, because that is what an open list means
+    /// Esc to do — otherwise closing the menu would throw away the answer being written.
+    /// Only at the prompt, where nothing is running, does it stay a no-op.
+    Stop,
     Eof,
 }
 
@@ -1824,13 +1831,23 @@ impl Screen {
                 self.move_menu(-1);
             }
             KeyCode::Esc => {
-                // Closing the menu must not drop what was typed, and it has to *stay*
-                // closed: the redraw at the end of this very keypress would otherwise put
-                // the list straight back. Typing on starts a fresh command name, so the
-                // menu comes back then.
-                self.menu_dismissed = self.editing.as_ref().map(Editor::text);
-                self.menu.clear();
-                self.menu_selected = 0;
+                // An open menu is what Esc closes first: it is a list the user is being
+                // asked about, and dismissing it must never cost them the answer the model
+                // is halfway through writing.
+                if !self.menu.is_empty() {
+                    // Closing the menu must not drop what was typed, and it has to *stay*
+                    // closed: the redraw at the end of this very keypress would otherwise put
+                    // the list straight back. Typing on starts a fresh command name, so the
+                    // menu comes back then.
+                    self.menu_dismissed = self.editing.as_ref().map(Editor::text);
+                    self.menu.clear();
+                    self.menu_selected = 0;
+                } else if self.working.is_some() {
+                    // Nothing to dismiss, and something is running: Esc stops it. The
+                    // spinner is the only thing on screen that says a turn is in flight, so
+                    // it is also what decides whether this key means "stop".
+                    return Some(Action::Stop);
+                }
             }
             // The arrows drive the menu when it is up, and the input history otherwise.
             //
@@ -2450,6 +2467,57 @@ mod tests {
 
         screen.absorb_event(Event::Key(KeyEvent::from(KeyCode::Up)));
         assert_eq!(screen.menu_selected, 0, "Up moves it back");
+    }
+
+    #[test]
+    fn esc_stops_the_turn_only_when_something_is_running() {
+        // Esc has two jobs and they must not collide: it closes an open menu, and it stops a
+        // turn. With nothing running and no menu it stays a no-op — it cannot be a Stop that
+        // nothing is listening for, because `read_input` at the prompt would then have to
+        // filter it back out.
+        let mut screen = screen_with_commands();
+        set_input(&mut screen, "hello");
+        screen.sync_menu();
+        assert!(screen.menu.is_empty());
+
+        // Nothing running: Esc is swallowed.
+        assert!(
+            screen.absorb_event(Event::Key(KeyEvent::from(KeyCode::Esc))).is_none(),
+            "Esc at an idle prompt is not an action"
+        );
+
+        // A turn in flight: Esc is the stop.
+        screen.working = Some(WORKING_LABEL.to_string());
+        assert_eq!(
+            screen.absorb_event(Event::Key(KeyEvent::from(KeyCode::Esc))),
+            Some(Action::Stop)
+        );
+    }
+
+    #[test]
+    fn esc_closes_an_open_menu_instead_of_stopping_the_turn() {
+        // The menu wins: it is a list the user is being asked about, and dismissing it must
+        // not cost them the answer being written behind it. The turn only stops on the Esc
+        // *after* the menu is gone, which is what makes the two jobs separable by pressing
+        // the key twice.
+        let mut screen = screen_with_commands();
+        screen.working = Some(WORKING_LABEL.to_string());
+        set_input(&mut screen, "/mo");
+        screen.sync_menu();
+        assert!(!screen.menu.is_empty(), "typing a command name opens the menu");
+
+        assert!(
+            screen.absorb_event(Event::Key(KeyEvent::from(KeyCode::Esc))).is_none(),
+            "the first Esc only closes the menu"
+        );
+        assert!(screen.menu.is_empty());
+        assert_eq!(input(&screen), "/mo", "and the buffer survives");
+
+        assert_eq!(
+            screen.absorb_event(Event::Key(KeyEvent::from(KeyCode::Esc))),
+            Some(Action::Stop),
+            "the second Esc, with no menu left, stops the turn"
+        );
     }
 
     #[test]

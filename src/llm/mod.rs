@@ -7,11 +7,48 @@ pub mod anthropic;
 pub mod client;
 pub mod compat;
 pub mod openai;
+pub mod responses;
 
 use serde::{Deserialize, Serialize};
 
 use crate::config::{ModelConfig, Provider, level_index};
 use crate::util;
+
+/// The wire protocols pi speaks. The config's `api` field names one of these directly, so
+/// this is also where a typo in it is caught.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Api {
+    AnthropicMessages,
+    OpenAiCompletions,
+    OpenAiResponses,
+}
+
+impl Api {
+    /// Every protocol, in the order the config's docs list them.
+    pub const ALL: [Api; 3] =
+        [Api::AnthropicMessages, Api::OpenAiCompletions, Api::OpenAiResponses];
+
+    /// The name as written in the config, which is also what the error message quotes.
+    pub fn name(self) -> &'static str {
+        match self {
+            Api::AnthropicMessages => "anthropic-messages",
+            Api::OpenAiCompletions => "openai-completions",
+            Api::OpenAiResponses => "openai-responses",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Api> {
+        Api::ALL.into_iter().find(|api| api.name() == name)
+    }
+
+    /// The endpoint a provider with no `base_url` writes to.
+    pub fn default_base_url(self) -> &'static str {
+        match self {
+            Api::AnthropicMessages => "https://api.anthropic.com",
+            Api::OpenAiCompletions | Api::OpenAiResponses => "https://api.openai.com/v1",
+        }
+    }
+}
 
 /// One block of assistant output or user input.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -147,6 +184,9 @@ pub enum StopReason {
     Length,
     ToolUse,
     Error,
+    /// The user stopped the turn with Esc. Kept distinct from `Error` so a resumed session
+    /// and the transcript agree that the answer was cut short on purpose.
+    Aborted,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -205,6 +245,8 @@ pub enum LlmError {
     Decode(String),
     #[error("provider「{0}」没有可用的 API key（设置对应环境变量或配置 api_key）")]
     MissingKey(String),
+    #[error("provider「{0}」的 api「{1}」无法识别")]
+    UnknownApi(String, String),
 }
 
 impl LlmError {

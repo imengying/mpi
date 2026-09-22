@@ -179,7 +179,12 @@ pub fn build_request(req: &Request<'_>) -> MessagesRequest {
                         }
                         Block::Thinking { thinking, signature } => out.push(OutBlock::Thinking {
                             thinking: thinking.clone(),
-                            signature: signature.clone(),
+                            // A signature belongs to the provider that issued it. A session
+                            // that switched models leaves the other protocol's signature on
+                            // the block, and Anthropic rejects one it did not sign.
+                            signature: signature
+                                .clone()
+                                .filter(|sig| !sig.starts_with(crate::llm::responses::SIGNATURE_PREFIX)),
                         }),
                         Block::ToolCall { id, name, arguments } => out.push(OutBlock::ToolUse {
                             id: id.clone(),

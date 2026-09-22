@@ -115,6 +115,10 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 }
             }
             Action::Interrupt => continue,
+            // Esc stops the turn in flight, and this is the prompt: nothing is running, so
+            // there is nothing to stop. The screen only raises it while the spinner is up,
+            // which is why reaching here is a no-op rather than a special case.
+            Action::Stop => continue,
             Action::Eof => break,
         }
     }
