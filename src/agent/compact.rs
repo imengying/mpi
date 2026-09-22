@@ -285,8 +285,19 @@ pub fn format_file_blocks(read_files: &[String], modified_files: &[String]) -> S
 /// output could blow up the summary request itself.
 const TOOL_RESULT_MAX_CHARS: usize = 2000;
 
+/// How much of one assistant message's prose the summariser sees.
+///
+/// A turn can carry a long write-up, and the *summary* of a turn does not need it in full —
+/// the sections that matter (goal, decisions, next steps) are a reduction of it, and a
+/// verbatim copy of the input is the one thing a summariser has to read but never produces.
+const ASSISTANT_TEXT_MAX_CHARS: usize = 20_000;
+
 /// Flatten a conversation into text. Serialising rather than sending the messages keeps
 /// the summariser from treating them as a conversation to continue.
+///
+/// **Reasoning traces are left out** (see the note in the match arm), along with anything
+/// else already bounded. What is sent is the conversation as it reads on screen: what the
+/// user asked, what the assistant answered, what tools ran and what they returned.
 pub fn serialize_conversation(messages: &[Message]) -> String {
     let mut parts: Vec<String> = Vec::new();
     for message in messages {
@@ -298,14 +309,27 @@ pub fn serialize_conversation(messages: &[Message]) -> String {
                 }
             }
             Message::Assistant { .. } => {
-                let thinking = message.thinking();
-                if !thinking.is_empty() {
-                    parts.push(format!("[助手思考]: {thinking}"));
-                }
                 let text = message.text();
                 if !text.trim().is_empty() {
-                    parts.push(format!("[助手]: {text}"));
+                    parts.push(format!(
+                        "[助手]: {}",
+                        truncate_chars(&text, ASSISTANT_TEXT_MAX_CHARS)
+                    ));
                 }
+                // The reasoning trace is deliberately not serialised.
+                //
+                // It is the model thinking aloud, and it is enormous: in a real long session
+                // it was 3.4M of the 4.4M characters sent to the summariser — 78% of the
+                // request, against 481 characters of user text. That is what pushed the
+                // summary request past the model's own window ("prompt is too long: 1113399
+                // tokens > 1048576 maximum"): the request to shrink the conversation was
+                // itself larger than any conversation it could be asked to shrink.
+                //
+                // It is also the part a summary does not need. The trace is scratch work on
+                // the way to the answer; the answer, the tool calls that produced it and the
+                // results they returned are what the next model has to know. Sending the
+                // scratch work back in asks the summariser to re-derive what it is being
+                // handed the conclusion of.
                 let calls: Vec<String> = message
                     .tool_calls()
                     .into_iter()
@@ -327,10 +351,18 @@ pub fn serialize_conversation(messages: &[Message]) -> String {
 }
 
 fn truncate_for_summary(text: &str) -> String {
-    if text.chars().count() <= TOOL_RESULT_MAX_CHARS {
+    truncate_chars(text, TOOL_RESULT_MAX_CHARS)
+}
+
+/// Cut `text` to `max` characters, saying so when anything was dropped.
+///
+/// Counted in characters rather than bytes: the limit is about how much a model reads, and
+/// slicing a multi-byte character in half would send invalid UTF-8.
+fn truncate_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
         return text.to_string();
     }
-    let kept: String = text.chars().take(TOOL_RESULT_MAX_CHARS).collect();
+    let kept: String = text.chars().take(max).collect();
     format!("{kept}\n[... 已截断]")
 }
 
@@ -589,6 +621,43 @@ pub fn plan(messages: &[Message], keep_recent_tokens: u64) -> Option<(CutPoint, 
     Some((cut, summarized, kept))
 }
 
+/// Decide what one summary request will contain: where the cut goes and what is sent.
+///
+/// Split out from [`run`] so the wiring — budget applied to the messages actually sent, not
+/// merely available as a helper — is what the tests exercise. Getting that wiring wrong is
+/// silent: the caps all look right and the request is still unbounded.
+pub struct SummaryPlan {
+    /// The messages folded into the summary.
+    pub summarized: Vec<Message>,
+    /// The messages kept verbatim after the checkpoint.
+    pub kept: Vec<Message>,
+    pub cut: CutPoint,
+    /// The oldest turns were left out to fit the model's window.
+    pub trimmed: bool,
+    /// What the request will cost, so the caller can act on it if it still does not fit.
+    pub request_tokens: u64,
+}
+
+/// Plan a summary request against the model's window.
+pub fn plan_summary(
+    messages: &[Message],
+    keep_recent_tokens: u64,
+    context_window: Option<u64>,
+) -> Result<SummaryPlan, CompactError> {
+    let Some((cut, summarized, kept)) = plan(messages, keep_recent_tokens) else {
+        return Err(CompactError::TooShort { keep_recent_tokens });
+    };
+    let budget = summary_budget_for(context_window.unwrap_or(0));
+    let (summarized, trimmed) = limit_for_summary(&summarized, budget);
+    // Measured through the same serialisation the request uses, so the number means what it
+    // says: the conversation text plus the fixed instructions around it.
+    let conversation = serialize_conversation(&summarized);
+    let request_tokens = util::estimate_tokens(&conversation)
+        + util::estimate_tokens(SUMMARIZATION_SYSTEM_PROMPT)
+        + util::estimate_tokens(crate::config::SUMMARY_SECTIONS);
+    Ok(SummaryPlan { summarized, kept, cut, trimmed, request_tokens })
+}
+
 /// Everything a compaction needs, so the caller in `loop.rs` stays readable.
 pub struct CompactionOutcome {
     pub summary: String,
@@ -599,6 +668,64 @@ pub struct CompactionOutcome {
     pub tokens_before: u64,
     /// Token estimate after the swap, so the user can see what was saved.
     pub tokens_after: u64,
+    /// Whether the oldest turns were left out of the summary request to keep it under the
+    /// model's window. The checkpoint still carries their user messages, so nothing the user
+    /// asked is lost — but the summary describes less, and that is worth saying.
+    pub trimmed_for_summary: bool,
+}
+
+/// How much of the summarised conversation may go into one summary request.
+///
+/// The request has to fit the model's own window along with the answer it is asked for. It
+/// is not "context_window minus reserve" but a good deal less: the summary is a *reduction*,
+/// and a summariser given the full window has to read all of it to produce a fraction of it.
+/// A third of the window leaves room for the seven-section answer and keeps the request
+/// comfortably inside the limit the provider enforces.
+///
+/// Without a bound the request is whatever the conversation happens to be, and a long session
+/// makes it larger than the window — the request to shrink the conversation is refused for
+/// being too large, and `/compact` is impossible exactly when it is needed. `/compact` on a
+/// real 1M-token session failed this way: `prompt is too long: 1113399 tokens > 1048576`.
+pub fn summary_budget_for(context_window: u64) -> u64 {
+    // A model with no declared window gets a conservative fixed budget rather than none:
+    // an unbounded request is the failure this exists to prevent.
+    match context_window {
+        0 => 120_000,
+        window => (window / 3).max(4_096),
+    }
+}
+
+/// Cut the messages to summarise down to `budget_tokens`, newest-first.
+///
+/// The oldest turns are dropped, because a summary of the recent history is worth more than
+/// one of the start of the session: the newest messages are what the next model continues
+/// from. What is dropped is *not* lost from the conversation — the checkpoint keeps every
+/// user message verbatim regardless (see [`replacement_history`]), so the intent of a
+/// dropped turn survives even when its prose does not reach the summariser.
+///
+/// Returns the messages to send and whether anything was dropped, so the caller can say so.
+pub fn limit_for_summary(messages: &[Message], budget_tokens: u64) -> (Vec<Message>, bool) {
+    let total: u64 = messages.iter().map(Message::estimate_tokens).sum();
+    if total <= budget_tokens {
+        return (messages.to_vec(), false);
+    }
+    let mut kept: Vec<Message> = Vec::new();
+    let mut used = 0u64;
+    for message in messages.iter().rev() {
+        let tokens = message.estimate_tokens();
+        if used + tokens > budget_tokens && !kept.is_empty() {
+            break;
+        }
+        used += tokens;
+        kept.push(message.clone());
+    }
+    kept.reverse();
+    // A cut that lands on a tool result would hand the summariser an orphan result with no
+    // call, the same pairing rule the checkpoint's own cut follows.
+    while kept.first().is_some_and(|m| matches!(m, Message::Tool { .. })) {
+        kept.remove(0);
+    }
+    (kept, true)
 }
 
 /// Run one compaction: cut, summarise, and assemble the replacement history.
@@ -614,14 +741,21 @@ pub async fn run(
     keep_recent_tokens: u64,
     real_usage: Option<u64>,
 ) -> Result<CompactionOutcome, CompactError> {
-    let Some((cut, summarized, kept)) = plan(messages, keep_recent_tokens) else {
-        return Err(CompactError::TooShort { keep_recent_tokens });
-    };
     let tokens_before = estimate_context(messages, system_prompt, real_usage);
     let mut file_ops = FileOps::default();
     for message in messages {
         file_ops.observe(message);
     }
+    // Bound the request itself, not just the caps inside it: a long session can still add up
+    // to more than the model's window, and a summary request that does not fit cannot be
+    // sent at all.
+    let SummaryPlan { cut, summarized, kept, trimmed, request_tokens } =
+        plan_summary(messages, keep_recent_tokens, request.model.context_window)?;
+    debug_assert!(
+        request.model.context_window.is_none_or(|window| request_tokens < window),
+        "a summary request must fit the window: {request_tokens} >= {:?}",
+        request.model.context_window
+    );
     let (summary, usage) = summarize(client, request, &summarized, cut.is_split_turn()).await?;
     let (read_files, modified_files) = file_ops.lists();
     let summary = format!("{summary}{}", format_file_blocks(&read_files, &modified_files));
@@ -636,6 +770,7 @@ pub async fn run(
         usage,
         tokens_before,
         tokens_after,
+        trimmed_for_summary: trimmed,
     })
 }
 
@@ -861,6 +996,138 @@ mod tests {
         assert!(text.contains("[助手工具调用]: bash("));
         assert!(text.contains("已截断"));
         assert!(text.chars().count() < 50_000);
+    }
+
+    #[test]
+    fn reasoning_traces_are_left_out_of_the_summary_request() {
+        // This is the bug that made `/compact` fail on a long session: the reasoning traces
+        // were 3.4M of a 4.4M-character request, so the request to shrink the conversation
+        // was itself larger than the model's window and was refused. A trace is the model's
+        // scratch work; the summary is of the conversation, not of the working.
+        let messages = vec![
+            user("what changed?"),
+            Message::Assistant {
+                content: vec![
+                    Block::Thinking { thinking: sized("scratch ", 40_000), signature: None },
+                    Block::Text { text: "I edited a.rs".into() },
+                ],
+                stop_reason: Some(StopReason::Stop),
+            },
+        ];
+        let text = serialize_conversation(&messages);
+        assert!(!text.contains("scratch "), "the trace must not be sent: {}", text.chars().count());
+        assert!(!text.contains("助手思考"), "{text}");
+        // The answer itself is still there — that is the part worth summarising.
+        assert!(text.contains("[助手]: I edited a.rs"), "{text}");
+    }
+
+    #[test]
+    fn a_long_assistant_message_is_capped() {
+        // The per-message cap is the other half: one very long write-up should not decide how
+        // big the request is either.
+        let messages = vec![Message::Assistant {
+            content: vec![Block::Text { text: sized("word ", 80_000) }],
+            stop_reason: Some(StopReason::Stop),
+        }];
+        let text = serialize_conversation(&messages);
+        assert!(text.contains("已截断"), "a capped message says so");
+        assert!(text.chars().count() < ASSISTANT_TEXT_MAX_CHARS * 2, "{}", text.chars().count());
+    }
+
+    #[test]
+    fn the_request_budget_keeps_the_newest_turns() {
+        // Over budget, the oldest turns go: a summary of the recent work is what the next
+        // model continues from. The user messages of the dropped turns are not lost from the
+        // conversation — the checkpoint keeps them verbatim.
+        let messages: Vec<Message> = (0..40)
+            .flat_map(|i| {
+                vec![
+                    user(&format!("question {i} {}", sized("x", 4_000))),
+                    Message::Assistant {
+                        content: vec![Block::Text { text: format!("answer {i}") }],
+                        stop_reason: Some(StopReason::Stop),
+                    },
+                ]
+            })
+            .collect();
+        let budget = summary_budget_for(60_000);
+        let (kept, trimmed) = limit_for_summary(&messages, budget);
+        assert!(trimmed, "this is over budget");
+        let text = serialize_conversation(&kept);
+        assert!(text.contains("question 39"), "the newest turn survives");
+        assert!(!text.contains("question 0 "), "the oldest turns are dropped: {budget}");
+        let used: u64 = kept.iter().map(Message::estimate_tokens).sum();
+        assert!(used <= budget, "the budget is respected: {used} > {budget}");
+        // Never starts on a tool result: the summariser must not see an orphan.
+        assert!(!matches!(kept.first(), Some(Message::Tool { .. })));
+    }
+
+    #[test]
+    fn a_request_that_fits_is_sent_whole() {
+        let messages = vec![user("short"), Message::Assistant {
+            content: vec![Block::Text { text: "reply".into() }],
+            stop_reason: Some(StopReason::Stop),
+        }];
+        let (kept, trimmed) = limit_for_summary(&messages, summary_budget_for(1_000_000));
+        assert!(!trimmed);
+        assert_eq!(kept.len(), messages.len());
+    }
+
+    #[test]
+    fn the_planned_request_fits_the_window() {
+        // The wiring is the part that broke in production: every cap can look right while the
+        // request that actually gets built is still unbounded. This measures the plan itself,
+        // through the same serialisation the request uses.
+        //
+        // A session shaped like the real one that failed — a lot of agent traffic, most of it
+        // reasoning — over a window of 1M tokens.
+        let window = 1_048_576u64;
+        let messages: Vec<Message> = (0..400)
+            .flat_map(|i| {
+                let mut content = vec![
+                    Block::Thinking { thinking: sized("scratch ", 30_000), signature: None },
+                    Block::Text { text: format!("step {i}") },
+                ];
+                content.push(Block::ToolCall {
+                    id: format!("c{i}"),
+                    name: "bash".into(),
+                    arguments: serde_json::json!({"command": sized("ls ", 1_000)}),
+                });
+                vec![
+                    user(&format!("task {i}")),
+                    Message::Assistant { content, stop_reason: Some(StopReason::Stop) },
+                    Message::Tool {
+                        tool_call_id: format!("c{i}"),
+                        name: "bash".into(),
+                        content: sized("output ", 20_000),
+                    },
+                ]
+            })
+            .collect();
+
+        let plan = plan_summary(&messages, keep_recent_for(window), Some(window)).unwrap();
+        let request_tokens = plan.request_tokens;
+        assert!(
+            request_tokens < window,
+            "the summary request must fit the window: {request_tokens} >= {window}"
+        );
+        // And the reasoning traces are not what it is made of.
+        let text = serialize_conversation(&plan.summarized);
+        assert!(!text.contains("scratch "), "no traces in the request");
+        assert!(text.contains("task 399"), "the newest work is covered");
+        // The fixture is over budget, so the cap is what makes the request fit.
+        assert!(plan.trimmed, "this session is over the summary budget");
+    }
+
+    #[test]
+    fn the_budget_leaves_room_for_the_answer() {
+        // A third of the window: the request has to fit alongside the summary it asks for.
+        assert_eq!(summary_budget_for(1_048_576), 349_525);
+        assert_eq!(summary_budget_for(60_000), 20_000);
+        // An undeclared window gets a fixed budget, not none: unbounded is the failure mode.
+        assert!(summary_budget_for(0) > 0);
+        // And a tiny window still gets something usable rather than zero.
+        assert_eq!(summary_budget_for(1_000), 4_096);
     }
 
     #[test]

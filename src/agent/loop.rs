@@ -744,6 +744,15 @@ impl Agent {
         };
         self.screen
             .push_lines(ui_compact::note_lines(&note, crate::ui::screen::Style::new(Color::Dim)));
+        if outcome.trimmed_for_summary {
+            // Say it rather than let the summary quietly describe less than the session did:
+            // "the checkpoint does not mention that" and "that never happened" read the same
+            // otherwise, and the user is the only one who can tell the difference.
+            self.screen.push_lines(ui_compact::note_lines(
+                "（会话较长，摘要只覆盖了最近的部分；更早的对话仍完整保存在会话文件里）",
+                crate::ui::screen::Style::new(Color::Dim),
+            ));
+        }
         Ok(())
     }
 
