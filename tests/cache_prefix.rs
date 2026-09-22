@@ -12,7 +12,7 @@ fn fixtures() -> (ModelConfig, Provider) {
         r#"{
           "providers": [{
             "name": "name",
-            "api": "openai-completions",
+            "api": "completions",
             "base_url": "url",
             "models": [{
               "id": "deepseek-v4.1-flash",
@@ -250,7 +250,7 @@ fn a_summary_request_opts_out_of_the_cache() {
 #[test]
 fn anthropic_puts_breakpoints_on_system_tools_and_the_last_block() {
     let config: Config = serde_json::from_str(
-        r#"{"providers":[{"name":"a","api":"anthropic-messages","base_url":"https://api.anthropic.com",
+        r#"{"providers":[{"name":"a","api":"messages","base_url":"https://api.anthropic.com",
              "models":[{"id":"claude","max_tokens":8000,"reasoning":true,"thinking_levels":["high"]}]}]}"#,
     )
     .unwrap();
@@ -286,7 +286,7 @@ fn anthropic_puts_breakpoints_on_system_tools_and_the_last_block() {
 #[test]
 fn the_tool_block_is_identical_across_anthropic_turns() {
     let config: Config = serde_json::from_str(
-        r#"{"providers":[{"name":"a","api":"anthropic-messages","base_url":"https://api.anthropic.com",
+        r#"{"providers":[{"name":"a","api":"messages","base_url":"https://api.anthropic.com",
              "models":[{"id":"claude","max_tokens":8000,"reasoning":true,"thinking_levels":["high"]}]}]}"#,
     )
     .unwrap();

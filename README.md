@@ -67,7 +67,7 @@ install -m755 target/release/pi ~/.local/bin/pi
   "providers": [
     {
       "name": "name",
-      "api": "openai-completions",
+      "api": "completions",
       "base_url": "url",
       "api_key_env": "NAME_API_KEY",
       "models": [
@@ -91,7 +91,7 @@ pi 没有内置模型目录，也不会去猜。没配置 providers 会直接报
 
 | 字段 | 说明 |
 |---|---|
-| `api` | `anthropic-messages`、`openai-completions` 或 `openai-responses` |
+| `api` | `messages`、`completions` 或 `responses` |
 | `base_url` | 缺省按 `api` 取官方地址；任意 OpenAI 兼容网关直接写它即可 |
 | `api_key_env` | 读哪个环境变量取 key，缺省为 `<PROVIDER>_API_KEY` |
 | `api_key` | 直接写 key（不推荐）；两者都缺时请求会报错 |
@@ -104,6 +104,10 @@ pi 没有内置模型目录，也不会去猜。没配置 providers 会直接报
 思考级别的词汇表只有五档：`low`、`medium`、`high`、`xhigh`、`max`。
 写别的值会在启动时报错，不会静默忽略。
 
+`api` 同样只有 `messages`、`completions`、`responses` 三个取值，**没有别名**：
+协议名只有一种写法，长名字（`openai-completions` 这类）不会因为是旧写法而被接受。
+少一种写法就少一件要记住的事，而写错时那句报错会把该写什么直接说出来。
+
 **写错的字段名同样会在启动时报错。** 配置字段一律 snake_case，写成 `baseUrl`
 这样的驼峰名不会生效——而一个被悄悄忽略的 `base_url` 意味着请求发给的是协议默认的
 主机（比如 `api.openai.com`），带着你的 key 和整段对话。所以这类拼写错误会被点名
@@ -113,11 +117,11 @@ pi 没有内置模型目录，也不会去猜。没配置 providers 会直接报
 
 | `api` | 什么时候用 |
 |---|---|
-| `openai-completions` | 绝大多数网关与中转（DeepSeek、GLM、Kimi…）；先试这个 |
-| `openai-responses` | 只会说 Responses 的模型（GPT-5 系、Codex），或网关只对这个端点开通了某模型 |
-| `anthropic-messages` | Anthropic 官方或兼容 Messages 的服务 |
+| `completions` | 绝大多数网关与中转（DeepSeek、GLM、Kimi…）；先试这个 |
+| `responses` | 只会说 Responses 的模型（GPT-5 系、Codex），或网关只对这个端点开通了某模型 |
+| `messages` | Anthropic 官方或兼容 Messages 的服务 |
 
-`openai-responses` 会以 `store: false` 发送，会话只在本地存一份，服务端不留档；
+`responses` 会以 `store: false` 发送，会话只在本地存一份，服务端不留档；
 推理摘要以 `encrypted_content` 原样回放，且只在**同一个 provider 与模型**下回放——
 中途 `/model` 换了模型，旧的推理块会被丢掉而不是发给不认识它的上游。
 
@@ -125,7 +129,7 @@ pi 没有内置模型目录，也不会去猜。没配置 providers 会直接报
 
 不同网关对「OpenAI 兼容」的理解不一样。pi 按 `base_url` 自动探测一组开关，
 配置里只写例外（`compat` 可以是 provider 级或 model 级，model 级优先）。
-`openai-responses` 只用到其中的 `supports_strict_mode`（工具定义上的 `strict`）
+`responses` 只用到其中的 `supports_strict_mode`（工具定义上的 `strict`）
 与 `send_session_affinity`（会话粘性头），其余开关对它没有意义——
 它的思考参数、请求形状与缓存键都是这个协议固定的写法。
 
@@ -233,6 +237,10 @@ Linux 二进制依赖 runner 自带的 glibc（当前 2.39），构建摘要里�
 从历史里恢复一条 `/命令` 不会弹出菜单——按 `↑` 要的是上一行，不是一张没要过的列表，
 菜单一开方向键就被它拿走，人就卡在那条命令里退不出来了；你再敲一个字符它就会回来。
 历史往回走到头就停住；往下走过最后一条之后回到**空白行**，并且把你漫游前正在写的那半句还给你。
+
+历史属于**会话**，不属于进程：`/resume`（或 `pi resume`）之后，这次之前你说过的每一句
+都在 `↑` 的射程里，不必重新打一遍。`/new` 则是真的从零开始——新会话没有听过那些话，
+把它们摆在这里会像是这段对话说过。
 
 `←`/`→` 在输入行里移动光标（按字符，中文算一个），在中间打字、退格都改在光标处；
 `Home`/`Ctrl+A` 到行首，`End`/`Ctrl+E` 到行尾，`Ctrl+K` 删到行尾，`Delete` 删光标处的字符。

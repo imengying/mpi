@@ -165,7 +165,8 @@ pub struct ResponsesRequest {
 /// Build the request body for one turn.
 pub fn build_request(req: &Request<'_>, stream: bool) -> ResponsesRequest {
     let model = req.model;
-    let provider = req.provider;    let compat: Compat = provider.compat(model);
+    let provider = req.provider;
+    let compat: Compat = provider.compat(model);
     let max_tokens = model.max_tokens();
     let plan = plan_thinking(model, req.level, max_tokens);
 
@@ -878,7 +879,7 @@ mod tests {
             r#"{
               "providers": [{
                 "name": "name",
-                "api": "openai-responses",
+                "api": "responses",
                 "base_url": "https://api.openai.com/v1",
                 "models": [{
                   "id": "gpt-5",
@@ -1061,7 +1062,7 @@ mod tests {
     #[test]
     fn a_non_reasoning_model_sends_no_reasoning_field() {
         let config: Config = serde_json::from_str(
-            r#"{"providers":[{"name":"n","api":"openai-responses","base_url":"url",
+            r#"{"providers":[{"name":"n","api":"responses","base_url":"url",
                 "models":[{"id":"m","reasoning":false,"max_tokens":1000}]}]}"#,
         )
         .unwrap();
@@ -1086,7 +1087,7 @@ mod tests {
     #[test]
     fn a_tiny_output_budget_is_raised_to_the_api_minimum() {
         let config: Config = serde_json::from_str(
-            r#"{"providers":[{"name":"n","api":"openai-responses","base_url":"url",
+            r#"{"providers":[{"name":"n","api":"responses","base_url":"url",
                 "models":[{"id":"m","max_tokens":4}]}]}"#,
         )
         .unwrap();

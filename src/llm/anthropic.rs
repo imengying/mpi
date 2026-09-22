@@ -621,7 +621,7 @@ mod tests {
         )
         .unwrap();
         let provider: Provider =
-            serde_json::from_str(r#"{"name":"a","api":"anthropic-messages"}"#).unwrap();
+            serde_json::from_str(r#"{"name":"a","api":"messages"}"#).unwrap();
         (model, provider)
     }
 

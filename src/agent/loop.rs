@@ -237,6 +237,10 @@ impl Agent {
         for block in ui_compact::replay_blocks(&session.context_messages()) {
             screen.push(block);
         }
+        // The arrows reach back into the conversation, not just into this process: Up on a
+        // resumed session has to find the message that was typed before the resume, or the
+        // turns already in the file look like they were never typed.
+        screen.seed_history(session.user_history());
         // The working directory travels with the session: the newest environment block names
         // it, so running the tools somewhere else would make the transcript lie about where
         // it is. The header records where the session *started*, which is not the same thing
@@ -506,6 +510,10 @@ impl Agent {
         self.session.push_message(Message::user_text(block), None, None)?;
         self.gate.reset();
         self.screen.clear_transcript();
+        // A new session starts with no history: the lines from the conversation just left
+        // belong to it, not to this one, and offering them here would be recalling words
+        // this session never heard.
+        self.screen.seed_history(Vec::new());
         self.screen
             .push_lines(ui_compact::note_lines(note, crate::ui::screen::Style::new(Color::Dim)));
         Ok(())
@@ -572,6 +580,9 @@ impl Agent {
                 for block in ui_compact::replay_blocks(&self.session.context_messages()) {
                     self.screen.push(block);
                 }
+                // …and the same history: the arrows belong to the session that is now
+                // open, not to the one that was left behind.
+                self.screen.seed_history(self.session.user_history());
             }
             Err(err) => {
                 self.screen.push_lines(ui_compact::note_lines(

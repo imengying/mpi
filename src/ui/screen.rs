@@ -38,6 +38,13 @@ pub const WORKING_LABEL: &str = "Working";
 const WORKING_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 pub const WORKING_INTERVAL: std::time::Duration = std::time::Duration::from_millis(80);
 
+/// How many submitted lines the input history keeps.
+///
+/// A cap rather than a growing list: the arrows are for the message just before this one,
+/// and a session that has been running for days should not carry every line it ever saw.
+/// Oldest entries fall off the front, so what is kept is what is still plausible.
+const HISTORY_LIMIT: usize = 200;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Style {
     pub fg: Color,
@@ -686,6 +693,26 @@ impl Screen {
             .iter()
             .map(|(name, help)| ((*name).to_string(), (*help).to_string()))
             .collect();
+    }
+
+    /// Fill the input history from a conversation that was already under way.
+    ///
+    /// The history is the line editor's own, so a screen that has just been built for a
+    /// resumed session starts empty — Up would then only ever reach what was typed in *this*
+    /// process, and the turns before the resume would look like they had never been typed.
+    /// What the user wrote is part of the session, so the arrows have to reach back into it.
+    ///
+    /// Entries are oldest first, matching the order Up walks them. The list is trimmed from
+    /// the front to the same cap `remember` enforces: the newest entries are the ones a
+    /// recalled line is likely to be.
+    pub fn seed_history(&mut self, lines: impl IntoIterator<Item = String>) {
+        self.history = lines.into_iter().filter(|line| !line.trim().is_empty()).collect();
+        if self.history.len() > HISTORY_LIMIT {
+            let excess = self.history.len() - HISTORY_LIMIT;
+            self.history.drain(..excess);
+        }
+        self.history_index = None;
+        self.history_draft = None;
     }
 
     pub fn new() -> Self {
@@ -1906,7 +1933,7 @@ impl Screen {
             return;
         }
         self.history.push(line.to_string());
-        if self.history.len() > 200 {
+        if self.history.len() > HISTORY_LIMIT {
             self.history.remove(0);
         }
     }
@@ -2690,6 +2717,72 @@ mod tests {
         screen.history_up();
         assert_eq!(input(&screen), "only");
         assert_eq!(screen.history_index, Some(0));
+    }
+
+    #[test]
+    fn a_resumed_session_offers_the_lines_it_already_holds() {
+        // The bug this guards: history lived only in the process, so Up after a resume
+        // reached nothing that was typed before it — the turns in the file looked like they
+        // had never been typed, and the user had to retype a line that was already there.
+        let mut screen = screen_with_commands();
+        screen.seed_history(["asked before resuming".to_string(), "and again".to_string()]);
+
+        screen.history_up();
+        assert_eq!(input(&screen), "and again", "the newest seeded line comes first");
+        screen.history_up();
+        assert_eq!(input(&screen), "asked before resuming");
+        screen.history_up();
+        assert_eq!(input(&screen), "asked before resuming", "the top of the history");
+
+        // A line typed after the resume joins the same list, in the order it was typed.
+        set_input(&mut screen, "typed just now");
+        screen.remember("typed just now");
+        screen.history_down();
+        screen.history_down();
+        assert_eq!(input(&screen), "typed just now");
+    }
+
+    #[test]
+    fn seeding_replaces_the_list_it_inherits() {
+        // Seeding happens when the screen changes which conversation it is showing — a
+        // resume, a `/resume` to another session, a `/new`. The lines that came with the
+        // session being left are not history for the one being opened, and keeping them
+        // would put a message from one conversation into the arrows of another.
+        let mut screen = screen_with_commands();
+        screen.history = vec!["from the last session".into()];
+        screen.history_index = Some(0);
+        screen.history_draft = Some(Editor::from_text("half written"));
+
+        screen.seed_history(["from this one".to_string()]);
+
+        assert_eq!(screen.history, vec!["from this one".to_string()]);
+        assert!(screen.history_index.is_none(), "the walk belongs to the old list");
+        assert!(screen.history_draft.is_none());
+
+        // A new session has nothing to recall.
+        screen.seed_history(Vec::new());
+        assert!(screen.history.is_empty());
+    }
+
+    #[test]
+    fn seeding_keeps_the_newest_entries() {
+        // A long session has more lines than the cap; what is kept has to be the tail, since
+        // that is what a recalled line is likely to be about.
+        let mut screen = screen_with_commands();
+        screen.seed_history((0..HISTORY_LIMIT + 5).map(|i| format!("line {i}")));
+
+        assert_eq!(screen.history.len(), HISTORY_LIMIT);
+        assert_eq!(screen.history[0], "line 5", "the oldest entries are the ones dropped");
+        assert_eq!(screen.history[HISTORY_LIMIT - 1], format!("line {}", HISTORY_LIMIT + 4));
+    }
+
+    #[test]
+    fn blank_seeded_lines_are_not_entries() {
+        // Up on a blank line looks like a broken key: it takes the walk from one empty entry
+        // to the next, and the user cannot tell it apart from reaching the top.
+        let mut screen = screen_with_commands();
+        screen.seed_history(["real".to_string(), "   ".to_string(), String::new()]);
+        assert_eq!(screen.history, vec!["real".to_string()]);
     }
 
     #[test]

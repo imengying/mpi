@@ -27,7 +27,8 @@ struct Assemblers {
 /// Which body/parser pair a provider uses. Read once per request so the dispatch is a
 /// single match rather than a string comparison scattered through the call.
 fn api_of(provider: &Provider) -> Result<Api, LlmError> {
-    Api::from_name(&provider.api)
+    provider
+        .api()
         .ok_or_else(|| LlmError::UnknownApi(provider.name.clone(), provider.api.clone()))
 }
 

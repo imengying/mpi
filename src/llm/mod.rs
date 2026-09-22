@@ -28,12 +28,16 @@ impl Api {
     pub const ALL: [Api; 3] =
         [Api::AnthropicMessages, Api::OpenAiCompletions, Api::OpenAiResponses];
 
-    /// The name as written in the config, which is also what the error message quotes.
+    /// The name the config writes, which is also what the error message quotes.
+    ///
+    /// One word, because it is a value the user types: `completions` names the protocol as
+    /// precisely as a longer `openai-` prefix would, next to a `base_url` that already says
+    /// whose API it is.
     pub fn name(self) -> &'static str {
         match self {
-            Api::AnthropicMessages => "anthropic-messages",
-            Api::OpenAiCompletions => "openai-completions",
-            Api::OpenAiResponses => "openai-responses",
+            Api::AnthropicMessages => "messages",
+            Api::OpenAiCompletions => "completions",
+            Api::OpenAiResponses => "responses",
         }
     }
 

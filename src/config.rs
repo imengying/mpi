@@ -36,7 +36,7 @@ impl Default for ShellConfig {
 #[serde(default)]
 pub struct Provider {
     pub name: String,
-    /// `anthropic-messages`, `openai-completions` or `openai-responses`.
+    /// `messages`, `completions` or `responses`.
     pub api: String,
     pub base_url: String,
     pub api_key_env: Option<String>,
@@ -133,7 +133,7 @@ pub enum ConfigError {
     NoProviders(PathBuf),
     #[error("provider「{provider}」的模型「{model}」思考级别「{level}」无效（可用：low、medium、high、xhigh、max）")]
     BadLevel { provider: String, model: String, level: String },
-    #[error("provider「{0}」的 api 必须是 anthropic-messages、openai-completions 或 openai-responses")]
+    #[error("provider「{0}」的 api 必须是 messages、completions 或 responses")]
     BadApi(String),
     #[error("{0}")]
     UnknownField(String),
@@ -297,7 +297,7 @@ pub const TEMPLATE: &str = r#"{
   "providers": [
     {
       "name": "provider-name",
-      "api": "openai-completions",
+      "api": "completions",
       "base_url": "http://127.0.0.1:8000/v1",
       "api_key_env": "PROVIDER_NAME_API_KEY",
       "models": [
@@ -369,7 +369,7 @@ impl Config {
             return Err(ConfigError::NoProviders(path.clone()));
         }
         for provider in &self.providers {
-            if crate::llm::Api::from_name(&provider.api).is_none() {
+            if provider.api().is_none() {
                 return Err(ConfigError::BadApi(provider.name.clone()));
             }
             if provider.models.is_empty() {
@@ -471,8 +471,21 @@ impl Config {
 }
 
 impl Provider {
+    /// The protocol this provider speaks, or `None` when the config names one that does not
+    /// exist.
+    ///
+    /// The one place that turns the config's `api` string into a protocol: start-up
+    /// validation, the request shape and the compatibility defaults all ask here, so they
+    /// cannot disagree about what a provider is.
+    pub fn api(&self) -> Option<crate::llm::Api> {
+        crate::llm::Api::from_name(&self.api)
+    }
+
     pub fn compat(&self, model: &ModelConfig) -> Compat {
-        let mut compat = Compat::from_base_url(&self.base_url, &self.api);
+        // An unrecognised api has already been rejected at start-up; falling back to the
+        // completions shape here keeps this total without inventing a protocol.
+        let api = self.api().unwrap_or(crate::llm::Api::OpenAiCompletions);
+        let mut compat = Compat::from_base_url(&self.base_url, api);
         if let Some(overrides) = &self.compat {
             compat.apply(overrides);
         }
@@ -795,7 +808,7 @@ mod tests {
     fn sample() -> Config {
         let raw = r#"{
           "providers": [
-            {"name":"work","api":"openai-completions","base_url":"http://x/v1",
+            {"name":"work","api":"completions","base_url":"http://x/v1",
              "models":[{"id":"m1","reasoning":true,"thinking_levels":["low","high","max"]},
                        {"id":"m2"}]}
           ]
@@ -920,14 +933,14 @@ mod tests {
 
     #[test]
     fn unknown_level_is_rejected() {
-        let raw = r#"{"providers":[{"name":"p","api":"openai-completions","models":[{"id":"m","thinking_levels":["off"]}]}]}"#;
+        let raw = r#"{"providers":[{"name":"p","api":"completions","models":[{"id":"m","thinking_levels":["off"]}]}]}"#;
         let cfg: Config = serde_json::from_str(raw).unwrap();
         assert!(matches!(cfg.validate(&PathBuf::from("x")), Err(ConfigError::BadLevel { .. })));
     }
 
     #[test]
     fn the_third_protocol_is_accepted_and_gets_its_own_default_host() {
-        let raw = r#"{"providers":[{"name":"p","api":"openai-responses","models":[{"id":"m"}]}]}"#;
+        let raw = r#"{"providers":[{"name":"p","api":"responses","models":[{"id":"m"}]}]}"#;
         let mut cfg: Config = serde_json::from_str(raw).unwrap();
         cfg.validate(&PathBuf::from("x")).unwrap();
         cfg.fill_defaults();
@@ -942,6 +955,22 @@ mod tests {
     }
 
     #[test]
+    fn the_long_protocol_names_are_gone_not_aliased() {
+        // The config names a protocol with one word. The names these replaced are not
+        // accepted as a second spelling: two ways to write the same thing means the next
+        // reader has to know both, and the error says the same thing the docs do.
+        for raw in [
+            r#"{"providers":[{"name":"p","api":"openai-completions","models":[{"id":"m"}]}]}"#,
+            r#"{"providers":[{"name":"p","api":"anthropic-messages","models":[{"id":"m"}]}]}"#,
+            r#"{"providers":[{"name":"p","api":"openai-responses","models":[{"id":"m"}]}]}"#,
+        ] {
+            let cfg: Config = serde_json::from_str(raw).unwrap();
+            let err = cfg.validate(&PathBuf::from("x")).unwrap_err().to_string();
+            assert!(err.contains("messages、completions 或 responses"), "{err}");
+        }
+    }
+
+    #[test]
     fn a_misspelled_key_is_an_error_not_a_silent_default() {
         // The bug this guards: `baseUrl` parses, is dropped, and the request goes to the
         // protocol's default host with the user's key attached — which is how a working
@@ -949,7 +978,7 @@ mod tests {
         let raw = serde_json::json!({
             "providers": [{
                 "name": "grok",
-                "api": "openai-completions",
+                "api": "completions",
                 "baseUrl": "https://api.example.org/v1",
                 "models": [{"id": "grok-4.7"}]
             }]
@@ -965,20 +994,20 @@ mod tests {
     fn misspellings_are_caught_at_every_level() {
         let cases = [
             // A provider field.
-            serde_json::json!({"providers":[{"name":"p","api":"openai-completions",
+            serde_json::json!({"providers":[{"name":"p","api":"completions",
                 "key":"x","models":[{"id":"m"}]}]}),
             // A model field.
-            serde_json::json!({"providers":[{"name":"p","api":"openai-completions",
+            serde_json::json!({"providers":[{"name":"p","api":"completions",
                 "models":[{"id":"m","maxTokens":100}]}]}),
             // A compat switch.
-            serde_json::json!({"providers":[{"name":"p","api":"openai-completions",
+            serde_json::json!({"providers":[{"name":"p","api":"completions",
                 "compat":{"sendSessionAffinityHeaders":true},"models":[{"id":"m"}]}]}),
             // The shell block.
             serde_json::json!({"shell":{"shell":"/bin/zsh"},"providers":[{"name":"p",
-                "api":"openai-completions","models":[{"id":"m"}]}]}),
+                "api":"completions","models":[{"id":"m"}]}]}),
             // The root itself.
             serde_json::json!({"provider":[],"providers":[{"name":"p",
-                "api":"openai-completions","models":[{"id":"m"}]}]}),
+                "api":"completions","models":[{"id":"m"}]}]}),
         ];
         for case in cases {
             let err = check_unknown_fields(&case)
@@ -997,7 +1026,7 @@ mod tests {
             "shell": {"path": "/usr/bin/zsh"},
             "providers": [{
                 "name": "p",
-                "api": "openai-responses",
+                "api": "responses",
                 "base_url": "https://api.example.org/v1",
                 "api_key_env": "P_API_KEY",
                 "api_key": "sk-x",
@@ -1032,7 +1061,7 @@ mod tests {
 
     #[test]
     fn a_key_with_no_obvious_snake_case_form_is_still_reported() {
-        let raw = serde_json::json!({"providers":[{"name":"p","api":"openai-completions",
+        let raw = serde_json::json!({"providers":[{"name":"p","api":"completions",
             "models":[{"id":"m","contextwindo":1}]}]});
         let text = check_unknown_fields(&raw).unwrap_err().to_string();
         assert!(text.contains("contextwindo"), "{text}");

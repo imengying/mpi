@@ -384,6 +384,33 @@ impl Session {
         })
     }
 
+    /// What the user typed, oldest first, for the input history of a resumed screen.
+    ///
+    /// Only the user's own lines: the model's answers, the tool traffic and the environment
+    /// block are all in the file, and none of them is a line the user can recall and send
+    /// again. Reading from the records rather than from the context means a compacted
+    /// session still offers the turns the summary folded away — they are what the user
+    /// actually typed, which is what the arrows are for.
+    ///
+    /// Multi-line input is stored as one message but the editor is single-line, so each line
+    /// becomes its own history entry: recalling a message that was typed over three lines
+    /// would otherwise drop a newline into a buffer that cannot hold one.
+    pub fn user_history(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for record in &self.records {
+            let Some(message) = record.message() else { continue };
+            if !matches!(message, Message::User { .. }) || crate::agent::r#loop::is_environment_block(message) {
+                continue;
+            }
+            for line in message.text().lines() {
+                if !line.trim().is_empty() {
+                    out.push(line.to_string());
+                }
+            }
+        }
+        out
+    }
+
     /// Point the session header at `cwd`. The header line itself is never rewritten: the
     /// update is appended as a `session_info` record, like the session name.
     pub fn relocate(&mut self, cwd: &Path) -> Result<(), SessionError> {        if self.header.cwd == cwd.to_string_lossy() {
@@ -931,6 +958,61 @@ mod tests {
             .push_message(Message::user_text("你好"), None, None)
             .unwrap();
         (session, dir)
+    }
+
+    #[test]
+    fn user_history_holds_what_the_user_typed_and_nothing_else() {
+        // Up on a resumed screen reaches back into the conversation. What it must *not*
+        // reach is the model's own words: recalling an answer and sending it back would look
+        // like the user saying something they never said.
+        let (mut session, dir) = temp_session("history");
+        session
+            .push_message(Message::user_text("第一行\n第二行"), None, None)
+            .unwrap();
+        session
+            .push_message(Message::assistant_text("回答"), None, None)
+            .unwrap();
+        session
+            .push_message(
+                Message::Tool {
+                    tool_call_id: "c1".into(),
+                    name: "bash".into(),
+                    content: "输出".into(),
+                },
+                None,
+                None,
+            )
+            .unwrap();
+        session
+            .push_message(Message::System { content: "系统".into() }, None, None)
+            .unwrap();
+        // The environment block is a user message by type but bookkeeping by intent.
+        session
+            .push_message(Message::user_text("<environment>\n工作目录: /tmp"), None, None)
+            .unwrap();
+
+        // Each line of a multi-line message is its own entry: the editor is single-line, so
+        // recalling a message that was typed over two lines would drop a newline into a
+        // buffer that cannot hold one.
+        assert_eq!(session.user_history(), vec!["第一行".to_string(), "第二行".to_string()]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn user_history_survives_a_compaction() {
+        // Compaction replaces the context with a summary, but the arrows are about what the
+        // user typed, and those turns did happen. Reading the records instead of the context
+        // is what keeps them reachable.
+        let (mut session, dir) = temp_session("history-compacted");
+        session.push_message(Message::user_text("被压缩掉的话"), None, None).unwrap();
+        session
+            .push_compaction("test", "摘要", vec![Message::user_text("摘要占位")], vec![], vec![], None)
+            .unwrap();
+        assert_eq!(session.context_messages().len(), 1, "the summary replaced the turn");
+        assert_eq!(session.user_history(), vec!["被压缩掉的话".to_string()]);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -70,10 +70,10 @@ impl Default for Compat {
 }
 
 impl Compat {
-    pub fn from_base_url(base_url: &str, api: &str) -> Self {
+    pub fn from_base_url(base_url: &str, api: crate::llm::Api) -> Self {
         let mut compat = Compat::default();
         let url = base_url.to_lowercase();
-        if api == "anthropic-messages" {
+        if api == crate::llm::Api::AnthropicMessages {
             compat.thinking_format = ThinkingFormat::Anthropic;
             compat.send_session_affinity = true;
             return compat;
@@ -177,10 +177,11 @@ pub struct CompatPatch {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm::Api;
 
     #[test]
     fn openai_uses_max_completion_tokens_and_developer_role() {
-        let compat = Compat::from_base_url("https://api.openai.com/v1", "openai-completions");
+        let compat = Compat::from_base_url("https://api.openai.com/v1", Api::OpenAiCompletions);
         assert_eq!(compat.max_tokens_field, "max_completion_tokens");
         assert!(compat.supports_developer_role);
         assert!(compat.supports_strict_mode);
@@ -188,7 +189,7 @@ mod tests {
 
     #[test]
     fn a_local_gateway_keeps_the_permissive_defaults() {
-        let compat = Compat::from_base_url("url", "openai-completions");
+        let compat = Compat::from_base_url("url", Api::OpenAiCompletions);
         assert_eq!(compat.max_tokens_field, "max_tokens");
         assert!(!compat.supports_developer_role);
         assert_eq!(compat.thinking_format, ThinkingFormat::Openai);
@@ -196,13 +197,13 @@ mod tests {
 
     #[test]
     fn anthropic_api_selects_the_budget_format() {
-        let compat = Compat::from_base_url("https://api.anthropic.com", "anthropic-messages");
+        let compat = Compat::from_base_url("https://api.anthropic.com", Api::AnthropicMessages);
         assert_eq!(compat.thinking_format, ThinkingFormat::Anthropic);
     }
 
     #[test]
     fn config_patch_overrides_only_what_it_names() {
-        let mut compat = Compat::from_base_url("url", "openai-completions");
+        let mut compat = Compat::from_base_url("url", Api::OpenAiCompletions);
         let patch: CompatPatch = serde_json::from_str(
             r#"{"thinking_format":"deepseek","requires_reasoning_content_on_assistant":true}"#,
         )
