@@ -157,10 +157,14 @@ impl Agent {
         // The session id is deliberately *not* announced here: it is printed on the way out,
         // as part of the command that resumes it, which is the only time it is useful.
         // No `AGENTS.md` means no system message at all: pi has no prompt of its own.
-        let system_prompt = system_prompt_from(&cwd);
-        if let Some((path, text)) = load_agents_md(&cwd) {
+        // Read once for both uses, so the note below and the message sent cannot disagree.
+        let agents = load_agents_md(&cwd);
+        let system_prompt = agents.as_ref().map(|(_, text)| text.clone());
+        // Which file shapes the session is invisible otherwise and worth a line; how long it
+        // is, is not — the file is one `read` away if that matters.
+        if let Some((path, _)) = &agents {
             screen.push_lines(ui_compact::note_lines(
-                &format!("系统提示词：{}（{} 字）", util::shorten_home(&path, dirs::home_dir().as_deref()), text.chars().count()),
+                &format!("系统提示词：{}", util::shorten_home(path, dirs::home_dir().as_deref())),
                 crate::ui::screen::Style::new(Color::Dim),
             ));
         }
@@ -224,9 +228,11 @@ impl Agent {
         // Read from the directory the session is being resumed in: the instructions are
         // about the code being worked on, and that is where the work happens now.
         let system_prompt = system_prompt_from(&cwd);
+        // The transcript below is the session, so the note does not repeat what it says:
+        // only the name it goes under, which the replay itself does not carry.
         let name = session.name().unwrap_or_else(|| "未命名".into());
         screen.push_lines(ui_compact::note_lines(
-            &format!("已恢复会话 {name}（{} 条消息）", session.context_messages().len()),
+            &format!("已恢复会话 {name}"),
             crate::ui::screen::Style::new(Color::Dim),
         ));
         // Replay the transcript so the user can see where the work stopped. The whole
@@ -249,17 +255,20 @@ impl Agent {
         if recorded == cwd {
             // Same directory as before: nothing to say and nothing to write.
         } else {
+            // The old directory is named because it is the reason the transcript's paths no
+            // longer resolve here; whether it still exists tells the user which of the two
+            // ways it went. How the environment block was refreshed is bookkeeping.
             let missing = !recorded.is_dir();
             screen.push_lines(ui_compact::note_lines(
                 &if missing {
                     format!(
-                        "会话原目录 {} 已不存在，本次在 {} 继续；已写入新的环境信息。",
+                        "会话原目录 {} 已不存在，本次在 {} 继续。",
                         recorded.display(),
                         cwd.display()
                     )
                 } else {
                     format!(
-                        "会话原目录 {}，本次在 {} 继续；已写入新的环境信息。",
+                        "会话原目录 {}，本次在 {} 继续。",
                         recorded.display(),
                         cwd.display()
                     )
@@ -400,11 +409,8 @@ impl Agent {
             Some(argument.replace('\n', " "))
         };
         self.session.set_name(name.as_deref())?;
-        let note = match &name {
-            Some(name) => format!("会话名已设为「{}」", util::truncate(name, Defaults::SESSION_NAME_WIDTH, "…")),
-            None => "会话名已清空".to_string(),
-        };
-        self.screen.push_lines(ui_compact::note_lines(&note, crate::ui::screen::Style::new(Color::Dim)));
+        // No confirmation line: the name is drawn in the footer on the very next frame, so a
+        // note repeating it here would be the second copy of the same fact.
         Ok(())
     }
 
@@ -445,38 +451,29 @@ impl Agent {
             ));
             return Ok(true);
         }
+        // A refusal is still reported: the session ends only when the user says so, and the
+        // manual command is the one thing they can do about it.
         let choice = self.screen.pick(
             &format!("删除会话「{name}」？"),
             &["不删，继续".to_string(), "是的，删除并退出".to_string()],
         );
-        // The safe option is highlighted first, so a reflexive Enter keeps the session.
+        // The safe option is highlighted first, so a reflexive Enter keeps the session. No
+        // note for it: the session is still on screen, which is the answer to "was it kept?".
         if choice != Some(1) {
-            self.screen.push_lines(ui_compact::note_lines(
-                "已取消，会话保留。",
-                crate::ui::screen::Style::new(Color::Dim),
-            ));
             return Ok(true);
         }
+        // The early return above proved there is a file, so the deletion is a fact and not a
+        // question: report the path that is gone, which is the one thing the user cannot see
+        // from the screen.
         let removed = self.session.delete()?;
+        debug_assert!(removed, "a saved session always has a file to unlink");
         self.deleted = true;
         // The store's entry goes with the last session in it. Otherwise a directory stays
         // listed for every project that was ever used, and the store stops being a list of
         // where history *is* — which is the whole reason for grouping by directory.
-        let forgotten = crate::config::forget_dir_if_empty(&self.cwd);
-        let note = if removed {
-            if forgotten {
-                format!("已删除会话文件：{path}")
-            } else {
-                // Other sessions remain here, so the directory stays.
-                format!("已删除会话文件：{path}（本目录还有其它会话）")
-            }
-        } else {
-            // A session that never said anything has no file: there was nothing to delete,
-            // and reporting a path as deleted would be false.
-            "本会话没有内容，未生成文件。".to_string()
-        };
+        crate::config::forget_dir_if_empty(&self.cwd);
         self.screen.push_lines(ui_compact::note_lines(
-            &note,
+            &format!("已删除会话文件：{path}"),
             crate::ui::screen::Style::new(Color::Dim),
         ));
         Ok(false)
@@ -495,14 +492,17 @@ impl Agent {
     fn command_new(&mut self) -> anyhow::Result<()> {
         // The id is not announced: it is printed on the way out, with the command that
         // resumes it, which is the only place it is useful.
-        self.start_new_session("新会话开始。")
+        self.start_new_session()
     }
 
     /// Replace the current session with a fresh one, keeping the working directory.
     ///
     /// The old session is not deleted: it is on disk and still reachable through `/resume`,
     /// so "new" costs nothing and undo is a resume away.
-    fn start_new_session(&mut self, note: &str) -> anyhow::Result<()> {
+    ///
+    /// Nothing is printed: the transcript is wiped, and an empty screen under a footer with
+    /// no session name already says "new session" more plainly than a line of prose would.
+    fn start_new_session(&mut self) -> anyhow::Result<()> {
         let model_spec = self.model_spec.clone();
         self.session = Session::create(&self.cwd, &model_spec)?;
         self.system_prompt = system_prompt_from(&self.cwd);
@@ -514,8 +514,6 @@ impl Agent {
         // belong to it, not to this one, and offering them here would be recalling words
         // this session never heard.
         self.screen.seed_history(Vec::new());
-        self.screen
-            .push_lines(ui_compact::note_lines(note, crate::ui::screen::Style::new(Color::Dim)));
         Ok(())
     }
 
@@ -543,14 +541,14 @@ impl Agent {
         // blank line with no way to start over — the current session is still the one they
         // were trying to leave. So cancelling *is* the new session here. When the current
         // session has already said something it is kept (it stays in `/resume`), so nothing
-        // is lost; the confirmation exists because "I pressed Esc" does not obviously mean
-        // "discard the screen I am looking at".
+        // is lost; the menu's own hint says what the key will do, and the wiped screen says
+        // it happened, so no note follows.
         let Some(index) = self.screen.pick_with_hint(
             "恢复历史会话",
             "↑↓ 选择 · Enter 确认 · Esc 开始新会话",
             &items,
         ) else {
-            self.start_new_session("已按 Esc：新会话开始。")?;
+            self.start_new_session()?;
             return Ok(());
         };
         let target = summaries[index].path.clone();
@@ -567,11 +565,8 @@ impl Agent {
                 // The switched-to session may have started under a different `AGENTS.md`,
                 // so the prompt is re-read here too.
                 self.system_prompt = system_prompt_from(&self.cwd);
-                let name = self.session.name().unwrap_or_else(|| "未命名".into());
-                self.screen.push_lines(ui_compact::note_lines(
-                    &format!("已切到会话「{name}」"),
-                    crate::ui::screen::Style::new(Color::Dim),
-                ));
+                // No note: the user picked this session from a list that already showed its
+                // name, and the replay below plus the footer carry it from here.
                 if self.config.find(&model_spec).is_some() {
                     self.model_spec = model_spec;
                 }
@@ -635,13 +630,14 @@ impl Agent {
         let spec = catalogue[index].1.clone();
         self.model_spec = spec.clone();
         let (_, model) = self.config.find(&spec).expect("chosen from the catalogue");
-        let model_name = model.display_name().to_string();
         let levels = model.levels();
-        let mut note = format!("已切换到 {model_name}");
+        // The footer is redrawn with every change, so the model and level that are now in
+        // force need no note. The one thing it cannot show is a level the user asked for and
+        // did not get, because that was silently replaced.
+        let mut clamped_from: Option<String> = None;
 
         if levels.is_empty() {
             self.level.clear();
-            note.push_str("（该模型不支持推理）");
         } else {
             let current = levels.iter().position(|level| *level == self.level).unwrap_or(0);
             let level_items: Vec<String> = levels.iter().map(|level| level.to_string()).collect();
@@ -651,29 +647,26 @@ impl Agent {
             // A level that came from another model may not exist here.
             let (clamped, moved) = llm::clamp_level(model, &self.level);
             if moved {
-                note.push_str(&format!(" · 思考级别 {level} 不受支持，已调整为 {clamped}", level = self.level));
+                clamped_from = Some(self.level.clone());
             }
             self.level = clamped;
-            note.push_str(&format!(" · {}", self.level));
         }
-        self.screen.push_lines(ui_compact::note_lines(&note, crate::ui::screen::Style::new(Color::Dim)));
+        if let Some(asked) = clamped_from {
+            self.screen.push_lines(ui_compact::note_lines(
+                &format!("思考级别 {asked} 不受支持，已调整为 {}", self.level),
+                crate::ui::screen::Style::new(Color::Dim),
+            ));
+        }
         Ok(())
     }
 
     /// `/compact`: always allowed on request, but it reports the reason when there is
     /// nothing to cut.
     async fn command_compact(&mut self, instructions: &str) -> anyhow::Result<()> {
-        if self.streaming {
-            self.screen.push_lines(ui_compact::note_lines(
-                "正在流式输出，无法压缩；等这一轮结束后再试。",
-                crate::ui::screen::Style::new(Color::Yellow),
-            ));
-            return Ok(());
-        }
         let custom = (!instructions.trim().is_empty()).then_some(instructions);
-        // Summarising the history is another long request, and outside a turn there is no
-        // spinner running already.
-        self.screen.set_working(WORKING_LABEL);
+        // The footer's banner is the whole indication here. A spinner would be the second
+        // one, and a spinner that nothing ticks is worse than none: it sits at its first
+        // frame for as long as the summary takes, which is the look of a hung process.
         match self.compact(Reason::Manual, custom).await {
             Ok(()) => {}
             Err(err) => {
@@ -683,12 +676,18 @@ impl Agent {
                 ));
             }
         };
-        self.screen.clear_working();
         Ok(())
     }
 
     /// Run one compaction and write the checkpoint.
+    ///
+    /// Every refusal lives here rather than at the call sites: the check that a compaction
+    /// cannot start while an answer is streaming used to be spelled out in `command_compact`
+    /// as well, and the two could drift apart.
     async fn compact(&mut self, reason: Reason, custom: Option<&str>) -> Result<(), CompactError> {
+        if self.streaming {
+            return Err(CompactError::Streaming);
+        }
         if self.compaction.running {
             return Err(CompactError::InProgress);
         }
@@ -737,9 +736,6 @@ impl Agent {
             real_usage,
         )
         .await?;
-        // A compaction that did not actually shrink anything is worth saying out loud: it
-        // means the summary request cost more than it saved.
-        let grew = outcome.tokens_after >= outcome.tokens_before;
         self.session
             .push_compaction(
                 reason.label(),
@@ -750,37 +746,16 @@ impl Agent {
                 Some(outcome.usage),
             )
             .map_err(|err| CompactError::Session(err.to_string()))?;
-        let saved = outcome.tokens_before.saturating_sub(outcome.tokens_after);
-        let note = if grew {
-            // Compaction is not free; if it did not help, the user should know that the model's
-            // window is too small for the summary to pay for itself.
-            format!(
-                "已压缩上下文（{}）：约 {} → {} token，这次没有变小；\n\
-                 该模型窗口偏小，摘要本身的开销超过了省下的量。",
-                reason.label(),
-                util::fmt_tokens(outcome.tokens_before, true),
-                util::fmt_tokens(outcome.tokens_after, true),
-            )
+        // The token counts are not restated: the footer carries the context gauge, and that is
+        // the number the user is already reading. What the footer cannot say is that the
+        // compaction did not help, because nothing shrank.
+        let note = if outcome.tokens_after >= outcome.tokens_before {
+            "已压缩（没有变小）"
         } else {
-            format!(
-                "已压缩上下文（{}）：约 {} → {} token（省下约 {}）",
-                reason.label(),
-                util::fmt_tokens(outcome.tokens_before, true),
-                util::fmt_tokens(outcome.tokens_after, true),
-                util::fmt_tokens(saved, true),
-            )
+            "已压缩"
         };
         self.screen
-            .push_lines(ui_compact::note_lines(&note, crate::ui::screen::Style::new(Color::Dim)));
-        if outcome.trimmed_for_summary {
-            // Say it rather than let the summary quietly describe less than the session did:
-            // "the checkpoint does not mention that" and "that never happened" read the same
-            // otherwise, and the user is the only one who can tell the difference.
-            self.screen.push_lines(ui_compact::note_lines(
-                "（会话较长，摘要只覆盖了最近的部分；更早的对话仍完整保存在会话文件里）",
-                crate::ui::screen::Style::new(Color::Dim),
-            ));
-        }
+            .push_lines(ui_compact::note_lines(note, crate::ui::screen::Style::new(Color::Dim)));
         Ok(())
     }
 
@@ -836,7 +811,7 @@ impl Agent {
                 // model for the next step — of the very turn that was just stopped.
                 Ok(TurnEnd::Stopped) => {
                     self.screen.push_lines(ui_compact::note_lines(
-                        "已停止。可以接着说，或直接输入新的要求。",
+                        "已停止",
                         crate::ui::screen::Style::new(Color::Dim),
                     ));
                     break;
@@ -881,14 +856,9 @@ impl Agent {
                 real_usage,
             );
             if used > limit {
-                self.screen.push_lines(ui_compact::note_lines(
-                    &format!(
-                        "上下文已用 {}/{}，接近上限，正在压缩…",
-                        util::fmt_tokens(used, true),
-                        util::fmt_tokens(window, true)
-                    ),
-                    crate::ui::screen::Style::new(Color::Yellow),
-                ));
+                // No note here: the footer's own banner already says the context is near its
+                // limit and a compaction is running. It is the same sentence, on the row the
+                // user is looking at while the request is in flight.
                 if let Err(err) = self.compact(Reason::Threshold, None).await {
                     // A failed automatic compaction must not lose the turn; the request
                     // may still fit, and if it does not the overflow path will try again.
@@ -1000,13 +970,10 @@ impl Agent {
 
         // An overflow can also arrive as a "successful" response: either the prompt alone
         // filled the window, or the server truncated it and left no room to answer. Both
-        // are compacted here, before the message is recorded.
+        // are compacted here, before the message is recorded. No note: the compaction puts
+        // its own banner in the footer, and it says exactly what happened.
         let overflow = compact::detect_overflow(&completion, model.context_window, model.max_tokens());
-        if let Some(signal) = overflow {
-            self.screen.push_lines(ui_compact::note_lines(
-                &describe_overflow(&signal),
-                crate::ui::screen::Style::new(Color::Yellow),
-            ));
+        if overflow.is_some() {
             let retried = self.recover_overflow("").await?;
             if let Some(end) = retried {
                 return Ok(end);
@@ -1067,8 +1034,10 @@ impl Agent {
             None,
             Some(StopReason::Aborted),
         )?;
+        // The partial answer is on screen above this line, so "已停止" is enough to account
+        // for why it ends mid-sentence; how to carry on needs no instruction.
         self.screen.push_lines(ui_compact::note_lines(
-            "已停止。可以接着说，或直接输入新的要求。",
+            "已停止",
             crate::ui::screen::Style::new(Color::Dim),
         ));
         self.render_footer(None);
@@ -1085,10 +1054,10 @@ impl Agent {
         }
         if calls.is_empty() {
             // A length stop with no tool calls means the answer was cut off; say so rather
-            // than silently pretending it finished.
+            // than silently pretending it finished. "Continue" needs no spelling out.
             if completion.stop_reason == StopReason::Length {
                 self.screen.push_lines(ui_compact::note_lines(
-                    "输出达到长度上限，回答可能不完整。可以继续要求补全。",
+                    "输出达到长度上限，回答可能不完整。",
                     crate::ui::screen::Style::new(Color::Yellow),
                 ));
             }
@@ -1232,6 +1201,9 @@ impl Agent {
 
     /// The single overflow recovery attempt for this turn. Returns `Some(..)` when the turn
     /// was handled here, `None` when the caller should carry on with normal error handling.
+    ///
+    /// Nothing is announced here: the compaction this triggers puts the overflow banner in
+    /// the footer, and it is already on screen before this returns.
     async fn recover_overflow(&mut self, error_text: &str) -> anyhow::Result<Option<TurnEnd>> {
         let (_, model) = self.model()?;
         let is_overflow = error_text.is_empty()
@@ -1240,16 +1212,14 @@ impl Agent {
             return Ok(None);
         }
         self.retry.spend();
-        self.screen.push_lines(ui_compact::note_lines(
-            "上下文超限，正在压缩后重试…",
-            crate::ui::screen::Style::new(Color::Yellow),
-        ));
         // Drop the failed assistant message before compacting: keeping it would fold a
         // half-written answer into the summary.
         self.session.drop_last_assistant()?;
         if let Err(err) = self.compact(Reason::Overflow, None).await {
+            // The one thing left to say: the automatic recovery did not work, so what happens
+            // next is the user's call.
             self.screen.push_lines(ui_compact::note_lines(
-                &format!("压缩失败：{err}。请减少上下文或换用窗口更大的模型。"),
+                &format!("压缩失败：{err}"),
                 crate::ui::screen::Style::new(Color::Red),
             ));
             return Ok(Some(TurnEnd::Done));
@@ -1271,14 +1241,10 @@ fn on_turn_action(screen: &mut Screen, action: crate::ui::screen::Action) -> boo
     match action {
         Action::Line(text) => queue_mid_turn(screen, text, Vec::new()),
         Action::LineWithImages(text, images) => queue_mid_turn(screen, text, images),
-        // Ctrl+O is exactly what a user does while a long tool call is on screen.
+        // Ctrl+O is exactly what a user does while a long tool call is on screen. The note
+        // for "nothing to expand" comes from the screen itself.
         Action::ToggleExpand => {
-            if !screen.toggle_last_collapsible() {
-                screen.push_lines(ui_compact::note_lines(
-                    "没有可展开的内容。",
-                    crate::ui::screen::Style::new(Color::Dim),
-                ));
-            }
+            let _ = screen.toggle_last_collapsible();
         }
         Action::Stop => return true,
         // Ctrl+C / Ctrl+D during a turn do nothing: Ctrl+C clears the input line, and the
@@ -1374,22 +1340,6 @@ fn drain_deltas(screen: &mut Screen, deltas: &mut tokio::sync::mpsc::UnboundedRe
 /// Exposed for tests: the dialect pi will hand to the policy.
 pub fn dialect_for(config: &Config) -> Dialect {
     policy::configured_dialect(&config.shell.path)
-}
-
-/// Human-readable form of an overflow signal, shown before the compaction starts.
-pub fn describe_overflow(signal: &compact::OverflowSignal) -> String {
-    match signal {
-        compact::OverflowSignal::ExplicitError => "上游报告上下文超限，正在压缩后重试…".to_string(),
-        compact::OverflowSignal::SilentOverflow { prompt_tokens, context_window } => format!(
-            "输入 {}/{} token 已超出窗口，正在压缩后重试…",
-            util::fmt_tokens(*prompt_tokens, true),
-            util::fmt_tokens(*context_window, true)
-        ),
-        compact::OverflowSignal::LengthCut { output_tokens, max_tokens } => format!(
-            "输出只剩 {}/{max_tokens} token，疑似上下文挤占，正在压缩后重试…",
-            output_tokens
-        ),
-    }
 }
 
 /// `AGENTS.md` filenames, in the order pi looks for them.

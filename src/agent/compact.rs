@@ -36,12 +36,15 @@ impl Reason {
         }
     }
 
-    /// The line shown above the transcript while the summary is generated.
+    /// The footer's busy row while the summary is generated.
+    ///
+    /// Threshold and manual look identical from here — both just shrink the history — so they
+    /// share one word. Overflow adds something the user will otherwise see happen with no
+    /// explanation: the turn they already sent is sent again.
     pub fn banner(self) -> &'static str {
         match self {
-            Reason::Manual => "正在压缩上下文…",
-            Reason::Threshold => "上下文接近上限，正在压缩…",
-            Reason::Overflow => "上下文超限，正在压缩后重试…",
+            Reason::Manual | Reason::Threshold => "正在压缩",
+            Reason::Overflow => "正在压缩后重试",
         }
     }
 }
@@ -49,17 +52,17 @@ impl Reason {
 /// Errors that must be reported rather than swallowed.
 #[derive(Debug, thiserror::Error)]
 pub enum CompactError {
-    #[error("历史太短，没有可以压缩的内容（最近 {keep_recent_tokens} token 会原样保留）")]
-    TooShort { keep_recent_tokens: u64 },
-    #[error("正在流式输出，无法压缩；等这一轮结束后再试")]
+    #[error("历史太短，没有可压缩的内容")]
+    TooShort,
+    #[error("正在输出，无法压缩")]
     Streaming,
     #[error("上一次压缩尚未完成")]
     InProgress,
     #[error("摘要请求失败：{0}")]
     Summarize(String),
-    #[error("摘要被长度限制截断，未写入检查点（请重试或换用更小的历史）")]
+    #[error("摘要被长度限制截断，未写入检查点")]
     Truncated,
-    #[error("摘要模型调用了工具，结果不可用；未写入检查点")]
+    #[error("摘要模型调用了工具，未写入检查点")]
     ToolCallInSummary,
     #[error("会话写入失败：{0}")]
     Session(String),
@@ -654,7 +657,7 @@ pub fn plan_summary(
     context_window: Option<u64>,
 ) -> Result<SummaryPlan, CompactError> {
     let Some((cut, summarized, kept)) = plan(messages, keep_recent_tokens) else {
-        return Err(CompactError::TooShort { keep_recent_tokens });
+        return Err(CompactError::TooShort);
     };
     let budget = summary_budget_for(context_window.unwrap_or(0));
     let (summarized, trimmed) = limit_for_summary(&summarized, budget);
@@ -675,12 +678,8 @@ pub struct CompactionOutcome {
     pub modified_files: Vec<String>,
     pub usage: crate::config::Usage,
     pub tokens_before: u64,
-    /// Token estimate after the swap, so the user can see what was saved.
+    /// Token estimate after the swap, so the caller can tell whether it actually helped.
     pub tokens_after: u64,
-    /// Whether the oldest turns were left out of the summary request to keep it under the
-    /// model's window. The checkpoint still carries their user messages, so nothing the user
-    /// asked is lost — but the summary describes less, and that is worth saying.
-    pub trimmed_for_summary: bool,
 }
 
 /// How much of the summarised conversation may go into one summary request.
@@ -758,7 +757,7 @@ pub async fn run(
     // Bound the request itself, not just the caps inside it: a long session can still add up
     // to more than the model's window, and a summary request that does not fit cannot be
     // sent at all.
-    let SummaryPlan { cut, summarized, kept, trimmed, request_tokens } =
+    let SummaryPlan { cut, summarized, kept, request_tokens, .. } =
         plan_summary(messages, keep_recent_tokens, request.model.context_window)?;
     debug_assert!(
         request.model.context_window.is_none_or(|window| request_tokens < window),
@@ -779,7 +778,6 @@ pub async fn run(
         usage,
         tokens_before,
         tokens_after,
-        trimmed_for_summary: trimmed,
     })
 }
 

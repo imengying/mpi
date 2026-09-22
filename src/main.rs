@@ -37,17 +37,11 @@ fn run(cli: Cli) -> anyhow::Result<()> {
     let config = match Config::load() {
         Ok(config) => config,
         Err(err) => {
-            // The "write a example config" message already carries the path and what to do
-            // next, so it is printed as-is rather than prefixed with `pi:`.
+            // The messages that already carry the path and the next step are printed as-is:
+            // prefixing them with `pi:` would say the same thing twice, and repeating the
+            // missing-provider advice in a second line is the same mistake in another shape.
             match &err {
-                mpi::config::ConfigError::Created(path) => {
-                    eprintln!("已写出示例配置：{}
-编辑它，至少写出一个 provider 及其 models，然后重新运行。", path.display());
-                }
-                mpi::config::ConfigError::NoProviders(path) => {
-                    eprintln!("pi: {err}");
-                    eprintln!("编辑 {path}，至少写出一个 provider 及其 models。", path = path.display());
-                }
+                mpi::config::ConfigError::Created(_) => eprintln!("{err}"),
                 _ => eprintln!("pi: {err}"),
             }
             std::process::exit(1);
@@ -107,12 +101,8 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 }
             }
             Action::ToggleExpand => {
-                if !agent.screen.toggle_last_collapsible() {
-                    agent.screen.push_lines(ui_compact::note_lines(
-                        "没有可展开的内容。",
-                        mpi::ui::screen::Style::new(Color::Dim),
-                    ));
-                }
+                // The note for "nothing to expand" comes from the screen itself.
+                let _ = agent.screen.toggle_last_collapsible();
             }
             Action::Interrupt => continue,
             // Esc stops the turn in flight, and this is the prompt: nothing is running, so

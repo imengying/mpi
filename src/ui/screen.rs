@@ -829,8 +829,16 @@ impl Screen {
     /// in place, so the block is printed again below, in its new state. Re-printing rather
     /// than repainting keeps the history honest: what the user read stays where they read
     /// it, and the fresh copy is the one that is now current.
+    ///
+    /// Nothing to flip is still an answer: the note is pushed here rather than at each call
+    /// site, so a caller cannot forget it and leave the key looking broken.
     pub fn toggle_last_collapsible(&mut self) -> bool {
         let Some(index) = self.blocks.iter().rposition(Block::is_collapsible) else {
+            self.push_lines(crate::ui::compact::note_lines(
+                "没有可展开的内容",
+                Style::new(Color::Dim),
+            ));
+            self.draw_live();
             return false;
         };
         if let Block::Collapsible(collapsible) = &mut self.blocks[index] {
@@ -3106,6 +3114,16 @@ mod tests {
         }
         assert_eq!(block.render(40).len(), 4);
         assert!(!block.render(40).iter().any(|line| line.text().contains("收起")));
+    }
+
+    #[test]
+    fn toggling_with_nothing_to_expand_says_so() {
+        // Ctrl+O with no collapsible block on screen must not look like a dead key. The note
+        // is pushed by the screen rather than by each caller, so this is where it is checked.
+        let mut screen = screen();
+        screen.push(Block::lines(vec![Line::plain("plain output")]));
+        assert!(!screen.toggle_last_collapsible());
+        assert!(screen.blocks.last().unwrap().render(80)[0].text().contains("没有可展开"));
     }
 
     #[test]
