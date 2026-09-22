@@ -83,19 +83,27 @@ pub fn encode_rgba(width: usize, height: usize, rgba: &[u8]) -> Result<PastedIma
             rgba.len()
         )));
     }
-    // Through `image`'s PNG encoder rather than a raw `png` handle: it is the crate this
-    // module declares, and its writer owns the Vec for us.
-    let buffer = image::RgbaImage::from_raw(w, h, rgba[..expected].to_vec())
-        .ok_or_else(|| ImageError::Encode("像素缓冲与尺寸不匹配".into()))?;
-    let mut png = Vec::new();
-    image::DynamicImage::ImageRgba8(buffer)
-        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
-        .map_err(|err| ImageError::Encode(err.to_string()))?;
-    let bytes = png.len();
+    // Clipboard data is already RGBA8 — a screenshot and a photo both arrive as
+    // pixels, not as a file — so this writes PNG directly. Going through `image`
+    // pulled a JPEG decoder, TIFF and a color-management stack that nothing calls.
+    let mut encoded = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut encoded, w, h);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder
+            .write_header()
+            .map_err(|err| ImageError::Encode(err.to_string()))?;
+        writer
+            .write_image_data(&rgba[..expected])
+            .map_err(|err| ImageError::Encode(err.to_string()))?;
+        writer.finish().map_err(|err| ImageError::Encode(err.to_string()))?;
+    }
+    let bytes = encoded.len();
     Ok(PastedImage {
         width: w,
         height: h,
-        data: base64::engine::general_purpose::STANDARD.encode(&png),
+        data: base64::engine::general_purpose::STANDARD.encode(&encoded),
         bytes,
     })
 }

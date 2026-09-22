@@ -27,12 +27,19 @@ dirs = "7.0"
 unicode-width = "0.2"
 similar = "3.2"
 uuid = { version = "1.26", features = ["v7"] }
-# Clipboard image input. `default-features = false` drops the unused SVG/decoder surface;
-# png+jpeg is what a screenshot or a photo actually arrives as.
+# Clipboard image input. Pixels are re-encoded as PNG; a JPEG/TIFF stack is never
+# on this path, so the encoder is `png` rather than `image`.
 arboard = { version = "3.6", features = ["wayland-data-control"] }
 # Already in the tree via reqwest; declared because the image path needs it directly.
 base64 = "0.23"
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+png = "0.18"
 
 [profile.release]
-opt-level = 2
+# Shipping profile in the shape fast CLIs use: full opts, thin LTO, one codegen
+# unit, symbols stripped. opt-level 2 compiled faster but left a larger, slower
+# binary. Fat LTO is skipped — it multiplies CI time across the four targets for
+# a smaller gain, and `cargo test --release` builds this same profile.
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

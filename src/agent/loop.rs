@@ -864,11 +864,14 @@ impl Agent {
             let compat = provider.compat(model);
             (provider.clone(), model.clone(), compat)
         };
+        // Built once. The threshold check below only reads it; cloning the history a
+        // second time would copy every image in the context on the common path, where
+        // compaction does not fire. After a compaction the list is stale and is rebuilt.
+        let mut messages = self.session.context_messages();
         // Threshold compaction runs before the request, using real usage when it is still
         // valid and an estimate otherwise.
         if let Some(window) = model.context_window {
             let limit = compact::threshold_for(window);
-            let messages = self.session.context_messages();
             let real_usage = self.session.last_usage.as_ref().map(|usage| {
                 usage.input + usage.output + usage.cache_read + usage.cache_write
             });
@@ -894,10 +897,10 @@ impl Agent {
                         crate::ui::screen::Style::new(Color::Yellow),
                     ));
                 }
+                messages = self.session.context_messages();
             }
         }
 
-        let mut messages = self.session.context_messages();
         // The system message is prepended per request rather than stored in the session:
         // the file stays a record of the conversation itself, and the prompt can be
         // changed on disk without rewriting history.

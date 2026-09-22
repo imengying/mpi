@@ -114,11 +114,18 @@ impl Client {
             .await
             .map_err(|err| LlmError::Transport(err.to_string()))?
         {
-            buffer.push_str(&String::from_utf8_lossy(&chunk));
-            // Frames end at a blank line; the trailing partial frame stays buffered.
+            // Valid UTF-8 is the common case; `from_utf8_lossy` allocates even then.
+            match std::str::from_utf8(&chunk) {
+                Ok(text) => buffer.push_str(text),
+                Err(_) => buffer.push_str(&String::from_utf8_lossy(&chunk)),
+            }
+            // Frames end at a blank line. `split_off` keeps the frame and returns the
+            // tail. `drain` + `collect` does the opposite: it copies the frame, then
+            // slides the rest of the buffer down a byte at a time.
             while let Some(index) = buffer.find("\n\n") {
-                let frame: String = buffer.drain(..index + 2).collect();
-                dispatch(&frame, api, &mut assemblers, on_delta)?;
+                let rest = buffer.split_off(index + 2);
+                dispatch(&buffer, api, &mut assemblers, on_delta)?;
+                buffer = rest;
             }
         }
         if !buffer.trim().is_empty() {

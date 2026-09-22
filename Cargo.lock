@@ -918,8 +918,6 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
- "zune-core",
- "zune-jpeg",
 ]
 
 [[package]]
@@ -1133,7 +1131,7 @@ dependencies = [
  "clap",
  "crossterm",
  "dirs",
- "image",
+ "png",
  "reqwest",
  "serde",
  "serde_json",
