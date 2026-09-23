@@ -41,12 +41,21 @@ pub enum Color {
     Red,     // context error
     DiffAddedText,
     DiffRemovedText,
-    /// Code inside a fenced block. The three syntax colours are codex's, and they are the
-    /// only colours in the program that are not a UI role: a code block is read by
-    /// scanning it, and shape is what makes it scannable.
-    SyntaxKeyword,
-    SyntaxString,
-    SyntaxNumber,
+    /// Status and function names. Catppuccin Mocha blue — Codex's default dark theme —
+    /// which stays readable where the hint grey disappears into the background.
+    Blue,    // #89b4fa
+    /// Code inside a fenced block, in Codex's default dark theme (Catppuccin Mocha).
+    ///
+    /// The roles are the ones a reader scans for: a keyword, a call, a type, a string, a
+    /// number, a comment. They are not UI colours. Folding a call into the keyword colour,
+    /// which is what the first cut did, makes a block look like one washed-out tint.
+    SyntaxKeyword,  // mauve  #cba6f7
+    SyntaxFunction, // blue, same role as [`Color::Blue`] but kept apart so a UI change
+                    // cannot recolour every function in a code block
+    SyntaxType,     // yellow #f9e2af
+    SyntaxString,   // green  #a6e3a1
+    SyntaxNumber,   // peach  #fab387
+    SyntaxComment,  // overlay #9399b2 — quieter than code, lighter than the hint grey
 }
 
 impl Color {
@@ -61,13 +70,18 @@ impl Color {
             Color::Yellow => (0xd6, 0xbb, 0x7a, 180),
             Color::Red => (0xf0, 0x8a, 0x83, 210),
             Color::Dim => (0x80, 0x80, 0x80, 244),
+            Color::Blue => (0x89, 0xb4, 0xfa, 111),
             Color::DiffAddedText => (0xa3, 0xd9, 0xa5, 151),
             Color::DiffRemovedText => (0xf2, 0xa2, 0x9a, 216),
-            // codex's syntax roles: keyword blue-grey, string green, number amber. The 256
-            // indices are the nearest cube entries to the truecolor values.
-            Color::SyntaxKeyword => (0xaf, 0xc5, 0xde, 152),
-            Color::SyntaxString => (0xa7, 0xc4, 0x9f, 151),
-            Color::SyntaxNumber => (0xc9, 0xb8, 0x91, 180),
+            // Catppuccin Mocha, which is the theme Codex picks on a dark terminal. The 256
+            // indices are the nearest cube entries, so a terminal without truecolor still
+            // separates a keyword from a string.
+            Color::SyntaxKeyword => (0xcb, 0xa6, 0xf7, 183),
+            Color::SyntaxFunction => (0x89, 0xb4, 0xfa, 111),
+            Color::SyntaxType => (0xf9, 0xe2, 0xaf, 223),
+            Color::SyntaxString => (0xa6, 0xe3, 0xa1, 151),
+            Color::SyntaxNumber => (0xfa, 0xb3, 0x87, 216),
+            Color::SyntaxComment => (0x93, 0x99, 0xb2, 146),
         })
     }
 }

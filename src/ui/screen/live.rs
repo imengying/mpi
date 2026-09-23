@@ -55,7 +55,7 @@ impl Screen {
                 lines.push(Line::spans(vec![
                     Span::new(frame, Style::new(Color::Cyan)),
                     Span::plain(" "),
-                    Span::new(label.clone(), Style::new(Color::Dim)),
+                    Span::new(label.clone(), Style::new(Color::Blue)),
                 ]));
             }
             if let Some(editing) = &self.editing {

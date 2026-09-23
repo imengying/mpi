@@ -139,6 +139,8 @@ use crate::ui::footer::FooterState;
         let text: Vec<String> = lines.iter().map(Line::text).collect();
         assert_eq!(input, 1, "the spinner is one row: {text:?}");
         assert_eq!(lines[0].text(), format!("{} {}", WORKING_FRAMES[0], WORKING_LABEL));
+        let label = lines[0].spans.iter().find(|span| span.text == WORKING_LABEL).unwrap();
+        assert_eq!(label.style.fg, Color::Blue, "Working is blue, not the hint grey");
 
         // Each tick advances by exactly one frame and wraps, so the animation has no jump.
         screen.working_frame = WORKING_FRAMES.len() - 1;

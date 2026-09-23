@@ -55,7 +55,7 @@ pub fn render(text: &str, width: usize) -> Vec<Line> {
     // A fence's body is buffered so its frame can be sized to the widest line. An open
     // fence is `Some`, and the body is flushed when the closing marker arrives (or at the
     // end of the text, since the tail of a stream is an unterminated fence).
-    let mut fence: Option<(Fence, Vec<Line>)> = None;
+    let mut fence: Option<(Fence, Vec<String>)> = None;
     let mut table: Vec<String> = Vec::new();
 
     for raw in clean.split('\n') {
@@ -66,7 +66,7 @@ pub fn render(text: &str, width: usize) -> Vec<Line> {
                     lines.extend(open.frame(&body, width));
                 }
             } else {
-                body.push(code_line(raw.trim_end(), open.lang.as_deref()));
+                body.push(raw.trim_end().to_string());
             }
             continue;
         }
@@ -121,10 +121,15 @@ fn is_blank_line(line: &Line) -> bool {
 
 /// One line of a fenced block. The indent is part of the line, and `hang` matches it so a
 /// wrapped code line lines up under the code rather than under the frame.
-fn code_line(text: &str, lang: Option<&str>) -> Line {
-    let mut spans = vec![Span::new(CODE_INDENT, Style::plain())];
-    spans.extend(highlight_code(text, lang));
-    Line::hanging(spans, CODE_INDENT.len())
+fn paint_code(lang: Option<&str>, raw: &[String]) -> Vec<Line> {
+    code::highlight_fence(lang, raw)
+        .into_iter()
+        .map(|spans| {
+            let mut all = vec![Span::new(CODE_INDENT, Style::plain())];
+            all.extend(spans);
+            Line::hanging(all, CODE_INDENT.len())
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -176,7 +181,8 @@ impl Fence {
     /// Both bars are the same length on purpose: the pair reads as a frame around the code,
     /// and a frame that does not close is worse than no frame. Its length comes from the
     /// longest line, so a block of short commands is not wrapped in sixty columns of rule.
-    fn frame(&self, body: &[Line], width: usize) -> Vec<Line> {
+    fn frame(&self, raw: &[String], width: usize) -> Vec<Line> {
+        let body = paint_code(self.lang.as_deref(), raw);
         let longest = body.iter().map(Line::width).max().unwrap_or(0);
         let label = self.label();
         let label_width = label.as_ref().map_or(0, |label| util::width(label));
@@ -201,11 +207,14 @@ impl Fence {
     fn bar(&self, corner: char, total: usize, label: Option<&str>) -> Line {
         let label = util::truncate(label.unwrap_or(""), total.saturating_sub(1), "");
         let rule = "─".repeat(total.saturating_sub(1 + util::width(&label)));
-        Line::spans(vec![
-            Span::new(corner.to_string(), Style::new(Color::Dim)),
-            Span::new(label, Style::new(Color::Dim)),
-            Span::new(rule, Style::new(Color::Dim)),
-        ])
+        let mut spans = vec![Span::new(corner.to_string(), Style::new(Color::Dim))];
+        // The language is what the bar is for. The rule stays quiet; the name takes the
+        // accent, the way Codex paints a fence's info string in the theme accent.
+        if !label.is_empty() {
+            spans.push(Span::new(label, Style::new(Color::Cyan)));
+        }
+        spans.push(Span::new(rule, Style::new(Color::Dim)));
+        Line::spans(spans)
     }
 }
 
@@ -235,18 +244,22 @@ fn block_line(line: &str) -> Vec<Line> {
     if is_rule(line) {
         return vec![Line::new("─".repeat(24), Style::new(Color::Dim))];
     }
-    if let Some(rest) = heading(line) {
-        return vec![Line::spans(inline(rest, Style::bold(Color::Cyan)))];
+    if let Some((level, rest)) = heading(line) {
+        // Codex weights a heading by its level instead of painting every one the same:
+        // the title is underlined, the next is bold, and the smaller ones step down.
+        return vec![Line::spans(inline(rest, heading_style(level)))];
     }
     // Quotes nest: `>> x` and `> > x` are both two levels deep, and the number of bars is
-    // how a reader sees the nesting without counting characters.
+    // how a reader sees the nesting without counting characters. The bar is green, which
+    // is the colour Codex uses for a block quote; the words stay in the terminal's own
+    // foreground so a quote is not the same grey as a hint.
     let (level, body) = quote_depth(line);
     if level > 0 {
         let mut spans: Vec<Span> = Vec::new();
         for _ in 0..level {
-            spans.push(Span::new("│\u{a0}", Style::new(Color::Dim)));
+            spans.push(Span::new("│\u{a0}", Style::new(Color::Green)));
         }
-        spans.extend(inline(body, Style::new(Color::Dim)));
+        spans.extend(inline(body, Style::italic(Color::Text)));
         return vec![Line::hanging(spans, level * 2)];
     }
     if let Some((marker, body)) = list_item(line) {
@@ -290,12 +303,24 @@ fn is_rule(line: &str) -> bool {
             .is_some_and(|first| matches!(first, '-' | '*' | '_') && bare.chars().all(|c| c == first))
 }
 
-fn heading(line: &str) -> Option<&str> {
+fn heading(line: &str) -> Option<(usize, &str)> {
     let hashes = line.chars().take_while(|c| *c == '#').count();
     if (1..=6).contains(&hashes) && line.chars().nth(hashes) == Some(' ') {
-        return Some(line[hashes + 1..].trim_end());
+        return Some((hashes, line[hashes + 1..].trim_end()));
     }
     None
+}
+
+/// Weight by level, the way Codex does: a title is underlined, a section is bold, and
+/// the rest step down. The colour stays the accent — a heading in the body colour
+/// disappears into the paragraph under it.
+fn heading_style(level: usize) -> Style {
+    match level {
+        1 => Style { bold: true, underline: true, ..Style::new(Color::Cyan) },
+        2 => Style::bold(Color::Cyan),
+        3 => Style { bold: true, italic: true, ..Style::new(Color::Cyan) },
+        _ => Style::italic(Color::Cyan),
+    }
 }
 
 /// `"- item"` / `"1. item"` / `"- [x] done"` → the marker to draw and the body.
@@ -512,8 +537,9 @@ fn bare_url(chars: &[char], at: usize) -> Option<(String, usize)> {
 }
 
 mod code;
+mod syntax;
 
-use code::{highlight_code, push, render_table, starts_with};
+use code::{push, render_table, starts_with};
 
 #[cfg(test)]
 mod tests {
@@ -636,15 +662,18 @@ mod tests {
     fn shell_commands_get_their_flags_and_strings_coloured() {
         let rows = render("```sh\ngit commit -m \"fix\" --amend\n```", 80);
         let line = find(&rows, "git commit");
+        assert_eq!(span(&rows, "git").style.fg, Color::SyntaxFunction, "{:?}", line.spans);
         assert!(line.spans.iter().any(|s| s.style.fg == Color::SyntaxString), "{:?}", line.spans);
-        assert!(line.spans.iter().any(|s| s.style.fg == Color::SyntaxKeyword), "{:?}", line.spans);
+        assert_eq!(span(&rows, "--amend").style.fg, Color::SyntaxNumber, "{:?}", line.spans);
     }
 
     #[test]
-    fn comments_are_dimmer_than_the_code() {
+    fn comments_are_quieter_than_the_code_but_not_hint_grey() {
         let rows = render("```python\nx = 1  # note\n```", 80);
         let line = find(&rows, "note");
-        assert!(line.spans.iter().any(|s| s.text.contains("note") && s.style.fg == Color::Dim));
+        let note = line.spans.iter().find(|s| s.text.contains("note")).unwrap();
+        assert_eq!(note.style.fg, Color::SyntaxComment);
+        assert_ne!(note.style.fg, Color::Dim, "a comment is code, not a UI hint");
     }
 
     #[test]
@@ -653,7 +682,7 @@ mod tests {
         let rows = render("```sh\necho ${a#b}\n```", 80);
         let line = find(&rows, "a#b");
         assert!(
-            !line.spans.iter().any(|s| s.text.contains("#b}") && s.style.fg == Color::Dim),
+            !line.spans.iter().any(|s| s.text.contains("#b}") && s.style.fg == Color::SyntaxComment),
             "{:?}",
             line.spans
         );
@@ -735,10 +764,88 @@ mod tests {
 
     #[test]
     fn headings_are_emphasised() {
-        let rows = render("# Title\n## Sub", 80);
-        assert_eq!(rendered_rows(&rows), vec!["Title", "Sub"]);
-        assert!(rows[0].spans[0].style.bold);
+        let rows = render("# Title\n## Sub\n### Smaller", 80);
+        assert_eq!(rendered_rows(&rows), vec!["Title", "Sub", "Smaller"]);
+        assert!(rows[0].spans[0].style.bold && rows[0].spans[0].style.underline, "h1 is underlined");
+        assert!(rows[1].spans[0].style.bold && !rows[1].spans[0].style.underline, "h2 is bold only");
+        assert!(rows[2].spans[0].style.bold && rows[2].spans[0].style.italic, "h3 steps down");
         assert_eq!(rows[0].spans[0].style.fg, Color::Cyan);
+    }
+
+    #[test]
+    fn a_quote_is_not_painted_as_a_hint() {
+        let rows = render("> said", 80);
+        let said = span(&rows, "said");
+        assert_ne!(said.style.fg, Color::Dim);
+        assert!(said.style.italic);
+        assert!(rows[0].spans.iter().any(|s| s.text.starts_with('│') && s.style.fg == Color::Green));
+    }
+
+    #[test]
+    fn a_code_block_separates_keywords_calls_types_and_strings() {
+        // Codex's default dark theme (Catppuccin Mocha) gives each of these its own colour.
+        // Folding a call into the keyword colour is what made a block look like one tint.
+        let rows = render("```rust\nfn demo(user: UserId) -> String {\n    let n = 1;\n    print(n)\n}\n```", 80);
+        assert_eq!(span(&rows, "fn").style.fg, Color::SyntaxKeyword);
+        assert_eq!(span(&rows, "demo").style.fg, Color::SyntaxFunction);
+        assert_eq!(span(&rows, "UserId").style.fg, Color::SyntaxType);
+        assert_eq!(span(&rows, "String").style.fg, Color::SyntaxType);
+        assert_eq!(span(&rows, "1").style.fg, Color::SyntaxNumber);
+        assert_eq!(span(&rows, "print").style.fg, Color::SyntaxFunction);
+    }
+
+    #[test]
+    fn a_block_comment_keeps_its_colour_on_the_next_line() {
+        let rows = render("```rust\n/* open\nstill\n*/\nlet x = 1;\n```", 80);
+        let still = find(&rows, "still");
+        assert!(still.spans.iter().any(|s| s.text.contains("still") && s.style.fg == Color::SyntaxComment));
+        assert_eq!(span(&rows, "let").style.fg, Color::SyntaxKeyword);
+    }
+
+    #[test]
+    fn a_lifetime_is_not_a_string() {
+        let rows = render("```rust\nfn f<'a>(x: &'a str) {}\n```", 80);
+        let line = find(&rows, "'a");
+        // The grammar colours the lifetime's name, and leaves the `'` as punctuation.
+        assert!(
+            line.spans.iter().any(|s| s.text == "a" && s.style.fg == Color::SyntaxType),
+            "{:?}",
+            line.spans
+        );
+        assert!(!line.spans.iter().any(|s| s.text.contains('\'') && s.style.fg == Color::SyntaxString));
+    }
+
+    #[test]
+    fn javascript_typescript_and_kotlin_use_their_grammars() {
+        let js = render("```js\nconst n = 1;\nfunction f() {}\n```", 80);
+        assert_eq!(span(&js, "const").style.fg, Color::SyntaxKeyword);
+        assert_eq!(span(&js, "function").style.fg, Color::SyntaxKeyword);
+        assert_eq!(span(&js, "f").style.fg, Color::SyntaxFunction);
+        assert_eq!(span(&js, "1").style.fg, Color::SyntaxNumber);
+
+        let ts = render("```ts\ntype Name = string;\n```", 80);
+        assert_eq!(span(&ts, "type").style.fg, Color::SyntaxKeyword);
+        assert_eq!(span(&ts, "Name").style.fg, Color::SyntaxType);
+
+        let kt = render("```kotlin\nfun main(name: String) {}\n```", 80);
+        assert_eq!(span(&kt, "fun").style.fg, Color::SyntaxKeyword);
+        assert_eq!(span(&kt, "main").style.fg, Color::SyntaxFunction);
+        assert_eq!(span(&kt, "String").style.fg, Color::SyntaxType);
+    }
+
+    #[test]
+    fn python_and_json_use_their_grammars() {
+        let py = render("```python\ndef greet(name):\n    return name  # hi\n```", 80);
+        assert_eq!(span(&py, "def").style.fg, Color::SyntaxKeyword);
+        assert_eq!(span(&py, "greet").style.fg, Color::SyntaxFunction);
+        assert_eq!(span(&py, "return").style.fg, Color::SyntaxKeyword);
+        let note = find(&py, "hi");
+        assert!(note.spans.iter().any(|s| s.text.contains("hi") && s.style.fg == Color::SyntaxComment));
+
+        let json = render("```json\n{\"name\": \"ada\", \"ok\": true}\n```", 80);
+        assert_eq!(span(&json, "\"name\"").style.fg, Color::SyntaxFunction, "a key is not a value");
+        assert_eq!(span(&json, "\"ada\"").style.fg, Color::SyntaxString);
+        assert_eq!(span(&json, "true").style.fg, Color::SyntaxNumber);
     }
 
     #[test]
