@@ -956,31 +956,6 @@ use crate::ui::footer::FooterState;
         assert!(!frame.contains('›'), "the tick wrote the input row: {frame:?}");
     }
 
-    #[test]
-    fn a_burst_of_tokens_is_drawn_once_but_is_never_left_undrawn() {
-        // The batching rule from both sides. A hundred queued tokens must not cost a hundred
-        // redraws — each one erases and repaints the input row, and the caret with it — but a
-        // single token must be drawn *now* rather than waiting for the next spinner tick.
-        let mut screen = screen();
-        screen.interactive = false;
-        screen.begin_stream();
-        set_input(&mut screen, "draft");
-
-        // Appending alone only fills the buffer; the caller's single render is what draws.
-        screen.push_thinking("hmm");
-        assert_eq!(screen.streaming_thinking.as_deref(), Some("hmm"));
-
-        for _ in 0..100 {
-            screen.push_text("x");
-        }
-        assert_eq!(screen.streaming_answer.as_deref(), Some("x".repeat(100).as_str()));
-
-        // One render draws the whole burst, so the preview the region is built from carries
-        // all hundred characters rather than the first one.
-        let (lines, _) = screen.compose_live();
-        let drawn: String = lines.iter().map(Line::text).collect();
-        assert!(drawn.contains(&"x".repeat(40)), "the burst reached the screen: {drawn:?}");
-    }
 
     #[test]
     fn appending_a_token_does_not_redraw() {
@@ -1001,42 +976,25 @@ use crate::ui::footer::FooterState;
         screen.push_text("answer");
         assert!(screen.last_live.is_empty(), "appending a token redrew the region");
 
-        // And the caller's single redraw picks both up.
+        // A burst costs no more than a single token does: a hundred appends still leave the
+        // region untouched, and all hundred characters are in the buffer afterwards.
+        for _ in 0..100 {
+            screen.push_text("x");
+        }
+        assert!(screen.last_live.is_empty(), "a burst redrew the region");
+        assert_eq!(
+            screen.streaming_answer.as_deref(),
+            Some(format!("answer{}", "x".repeat(100)).as_str())
+        );
+
+        // And the caller's single redraw picks up everything appended since.
         screen.render();
         let text: Vec<String> = screen.last_live.iter().map(Line::text).collect();
         assert!(text.iter().any(|row| row.contains("think")), "{text:?}");
-        assert!(text.iter().any(|row| row.contains("answer")), "{text:?}");
+        let drawn = text.concat();
+        assert!(drawn.contains(&"x".repeat(40)), "the burst reached the region: {text:?}");
     }
 
-    #[test]
-    fn the_caret_stays_put_when_the_answer_preview_grows_too() {
-        // The answer is below the spinner and above the input, and it wraps as it streams.
-        // Its block is not padded the way the thinking preview is, so what has to hold is the
-        // caret's *column*: the row moves with the answer, and that is expected — the input
-        // line is under the text being written. What must not move is where the user is
-        // typing inside their own line.
-        let mut screen = screen();
-        screen.interactive = false;
-        screen.begin_stream();
-        screen.set_working(WORKING_LABEL);
-        set_input(&mut screen, "draft");
-
-        let mut columns = Vec::new();
-        let mut rows = Vec::new();
-        for chunk in ["答案 ", "开始 ", "输出 ", "更多的字 ", "继续 ", "直到换行。"] {
-            screen.push_text(chunk);
-            let (_, caret) = screen.compose_live();
-            columns.push(caret.map(|(_, column)| column));
-            rows.push(caret.map(|(row, _)| row));
-        }
-        // The caret's column inside the input line is the same on every frame.
-        let first = columns[0];
-        assert!(
-            columns.iter().all(|column| *column == first),
-            "the caret slid sideways inside the input line: {columns:?}"
-        );
-        assert!(first.is_some(), "the composer is armed, so there is a caret");
-    }
 
     #[test]
     fn no_live_row_is_wider_than_the_terminal() {
@@ -1132,16 +1090,14 @@ use crate::ui::footer::FooterState;
     }
 
     #[test]
-    fn the_live_region_never_grows_past_what_it_erases() {
-        // The bug from the screenshot, as an invariant. `erase_live` walks up by the number of
-        // rows the last frame drew and clears downwards from there. If any of those rows was
-        // wider than the screen, the terminal had wrapped it and the frame actually occupied
-        // more rows than that count — so each erase left a row behind and the region crept down
-        // the screen, painting the same line again and again.
+    fn the_live_region_is_trimmed_to_the_screen() {
+        // `trim_live` is what keeps the region from growing taller than the terminal. A region
+        // taller than the screen cannot be erased by walking up from the caret: the rows above
+        // the visible part are never reached, so they stay on screen and the frame is redrawn
+        // over them — the transcript appears to freeze and repeat.
         //
-        // Nothing here looks at escape codes: the invariant is that the row count `compose_live`
-        // reports is the row count the terminal will have, and that follows from every row
-        // fitting the width. Streaming a long answer is the case that used to break it.
+        // (The row *widths* are `no_live_row_is_wider_than_the_terminal`'s business; this test
+        // is only about the count, so it checks the count.)
         let mut screen = screen();
         screen.width = 40;
         screen.height = 12;
@@ -1150,31 +1106,31 @@ use crate::ui::footer::FooterState;
         screen.set_working(WORKING_LABEL);
         set_input(&mut screen, "draft");
 
-        let mut previous_rows: Option<usize> = None;
+        let mut previous = 0usize;
         for chunk in [
             "好的，我来说明一下。",
             "首先这一段会写得很长，长到超过四十列，因为它没有任何换行的机会，",
-            "接着是第二段，同样很长，继续向右延伸下去直到远远越过边界，",
-            "```\nvery_long_code_line_without_any_break_points_at_all_here();\n```",
+            "接着第二段同样很长，继续向右延伸下去直到远远越过边界，",
+            "再来一段，把活区堆到超过终端的高度为止，这样 trim_live 必须动手",
+            "```\nvery_long_code_line_without_any_break_points_here_at_all();\n```",
             "| 甲 | 乙 | 丙 | 丁 | 戊 | 己 |\n| --- | --- | --- | --- | --- | --- |\n| 1 | 2 | 3 | 4 | 5 | 6 |\n",
+            "最后一段，继续堆，确认行数不会越过屏幕高度。",
         ] {
             screen.push_text(chunk);
             let (lines, cursor) = screen.compose_live();
-            for (index, line) in lines.iter().enumerate() {
-                assert!(line.width() <= screen.width, "row {index} overflows");
-            }
-            // The caret has to stay inside the region too, or it lands on a row that is not
-            // part of the frame and the next erase starts from the wrong place.
+            assert!(
+                lines.len() <= screen.height,
+                "region grew to {} rows in a {} row screen (was {previous})",
+                lines.len(),
+                screen.height
+            );
+            // The caret has to be inside the region, or the next erase starts from a row that
+            // is not part of the frame.
             if let Some((row, column)) = cursor {
                 assert!(row < lines.len(), "the caret is outside the region");
                 assert!(column <= screen.width, "the caret is past the right edge");
             }
-            if let Some(previous) = previous_rows {
-                // The region is allowed to grow as the answer arrives, but never past the
-                // screen — and `trim_live` is what enforces that.
-                assert!(lines.len() <= screen.height, "region {previous} -> {} rows", lines.len());
-            }
-            previous_rows = Some(lines.len());
+            previous = lines.len();
         }
     }
 

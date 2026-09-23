@@ -179,9 +179,7 @@ fn split_lines(
                 } else {
                     stack.last().and_then(|&index| colors.get(index).copied()).unwrap_or(Color::Text)
                 };
-                let Ok(chunk) = std::str::from_utf8(&source.as_bytes()[start..end]) else {
-                    continue;
-                };
+                let Some(chunk) = source.get(start..end) else { continue };
                 for (index, piece) in chunk.split('\n').enumerate() {
                     if index > 0 {
                         lines.push(Vec::new());
@@ -194,7 +192,7 @@ fn split_lines(
     lines
 }
 
-fn push(lines: &mut Vec<Vec<Span>>, text: &str, color: Color) {
+fn push(lines: &mut [Vec<Span>], text: &str, color: Color) {
     if text.is_empty() {
         return;
     }
