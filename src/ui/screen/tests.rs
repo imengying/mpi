@@ -1132,7 +1132,7 @@ use super::*;
     #[test]
     fn the_thinking_preview_only_keeps_the_last_two_lines() {
         let mut screen = screen();
-        screen.streaming_thinking = Some("a\nb\nc\nd\ne".repeat(1));
+        screen.streaming_thinking = Some("a\nb\nc\nd\ne".to_string());
         let (live, _) = screen.compose_live();
         assert!(live.len() <= 2, "{live:?}");
         assert!(live.iter().any(|line| line.text().contains('e')));

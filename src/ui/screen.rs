@@ -193,6 +193,12 @@ pub struct Screen {
     menu_dismissed: Option<String>,
 }
 
+impl Default for Screen {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Screen {
     /// Register the commands the input area completes and the menu lists.
     ///

@@ -101,7 +101,7 @@ fn the_system_message_and_tools_are_identical_between_turns() {
     let one = serde_json::to_string(&body(&first)["messages"]).unwrap();
     let two = serde_json::to_string(&body(&second)["messages"]).unwrap();
     assert!(
-        two.starts_with(&one.trim_end_matches(']')),
+        two.starts_with(one.trim_end_matches(']')),
         "turn one is not a prefix of turn two:\n{one}\n{two}"
     );
 }
@@ -224,7 +224,7 @@ fn openai_requests_carry_the_prompt_cache_key() {
     let body = body_of(&messages, &model, &provider);
     assert_eq!(body["prompt_cache_key"], "session-id");
     // The session id is also what pins a gateway's load balancer to one backend.
-    assert_eq!(provider.compat(&model).send_session_affinity, true);
+    assert!(provider.compat(&model).send_session_affinity);
 }
 
 #[test]

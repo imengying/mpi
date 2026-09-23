@@ -482,12 +482,7 @@ fn user_content(blocks: &[Block], last_block_hint: bool) -> ChatContent {
 }
 
 pub fn endpoint(base_url: &str) -> String {
-    let trimmed = base_url.trim_end_matches('/');
-    if trimmed.ends_with("/chat/completions") {
-        trimmed.to_string()
-    } else {
-        format!("{trimmed}/chat/completions")
-    }
+    crate::llm::client::endpoint(base_url, "/chat/completions")
 }
 
 // ---------------------------------------------------------------------------
@@ -698,13 +693,7 @@ impl Assembler {
 
 /// Parse one SSE payload; `None` for frames that carry no JSON (e.g. `[DONE]`).
 pub fn parse_frame(payload: &str) -> Result<Option<StreamChunk>, LlmError> {
-    let trimmed = payload.trim();
-    if trimmed.is_empty() || trimmed == "[DONE]" {
-        return Ok(None);
-    }
-    serde_json::from_str(trimmed)
-        .map(Some)
-        .map_err(|err| LlmError::Decode(format!("{err}: {}", crate::util::truncate(trimmed, 300, "…"))))
+    crate::llm::client::decode_frame(payload)
 }
 
 impl StreamChunk {

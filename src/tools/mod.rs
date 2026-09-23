@@ -71,7 +71,7 @@ impl ToolOutput {
                 path: arguments
                     .get("path")
                     .and_then(|value| value.as_str())
-                    .map(|path| crate::util::one_line(path))
+                    .map(crate::util::one_line)
                     .unwrap_or_else(|| "…".into()),
             },
             _ => Display::None,
@@ -187,6 +187,19 @@ pub async fn execute(
         .unwrap_or_else(|err| ToolOutput::error(err.to_string()))
         .budget()
         .timed(elapsed)
+}
+
+/// Locate a command at the first of `candidates` that exists, as an absolute path.
+///
+/// Both search tools prefer a modern engine and fall back to the GNU one, and both look them
+/// up by absolute path rather than through `PATH`: these run on the user's behalf, and a
+/// relative lookup would pick whichever binary a stray directory entry put first.
+pub(crate) fn first_present(candidates: &[&str]) -> Option<std::path::PathBuf> {
+    candidates
+        .iter()
+        .map(Path::new)
+        .find(|path| path.is_file())
+        .map(Path::to_path_buf)
 }
 
 /// Every tool needs a string argument; this keeps the error text uniform.

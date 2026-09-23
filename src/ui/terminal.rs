@@ -30,12 +30,11 @@ static RAW_HOLDERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUs
 
 impl RawGuard {
     pub(crate) fn enter() -> std::io::Result<Self> {
-        if RAW_HOLDERS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
-            if let Err(err) = terminal::enable_raw_mode() {
+        if RAW_HOLDERS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0
+            && let Err(err) = terminal::enable_raw_mode() {
                 RAW_HOLDERS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                 return Err(err);
             }
-        }
         Ok(RawGuard)
     }
 }

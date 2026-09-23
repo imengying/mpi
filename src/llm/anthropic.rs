@@ -327,14 +327,13 @@ fn hosted_out(payload: &serde_json::Value) -> Option<OutBlock> {
 }
 
 pub fn endpoint(base_url: &str) -> String {
+    // A base URL that already carries the version keeps it: `…/v1` plus `/messages` is the
+    // same endpoint as `…` plus `/v1/messages`, and writing `/v1/v1/messages` is not.
     let trimmed = base_url.trim_end_matches('/');
-    if trimmed.ends_with("/v1/messages") {
-        trimmed.to_string()
-    } else if trimmed.ends_with("/v1") {
-        format!("{trimmed}/messages")
-    } else {
-        format!("{trimmed}/v1/messages")
+    if trimmed.ends_with("/v1") {
+        return format!("{trimmed}/messages");
     }
+    crate::llm::client::endpoint(base_url, "/v1/messages")
 }
 
 // ---------------------------------------------------------------------------
@@ -497,7 +496,7 @@ impl Partial {
 pub struct Assembler {
     blocks: Vec<Partial>,
     citations: Vec<(String, String)>,
-    announced: bool,
+    search_notice: crate::llm::SearchNotice,
     usage: Usage,
     stop_reason: Option<String>,
     error: Option<String>,
@@ -513,11 +512,7 @@ impl Assembler {
     }
 
     fn note_search(&mut self, on_delta: &mut dyn FnMut(Delta)) {
-        if self.announced {
-            return;
-        }
-        self.announced = true;
-        on_delta(Delta::Notice("搜索了网页".into()));
+        self.search_notice.announce(on_delta);
     }
 
     fn record_citations(&mut self, citations: &[WireCitation]) {

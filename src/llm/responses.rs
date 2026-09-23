@@ -385,12 +385,7 @@ fn decode_signature(signature: &str) -> Option<StoredReasoning> {
 
 /// `base_url` may already name the endpoint; otherwise `/responses` is appended.
 pub fn endpoint(base_url: &str) -> String {
-    let trimmed = base_url.trim_end_matches('/');
-    if trimmed.ends_with("/responses") {
-        trimmed.to_string()
-    } else {
-        format!("{trimmed}/responses")
-    }
+    crate::llm::client::endpoint(base_url, "/responses")
 }
 
 // ---------------------------------------------------------------------------
@@ -477,9 +472,7 @@ impl Annotation {
     fn cite(&self) -> Option<(String, String)> {
         if self.kind != "url_citation" && self.kind != "url" {
             // xAI and OpenAI both use url_citation. Anything with a url is still a citation.
-            if self.url.is_none() {
-                return None;
-            }
+            self.url.as_ref()?;
         }
         let url = self.url.clone().filter(|url| !url.is_empty())?;
         Some((url, self.title.clone().unwrap_or_default()))
@@ -554,7 +547,7 @@ pub struct Assembler {
     incomplete: Option<String>,
     error: Option<String>,
     saw_terminal: bool,
-    announced: bool,
+    search_notice: crate::llm::SearchNotice,
     /// Where the reasoning payloads were issued. Recorded so a signature can be checked
     /// against the provider and model replaying it.
     provider: String,
@@ -606,7 +599,6 @@ impl Assembler {
                 let index = event.output_index.unwrap_or(self.items.len());
                 if let Some(item) = event.item {
                     let search = item.kind.as_deref().is_some_and(is_search_call);
-                    let action = item.action.clone();
                     let raw = search.then(|| serde_json::to_value(&item).ok()).flatten();
                     {
                         let slot = self.slot(index);
@@ -621,7 +613,7 @@ impl Assembler {
                         slot.raw = raw.or(slot.raw.take());
                     }
                     if search {
-                        self.note_search(action.as_ref(), on_delta);
+                        self.note_search(on_delta);
                     }
                 }
             }
@@ -683,7 +675,6 @@ impl Assembler {
                 let index = event.output_index.unwrap_or(self.items.len());
                 if let Some(item) = event.item {
                     let search = item.kind.as_deref().is_some_and(is_search_call);
-                    let action = item.action.clone();
                     let raw = search.then(|| serde_json::to_value(&item).ok()).flatten();
                     let mut citations = Vec::new();
                     if let Some(content) = &item.content {
@@ -735,7 +726,7 @@ impl Assembler {
                     let announce = slot.kind.as_deref().is_some_and(is_search_call);
                     let _ = item.role;
                     if announce {
-                        self.note_search(action.as_ref(), on_delta);
+                        self.note_search(on_delta);
                     }
                 }
             }
@@ -937,26 +928,14 @@ fn search_payload(slot: &Slot, kind: &str) -> serde_json::Value {
 }
 
 impl Assembler {
-    fn note_search(&mut self, _action: Option<&serde_json::Value>, on_delta: &mut dyn FnMut(Delta)) {
-        if self.announced {
-            return;
-        }
-        self.announced = true;
-        on_delta(Delta::Notice("搜索了网页".into()));
+    fn note_search(&mut self, on_delta: &mut dyn FnMut(Delta)) {
+        self.search_notice.announce(on_delta);
     }
 }
 
 /// Parse one SSE payload; `None` for frames that carry no JSON (e.g. `[DONE]`).
 pub fn parse_frame(payload: &str) -> Result<Option<StreamEvent>, LlmError> {
-    let trimmed = payload.trim();
-    if trimmed.is_empty() || trimmed == "[DONE]" {
-        return Ok(None);
-    }
-    serde_json::from_str(trimmed)
-        .map(Some)
-        .map_err(|err| {
-            LlmError::Decode(format!("{err}: {}", crate::util::truncate(trimmed, 300, "…")))
-        })
+    crate::llm::client::decode_frame(payload)
 }
 
 impl StreamEvent {

@@ -198,6 +198,41 @@ impl Client {
     }
 }
 
+/// Append a path to a base URL, unless the user already configured the full one.
+///
+/// A base URL is written by hand in the config, and people write it both ways — the API root
+/// and the endpoint itself — so the suffix is added only when it is missing. Trailing slashes
+/// are tolerated for the same reason.
+///
+/// Shared rather than repeated per dialect: the rule is about how a URL is written down, which
+/// has nothing to do with which provider is on the other end.
+pub fn endpoint(base_url: &str, path: &str) -> String {
+    let trimmed = base_url.trim_end_matches('/');
+    if trimmed.ends_with(path) {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}{path}")
+    }
+}
+
+/// Decode one SSE payload into a typed frame, or `None` when it carries no JSON.
+///
+/// The three dialects differ only in which struct they decode into, so the rule about what
+/// an unparseable frame means lives here once rather than three times. `[DONE]` is a
+/// terminator rather than an error: OpenAI ends its stream with it, the others simply stop.
+///
+/// The payload is truncated in the error message because a malformed frame is often a whole
+/// HTML error page, and the transcript should say what went wrong rather than reproduce it.
+pub fn decode_frame<T: serde::de::DeserializeOwned>(payload: &str) -> Result<Option<T>, LlmError> {
+    let trimmed = payload.trim();
+    if trimmed.is_empty() || trimmed == "[DONE]" {
+        return Ok(None);
+    }
+    serde_json::from_str(trimmed)
+        .map(Some)
+        .map_err(|err| LlmError::Decode(format!("{err}: {}", crate::util::truncate(trimmed, 300, "…"))))
+}
+
 fn dispatch(
     frame: &str,
     api: Api,

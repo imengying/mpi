@@ -231,6 +231,27 @@ pub enum Delta {
     Notice(String),
 }
 
+/// Announces a hosted search exactly once per response.
+///
+/// A search can be reported by more than one event — a start and a finish, or the same item
+/// arriving twice — and the transcript should say so once. The flag lives here rather than in
+/// each assembler because the wording and the rule are the same for every dialect, and a
+/// second copy is a second chance to drift.
+#[derive(Debug, Default)]
+pub(crate) struct SearchNotice {
+    announced: bool,
+}
+
+impl SearchNotice {
+    pub(crate) fn announce(&mut self, on_delta: &mut dyn FnMut(Delta)) {
+        if self.announced {
+            return;
+        }
+        self.announced = true;
+        on_delta(Delta::Notice("搜索了网页".into()));
+    }
+}
+
 /// The outcome of one assistant turn.
 #[derive(Debug, Clone)]
 pub struct Completion {

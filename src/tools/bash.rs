@@ -32,7 +32,7 @@ pub fn spec() -> ToolSpec {
 
 pub async fn execute(arguments: &serde_json::Value, cwd: &Path) -> Result<ToolOutput, String> {
     let command = crate::tools::required_str(arguments, "command")?;
-    execute_with_shell(command, cwd, &crate::config::DEFAULT_SHELL).await
+    execute_with_shell(command, cwd, crate::config::DEFAULT_SHELL).await
 }
 
 /// Run `command` in `shell`, with the working directory set to `cwd`.

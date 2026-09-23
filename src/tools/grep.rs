@@ -34,19 +34,10 @@ enum Engine {
 }
 
 fn engine() -> Option<Engine> {
-    for candidate in ["/usr/bin/rg", "/usr/local/bin/rg", "/bin/rg"] {
-        let path = Path::new(candidate);
-        if path.is_file() {
-            return Some(Engine::Ripgrep(path.to_path_buf()));
-        }
+    if let Some(path) = super::first_present(&["/usr/bin/rg", "/usr/local/bin/rg", "/bin/rg"]) {
+        return Some(Engine::Ripgrep(path));
     }
-    for candidate in ["/usr/bin/grep", "/bin/grep"] {
-        let path = Path::new(candidate);
-        if path.is_file() {
-            return Some(Engine::GnuGrep(path.to_path_buf()));
-        }
-    }
-    None
+    super::first_present(&["/usr/bin/grep", "/bin/grep"]).map(Engine::GnuGrep)
 }
 
 pub async fn execute(arguments: &serde_json::Value, cwd: &Path) -> Result<ToolOutput, String> {

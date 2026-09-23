@@ -62,9 +62,9 @@ pub async fn execute(arguments: &serde_json::Value, cwd: &Path) -> Result<ToolOu
         .output()
         .await
         .map_err(|err| format!("列目录失败：{err}"))?;
-    let stdout = util::sanitize(&String::from_utf8_lossy(&output.stdout).to_string());
+    let stdout = util::sanitize(String::from_utf8_lossy(&output.stdout).as_ref());
     if !output.status.success() {
-        let stderr = util::sanitize(&String::from_utf8_lossy(&output.stderr).to_string());
+        let stderr = util::sanitize(String::from_utf8_lossy(&output.stderr).as_ref());
         return Err(if stderr.trim().is_empty() {
             format!("列目录失败（退出码 {:?}）", output.status.code())
         } else {

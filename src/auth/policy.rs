@@ -942,8 +942,8 @@ fn vet_segment(words: &[Word], cwd: &Path, dialect: Dialect) -> Assessment {
                 pending = None;
                 continue;
             }
-            if let Some(operation) = pending {
-                if !arg.starts_with('-') {
+            if let Some(operation) = pending
+                && !arg.starts_with('-') {
                     let decision = assess_path(operation, arg, cwd);
                     pending = None;
                     if !decision.allows() {
@@ -951,10 +951,9 @@ fn vet_segment(words: &[Word], cwd: &Path, dialect: Dialect) -> Assessment {
                     }
                     continue;
                 }
-            }
             pending = None;
-            if arg.starts_with('-') && !arg.starts_with("--") {
-                if let Some((value, operation)) = glued_short_value(&name, arg) {
+            if arg.starts_with('-') && !arg.starts_with("--")
+                && let Some((value, operation)) = glued_short_value(&name, arg) {
                     if value.is_empty() {
                         pending = Some(operation);
                         continue;
@@ -965,7 +964,6 @@ fn vet_segment(words: &[Word], cwd: &Path, dialect: Dialect) -> Assessment {
                     }
                     continue;
                 }
-            }
             let values: Vec<&str> = if arg.starts_with('-') && !arg.starts_with("-/") && !arg.starts_with("-~") {
                 match arg.split_once('=') {
                     Some((_, value)) => vec![value],

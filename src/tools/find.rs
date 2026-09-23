@@ -30,19 +30,10 @@ enum Engine {
 }
 
 fn engine() -> Option<Engine> {
-    for candidate in ["/usr/bin/fd", "/usr/local/bin/fd", "/bin/fd"] {
-        let path = Path::new(candidate);
-        if path.is_file() {
-            return Some(Engine::Fd(path.to_path_buf()));
-        }
+    if let Some(path) = super::first_present(&["/usr/bin/fd", "/usr/local/bin/fd", "/bin/fd"]) {
+        return Some(Engine::Fd(path));
     }
-    for candidate in ["/usr/bin/find", "/bin/find"] {
-        let path = Path::new(candidate);
-        if path.is_file() {
-            return Some(Engine::GnuFind(path.to_path_buf()));
-        }
-    }
-    None
+    super::first_present(&["/usr/bin/find", "/bin/find"]).map(Engine::GnuFind)
 }
 
 pub async fn execute(arguments: &serde_json::Value, cwd: &Path) -> Result<ToolOutput, String> {
@@ -108,8 +99,8 @@ pub async fn execute(arguments: &serde_json::Value, cwd: &Path) -> Result<ToolOu
         .output()
         .await
         .map_err(|err| format!("查找命令启动失败：{err}"))?;
-    let stdout = util::sanitize(&String::from_utf8_lossy(&output.stdout).to_string());
-    let stderr = util::sanitize(&String::from_utf8_lossy(&output.stderr).to_string());
+    let stdout = util::sanitize(String::from_utf8_lossy(&output.stdout).as_ref());
+    let stderr = util::sanitize(String::from_utf8_lossy(&output.stderr).as_ref());
     let mut lines: Vec<String> = stdout
         .lines()
         .filter(|line| !line.trim().is_empty())

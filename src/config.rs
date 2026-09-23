@@ -374,16 +374,16 @@ impl Config {
         Ok(config)
     }
 
-    fn validate(&self, path: &PathBuf) -> Result<(), ConfigError> {
+    fn validate(&self, path: &Path) -> Result<(), ConfigError> {
         if self.providers.is_empty() {
-            return Err(ConfigError::NoProviders(path.clone()));
+            return Err(ConfigError::NoProviders(path.to_path_buf()));
         }
         for provider in &self.providers {
             if provider.api().is_none() {
                 return Err(ConfigError::BadApi(provider.name.clone()));
             }
             if provider.models.is_empty() {
-                return Err(ConfigError::NoProviders(path.clone()));
+                return Err(ConfigError::NoProviders(path.to_path_buf()));
             }
             for model in &provider.models {
                 for level in &model.thinking_levels {
