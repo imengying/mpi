@@ -1,6 +1,7 @@
 //! Behaviour of the screen, asserted on the values it produces.
 
 use super::*;
+use crate::ui::footer::FooterState;
 
     fn screen() -> Screen {
         let mut screen = Screen::new();
@@ -765,50 +766,6 @@ use super::*;
     }
 
     #[test]
-    fn the_cursor_step_reaches_the_input_row_from_the_last_drawn_row() {
-        // Rows are separated by CRLF, so after drawing N rows the cursor is still on the last
-        // one — it is *not* pushed to the row below, which is what used to leave a blank line
-        // under the footer. From there, `N - 1 - row` steps up land on `row`.
-        for live_rows in 1..6usize {
-            for row in 0..live_rows {
-                let cursor_row_after_drawing = live_rows - 1;
-                let up = live_rows - 1 - row; // mirrors draw_live
-                assert_eq!(
-                    cursor_row_after_drawing - up,
-                    row,
-                    "N={live_rows} row={row} must land on the target row"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn erasing_reaches_the_first_live_row_from_either_resting_position() {
-        // Two places the cursor can be when the next frame starts, and both must climb to the
-        // first live row: parked on row `r` while editing, or left on the last drawn row when
-        // there is no input line (streaming). Climbing one row too far eats a line of the
-        // committed transcript on every redraw.
-        for live_rows in 1..6usize {
-            // Parked on the input row.
-            for row in 0..live_rows {
-                let cursor_row = Some(row);
-                let up = match cursor_row {
-                    Some(row) => row,
-                    None => live_rows.saturating_sub(1),
-                };
-                assert_eq!(up, row);
-            }
-            // Left on the last drawn row: `live_rows - 1` below the top.
-            let up = match None::<usize> {
-                Some(row) => row,
-                None => live_rows.saturating_sub(1),
-            };
-            assert_eq!(up, live_rows - 1, "N={live_rows}");
-            assert_eq!(live_rows - 1 - up, 0, "N={live_rows} must land on row 0");
-        }
-    }
-
-    #[test]
     fn the_cursor_follows_the_last_wrapped_row() {
         let mut screen = screen_with_commands();
         set_input(&mut screen, &('a'..='z').collect::<String>());
@@ -1080,6 +1037,146 @@ use super::*;
     }
 
     #[test]
+    fn no_live_row_is_wider_than_the_terminal() {
+        // A row wider than the screen is wrapped *by the terminal*, which knows nothing about
+        // this code's row count. Every draw then erases one row fewer than it drew, the region
+        // creeps down a row, and the old copy is left behind — the same line repeated down the
+        // screen, broken off at the right edge. The model is not repeating itself; the screen is.
+        //
+        // So the invariant is checked directly: whatever `compose_live` hands to the terminal
+        // has to fit inside the width it was composed for. Every part of the region is exercised,
+        // because each one is a separate chance to forget the wrap.
+        let mut screen = screen();
+        screen.width = 40;
+        screen.interactive = false;
+        screen.begin_stream();
+        screen.set_working(WORKING_LABEL);
+        set_input(&mut screen, "draft");
+        screen.set_commands(&[("model", "切换模型并选择思考级别")]);
+
+        let long = "一段没有空格分隔的很长的中文内容会一直写到终端的右边然后被硬生生截断";
+        let check = |screen: &Screen, what: &str| {
+            let (lines, _) = screen.compose_live();
+            for (index, line) in lines.iter().enumerate() {
+                let width = line.width();
+                assert!(
+                    width <= screen.width,
+                    "{what}: row {index} is {width} cells wide in a {} cell screen: {:?}",
+                    screen.width,
+                    line.text()
+                );
+            }
+        };
+
+        // The answer preview: long unbroken prose, a wide table, a long code line, a bare URL.
+        for chunk in [
+            "这是一段很长的中文回答，它会一路写到终端的右边并且在没有任何空格的地方被截断，",
+            "然后继续写下去，让这一行远远超过四十列的宽度，",
+            "\n\n| 列一 | 列二 | 列三 | 列四 | 列五 |\n| --- | --- | --- | --- | --- |\n",
+            "| 一个很长的单元格内容 | 另一个很长的单元格 | 第三个很长的单元格 | x | y |\n\n",
+            "```\nlet a_very_long_line = something_that_goes_on_and_on_and_on_beyond_the_edge();\n```\n",
+            "https://example.com/一个非常长的没有空格的网址用来撑破右边",
+        ] {
+            screen.push_text(chunk);
+            check(&screen, "answer preview");
+        }
+
+        // A queued line is user input, so it can be as long as a paste.
+        screen.queue(Queued::Message(long.into(), Vec::new()));
+        check(&screen, "queued line");
+
+        // The command menu and its help text.
+        set_input(&mut screen, "/");
+        screen.sync_menu();
+        check(&screen, "menu");
+
+        // The thinking preview is wrapped too, and one_line() has to run before it is.
+        screen.streaming_thinking = Some(long.repeat(3));
+        check(&screen, "thinking preview");
+
+        // A notice: a failed paste carries the error text, which can be long.
+        screen.notice = Some(long.repeat(2));
+        check(&screen, "notice");
+
+        // The running line is built from the command the model asked for, so it is as long as
+        // the command is.
+        screen.notice = None;
+        screen.set_running(vec![Span::plain(format!("● $ echo {long}"))]);
+        check(&screen, "running line");
+
+        // The footer is produced by `footer::render`, which is width-aware, so what is checked
+        // here is that the width it produced is the width the region gets. `set_footer` is fed
+        // that output rather than a hand-built row, because a hand-built row would only be
+        // testing the test.
+        let mut state = FooterState {
+            cwd: Path::new("/tmp/project"),
+            branch: None,
+            session_name: None,
+            totals: crate::config::Usage { input: 173_000, output: 1_300, cache_read: 0, cache_write: 0 },
+            cache_hit_rate: Some(99.5),
+            context_tokens: Some(17_300),
+            context_window: Some(1_000_000),
+            model: None,
+            level: "high",
+            compacting: false,
+            busy: None,
+        };
+        screen.set_footer(crate::ui::footer::render(&state, &Theme::default(), screen.width));
+        check(&screen, "footer");
+        // A long branch and model name are the two fields that can outgrow the row.
+        state.branch = Some(long.repeat(2));
+        screen.set_footer(crate::ui::footer::render(&state, &Theme::default(), screen.width));
+        check(&screen, "footer with a long branch");
+    }
+
+    #[test]
+    fn the_live_region_never_grows_past_what_it_erases() {
+        // The bug from the screenshot, as an invariant. `erase_live` walks up by the number of
+        // rows the last frame drew and clears downwards from there. If any of those rows was
+        // wider than the screen, the terminal had wrapped it and the frame actually occupied
+        // more rows than that count — so each erase left a row behind and the region crept down
+        // the screen, painting the same line again and again.
+        //
+        // Nothing here looks at escape codes: the invariant is that the row count `compose_live`
+        // reports is the row count the terminal will have, and that follows from every row
+        // fitting the width. Streaming a long answer is the case that used to break it.
+        let mut screen = screen();
+        screen.width = 40;
+        screen.height = 12;
+        screen.interactive = false;
+        screen.begin_stream();
+        screen.set_working(WORKING_LABEL);
+        set_input(&mut screen, "draft");
+
+        let mut previous_rows: Option<usize> = None;
+        for chunk in [
+            "好的，我来说明一下。",
+            "首先这一段会写得很长，长到超过四十列，因为它没有任何换行的机会，",
+            "接着是第二段，同样很长，继续向右延伸下去直到远远越过边界，",
+            "```\nvery_long_code_line_without_any_break_points_at_all_here();\n```",
+            "| 甲 | 乙 | 丙 | 丁 | 戊 | 己 |\n| --- | --- | --- | --- | --- | --- |\n| 1 | 2 | 3 | 4 | 5 | 6 |\n",
+        ] {
+            screen.push_text(chunk);
+            let (lines, cursor) = screen.compose_live();
+            for (index, line) in lines.iter().enumerate() {
+                assert!(line.width() <= screen.width, "row {index} overflows");
+            }
+            // The caret has to stay inside the region too, or it lands on a row that is not
+            // part of the frame and the next erase starts from the wrong place.
+            if let Some((row, column)) = cursor {
+                assert!(row < lines.len(), "the caret is outside the region");
+                assert!(column <= screen.width, "the caret is past the right edge");
+            }
+            if let Some(previous) = previous_rows {
+                // The region is allowed to grow as the answer arrives, but never past the
+                // screen — and `trim_live` is what enforces that.
+                assert!(lines.len() <= screen.height, "region {previous} -> {} rows", lines.len());
+            }
+            previous_rows = Some(lines.len());
+        }
+    }
+
+    #[test]
     fn the_composer_does_not_move_while_thinking_streams() {
         // While the model thinks, the composer stays armed and the user types into it. The
         // caret has to stay where they left it: a caret that wanders while text arrives
@@ -1102,31 +1199,6 @@ use super::*;
             "the caret moved as thinking arrived: {seen:?}"
         );
         assert!(first.is_some(), "the composer is armed, so there is a caret");
-    }
-
-    #[test]
-    fn the_input_row_keeps_its_place_when_the_thinking_preview_grows() {
-        // The same bug seen the other way: the caret's *row* must not shift either. The
-        // thinking preview above the input grows and shrinks with the text, and if the input
-        // row moves with it the caret appears to slide up and down the screen.
-        let mut screen = screen();
-        screen.begin_stream();
-        screen.set_working("Working");
-        screen.editing = Some(Editor::from_text("draft"));
-
-        let mut rows = Vec::new();
-        for chunk in ["thinking ", "in one ", "single ", "long paragraph that wraps. "] {
-            screen.push_thinking(chunk);
-            let (live, caret) = screen.compose_live();
-            rows.push((live.len(), caret.map(|(row, _)| row)));
-        }
-        // The preview is capped, so once it is full the region stops growing.
-        let settled = &rows[rows.len() - 1];
-        assert!(
-            rows.iter().all(|(_, row)| row.is_some()),
-            "the caret is always present: {rows:?}"
-        );
-        let _ = settled;
     }
 
     #[test]

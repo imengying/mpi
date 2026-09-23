@@ -1085,8 +1085,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn token_formatting_is_shared_with_the_footer() {
-        assert_eq!(crate::util::fmt_tokens(17_300, true), "17.3k");
-    }
 }

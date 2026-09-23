@@ -47,23 +47,45 @@ pub fn render(state: &FooterState<'_>, theme: &Theme, width: usize) -> Vec<Line>
 fn location_line(state: &FooterState<'_>, theme: &Theme, width: usize) -> Line {
     let _ = theme;
     let cwd = util::shorten_home(state.cwd, dirs::home_dir().as_deref());
-    let mut spans = vec![Span::new(util::one_line(&cwd), Style::new(Color::Green))];
-    if let Some(branch) = &state.branch {
-        spans.push(Span::new(" (", Style::new(Color::Dim)));
-        spans.push(Span::new(util::one_line(branch), Style::new(Color::Magenta)));
-        spans.push(Span::new(")", Style::new(Color::Dim)));
-    }
-    if let Some(name) = &state.session_name {
-        let name = util::one_line(name);
-        if !name.is_empty() {
-            spans.push(Span::new(" • ", Style::new(Color::Dim)));
-            spans.push(Span::new(
-                util::truncate(&name, Defaults::SESSION_NAME_WIDTH, "…"),
-                Style::new(Color::Text),
-            ));
+    // The line is built to fit `width`: it is one row of the live region, and a row that the
+    // terminal wraps on its own would throw the region's row count off by one — which shows up
+    // as the whole footer creeping down the screen, a row per redraw.
+    //
+    // The directory is what the user needs to see, so it is what survives: the branch loses
+    // its tail first, then the session name, then the directory itself.
+    let name = state
+        .session_name
+        .as_ref()
+        .map(|name| util::one_line(name))
+        .filter(|name| !name.is_empty());
+    let branch = state.branch.as_ref().map(|branch| util::one_line(branch));
+    let mut budget = width;
+    let cwd = {
+        let shown = util::truncate(&util::one_line(&cwd), budget, "…");
+        budget = budget.saturating_sub(util::width(&shown));
+        shown
+    };
+    let mut spans = vec![Span::new(cwd, Style::new(Color::Green))];
+    if let Some(branch) = branch {
+        // " (" + branch + ")", and at least one column so an empty branch cannot produce "()".
+        let room = budget.saturating_sub(3);
+        if room > 0 {
+            let shown = util::truncate(&branch, room, "…");
+            budget = budget.saturating_sub(util::width(&shown) + 3);
+            spans.push(Span::new(" (", Style::new(Color::Dim)));
+            spans.push(Span::new(shown, Style::new(Color::Magenta)));
+            spans.push(Span::new(")", Style::new(Color::Dim)));
         }
     }
-    let _ = width;
+    if let Some(name) = name {
+        // A session name is the least important of the three: it is the one the user just
+        // chose, and the footer still has its own line for the model and level.
+        let room = budget.saturating_sub(3).min(Defaults::SESSION_NAME_WIDTH);
+        if room > 0 {
+            spans.push(Span::new(" • ", Style::new(Color::Dim)));
+            spans.push(Span::new(util::truncate(&name, room, "…"), Style::new(Color::Text)));
+        }
+    }
     Line::spans(spans)
 }
 
@@ -217,6 +239,31 @@ mod tests {
         assert!(text.starts_with("~/文档/pi-custom"), "{text:?}");
         assert!(text.contains("(main)"));
         assert!(text.ends_with("• 会话示例"), "{text:?}");
+    }
+
+    #[test]
+    fn the_location_line_never_exceeds_the_width() {
+        // This row is part of the live region, and a row the terminal wraps by itself throws
+        // the region's row count off — the footer then creeps down the screen, a row per
+        // redraw, which reads as the footer repeating itself. So the line is built to fit.
+        let theme = Theme { mode: ColorMode::Ansi256 };
+        let mut state = state("/tmp");
+        state.branch = Some("feature/一个很长的分支名字用来撑破这一行".repeat(3));
+        state.session_name = Some("会话名字同样可以很长".repeat(5));
+
+        for width in [20usize, 30, 40, 80, 120] {
+            let text = plain(&render(&state, &theme, width))[0].clone();
+            assert!(
+                util::width(&text) <= width,
+                "{width}: {text:?} is {} cells",
+                util::width(&text)
+            );
+        }
+
+        // The directory is what the user needs, so it is what survives the squeeze: the
+        // branch and the name give way first.
+        let text = plain(&render(&state, &theme, 30))[0].clone();
+        assert!(text.starts_with("/tmp"), "{text:?}");
     }
 
     #[test]

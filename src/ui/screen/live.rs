@@ -31,7 +31,15 @@ impl Screen {
             if let Some(answer) = &self.streaming_answer {
                 // The live preview re-renders on every token, so it lays out at the current
                 // width; whatever it draws is thrown away and re-rendered when the stream ends.
-                let body = crate::ui::markdown::render(answer, self.width);
+                //
+                // `markdown::render` returns **unwrapped** lines — wrapping is the caller's
+                // job, since only the caller knows the width to wrap to. Skipping it here meant
+                // any line past the right edge was wrapped by the *terminal* instead, which
+                // knows nothing about this code's row count: every draw then erased one row
+                // fewer than it drew, the region crept down a row per frame, and the old copy
+                // stayed on screen — the same line repeated down the screen, cut off at the
+                // edge, looking exactly like the model repeating itself.
+                let body = wrap_all(&crate::ui::markdown::render(answer, self.width), self.width);
                 lines.extend(body);
                 self.trim_live(&mut lines);
             }
@@ -82,10 +90,15 @@ impl Screen {
             // the user just typed them, so it is obvious they were taken and are queued rather
             // than lost.
             for queued in &self.pending {
-                lines.push(Line::spans(vec![
-                    Span::new("… ", Style::new(Color::Dim)),
-                    Span::new(util::one_line(queued.text()), Style::new(Color::Dim)),
-                ]));
+                // Wrapped for the same reason the answer is: an unwrapped row is wrapped by the
+                // terminal instead, and the row count this code erases by is then wrong.
+                lines.extend(wrap_line(
+                    &Line::spans(vec![
+                        Span::new("… ", Style::new(Color::Dim)),
+                        Span::new(util::one_line(queued.text()), Style::new(Color::Dim)),
+                    ]),
+                    self.width,
+                ));
             }
             // Pending images and one-off notices sit between the input and the menu: they are
             // about what is being composed, so they belong next to it.
@@ -93,7 +106,7 @@ impl Screen {
                 lines.push(Line::new(image.label(), Style::new(Color::Magenta)));
             }
             if let Some(notice) = &self.notice {
-                lines.push(Line::new(notice.clone(), Style::new(Color::Yellow)));
+                lines.extend(wrap_line(&Line::new(notice.clone(), Style::new(Color::Yellow)), self.width));
             }
             // The menu goes directly under the input line, above the footer.
             if !self.menu.is_empty() {
