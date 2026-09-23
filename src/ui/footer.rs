@@ -13,7 +13,7 @@
 use std::path::Path;
 
 use crate::config::{Defaults, ModelConfig, Usage};
-use crate::ui::screen::{Bg, Line, Span, Style};
+use crate::ui::screen::{Line, Span, Style};
 use crate::ui::theme::{CACHE_ICON, Color, Theme};
 use crate::util;
 
@@ -162,9 +162,9 @@ pub fn git_branch(cwd: &Path) -> Option<String> {
 /// Colour for a transcript-level status dot.
 pub fn status_style(ok: bool) -> (Style, &'static str) {
     if ok {
-        (Style { fg: Color::Green, bold: true, bg: Bg::None }, "✓")
+        (Style { fg: Color::Green, bold: true, ..Style::plain() }, "✓")
     } else {
-        (Style { fg: Color::Red, bold: true, bg: Bg::None }, "×")
+        (Style { fg: Color::Red, bold: true, ..Style::plain() }, "×")
     }
 }
 

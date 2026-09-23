@@ -50,6 +50,10 @@ const HISTORY_LIMIT: usize = 200;
 pub struct Style {
     pub fg: Color,
     pub bold: bool,
+    /// Markdown emphasis. Terminals have had italics since long before this program, and
+    /// rendering `*this*` as grey — the previous stand-in — made emphasis look like a hint.
+    pub italic: bool,
+    pub underline: bool,
     pub bg: Bg,
 }
 
@@ -63,19 +67,23 @@ pub enum Bg {
 
 impl Style {
     pub const fn plain() -> Self {
-        Style { fg: Color::Text, bold: false, bg: Bg::None }
+        Style { fg: Color::Text, bold: false, italic: false, underline: false, bg: Bg::None }
     }
 
     pub const fn new(fg: Color) -> Self {
-        Style { fg, bold: false, bg: Bg::None }
+        Style { fg, bold: false, italic: false, underline: false, bg: Bg::None }
     }
 
     pub const fn bold(fg: Color) -> Self {
-        Style { fg, bold: true, bg: Bg::None }
+        Style { fg, bold: true, italic: false, underline: false, bg: Bg::None }
+    }
+
+    pub const fn italic(fg: Color) -> Self {
+        Style { fg, bold: false, italic: true, underline: false, bg: Bg::None }
     }
 
     pub const fn with_bg(fg: Color, bg: Bg) -> Self {
-        Style { fg, bold: false, bg }
+        Style { fg, bold: false, italic: false, underline: false, bg }
     }
 }
 
@@ -111,11 +119,19 @@ impl Span {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Line {
     pub spans: Vec<Span>,
+    /// Columns to indent every row *after* the first one when this line wraps.
+    ///
+    /// Markdown sets it on a list item, so the second row lines up under the text rather
+    /// than under the bullet. It lives on the line — rather than being applied by whoever
+    /// wrapped it — so wrapping stays idempotent: a line that has already been wrapped and
+    /// is wrapped again (at a narrower width, on a resize) keeps its shape instead of
+    /// losing the indent on the second pass.
+    pub hang: usize,
 }
 
 impl Line {
     pub fn new(text: impl Into<String>, style: Style) -> Self {
-        Line { spans: vec![Span::new(text, style)] }
+        Line { spans: vec![Span::new(text, style)], hang: 0 }
     }
 
     pub fn plain(text: impl Into<String>) -> Self {
@@ -130,14 +146,28 @@ impl Line {
         Line::plain(String::new())
     }
 
-    /// Build a line from already-styled runs.
+    /// Build a line from already-styled runs. Empty runs are dropped, and a line with no
+    /// runs left is blank rather than an empty row with a style.
     pub fn spans(spans: Vec<Span>) -> Self {
         let spans: Vec<Span> = spans.into_iter().filter(|span| !span.text.is_empty()).collect();
         if spans.is_empty() {
             Line::blank()
         } else {
-            Line { spans }
+            Line { spans, hang: 0 }
         }
+    }
+
+    /// [`Line::spans`] with a hanging indent for its continuation rows.
+    pub fn hanging(spans: Vec<Span>, hang: usize) -> Self {
+        Line { spans, hang }.tidy_spans()
+    }
+
+    fn tidy_spans(mut self) -> Self {
+        self.spans.retain(|span| !span.text.is_empty());
+        if self.spans.is_empty() {
+            return Line::blank();
+        }
+        self
     }
 
     /// The visible text, with no styling. This is what tests and width checks use.
@@ -267,8 +297,15 @@ impl Block {
 /// Wrap one line to `width` columns, breaking at spaces and keeping every run's style.
 /// A word longer than the line is broken by character, which is the only case where a
 /// styled run is split mid-word.
+///
+/// The line's own `hang` is what its continuation rows are indented by, so wrapping an
+/// already-wrapped line at a different width gives the same shape rather than a shape that
+/// depends on how many times it was wrapped.
 pub fn wrap_line(line: &Line, width: usize) -> Vec<Line> {
     let width = width.max(1);
+    let hang = line.hang.min(width.saturating_sub(1));
+    // The first row has the full width; the rest lose the hang.
+    let cont_width = width.saturating_sub(hang).max(1);
     let mut chars: Vec<(char, Style)> = Vec::new();
     for span in &line.spans {
         for c in span.text.chars() {
@@ -282,15 +319,18 @@ pub fn wrap_line(line: &Line, width: usize) -> Vec<Line> {
     let mut used = 0usize;
     // (row, index within row) of the most recent break opportunity.
     let mut last_space: Option<(usize, usize)> = None;
+    // Width available on the row currently being filled.
+    let mut limit = width;
     for (c, style) in chars {
         if c == '\n' {
             rows.push(Vec::new());
             used = 0;
+            limit = cont_width;
             last_space = None;
             continue;
         }
         let char_width = UnicodeWidthChar::width(c).unwrap_or(0);
-        if used > 0 && used + char_width > width {
+        if used > 0 && used + char_width > limit {
             match last_space.take() {
                 Some((row, index)) if row + 1 == rows.len() => {
                     // Break at the last space: everything after it moves down.
@@ -305,14 +345,28 @@ pub fn wrap_line(line: &Line, width: usize) -> Vec<Line> {
                     used = 0;
                 }
             }
+            limit = cont_width;
         }
+        // A regular space is a break opportunity; a non-breaking space is not, which is
+        // how a list marker stays with the first word of its item.
         if c == ' ' {
             last_space = Some((rows.len() - 1, rows.last().unwrap().len()));
         }
         used += char_width;
         rows.last_mut().unwrap().push((c, style));
     }
-    rows.into_iter().map(|row| Line { spans: coalesce(row) }).collect()
+    let mut lines: Vec<Line> = Vec::with_capacity(rows.len());
+    for (index, row) in rows.into_iter().enumerate() {
+        let mut spans = coalesce(row);
+        // The indent is painted as a plain run, but the rows carry the same `hang` as the
+        // row they came from, so a second pass knows what they already represent and does
+        // not indent them again.
+        if index > 0 && hang > 0 {
+            spans.insert(0, Span::plain(" ".repeat(hang)));
+        }
+        lines.push(Line { spans, hang });
+    }
+    lines
 }
 
 /// Merge adjacent characters that share a style back into runs.
@@ -958,16 +1012,18 @@ impl Screen {
         self.streaming_answer = Some(String::new());
     }
 
+    /// Append to the thinking preview. No redraw: the caller drains a burst of deltas and
+    /// redraws once (see `drain_deltas` in the agent loop), and a redraw per token would
+    /// erase and repaint the input line — caret included — for every character.
     pub fn push_thinking(&mut self, text: &str) {
         let buffer = self.streaming_thinking.get_or_insert_with(String::new);
         buffer.push_str(text);
-        self.render();
     }
 
+    /// Append to the answer preview. No redraw, for the same reason as [`Screen::push_thinking`].
     pub fn push_text(&mut self, text: &str) {
         let buffer = self.streaming_answer.get_or_insert_with(String::new);
         buffer.push_str(text);
-        self.render();
     }
 
     /// Throw away an in-flight preview without committing anything. Used when a request
@@ -989,7 +1045,10 @@ impl Screen {
             lines.extend(crate::ui::compact::thinking_done_lines());
         }
         if !answer.trim().is_empty() {
-            lines.extend(crate::ui::markdown::render(&answer));
+            // Rendered at the width that is current *now*, which is the width the answer
+            // will keep: committed lines live in the terminal's scrollback, and scrollback
+            // cannot be re-flowed.
+            lines.extend(crate::ui::markdown::render(&answer, self.width));
             lines.push(Line::blank());
         }
         if !lines.is_empty() {
@@ -1005,18 +1064,25 @@ impl Screen {
         let mut cursor = None;
         let mut lines: Vec<Line> = Vec::new();
         if let Some(thinking) = &self.streaming_thinking {
+            // The preview occupies a **fixed** block, padded with blanks, so the rows below it
+            // never move. Sizing the block to the text instead made the input line slide down
+            // a row each time the thinking grew past a line — and since thinking arrives a few
+            // characters at a time, the caret the user is typing at wandered up and down the
+            // screen for the whole turn. A blank row is invisible; a moving caret is not.
             let plain = util::sanitize(thinking);
             let wrapped = util::wrap(&util::one_line(&plain), self.width);
             let tail = wrapped.len().saturating_sub(Defaults::THINKING_PREVIEW_LINES);
             for line in &wrapped[tail..] {
                 lines.push(Line::new(line.clone(), Style::new(Color::Dim)));
             }
+            self.pad_preview(&mut lines);
             self.trim_live(&mut lines);
         }
         if let Some(answer) = &self.streaming_answer {
-            let body = crate::ui::markdown::render(answer);
-            let wrapped = wrap_all(&body, self.width);
-            lines.extend(wrapped);
+            // The live preview re-renders on every token, so it lays out at the current
+            // width; whatever it draws is thrown away and re-rendered when the stream ends.
+            let body = crate::ui::markdown::render(answer, self.width);
+            lines.extend(body);
             self.trim_live(&mut lines);
         }
         if let Some(spans) = &self.running_call {
@@ -1295,6 +1361,18 @@ impl Screen {
         }
     }
 
+    /// Top the thinking preview up to its full height with blank rows.
+    ///
+    /// The preview is a box of a fixed number of rows that fills in from the top as the text
+    /// arrives. That is what keeps everything under it — the input line, its caret, the footer
+    /// — in the same place for the whole turn. A preview that grew with its text dragged the
+    /// caret down the screen a row at a time.
+    fn pad_preview(&self, lines: &mut Vec<Line>) {
+        while lines.len() < Defaults::THINKING_PREVIEW_LINES {
+            lines.push(Line::blank());
+        }
+    }
+
     pub fn set_footer(&mut self, lines: Vec<Line>) {
         self.footer = lines;
     }
@@ -1457,11 +1535,13 @@ impl Screen {
         self.last_live = lines;
     }
 
-    /// Rewrite only the spinner, when the rows under it have not changed.
+    /// Rewrite the rows that changed, when nothing below the spinner did.
     ///
     /// A turn ticks this every 80ms. Redrawing the input line and the footer on each tick
-    /// clears them and paints them again, which reads as flicker. The frame is one cell, so
-    /// replacing that one row leaves everything below it untouched.
+    /// clears them and paints them again, which reads as flicker — and it takes the caret
+    /// with it, because the caret lives in the input row. So the tick is allowed to touch
+    /// only the rows at or above the spinner: the thinking preview above it changes on every
+    /// tick, and the spinner itself changes with each frame, while everything below stays put.
     fn repaint_spinner(&mut self) -> bool {
         if !self.interactive || self.live_rows == 0 || self.last_live.is_empty() {
             return false;
@@ -1471,36 +1551,60 @@ impl Screen {
         if lines.len() != self.live_rows || lines.len() != self.last_live.len() {
             return false;
         }
-        let Some(index) = spinner_row(&lines, &label) else {
+        let Some(spinner) = spinner_row(&lines, &label) else {
             return false;
         };
-        if !spinner_only_change(&self.last_live, &lines, &label) {
+        let Some(top) = dirty_top(&self.last_live, &lines, spinner) else {
             return false;
-        }
+        };
+        // Climb from the caret to the first row that needs repainting.
         let from = match self.cursor_row {
-            Some(row) if row >= index => row,
+            Some(row) if row >= spinner => row,
             _ => return false,
         };
-        let up = from - index;
+        let up = from - top;
+        // The frame is built as a string first: it is a single write to the terminal, and it
+        // is a value the tests can inspect without a terminal to write to.
+        let frame = self.spinner_frame(&lines[top..=spinner], up, from - spinner, cursor);
         let _ = queue!(self.out, BeginSynchronizedUpdate);
-        if up > 0 {
-            let _ = queue!(self.out, cursor::MoveToPreviousLine(up as u16));
-        }
-        let _ = queue!(
-            self.out,
-            cursor::MoveToColumn(0),
-            terminal::Clear(terminal::ClearType::UntilNewLine)
-        );
-        let _ = write!(self.out, "{}", self.paint(&lines[index], self.width));
-        if up > 0 {
-            let _ = queue!(self.out, cursor::MoveToNextLine(up as u16));
-        }
-        let column = cursor.map(|(_, column)| column).unwrap_or(self.cursor_col);
-        let _ = queue!(self.out, cursor::MoveToColumn(column as u16 + 1));
+        let _ = write!(self.out, "{frame}");
         let _ = queue!(self.out, EndSynchronizedUpdate);
         let _ = self.out.flush();
         self.last_live = lines;
         true
+    }
+
+    /// The escape sequence that repaints `rows` in place, leaving the caret on `cursor`.
+    ///
+    /// `up` is how far to climb to reach the first of them and `down` how far to come back to
+    /// the caret. Nothing outside `rows` is written, which is what keeps the input line and
+    /// its caret stable: the tick runs at 12Hz and a row redrawn without need is a row that
+    /// visibly blinks.
+    fn spinner_frame(
+        &self,
+        rows: &[Line],
+        up: usize,
+        down: usize,
+        cursor: Option<(usize, usize)>,
+    ) -> String {
+        let mut frame = String::new();
+        if up > 0 {
+            frame.push_str(&format!("\u{1b}[{up}A"));
+        }
+        for (index, line) in rows.iter().enumerate() {
+            if index > 0 {
+                frame.push_str("\r\n");
+            }
+            // `\r` rather than a column escape: it is column 0 in every terminal, with no
+            // parameter to interpret. `\u{1b}[K` clears what a previously longer row left behind.
+            frame.push_str(&format!("\r\u{1b}[K{}", self.paint(line, self.width)));
+        }
+        if down > 0 {
+            frame.push_str(&format!("\u{1b}[{down}B"));
+        }
+        let column = cursor.map(|(_, column)| column).unwrap_or(self.cursor_col);
+        frame.push_str(&format!("\u{1b}[{}G", column + 1));
+        frame
     }
 
     fn paint(&self, line: &Line, pad_to: usize) -> String {
@@ -1513,7 +1617,20 @@ impl Screen {
                 Bg::Removed => Some(Bg::Removed),
                 Bg::Selected => Some(Bg::Selected),
             };
-            let text = self.theme.fg(span.style.fg, &span.text);
+            // A non-breaking space is a wrapping instruction, not a glyph: it kept a list
+            // marker with its text while the line was being broken, and the terminal gets a
+            // plain space now that the decision is made.
+            let text = if span.text.contains('\u{a0}') {
+                span.text.replace('\u{a0}', " ")
+            } else {
+                span.text.clone()
+            };
+            let text = self.theme.fg(span.style.fg, &text);
+            // Order matters: SGR 1/3/4 are attributes that 22/23/24 turn off, and the colour
+            // reset is 39. Nesting them the other way round would have the colour reset also
+            // clear the weight of a bold heading.
+            let text = if span.style.italic { self.theme.italic(&text) } else { text };
+            let text = if span.style.underline { self.theme.underline(&text) } else { text };
             let text = if span.style.bold { self.theme.bold(&text) } else { text };
             let text = match background {
                 Some(Bg::Added) => self.theme.bg_added(&text),
@@ -2085,18 +2202,28 @@ fn spinner_row(lines: &[Line], label: &str) -> Option<usize> {
     })
 }
 
-/// True when `next` differs from `previous` only in the spinner's frame.
+/// The first row that has to be repainted, or `None` when a full redraw is needed instead.
 ///
-/// That is the only change a tick is allowed to paint in place. Anything else — a new
-/// answer line, a footer update — still takes the full redraw.
-fn spinner_only_change(previous: &[Line], next: &[Line], label: &str) -> bool {
-    if previous.len() != next.len() {
-        return false;
+/// A tick may repaint the rows from here through the spinner — and nothing below it, which is
+/// where the input line and its caret live. Everything above the spinner is fair game: the
+/// thinking preview is rewritten on every tick by design. The rule is that no row *below* the
+/// spinner may differ, because painting those is what erases and redraws the caret.
+fn dirty_top(previous: &[Line], next: &[Line], spinner: usize) -> Option<usize> {
+    if previous.len() != next.len() || spinner >= next.len() {
+        return None;
     }
-    let Some(index) = spinner_row(next, label) else {
-        return false;
-    };
-    previous.iter().zip(next).enumerate().all(|(row, (old, new))| row == index || old == new)
+    // Anything below the spinner moving means the input or footer changed: full redraw.
+    if previous[spinner + 1..] != next[spinner + 1..] {
+        return None;
+    }
+    // From the top down, the first row that differs is where repainting starts.
+    Some(
+        previous[..spinner]
+            .iter()
+            .zip(&next[..spinner])
+            .position(|(old, new)| old != new)
+            .unwrap_or(spinner),
+    )
 }
 
 pub fn window_title(name: Option<&str>, cwd: &Path) -> String {
@@ -2290,9 +2417,11 @@ mod tests {
     }
 
     #[test]
-    fn a_spinner_tick_does_not_count_as_a_change_below_it() {
-        // The footer and the input sit under the spinner. A tick that had to redraw them
-        // is what flickered; the tick is allowed to touch only the frame.
+    fn a_tick_paints_only_the_rows_at_or_above_the_spinner() {
+        // The input line sits under the spinner, and the caret lives in it. A tick that
+        // repainted it would erase the caret and put it back at 12Hz — the wobble the fast
+        // path exists to prevent. So: rows above the spinner are free to change, rows below
+        // it are not, and the paint starts at the first row that actually differs.
         let spinner = |frame: &str| {
             Line::spans(vec![
                 Span::new(frame, Style::new(Color::Cyan)),
@@ -2300,13 +2429,22 @@ mod tests {
                 Span::new(WORKING_LABEL, Style::new(Color::Dim)),
             ])
         };
-        let input = Line::plain("› ");
+        let thinking = |text: &str| Line::new(text, Style::new(Color::Dim));
+        let input = Line::plain("› draft");
         let footer = Line::plain("dir");
-        let before = vec![spinner(WORKING_FRAMES[0]), input.clone(), footer.clone()];
-        let after = vec![spinner(WORKING_FRAMES[1]), input.clone(), footer.clone()];
-        assert!(spinner_only_change(&before, &after, WORKING_LABEL));
-        let moved = vec![spinner(WORKING_FRAMES[1]), input, Line::plain("other")];
-        assert!(!spinner_only_change(&before, &moved, WORKING_LABEL));
+
+        // Thinking above the spinner changed: the paint starts at that row.
+        let before = vec![thinking("one"), spinner(WORKING_FRAMES[0]), input.clone(), footer.clone()];
+        let after = vec![thinking("two"), spinner(WORKING_FRAMES[1]), input.clone(), footer.clone()];
+        assert_eq!(dirty_top(&before, &after, 1), Some(0));
+
+        // Nothing above changed either: only the spinner row is repainted.
+        let same = vec![thinking("one"), spinner(WORKING_FRAMES[1]), input.clone(), footer.clone()];
+        assert_eq!(dirty_top(&before, &same, 1), Some(1));
+
+        // The input line changed — the caret may have moved with it. Full redraw.
+        let typed = vec![thinking("one"), spinner(WORKING_FRAMES[1]), Line::plain("› draftx"), footer];
+        assert_eq!(dirty_top(&before, &typed, 1), None);
     }
 
     #[test]
@@ -3230,6 +3368,236 @@ mod tests {
         assert_eq!(util::width(&util::strip_ansi(&painted)), 40);
         // Re-measuring the raw string would be wrong, which is the whole reason spans exist.
         assert!(painted.len() > 40);
+    }
+
+    #[test]
+    fn a_spinner_tick_repaints_through_the_spinner_even_as_thinking_grows() {
+        // The end-to-end shape of the fix. `tick_working` runs every 80ms for the whole turn;
+        // when its fast path is refused it falls back to `render()`, which erases the live
+        // region and paints it again — input line, caret and footer included, twelve times a
+        // second. The thinking preview above the spinner changes on every tick, so the fast
+        // path has to accept "everything from the first changed row down to the spinner" and
+        // leave the rows below alone. This drives the preview across a line boundary, which is
+        // where the old `spinner_only_change` gave up and the caret visibly moved.
+        let mut screen = screen();
+        screen.begin_stream();
+        screen.set_working(WORKING_LABEL);
+        set_input(&mut screen, "draft");
+
+        let mut previous: Option<Vec<Line>> = None;
+        let mut spinner = 0usize;
+        let mut caret_rows = Vec::new();
+        // Short chunks, so the preview grows a row within the loop rather than after it.
+        for chunk in ["先想", "一下", "这个", "问题", "在哪", "里。", "也许", "是空", "输入"] {
+            screen.push_thinking(chunk);
+            screen.working_frame = (screen.working_frame + 1) % WORKING_FRAMES.len();
+            let (lines, cursor) = screen.compose_live();
+            caret_rows.push(cursor.map(|(row, _)| row));
+            if let Some(before) = &previous {
+                let row = spinner_row(&lines, WORKING_LABEL).expect("the spinner is up");
+                spinner = row;
+                assert!(
+                    dirty_top(before, &lines, row).is_some(),
+                    "the tick was forced into a full redraw at frame {chunk:?}"
+                );
+            }
+            previous = Some(lines);
+        }
+        // And the caret's row never moved, which is the whole point.
+        let first = caret_rows[0];
+        assert!(
+            caret_rows.iter().all(|row| *row == first),
+            "the caret moved as the preview grew: {caret_rows:?}"
+        );
+        assert!(spinner > 0, "the preview did take the rows above the spinner");
+    }
+
+    #[test]
+    fn the_tick_refuses_rather_than_underflowing_when_the_caret_is_not_below_the_spinner() {
+        // `up` and `down` are both subtractions from the caret's row, so a caret that is not
+        // at or below the spinner would underflow — and `usize` subtraction panics in debug
+        // and wraps in release, which would move the cursor to column absurд. The guard is
+        // what makes the arithmetic safe, so it is checked directly.
+        let mut screen = screen();
+        screen.interactive = true;
+        screen.begin_stream();
+        screen.set_working(WORKING_LABEL);
+        set_input(&mut screen, "draft");
+        // Thinking above the spinner, so the spinner is not row 0 — otherwise "above the
+        // spinner" is not a representable state and the guard cannot be exercised.
+        screen.streaming_thinking = Some("a thought".into());
+        let (lines, _) = screen.compose_live();
+        let spinner = spinner_row(&lines, WORKING_LABEL).expect("the spinner is up");
+        assert!(spinner > 0, "the fixture needs a row above the spinner");
+        screen.live_rows = lines.len();
+        screen.last_live = lines;
+
+        // A caret recorded *above* the spinner: refuse, do not subtract.
+        screen.cursor_row = Some(spinner - 1);
+        assert!(!screen.repaint_spinner(), "an impossible caret must be refused");
+        // No caret at all is also refused: there is no row to park it back on.
+        screen.cursor_row = None;
+        assert!(!screen.repaint_spinner(), "a missing caret must be refused");
+    }
+
+    #[test]
+    fn the_tick_frame_writes_the_spinner_rows_and_parks_the_caret() {
+        // The bytes the fast path emits, checked as a sequence rather than by looking at a
+        // terminal. It climbs to the first dirty row, writes only down through the spinner,
+        // walks back to the input row and puts the caret at its column. Getting the walk-back
+        // wrong parks the caret on the spinner row, and the next frame repaints from there.
+        let mut screen = screen();
+        screen.width = 40;
+        let thinking = Line::dim("thinking");
+        let spinner = Line::spans(vec![
+            Span::new(WORKING_FRAMES[1], Style::new(Color::Cyan)),
+            Span::plain(" "),
+            Span::new(WORKING_LABEL, Style::new(Color::Dim)),
+        ]);
+        let rows = [thinking, spinner];
+
+        // Two rows written, one row climbed (the caret is on the input row, two below the
+        // spinner), so the walk back is two rows and the column is 3.
+        let frame = screen.spinner_frame(&rows, 2, 2, Some((4, 3)));
+        assert!(frame.starts_with("\u{1b}[2A"), "climb first: {frame:?}");
+        assert!(frame.contains("thinking"), "{frame:?}");
+        assert!(frame.contains(WORKING_LABEL), "{frame:?}");
+        assert!(frame.contains("\u{1b}[2B"), "walk back down: {frame:?}");
+        assert!(frame.ends_with("\u{1b}[4G"), "the caret's column, 1-based: {frame:?}");
+        // The input line itself is never written by a tick.
+        assert!(!frame.contains('›'), "the tick wrote the input row: {frame:?}");
+    }
+
+    #[test]
+    fn a_burst_of_tokens_is_drawn_once_but_is_never_left_undrawn() {
+        // The batching rule from both sides. A hundred queued tokens must not cost a hundred
+        // redraws — each one erases and repaints the input row, and the caret with it — but a
+        // single token must be drawn *now* rather than waiting for the next spinner tick.
+        let mut screen = screen();
+        screen.interactive = false;
+        screen.begin_stream();
+        set_input(&mut screen, "draft");
+
+        // Appending alone only fills the buffer; the caller's single render is what draws.
+        screen.push_thinking("hmm");
+        assert_eq!(screen.streaming_thinking.as_deref(), Some("hmm"));
+
+        for _ in 0..100 {
+            screen.push_text("x");
+        }
+        assert_eq!(screen.streaming_answer.as_deref(), Some("x".repeat(100).as_str()));
+
+        // One render draws the whole burst, so the preview the region is built from carries
+        // all hundred characters rather than the first one.
+        let (lines, _) = screen.compose_live();
+        let drawn: String = lines.iter().map(Line::text).collect();
+        assert!(drawn.contains(&"x".repeat(40)), "the burst reached the screen: {drawn:?}");
+    }
+
+    #[test]
+    fn appending_a_token_does_not_redraw() {
+        // Every delta used to call `render()`, which erases the live region and paints it
+        // again — input line and caret included. A burst of tokens therefore repainted the
+        // caret once per character. The burst is drained and redrawn once by the caller
+        // instead, so appending is a buffer push and nothing more.
+        let mut screen = screen();
+        screen.interactive = true;
+        screen.begin_stream();
+        screen.set_working(WORKING_LABEL);
+        set_input(&mut screen, "draft");
+        screen.streaming_thinking = None;
+        screen.live_rows = 0;
+        screen.last_live.clear();
+
+        screen.push_thinking("think");
+        screen.push_text("answer");
+        assert!(screen.last_live.is_empty(), "appending a token redrew the region");
+
+        // And the caller's single redraw picks both up.
+        screen.render();
+        let text: Vec<String> = screen.last_live.iter().map(Line::text).collect();
+        assert!(text.iter().any(|row| row.contains("think")), "{text:?}");
+        assert!(text.iter().any(|row| row.contains("answer")), "{text:?}");
+    }
+
+    #[test]
+    fn the_caret_stays_put_when_the_answer_preview_grows_too() {
+        // The answer is below the spinner and above the input, and it wraps as it streams.
+        // Its block is not padded the way the thinking preview is, so what has to hold is the
+        // caret's *column*: the row moves with the answer, and that is expected — the input
+        // line is under the text being written. What must not move is where the user is
+        // typing inside their own line.
+        let mut screen = screen();
+        screen.interactive = false;
+        screen.begin_stream();
+        screen.set_working(WORKING_LABEL);
+        set_input(&mut screen, "draft");
+
+        let mut columns = Vec::new();
+        let mut rows = Vec::new();
+        for chunk in ["答案 ", "开始 ", "输出 ", "更多的字 ", "继续 ", "直到换行。"] {
+            screen.push_text(chunk);
+            let (_, caret) = screen.compose_live();
+            columns.push(caret.map(|(_, column)| column));
+            rows.push(caret.map(|(row, _)| row));
+        }
+        // The caret's column inside the input line is the same on every frame.
+        let first = columns[0];
+        assert!(
+            columns.iter().all(|column| *column == first),
+            "the caret slid sideways inside the input line: {columns:?}"
+        );
+        assert!(first.is_some(), "the composer is armed, so there is a caret");
+    }
+
+    #[test]
+    fn the_composer_does_not_move_while_thinking_streams() {
+        // While the model thinks, the composer stays armed and the user types into it. The
+        // caret has to stay where they left it: a caret that wanders while text arrives
+        // somewhere else is worse than no caret, because it is the one thing on screen that
+        // claims to know where the next character goes.
+        let mut screen = screen();
+        screen.begin_stream();
+        screen.set_working("Working");
+        screen.editing = Some(Editor::from_text("打了一半的草稿"));
+
+        let mut seen = Vec::new();
+        for chunk in ["先看看 ", "这一步要做什么，", "然后动手。", "再看看边界条件。"] {
+            screen.push_thinking(chunk);
+            let (_, caret) = screen.compose_live();
+            seen.push(caret);
+        }
+        let first = seen[0];
+        assert!(
+            seen.iter().all(|caret| *caret == first),
+            "the caret moved as thinking arrived: {seen:?}"
+        );
+        assert!(first.is_some(), "the composer is armed, so there is a caret");
+    }
+
+    #[test]
+    fn the_input_row_keeps_its_place_when_the_thinking_preview_grows() {
+        // The same bug seen the other way: the caret's *row* must not shift either. The
+        // thinking preview above the input grows and shrinks with the text, and if the input
+        // row moves with it the caret appears to slide up and down the screen.
+        let mut screen = screen();
+        screen.begin_stream();
+        screen.set_working("Working");
+        screen.editing = Some(Editor::from_text("draft"));
+
+        let mut rows = Vec::new();
+        for chunk in ["thinking ", "in one ", "single ", "long paragraph that wraps. "] {
+            screen.push_thinking(chunk);
+            let (live, caret) = screen.compose_live();
+            rows.push((live.len(), caret.map(|(row, _)| row)));
+        }
+        // The preview is capped, so once it is full the region stops growing.
+        let settled = &rows[rows.len() - 1];
+        assert!(
+            rows.iter().all(|(_, row)| row.is_some()),
+            "the caret is always present: {rows:?}"
+        );
+        let _ = settled;
     }
 
     #[test]

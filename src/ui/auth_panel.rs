@@ -2,9 +2,9 @@
 //!
 //! It is deliberately not a floating dialog. It sits flush with the last row, separated
 //! from the transcript by a rule, so the decision always appears in the same place and
-//! the transcript stays readable. The title is fixed ("需要用户授权 · 等待确认") — a
-//! category label used to live there and was removed because the body already says what
-//! is being asked, and the tool name (`bash`) carries no information on any platform.
+//! the transcript stays readable. The title is fixed ("需要授权") — a category label used to
+//! live there and was removed because the body already says what is being asked, and the
+//! tool name (`bash`) carries no information on any platform.
 //!
 //! There is no timeout: waiting forever is the point.
 
@@ -23,7 +23,7 @@ pub struct PanelRequest {
     pub body: String,
 }
 
-const TITLE: &str = "需要用户授权 · 等待确认";
+const TITLE: &str = "需要授权";
 const ALLOW_LABEL: &str = "1. 允许本次操作";
 const DENY_LABEL: &str = "2. 拒绝并停止";
 
@@ -139,9 +139,15 @@ impl PanelState {
         let visible = &content[self.offset..(self.offset + page).min(content.len())];
 
         let rule = theme.fg(Color::Dim, &"─".repeat(width));
-        let row = |text: &str, selected: bool| -> String {
-            let padded = util::pad(&util::truncate(text, inner, "…"), inner);
-            let line = format!(" {padded} ");
+        // A row is built from its *plain* text, and the padding is computed before any style
+        // is applied. Measuring a styled string counts escape sequences as characters — a
+        // colour is worth a dozen columns of "width" — which is why the selected row's band
+        // stopped short of the right edge: `util::pad` thought it had already filled the
+        // line. The visible text is the only thing that has a width.
+        let row = |plain: &str, selected: bool, style: &dyn Fn(&str) -> String| -> String {
+            let visible = util::truncate(plain, inner, "…");
+            let pad = " ".repeat(inner.saturating_sub(util::width(&visible)));
+            let line = format!(" {}{pad} ", style(&visible));
             if selected {
                 theme.bg_selected(&line)
             } else {
@@ -153,9 +159,9 @@ impl PanelState {
         if dock {
             lines.push(rule.clone());
         }
-        lines.push(row(&theme.fg(Color::Cyan, &theme.bold(TITLE)), false));
+        lines.push(row(TITLE, false, &|text| theme.fg(Color::Cyan, text)));
         for line in visible {
-            lines.push(row(&theme.fg(Color::Text, line), false));
+            lines.push(row(line, false, &|text| theme.fg(Color::Text, text)));
         }
         if divider {
             lines.push(rule.clone());
@@ -163,8 +169,10 @@ impl PanelState {
         let choice = |label: &str, selected: bool| -> String {
             let marker = if selected { "› " } else { "  " };
             let text = format!("{marker}{label}");
-            let styled = if selected { theme.bold(&text) } else { text };
-            row(&theme.fg(Color::Cyan, &styled), selected)
+            row(&text, selected, &|visible| {
+                let styled = if selected { theme.bold(visible) } else { visible.to_string() };
+                theme.fg(Color::Cyan, &styled)
+            })
         };
         lines.push(choice(ALLOW_LABEL, self.allow_selected));
         lines.push(choice(DENY_LABEL, !self.allow_selected));
@@ -172,7 +180,9 @@ impl PanelState {
         if self.drawn > 0 {
             crossterm::execute!(out, cursor::MoveToPreviousLine(self.drawn as u16))?;
         }
-        // Paint every cell so the transcript cannot bleed through between rows.
+        // Paint every cell so the transcript cannot bleed through between rows. The rows are
+        // already exactly `width` columns of *visible* text; the escapes are not counted,
+        // which is the whole reason for measuring the stripped form here.
         let mut frame = String::new();
         for line in &lines {
             let width_used = util::width(&util::strip_ansi(line));
@@ -291,6 +301,63 @@ mod tests {
             .collect()
     }
 
+    /// One frame, as `(visible text, visible width)` per row — no trimming, because the
+    /// trailing padding is exactly what has to be measured.
+    fn frame_widths(panel: &mut PanelState) -> Vec<(String, usize)> {
+        let mut out: Vec<u8> = Vec::new();
+        panel.draw(&mut out, &Theme { mode: crate::ui::theme::ColorMode::True }).unwrap();
+        let text = String::from_utf8_lossy(&out).to_string();
+        text.split("\r\n")
+            .filter(|line| !line.is_empty())
+            .map(|line| {
+                let plain = util::strip_ansi(line);
+                (plain.clone(), util::width(&plain))
+            })
+            .collect()
+    }
+
+    /// The terminal width the panel will draw at, as the panel itself asks for it.
+    fn terminal_width() -> usize {
+        terminal::size().map(|(cols, _)| cols as usize).unwrap_or(80)
+    }
+
+    #[test]
+    fn every_row_fills_the_terminal_width() {
+        // The bug this pins: the padding was computed from the *styled* string, so escape
+        // sequences counted as columns and the selected row's background band stopped short
+        // of the right edge — it looked like the highlight was a fixed-width box rather than
+        // a full-width bar. Every row is exactly the terminal's width, selected or not.
+        let width = terminal_width();
+        let mut panel = state_with_rows(3);
+        for selected_allow in [true, false] {
+            if !selected_allow {
+                panel.handle_key(KeyEvent::from(KeyCode::Tab));
+            }
+            for (text, drawn) in frame_widths(&mut panel) {
+                assert_eq!(drawn, width, "{drawn} columns, expected {width}: {text:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_selected_row_is_padded_like_the_rest() {
+        // The selected row is the one that carries a background, so it is the row where a
+        // short pad is visible as a box that ends early. Its visible text must be the same
+        // width as the unselected rows' — the highlight covers the full strip.
+        let width = terminal_width();
+        let mut panel = state_with_rows(1);
+        let rows = frame_widths(&mut panel);
+        let find = |prefix: &str| {
+            rows.iter()
+                .find(|(text, _)| text.trim_start().starts_with(prefix))
+                .unwrap_or_else(|| panic!("no row starts with {prefix:?}: {rows:?}"))
+        };
+        let selected = find("› 1.");
+        let other = find("2.");
+        assert_eq!(selected.1, other.1, "{rows:?}");
+        assert_eq!(selected.1, width, "{rows:?}");
+    }
+
     #[test]
     fn the_rendered_panel_has_the_fixed_title_and_both_choices() {
         let mut panel = state_with_rows(3);
@@ -298,7 +365,7 @@ mod tests {
         // Docked strip: a rule, the fixed title, the body, a rule, then the two choices.
         assert!(lines[0].starts_with('─'), "{lines:?}");
         assert_eq!(lines[1], TITLE, "{lines:?}");
-        assert!(TITLE.contains("等待确认"), "the title must state the wait");
+        assert_eq!(TITLE, "需要授权", "the title is short and fixed: the choices say the rest");
         // No category label and no tool name anywhere in the frame: the body already says
         // what is being asked, and `bash` is the same on every platform.
         for line in &lines {
@@ -368,3 +435,4 @@ mod tests {
         );
     }
 }
+

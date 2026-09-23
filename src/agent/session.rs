@@ -18,8 +18,6 @@ use serde::{Deserialize, Serialize};
 use crate::config::{Usage, sessions_dir};
 use crate::llm::{Block, Message, StopReason};
 
-pub const FORMAT: u32 = 1;
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionHeader {
     pub id: String,
@@ -34,7 +32,6 @@ pub struct SessionHeader {
 pub enum Record {
     /// First line: id, time, cwd, model.
     SessionMeta {
-        format: u32,
         #[serde(flatten)]
         header: SessionHeader,
     },
@@ -82,8 +79,6 @@ pub enum Record {
     Compacted {
         parent_id: Option<String>,
         id: String,
-        window_id: String,
-        previous_window_id: Option<String>,
         reason: String,
         summary: String,
         /// Full message list that supersedes everything before this record.
@@ -228,7 +223,7 @@ impl Session {
         };
         // Nothing is written here. A file appears with the first record that makes this a
         // conversation, so launching pi and leaving does not add a session to the list.
-        let record = Record::SessionMeta { format: FORMAT, header: header.clone() };
+        let record = Record::SessionMeta { header: header.clone() };
         Ok(Session {
             header,
             path,
@@ -557,20 +552,10 @@ impl Session {
         modified_files: Vec<String>,
         usage: Option<Usage>,
     ) -> Result<(), SessionError> {
-        let previous_window = self
-            .records
-            .iter()
-            .rev()
-            .find_map(|record| match record {
-                Record::Compacted { window_id, .. } => Some(window_id.clone()),
-                _ => None,
-            });
         let id = self.next_id();
         let record = Record::Compacted {
             parent_id: self.last_id.clone(),
             id: id.clone(),
-            window_id: uuid::Uuid::now_v7().to_string(),
-            previous_window_id: previous_window,
             reason: reason.to_string(),
             summary: summary.to_string(),
             replacement_history,
@@ -1283,6 +1268,38 @@ mod tests {
         // And it does not leak into the conversation.
         assert_eq!(reopened.context_messages().len(), 2);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_file_written_by_an_older_version_still_opens() {
+        // The compatibility that has to keep working is files already on disk. Records carry
+        // fields this version no longer writes — `format` on the header, the window chain on
+        // a checkpoint — and they must be ignored rather than fatal: a stricter reader would
+        // turn every existing session into "解析失败".
+        let dir = std::env::temp_dir().join(format!("pi-oldfile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("old.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"session_meta","format":1,"id":"01a0c9b3-b78c-726b-9e74-fc987dcd42bd","timestamp":"2026-09-22T15:19:53Z","cwd":"/tmp","model":"work/m"}"#,
+                "\n",
+                r#"{"type":"response_item","parent_id":"a","id":"x1","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#,
+                "\n",
+                r#"{"type":"compacted","parent_id":"x1","id":"c1","window_id":"w1","previous_window_id":"w0","reason":"manual","summary":"s","replacement_history":[],"read_files":[],"modified_files":[],"timestamp":"2026-09-22T15:20:00Z"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let session = Session::open(&path).unwrap();
+        assert_eq!(session.header().model, "work/m");
+        // The checkpoint's (empty) replacement history is the context, and the user message
+        // before it is still on disk as a record.
+        assert!(session.records().iter().any(|r| matches!(r, Record::Compacted { .. })));
+        assert_eq!(session.user_history(), vec!["hi".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

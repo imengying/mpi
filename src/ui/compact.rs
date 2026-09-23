@@ -225,7 +225,7 @@ pub fn note_lines(text: &str, style: Style) -> Vec<Line> {
 /// shown: the pairing lives in the `tool_call_id`, and a result printed on its own would
 /// read as unexplained output. Stored messages carry no `duration`, so a resumed command
 /// shows its output without a time — inventing one would be worse than omitting it.
-pub fn replay_blocks(messages: &[crate::llm::Message]) -> Vec<crate::ui::screen::Block> {
+pub fn replay_blocks(messages: &[crate::llm::Message], width: usize) -> Vec<crate::ui::screen::Block> {
     use crate::llm::{Block as MsgBlock, Message};
 
     // Tool results, keyed by the call they belong to.
@@ -268,7 +268,7 @@ pub fn replay_blocks(messages: &[crate::llm::Message]) -> Vec<crate::ui::screen:
                 for block in content {
                     match block {
                         MsgBlock::Text { text } => {
-                            lines.extend(crate::ui::markdown::render(text));
+                            lines.extend(crate::ui::markdown::render(text, width));
                             lines.push(Line::blank());
                         }
                         MsgBlock::ToolCall { id, name, arguments } => {
@@ -361,8 +361,12 @@ fn stored_output(name: &str, arguments: &serde_json::Value, content: &str) -> To
 }
 
 /// The one-line marker that replaces the live thinking preview once a turn ends.
+///
+/// It carries **no** trailing blank row: the answer follows immediately underneath, and an
+/// empty row between them reads as a paragraph break the model did not write. Blocks are
+/// separated by the transcript itself wherever that is wanted.
 pub fn thinking_done_lines() -> Vec<Line> {
-    vec![Line::new("思考完成", Style::new(Color::Dim)), Line::blank()]
+    vec![Line::new("思考完成", Style::new(Color::Dim))]
 }
 
 /// How many rows the collapsed command preview keeps.
@@ -513,7 +517,7 @@ mod tests {
             content: vec![MsgBlock::Text { text: "说到一半".into() }],
             stop_reason: Some(StopReason::Aborted),
         }];
-        let text: String = replay_blocks(&stopped)
+        let text: String = replay_blocks(&stopped, 80)
             .iter()
             .flat_map(|block| plain(&block.render(80)))
             .collect::<Vec<_>>()
@@ -526,7 +530,7 @@ mod tests {
             content: vec![MsgBlock::Text { text: "说完了".into() }],
             stop_reason: Some(StopReason::Stop),
         }];
-        let text: String = replay_blocks(&finished)
+        let text: String = replay_blocks(&finished, 80)
             .iter()
             .flat_map(|block| plain(&block.render(80)))
             .collect::<Vec<_>>()
@@ -565,7 +569,7 @@ mod tests {
             },
         ];
         let blocks: Vec<Vec<String>> =
-            replay_blocks(&messages).iter().map(|block| plain(&block.render(80))).collect();
+            replay_blocks(&messages, 80).iter().map(|block| plain(&block.render(80))).collect();
         let text = blocks.join(&"".to_string()).join("\n");
 
         assert!(text.contains("› 跑一下 echo"), "{text}");
@@ -575,6 +579,16 @@ mod tests {
         assert!(text.contains("思考完成"), "thinking stays collapsed: {text}");
         // The environment block is bookkeeping, not something the user said.
         assert!(!text.contains("<environment>"), "{text}");
+    }
+
+    #[test]
+    fn the_thinking_marker_is_not_followed_by_a_blank_row() {
+        // The marker sits directly above the answer it precedes. A blank row between them
+        // reads as a paragraph break the model never wrote — and it appeared on every single
+        // turn that involved thinking, which is most of them.
+        let lines = thinking_done_lines();
+        assert_eq!(lines.len(), 1, "the marker is one row: {lines:?}");
+        assert!(!lines.last().unwrap().is_empty(), "and that row has text in it");
     }
 
     #[test]
@@ -590,7 +604,7 @@ mod tests {
             }],
             stop_reason: None,
         }];
-        let text: Vec<String> = replay_blocks(&messages)
+        let text: Vec<String> = replay_blocks(&messages, 80)
             .iter()
             .flat_map(|block| plain(&block.render(80)))
             .collect();

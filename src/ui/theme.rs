@@ -41,6 +41,12 @@ pub enum Color {
     Red,     // context error
     DiffAddedText,
     DiffRemovedText,
+    /// Code inside a fenced block. The three syntax colours are codex's, and they are the
+    /// only colours in the program that are not a UI role: a code block is read by
+    /// scanning it, and shape is what makes it scannable.
+    SyntaxKeyword,
+    SyntaxString,
+    SyntaxNumber,
 }
 
 impl Color {
@@ -57,6 +63,11 @@ impl Color {
             Color::Dim => (0x80, 0x80, 0x80, 244),
             Color::DiffAddedText => (0xa3, 0xd9, 0xa5, 151),
             Color::DiffRemovedText => (0xf2, 0xa2, 0x9a, 216),
+            // codex's syntax roles: keyword blue-grey, string green, number amber. The 256
+            // indices are the nearest cube entries to the truecolor values.
+            Color::SyntaxKeyword => (0xaf, 0xc5, 0xde, 152),
+            Color::SyntaxString => (0xa7, 0xc4, 0x9f, 151),
+            Color::SyntaxNumber => (0xc9, 0xb8, 0x91, 180),
         })
     }
 }
@@ -89,6 +100,14 @@ impl Theme {
 
     pub fn bold(&self, text: &str) -> String {
         format!("\u{1b}[1m{text}\u{1b}[22m")
+    }
+
+    pub fn italic(&self, text: &str) -> String {
+        format!("\u{1b}[3m{text}\u{1b}[23m")
+    }
+
+    pub fn underline(&self, text: &str) -> String {
+        format!("\u{1b}[4m{text}\u{1b}[24m")
     }
 
     /// Diff row background: codex's dark tints, with a 256-colour fallback.

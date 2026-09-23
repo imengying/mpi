@@ -240,7 +240,7 @@ impl Agent {
         // questions would look like the answers were lost. Environment blocks are skipped —
         // they are bookkeeping, and the newest one is written back below if the directory
         // changed.
-        for block in ui_compact::replay_blocks(&session.context_messages()) {
+        for block in ui_compact::replay_blocks(&session.context_messages(), screen.width()) {
             screen.push(block);
         }
         // The arrows reach back into the conversation, not just into this process: Up on a
@@ -572,7 +572,7 @@ impl Agent {
                 }
                 // Same replay as a start-up resume: the switched-to session has to look
                 // like the session it is, answers included.
-                for block in ui_compact::replay_blocks(&self.session.context_messages()) {
+                for block in ui_compact::replay_blocks(&self.session.context_messages(), self.screen.width()) {
                     self.screen.push(block);
                 }
                 // …and the same history: the arrows belong to the session that is now
@@ -934,8 +934,7 @@ impl Agent {
                     // of tokens costs one redraw rather than one per token.
                     biased;
                     Some(delta) = deltas.recv() => {
-                        apply_delta(&mut self.screen, delta);
-                        drain_deltas(&mut self.screen, &mut deltas);
+                        apply_deltas(&mut self.screen, delta, &mut deltas);
                     }
                     _ = ticker.tick() => self.screen.tick_working(),
                     out = &mut stream => {
@@ -1315,26 +1314,46 @@ fn ticker() -> tokio::time::Interval {
     ticker
 }
 
-/// Show one delta, exactly as a direct sink would have.
+/// Put one delta into the screen's buffer. No redraw: the caller batches.
 fn apply_delta(screen: &mut Screen, delta: Delta) {
     match delta {
         Delta::Text(text) => screen.push_text(&text),
         Delta::Thinking(text) => screen.push_thinking(&text),
-        Delta::Notice(text) => {
-            screen.push_lines(ui_compact::note_lines(
-                &text,
-                crate::ui::screen::Style::new(Color::Dim),
-            ));
-            screen.flush();
-        }
+        Delta::Notice(text) => screen.push_lines(ui_compact::note_lines(
+            &text,
+            crate::ui::screen::Style::new(Color::Dim),
+        )),
     }
 }
 
-/// Move every delta the stream has produced so far into the screen.
-fn drain_deltas(screen: &mut Screen, deltas: &mut tokio::sync::mpsc::UnboundedReceiver<Delta>) {
+/// Apply one delta, take everything queued behind it, and redraw **once**.
+///
+/// One redraw per burst, not one per token. A redraw erases the live region and paints it
+/// again, so doing it per token repaints the input line — and the caret sitting in it — for
+/// every character that arrives, which is what made the caret look unsteady while the model
+/// thought. Exactly one render happens here even when the burst is a single token, or the
+/// first character of an answer would sit in the buffer until the next event.
+fn apply_deltas(
+    screen: &mut Screen,
+    first: Delta,
+    deltas: &mut tokio::sync::mpsc::UnboundedReceiver<Delta>,
+) {
+    apply_delta(screen, first);
     while let Ok(delta) = deltas.try_recv() {
         apply_delta(screen, delta);
     }
+    screen.render();
+}
+
+/// Move everything left in the channel into the screen, redrawing once if it was not empty.
+///
+/// The final drain after the stream ends: anything that arrived behind the last token still
+/// has to be drawn, and there is no next event to draw it on.
+fn drain_deltas(screen: &mut Screen, deltas: &mut tokio::sync::mpsc::UnboundedReceiver<Delta>) {
+    let Some(first) = deltas.try_recv().ok() else {
+        return;
+    };
+    apply_deltas(screen, first, deltas);
 }
 
 /// Exposed for tests: the dialect pi will hand to the policy.
