@@ -13,7 +13,11 @@ use crate::util;
 
 use super::inline;
 
-/// A table wider than this wraps rather than stretching the transcript off the screen.
+/// How wide a table may get before the border is dropped.
+///
+/// A bordered table that has to wrap is worse than a plain one: the columns stop lining up
+/// exactly when the alignment was the reason for the border. Past this the rows are laid
+/// out as plain text with the pipes removed.
 const TABLE_MAX_WIDTH: usize = 100;
 
 /// Flush the pending run into `spans`, if there is one.

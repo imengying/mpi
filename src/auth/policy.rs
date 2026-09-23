@@ -382,7 +382,7 @@ pub fn assess_path(operation: Operation, input: &str, cwd: &Path) -> Assessment 
 }
 
 // ---------------------------------------------------------------------------
-// Literal shell parsing
+// What runs without asking
 // ---------------------------------------------------------------------------
 
 const DATA_ARG_COMMANDS: &[&str] = &["echo", "printf", "true", "false", "uname", "df"];

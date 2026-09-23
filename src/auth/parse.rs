@@ -8,8 +8,6 @@
 //! The dialect matters here: zsh expands `=cmd` and `~+` where bash leaves them literal, so
 //! a word whose meaning differs from its text must not be rewritten into something else.
 
-
-
 /// One parsed word. zsh decides some expansions from the *source* text rather than the
 /// resulting value: a leading `=` or `~` is expanded only when it was not quoted or
 /// escaped, so `quoted` records whether a quote or escape produced the first character.

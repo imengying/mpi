@@ -33,12 +33,6 @@ use crate::ui::screen::{Line, Span, Style};
 use crate::ui::theme::Color;
 use crate::util;
 
-/// How wide a table may get before the border is dropped.
-///
-/// A bordered table that has to wrap is worse than a plain one: the columns stop lining up
-/// exactly when the alignment was the reason for the border. Past this the rows are laid
-/// out as plain text with the pipes removed.
-
 /// Indent for a fenced block's body, so code is visibly set in from the prose.
 const CODE_INDENT: &str = "  ";
 
