@@ -473,10 +473,6 @@ impl Config {
         found
     }
 
-    pub fn spec_of(&self, provider: &Provider, model: &ModelConfig) -> String {
-        format!("{}/{}", provider.name, model.id)
-    }
-
     /// Provider names to model specs, in configuration order. This list *is* the
     /// `/model` menu, so order matters and nothing is added or hidden.
     pub fn catalogue(&self) -> Vec<(String, String)> {
@@ -802,24 +798,6 @@ fn remove_dir_from_index(root: &Path, id: &str) -> bool {
 pub fn read_dirs_index_for_test(root: &Path) -> BTreeMap<String, String> {
     read_dirs_index(root)
 }
-
-/// Every directory that has sessions, newest id first, as `(id, path)`.
-///
-/// Kept for diagnostics: nothing in the turn loop needs it, but a store whose table is
-/// wrong is otherwise impossible to inspect.
-pub fn known_dirs() -> Vec<(String, String)> {
-    read_dirs_index(&sessions_root()).into_iter().collect()
-}
-
-/// Environment-variable names that must never be read. Kept for completeness: pi
-/// never reads process env values into the transcript on its own.
-pub fn is_secret_env(name: &str) -> bool {
-    let upper = name.to_uppercase();
-    upper.contains("KEY") || upper.contains("TOKEN") || upper.contains("SECRET") || upper.contains("PASSWORD")
-}
-
-/// Placeholder so `BTreeMap` stays in use for deterministic JSON output elsewhere.
-pub type OrderedMap = BTreeMap<String, serde_json::Value>;
 
 #[cfg(test)]
 mod tests {

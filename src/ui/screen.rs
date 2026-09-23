@@ -2261,10 +2261,6 @@ pub fn clear_title() {
 }
 
 /// A convenience wrapper for the home directory shortcut.
-pub fn short_cwd(cwd: &Path) -> String {
-    util::shorten_home(cwd, dirs::home_dir().as_deref())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

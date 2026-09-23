@@ -14,7 +14,7 @@
 use crate::config::Defaults;
 use crate::tools::{Display, ToolOutput};
 use crate::ui::diff;
-use crate::ui::screen::{Bg, Block, Line, Span, Style};
+use crate::ui::screen::{Block, Line, Span, Style};
 use crate::ui::theme::{Color, Theme};
 use crate::util;
 
@@ -39,18 +39,6 @@ pub fn status_mark(running: bool, failed: bool) -> (Style, &'static str) {
     } else {
         (Style::bold(Color::Green), "✓")
     }
-}
-
-/// Like [`tool_block`], but for a call that has not finished yet: no output, no duration,
-/// and a `●` mark instead of a verdict.
-pub fn running_block(name: &str, arguments: &serde_json::Value) -> Block {
-    let empty = ToolOutput {
-        content: String::new(),
-        display: arguments_display(name, arguments),
-        is_error: false,
-        duration: None,
-    };
-    tool_block_with(name, arguments, &empty, true)
 }
 
 /// The display a call would have, derived from its arguments alone. Used while running,
@@ -369,11 +357,6 @@ pub fn thinking_done_lines() -> Vec<Line> {
     vec![Line::new("思考完成", Style::new(Color::Dim))]
 }
 
-/// How many rows the collapsed command preview keeps.
-pub fn command_preview() -> usize {
-    Defaults::COMMAND_PREVIEW_LINES
-}
-
 /// The single line for a call in flight: `● $ sleep 30`.
 ///
 /// Only the first line of a multi-line command, matching the collapsed transcript row, so
@@ -486,15 +469,6 @@ pub fn highlight_spans(line: &str) -> Vec<Span> {
     spans
 }
 
-/// The diff background style for a row kind.
-pub fn diff_style(kind: diff::Kind) -> Style {
-    match kind {
-        diff::Kind::Added => Style::with_bg(Color::DiffAddedText, Bg::Added),
-        diff::Kind::Removed => Style::with_bg(Color::DiffRemovedText, Bg::Removed),
-        diff::Kind::Context => Style::new(Color::Dim),
-    }
-}
-
 fn theme_path(arguments: &serde_json::Value) -> String {
     arguments
         .get("path")
@@ -506,6 +480,7 @@ fn theme_path(arguments: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::screen::Bg;
     use crate::ui::plain;
 
     #[test]

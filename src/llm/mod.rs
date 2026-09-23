@@ -11,7 +11,7 @@ pub mod responses;
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::{ModelConfig, Provider, level_index};
+use crate::config::{ModelConfig, Provider};
 use crate::util;
 
 /// The wire protocols pi speaks. The config's `api` field names one of these directly, so
@@ -213,13 +213,6 @@ pub enum StopReason {
     Pause,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Role {
-    System,
-    User,
-    Assistant,
-}
-
 /// A tool as advertised to the model. Ordering is fixed by the tool registry so the
 /// tool block is a stable cache prefix.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -372,13 +365,6 @@ pub fn clamp_level(model: &ModelConfig, level: &str) -> (String, bool) {
     }
     let clamped = model.clamp_level(level);
     (clamped, true)
-}
-
-/// True when the level names sort in pi's canonical order.
-pub fn levels_sorted(levels: &[String]) -> bool {
-    levels
-        .windows(2)
-        .all(|pair| level_index(&pair[0]).unwrap_or(0) < level_index(&pair[1]).unwrap_or(0))
 }
 
 /// Rough token estimate for a whole request, used by the threshold compaction path.

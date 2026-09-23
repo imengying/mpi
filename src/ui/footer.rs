@@ -159,15 +159,6 @@ pub fn git_branch(cwd: &Path) -> Option<String> {
     None
 }
 
-/// Colour for a transcript-level status dot.
-pub fn status_style(ok: bool) -> (Style, &'static str) {
-    if ok {
-        (Style { fg: Color::Green, bold: true, ..Style::plain() }, "✓")
-    } else {
-        (Style { fg: Color::Red, bold: true, ..Style::plain() }, "×")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
