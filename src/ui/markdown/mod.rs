@@ -121,13 +121,16 @@ fn is_blank_line(line: &Line) -> bool {
 
 /// One line of a fenced block. The indent is part of the line, and `hang` matches it so a
 /// wrapped code line lines up under the code rather than under the frame.
-fn paint_code(lang: Option<&str>, raw: &[String]) -> Vec<Line> {
-    code::highlight_fence(lang, raw)
-        .into_iter()
-        .map(|spans| {
-            let mut all = vec![Span::new(CODE_INDENT, Style::plain())];
-            all.extend(spans);
-            Line::hanging(all, CODE_INDENT.len())
+///
+/// The text is passed through untouched. Colour here would have to come from a tokeniser,
+/// and a tokeniser that is wrong about a language is worse than none: it repaints code the
+/// reader is trying to check, and it cannot know which of the languages a model invents a
+/// fence is even asking for.
+fn paint_code(raw: &[String]) -> Vec<Line> {
+    raw.iter()
+        .map(|line| {
+            let spans = vec![Span::new(CODE_INDENT, Style::plain()), Span::plain(line.clone())];
+            Line::hanging(spans, CODE_INDENT.len())
         })
         .collect()
 }
@@ -182,7 +185,7 @@ impl Fence {
     /// and a frame that does not close is worse than no frame. Its length comes from the
     /// longest line, so a block of short commands is not wrapped in sixty columns of rule.
     fn frame(&self, raw: &[String], width: usize) -> Vec<Line> {
-        let body = paint_code(self.lang.as_deref(), raw);
+        let body = paint_code(raw);
         let longest = body.iter().map(Line::width).max().unwrap_or(0);
         let label = self.label();
         let label_width = label.as_ref().map_or(0, |label| util::width(label));
@@ -537,7 +540,6 @@ fn bare_url(chars: &[char], at: usize) -> Option<(String, usize)> {
 }
 
 mod code;
-mod syntax;
 
 use code::{push, render_table, starts_with};
 
@@ -549,12 +551,6 @@ mod tests {
 
     fn rendered(input: &str) -> Vec<String> {
         render(input, 80).iter().map(visible).collect()
-    }
-
-    fn find<'a>(rows: &'a [Line], needle: &str) -> &'a Line {
-        rows.iter()
-            .find(|row| row.text().contains(needle))
-            .unwrap_or_else(|| panic!("no line contains {needle:?}: {:?}", rendered_rows(rows)))
     }
 
     /// The span whose text *is* `needle`. Positional indexing is not used in these tests:
@@ -616,7 +612,6 @@ mod tests {
         // The body is one row, and the `**` is still there: inside a fence nothing is
         // scanned for emphasis.
         assert_eq!(rendered_rows(&rows)[1], "  let x = **no**;");
-        assert_eq!(span(&rows, "let").style.fg, Color::SyntaxKeyword, "`let` is a keyword");
     }
 
     #[test]
@@ -629,6 +624,26 @@ mod tests {
         assert!(open.starts_with("┌─ bash"), "the language labels the block: {open:?}");
         assert_eq!(text[2].trim(), "echo hi", "{text:?}");
         assert!(text[3].starts_with('└'), "{text:?}");
+    }
+
+    #[test]
+    fn a_fence_body_is_passed_through_untouched() {
+        // The block is a frame, not a repaint. Whatever a model writes inside a fence —
+        // Rust, Kotlin, a language this code has never heard of, or plain prose — reaches
+        // the screen character for character, so what a reader copies is what was written.
+        for (lang, body) in [
+            ("rust", "fn f<'a>(x: &'a str) {}"),
+            ("json", "{\"name\": \"ada\", \"ok\": true}"),
+            ("klingon", "nuqneH 'ej 'ej"),
+        ] {
+            let source = format!("```{lang}\n{body}\n```");
+            let rows = render(&source, 80);
+            assert!(
+                rows.iter().any(|row| row.text().contains(body)),
+                "the body did not survive a `{lang}` fence intact: {:?}",
+                rendered_rows(&rows)
+            );
+        }
     }
 
     #[test]
@@ -650,43 +665,9 @@ mod tests {
         assert!(text.iter().all(|row| !row.contains("```")), "{text:?}");
     }
 
-    #[test]
-    fn an_unknown_language_is_left_plain() {
-        // Colourising an unknown fence would colour prose, which reads worse than no colour.
-        let rows = render("```text\njust words here\n```", 80);
-        let code = find(&rows, "just words");
-        assert!(code.spans.iter().all(|span| span.style == Style::plain()), "{:?}", code);
-    }
 
-    #[test]
-    fn shell_commands_get_their_flags_and_strings_coloured() {
-        let rows = render("```sh\ngit commit -m \"fix\" --amend\n```", 80);
-        let line = find(&rows, "git commit");
-        assert_eq!(span(&rows, "git").style.fg, Color::SyntaxFunction, "{:?}", line.spans);
-        assert!(line.spans.iter().any(|s| s.style.fg == Color::SyntaxString), "{:?}", line.spans);
-        assert_eq!(span(&rows, "--amend").style.fg, Color::SyntaxNumber, "{:?}", line.spans);
-    }
 
-    #[test]
-    fn comments_are_quieter_than_the_code_but_not_hint_grey() {
-        let rows = render("```python\nx = 1  # note\n```", 80);
-        let line = find(&rows, "note");
-        let note = line.spans.iter().find(|s| s.text.contains("note")).unwrap();
-        assert_eq!(note.style.fg, Color::SyntaxComment);
-        assert_ne!(note.style.fg, Color::Dim, "a comment is code, not a UI hint");
-    }
 
-    #[test]
-    fn a_hash_inside_shell_word_is_not_a_comment() {
-        // `${a#b}` is code; colouring from the `#` would dim the rest of the line.
-        let rows = render("```sh\necho ${a#b}\n```", 80);
-        let line = find(&rows, "a#b");
-        assert!(
-            !line.spans.iter().any(|s| s.text.contains("#b}") && s.style.fg == Color::SyntaxComment),
-            "{:?}",
-            line.spans
-        );
-    }
 
     #[test]
     fn a_table_gets_a_border_and_alignment() {
@@ -781,72 +762,10 @@ mod tests {
         assert!(rows[0].spans.iter().any(|s| s.text.starts_with('│') && s.style.fg == Color::Green));
     }
 
-    #[test]
-    fn a_code_block_separates_keywords_calls_types_and_strings() {
-        // Codex's default dark theme (Catppuccin Mocha) gives each of these its own colour.
-        // Folding a call into the keyword colour is what made a block look like one tint.
-        let rows = render("```rust\nfn demo(user: UserId) -> String {\n    let n = 1;\n    print(n)\n}\n```", 80);
-        assert_eq!(span(&rows, "fn").style.fg, Color::SyntaxKeyword);
-        assert_eq!(span(&rows, "demo").style.fg, Color::SyntaxFunction);
-        assert_eq!(span(&rows, "UserId").style.fg, Color::SyntaxType);
-        assert_eq!(span(&rows, "String").style.fg, Color::SyntaxType);
-        assert_eq!(span(&rows, "1").style.fg, Color::SyntaxNumber);
-        assert_eq!(span(&rows, "print").style.fg, Color::SyntaxFunction);
-    }
 
-    #[test]
-    fn a_block_comment_keeps_its_colour_on_the_next_line() {
-        let rows = render("```rust\n/* open\nstill\n*/\nlet x = 1;\n```", 80);
-        let still = find(&rows, "still");
-        assert!(still.spans.iter().any(|s| s.text.contains("still") && s.style.fg == Color::SyntaxComment));
-        assert_eq!(span(&rows, "let").style.fg, Color::SyntaxKeyword);
-    }
 
-    #[test]
-    fn a_lifetime_is_not_a_string() {
-        let rows = render("```rust\nfn f<'a>(x: &'a str) {}\n```", 80);
-        let line = find(&rows, "'a");
-        // The grammar colours the lifetime's name, and leaves the `'` as punctuation.
-        assert!(
-            line.spans.iter().any(|s| s.text == "a" && s.style.fg == Color::SyntaxType),
-            "{:?}",
-            line.spans
-        );
-        assert!(!line.spans.iter().any(|s| s.text.contains('\'') && s.style.fg == Color::SyntaxString));
-    }
 
-    #[test]
-    fn javascript_typescript_and_kotlin_use_their_grammars() {
-        let js = render("```js\nconst n = 1;\nfunction f() {}\n```", 80);
-        assert_eq!(span(&js, "const").style.fg, Color::SyntaxKeyword);
-        assert_eq!(span(&js, "function").style.fg, Color::SyntaxKeyword);
-        assert_eq!(span(&js, "f").style.fg, Color::SyntaxFunction);
-        assert_eq!(span(&js, "1").style.fg, Color::SyntaxNumber);
 
-        let ts = render("```ts\ntype Name = string;\n```", 80);
-        assert_eq!(span(&ts, "type").style.fg, Color::SyntaxKeyword);
-        assert_eq!(span(&ts, "Name").style.fg, Color::SyntaxType);
-
-        let kt = render("```kotlin\nfun main(name: String) {}\n```", 80);
-        assert_eq!(span(&kt, "fun").style.fg, Color::SyntaxKeyword);
-        assert_eq!(span(&kt, "main").style.fg, Color::SyntaxFunction);
-        assert_eq!(span(&kt, "String").style.fg, Color::SyntaxType);
-    }
-
-    #[test]
-    fn python_and_json_use_their_grammars() {
-        let py = render("```python\ndef greet(name):\n    return name  # hi\n```", 80);
-        assert_eq!(span(&py, "def").style.fg, Color::SyntaxKeyword);
-        assert_eq!(span(&py, "greet").style.fg, Color::SyntaxFunction);
-        assert_eq!(span(&py, "return").style.fg, Color::SyntaxKeyword);
-        let note = find(&py, "hi");
-        assert!(note.spans.iter().any(|s| s.text.contains("hi") && s.style.fg == Color::SyntaxComment));
-
-        let json = render("```json\n{\"name\": \"ada\", \"ok\": true}\n```", 80);
-        assert_eq!(span(&json, "\"name\"").style.fg, Color::SyntaxFunction, "a key is not a value");
-        assert_eq!(span(&json, "\"ada\"").style.fg, Color::SyntaxString);
-        assert_eq!(span(&json, "true").style.fg, Color::SyntaxNumber);
-    }
 
     #[test]
     fn rules_lose_their_syntax() {

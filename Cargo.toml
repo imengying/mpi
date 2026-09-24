@@ -33,18 +33,6 @@ arboard = { version = "3.6", features = ["wayland-data-control"] }
 # Already in the tree via reqwest; declared because the image path needs it directly.
 base64 = "0.23"
 png = "0.18"
-# Syntax highlighting. The grammars are tree-sitter's, and only these are linked:
-# Rust, JavaScript, TypeScript, Bash, Kotlin, Python and JSON. Everything else
-# stays on the small hand-written scanner.
-tree-sitter = { version = "0.25.10", default-features = false, features = ["std"] }
-tree-sitter-highlight = "0.25.10"
-tree-sitter-rust = "0.24.2"
-tree-sitter-javascript = "0.25.0"
-tree-sitter-typescript = "0.23.2"
-tree-sitter-bash = "0.25.1"
-tree-sitter-kotlin-ng = "1.1.0"
-tree-sitter-python = "0.25.0"
-tree-sitter-json = "0.24.8"
 
 [profile.release]
 # Shipping profile in the shape fast CLIs use: full opts, thin LTO, one codegen
