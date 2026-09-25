@@ -2,8 +2,15 @@
 //!
 //! The subset is deliberately tiny: quotes, escapes, `&&`/`||`/`;`/`|` separators, and
 //! plain words. Anything whose meaning depends on evaluation — `$(…)`, backticks, `*`,
-//! redirections, background jobs — is a parse error rather than a guess. A command pi
-//! cannot read is a command it asks the user about.
+//! background jobs — is a parse error rather than a guess. A command pi cannot read is a
+//! command it asks the user about.
+//!
+//! Redirections are the one exception, because the common ones do not touch a file at all.
+//! `2>&1` and `2>/dev/null` move or discard a file descriptor; they appear in a large share
+//! of the commands a model writes by habit, and refusing them teaches the model to reach
+//! for something worse — the refusal of `cargo test 2>&1` in practice produced a
+//! `python3 - <<EOF`, which is a script that can do anything. So the descriptor forms are
+//! parsed and passed through, and only a redirection that names a real file is a refusal.
 //!
 //! The dialect matters here: zsh expands `=cmd` and `~+` where bash leaves them literal, so
 //! a word whose meaning differs from its text must not be rewritten into something else.
@@ -23,6 +30,62 @@ pub struct Word {
 pub struct Segment {
     pub words: Vec<Word>,
     pub operator: Option<String>,
+    /// Redirections that only move or discard a file descriptor, kept in the form they
+    /// were written so the command that runs is the command that was checked.
+    ///
+    /// Only descriptor forms land here — [`descriptor_redirect`] returns nothing for a
+    /// redirection that names a file, and the parser refuses those.
+    pub redirects: Vec<String>,
+}
+
+/// Parse a redirection that does not touch the filesystem, returning the text to put back
+/// into the command and the index just past it. `None` means it names a real file (or is
+/// malformed), which the caller refuses.
+///
+/// `2>&1` duplicates a descriptor and `2>/dev/null` writes to the discard device: neither
+/// can create, truncate or leak anything a reader would care about. `fd` is the descriptor
+/// number written before the operator, empty when the command did not name one.
+fn descriptor_redirect(chars: &[char], from: usize, fd: &str) -> Option<(usize, String)> {
+    let op = *chars.get(from)?;
+    let mut i = from + 1;
+    // `2>&1`, `>&2`, `2>&-`, and the input equivalents: a descriptor is named, not a path.
+    if chars.get(i) == Some(&'&') {
+        let mut j = i + 1;
+        let start = j;
+        while chars.get(j).is_some_and(char::is_ascii_digit) {
+            j += 1;
+        }
+        if j > start {
+            let target: String = chars[start..j].iter().collect();
+            return Some((j, format!("{fd}{op}&{target}")));
+        }
+        if chars.get(j) == Some(&'-') {
+            return Some((j + 1, format!("{fd}{op}&-")));
+        }
+        // `>& file` sends both streams to a file: that is a write.
+        return None;
+    }
+    // Appending is still writing, so only the discard device is accepted either way.
+    let append = op == '>' && chars.get(i) == Some(&'>');
+    if append {
+        i += 1;
+    }
+    while chars.get(i) == Some(&' ') {
+        i += 1;
+    }
+    let start = i;
+    while chars
+        .get(i)
+        .is_some_and(|c| !c.is_whitespace() && !matches!(c, '<' | '>' | '|' | '&' | ';'))
+    {
+        i += 1;
+    }
+    let target: String = chars[start..i].iter().collect();
+    if target == "/dev/null" {
+        let arrows = if append { ">>" } else { "" };
+        return Some((i, format!("{fd}{op}{arrows}/dev/null")));
+    }
+    None
 }
 
 /// Recognise a small literal-shell subset. Everything else returns `Err(reason)` so the
@@ -34,6 +97,7 @@ pub fn parse_literal_commands(command: &str) -> Result<Vec<Segment>, String> {
     let chars: Vec<char> = command.chars().collect();
     let mut segments: Vec<Segment> = Vec::new();
     let mut words: Vec<Word> = Vec::new();
+    let mut redirects: Vec<String> = Vec::new();
     let mut word = String::new();
     let mut started = false;
     let mut quoted_start = false;
@@ -58,7 +122,11 @@ pub fn parse_literal_commands(command: &str) -> Result<Vec<Segment>, String> {
             if words.is_empty() {
                 false
             } else {
-                segments.push(Segment { words: std::mem::take(&mut words), operator: $operator });
+                segments.push(Segment {
+                    words: std::mem::take(&mut words),
+                    operator: $operator,
+                    redirects: std::mem::take(&mut redirects),
+                });
                 true
             }
         }};
@@ -173,12 +241,26 @@ pub fn parse_literal_commands(command: &str) -> Result<Vec<Segment>, String> {
                 }
                 index += 1;
             }
-            '<' | '>' | '(' | ')' | '{' | '}' | '*' | '?' | '[' | ']' => {
-                return Err(if c == '<' || c == '>' {
-                    "重定向可能写入文件或执行脚本".into()
-                } else {
-                    "通配符或复合 shell 语法需要确认".into()
-                });
+            '<' | '>' => {
+                // A descriptor number is written straight against the operator (`2>&1`),
+                // so the word the scanner is holding is either that number or nothing.
+                // Anything else — `echo a>f` — names a file, and is refused.
+                let fd = std::mem::take(&mut word);
+                if !fd.is_empty() && (!fd.chars().all(|c| c.is_ascii_digit()) || !started) {
+                    return Err("重定向可能写入文件或执行脚本".into());
+                }
+                match descriptor_redirect(&chars, index, &fd) {
+                    Some((end, text)) => {
+                        started = false;
+                        quoted_start = false;
+                        redirects.push(text);
+                        index = end;
+                    }
+                    None => return Err("重定向可能写入文件或执行脚本".into()),
+                }
+            }
+            '(' | ')' | '{' | '}' | '*' | '?' | '[' | ']' => {
+                return Err("通配符或复合 shell 语法需要确认".into());
             }
             other => {
                 started = true;

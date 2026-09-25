@@ -343,11 +343,22 @@ Linux 二进制依赖 runner 自带的 glibc（当前 2.39），构建摘要里�
 **自动放行**：白名单里的简单只读命令（`pwd ls cat head tail wc stat readlink realpath
 printf echo true false cut tr du df uname rg grep find sort file sed git`），
 其中 `git` 只放行 `status diff log show rev-parse ls-files ls-tree`，
-`sed` 只放行纯行范围打印；以及当前项目目录内的普通 `edit` / `write`。
+`sed` 只放行纯行范围打印；`which date nproc uptime free ps id whoami basename dirname
+column lscpu seq` 这类探查命令也放行——它们改不了任何东西；
+以及当前项目目录内的普通 `edit` / `write`。
 
-**需要授权**：删除、提权、Git 写操作、网络传输、脚本、重定向、变量或命令替换、
-写到项目目录外、敏感路径（`~/.ssh`、`.env*`、`id_rsa`、`~/.pi`、`~/.codex`、`*.pem` 等）、
-以及任何未被识别的选项或语法。
+`cd` 放行，但它后面的命令按**实际运行的位置**检查：`cd /etc && cat shadow`
+读的是 `/etc/shadow`，按项目目录判断相对路径会把它看成无害的名字。
+`cd -`、多参数、不存在的目录、以及目标经过符号链接的情况仍然询问。
+
+只挪文件描述符的重定向（`2>&1`、`2>/dev/null`、`>&2`、`2>&-`、`> /dev/null`）放行，
+碰文件的一律询问（`> file`、`>> file`、`< file`、`>& file`、heredoc）。
+拒绝 `2>&1` 看着安全，实际会把模型逼向 `python3 - <<EOF` 那种能执行任意代码的写法。
+
+**需要授权**：删除、提权、Git 写操作、网络传输、脚本、变量或命令替换、
+会写文件的重定向、写到项目目录外、
+敏感路径（`~/.ssh`、`.env*`、`id_rsa`、`~/.pi`、`~/.codex`、`*.pem` 等）、
+以及任何未被识别的选项或语法。`env` 不放行：裸 `env` 打印全部环境变量（含 provider key）。
 
 路径检查逐参数进行，覆盖 `--file=/path`、`-f/path` 与 `-nf/path`（按 `-n -f /path` 理解）
 三种写法，`git show <rev>:<path>` 冒号后的路径也检查。

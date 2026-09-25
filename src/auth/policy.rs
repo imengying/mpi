@@ -385,13 +385,33 @@ pub fn assess_path(operation: Operation, input: &str, cwd: &Path) -> Assessment 
 // What runs without asking
 // ---------------------------------------------------------------------------
 
-const DATA_ARG_COMMANDS: &[&str] = &["echo", "printf", "true", "false", "uname", "df"];
+/// Commands whose arguments are data rather than paths.
+///
+/// `basename` and `dirname` never open what they are given — `basename /etc/shadow` prints
+/// `shadow` — so path-checking their arguments invents a leak that cannot happen. The rest
+/// are the printing commands whose arguments are text.
+const DATA_ARG_COMMANDS: &[&str] = &[
+    "echo", "printf", "true", "false", "uname", "df", "basename", "dirname",
+];
 
 /// Commands auto-approved when every argument checks out.
+///
+/// The second group is the inspection tools a model reaches for constantly and that cannot
+/// change anything: `which` finds a binary, `date` prints the clock, `ps` lists processes.
+/// They were all asking before, and a question that always has the same answer is a tax on
+/// every turn — the refusal is not protecting anything, it is being clicked through.
+///
+/// Membership is not a promise that a command is harmless with *any* argument. `date -s`
+/// sets the system clock, so the ones with a dangerous option get a check in [`vet_segment`]
+/// alongside the rest. `env` is deliberately absent: bare `env` prints every environment
+/// variable, provider keys included, and `env cmd` runs an arbitrary command.
 const READ_COMMANDS: &[&str] = &[
     "pwd", "ls", "cat", "head", "tail", "wc", "stat", "readlink", "realpath", "printf",
     "echo", "true", "false", "cut", "tr", "du", "df", "uname", "rg", "grep", "find",
     "sort", "file", "sed",
+    // Inspection only: no argument writes, and nothing here reads a path as data.
+    "which", "date", "nproc", "uptime", "free", "ps", "id", "whoami", "basename", "dirname",
+    "column", "lscpu", "seq",
 ];
 
 /// Where a trusted executable may live. Anything else (including a `./cat`) is not
@@ -575,6 +595,153 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+/// The per-command option rules.
+///
+/// Every command in [`READ_COMMANDS`] has its own idea of which arguments are safe, and a
+/// few have an option that turns a read into something else — `sort -o` writes, `find
+/// -exec` runs, `file -z` unpacks. They live together, away from the parsing and path
+/// checking that every command shares, so a rule can be read next to the command it
+/// belongs to instead of inside a 200-line function.
+///
+/// `args` has already had `~` expanded and dialect rewrites resolved. `Some(reason)` asks
+/// the user; `None` means the command's options were all recognised.
+fn option_problem(name: &str, args: &[String]) -> Option<String> {
+if name == "rg"
+    && args
+        .iter()
+        .any(|arg| arg.starts_with("--pre=") || arg == "--pre" || arg.starts_with("--hostname-bin"))
+{
+    return Some("搜索参数会启动外部程序".to_string());
+}
+if name == "find"
+    && args.iter().any(|arg| {
+        matches!(
+            arg.as_str(),
+            "-exec" | "-execdir" | "-ok" | "-okdir" | "-delete" | "-fprint" | "-fprint0"
+                | "-fprintf" | "-fls"
+        )
+    })
+{
+    return Some("find 参数会执行命令、删除或写入文件".to_string());
+}
+if name == "sort"
+    && args.iter().any(|arg| {
+        matches!(arg.as_str(), "--output" | "--compress-program")
+            || arg.starts_with("--output=")
+            || arg.starts_with("--compress-program=")
+            || (arg.starts_with('-') && !arg.starts_with("--") && arg[1..].contains('o'))
+    })
+{
+    return Some("sort 参数会写入文件或执行外部程序".to_string());
+}
+if name == "file"
+    && args.iter().any(|arg| arg.starts_with("--uncompress") || (arg.starts_with('-') && !arg.starts_with("--") && (arg.contains('z') || arg.contains('Z'))))
+{
+    return Some("file 解压参数可能调用外部程序".to_string());
+}
+
+match name {
+    "sort" => {
+        if !known_long_options(
+            args,
+            &[
+                "--numeric-sort", "--general-numeric-sort", "--human-numeric-sort",
+                "--version-sort", "--reverse", "--unique", "--stable", "--ignore-case",
+                "--ignore-leading-blanks", "--field-separator", "--key", "--check",
+                "--help", "--version",
+            ],
+        ) || !known_short_options(args, "nNgGhHrVuMsbfcdm", "kt")
+        {
+            return Some("sort 参数未被确认为只读".to_string());
+        }
+    }
+    "file" => {
+        if !known_long_options(
+            args,
+            &[
+                "--brief", "--mime", "--mime-type", "--mime-encoding", "--dereference",
+                "--separator", "--keep-going", "--version", "--help",
+            ],
+        ) || !known_short_options(args, "bikLNprsv0", "fm")
+        {
+            return Some("file 参数未被确认为只读".to_string());
+        }
+    }
+    "rg" => {
+        if !known_long_options(
+            args,
+            &[
+                "--files", "--hidden", "--no-ignore", "--no-ignore-vcs", "--no-ignore-parent",
+                "--no-ignore-global", "--glob", "--iglob", "--type", "--type-not",
+                "--type-list", "--line-number", "--no-line-number", "--count",
+                "--count-matches", "--with-filename", "--no-filename", "--ignore-case",
+                "--smart-case", "--case-sensitive", "--fixed-strings", "--word-regexp",
+                "--line-regexp", "--invert-match", "--max-count", "--max-depth",
+                "--max-filesize", "--context", "--before-context", "--after-context",
+                "--color", "--colors", "--heading", "--no-heading", "--sort", "--sortr",
+                "--stats", "--json", "--only-matching", "--replace", "--trim", "--pcre2",
+                "--multiline", "--multiline-dotall", "--follow", "--files-without-match",
+                "--files-with-matches", "--null", "--null-data", "--text", "--regexp",
+                "--file", "--quiet", "--encoding", "--no-messages", "--version", "--help",
+                "--crlf",
+            ],
+        ) || !known_short_options(args, "nHhIilLovswxUaFcqSPz0u", "egftTrABCm")
+        {
+            return Some("rg 参数未被确认为只读".to_string());
+        }
+    }
+    "find" => {
+        let known: HashSet<&str> = [
+            "-name", "-iname", "-path", "-ipath", "-regex", "-iregex", "-type", "-maxdepth",
+            "-mindepth", "-print", "-print0", "-ls", "-empty", "-size", "-mtime", "-mmin",
+            "-atime", "-amin", "-ctime", "-cmin", "-newer", "-anewer", "-cnewer", "-user",
+            "-group", "-perm", "-a", "-and", "-o", "-or", "-not", "-true", "-false",
+            "-readable", "-writable", "-executable", "-P", "-H", "-L",
+        ]
+        .into_iter()
+        .collect();
+        let looks_numeric = |arg: &str| {
+            arg.strip_prefix('-')
+                .is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()))
+        };
+        if args.iter().any(|arg| {
+            arg.starts_with('-') && !known.contains(arg.as_str()) && !looks_numeric(arg)
+        }) {
+            return Some("find 参数未被确认为只读".to_string());
+        }
+    }
+    "sed" => {
+        let rest: Vec<&String> = if args.first().map(String::as_str) == Some("-n") {
+            args[1..].iter().collect()
+        } else {
+            args.iter().collect()
+        };
+        let script_ok = rest.first().is_some_and(|script| is_line_range_print(script));
+        if !script_ok || rest[1..].iter().any(|arg| arg.starts_with('-')) {
+            return Some("只自动放行 sed 的行范围打印；编辑、脚本及其他参数需要确认".to_string());
+        }
+    }
+    "date" => {
+        // `date -s` sets the system clock and `date -f` reads a file as input; every
+        // other option only formats the current time, which cannot change anything.
+        // This one is a block-list rather than an allow-list because `date` takes a
+        // format string as a bare argument (`date +%Y-%m-%d`), so an allow-list would
+        // have to enumerate every date format a caller might want.
+        let sets_or_reads = args.iter().any(|arg| {
+            matches!(arg.as_str(), "-s" | "--set" | "-f" | "--file")
+                || arg.starts_with("--set=")
+                || arg.starts_with("--file=")
+                || (arg.starts_with("-s") && arg.len() > 2 && !arg.starts_with("--"))
+        });
+        if sets_or_reads {
+            return Some("date 参数会设置系统时间或读取文件".to_string());
+        }
+    }
+    _ => {}
+}
+    None
+}
+
 fn vet_segment(words: &[Word], cwd: &Path, dialect: Dialect) -> Assessment {
     let Some((command, raw_args)) = words.split_first() else {
         return Assessment::ask("未找到可执行命令");
@@ -616,175 +783,12 @@ fn vet_segment(words: &[Word], cwd: &Path, dialect: Dialect) -> Assessment {
         args.push(expanded);
     }
 
-    // Vetted read operations must not sneak in subcommands or output-file flags.
-    if name == "rg"
-        && args
-            .iter()
-            .any(|arg| arg.starts_with("--pre=") || arg == "--pre" || arg.starts_with("--hostname-bin"))
-    {
-        return Assessment::ask("搜索参数会启动外部程序");
-    }
-    if name == "find"
-        && args.iter().any(|arg| {
-            matches!(
-                arg.as_str(),
-                "-exec" | "-execdir" | "-ok" | "-okdir" | "-delete" | "-fprint" | "-fprint0"
-                    | "-fprintf" | "-fls"
-            )
-        })
-    {
-        return Assessment::ask("find 参数会执行命令、删除或写入文件");
-    }
-    if name == "sort"
-        && args.iter().any(|arg| {
-            matches!(arg.as_str(), "--output" | "--compress-program")
-                || arg.starts_with("--output=")
-                || arg.starts_with("--compress-program=")
-                || (arg.starts_with('-') && !arg.starts_with("--") && arg[1..].contains('o'))
-        })
-    {
-        return Assessment::ask("sort 参数会写入文件或执行外部程序");
-    }
-    if name == "file"
-        && args.iter().any(|arg| arg.starts_with("--uncompress") || (arg.starts_with('-') && !arg.starts_with("--") && (arg.contains('z') || arg.contains('Z'))))
-    {
-        return Assessment::ask("file 解压参数可能调用外部程序");
+    if let Some(reason) = option_problem(&name, &args) {
+        return Assessment::ask(reason);
     }
 
-    match name.as_str() {
-        "sort" => {
-            if !known_long_options(
-                &args,
-                &[
-                    "--numeric-sort", "--general-numeric-sort", "--human-numeric-sort",
-                    "--version-sort", "--reverse", "--unique", "--stable", "--ignore-case",
-                    "--ignore-leading-blanks", "--field-separator", "--key", "--check",
-                    "--help", "--version",
-                ],
-            ) || !known_short_options(&args, "nNgGhHrVuMsbfcdm", "kt")
-            {
-                return Assessment::ask("sort 参数未被确认为只读");
-            }
-        }
-        "file" => {
-            if !known_long_options(
-                &args,
-                &[
-                    "--brief", "--mime", "--mime-type", "--mime-encoding", "--dereference",
-                    "--separator", "--keep-going", "--version", "--help",
-                ],
-            ) || !known_short_options(&args, "bikLNprsv0", "fm")
-            {
-                return Assessment::ask("file 参数未被确认为只读");
-            }
-        }
-        "rg" => {
-            if !known_long_options(
-                &args,
-                &[
-                    "--files", "--hidden", "--no-ignore", "--no-ignore-vcs", "--no-ignore-parent",
-                    "--no-ignore-global", "--glob", "--iglob", "--type", "--type-not",
-                    "--type-list", "--line-number", "--no-line-number", "--count",
-                    "--count-matches", "--with-filename", "--no-filename", "--ignore-case",
-                    "--smart-case", "--case-sensitive", "--fixed-strings", "--word-regexp",
-                    "--line-regexp", "--invert-match", "--max-count", "--max-depth",
-                    "--max-filesize", "--context", "--before-context", "--after-context",
-                    "--color", "--colors", "--heading", "--no-heading", "--sort", "--sortr",
-                    "--stats", "--json", "--only-matching", "--replace", "--trim", "--pcre2",
-                    "--multiline", "--multiline-dotall", "--follow", "--files-without-match",
-                    "--files-with-matches", "--null", "--null-data", "--text", "--regexp",
-                    "--file", "--quiet", "--encoding", "--no-messages", "--version", "--help",
-                    "--crlf",
-                ],
-            ) || !known_short_options(&args, "nHhIilLovswxUaFcqSPz0u", "egftTrABCm")
-            {
-                return Assessment::ask("rg 参数未被确认为只读");
-            }
-        }
-        "find" => {
-            let known: HashSet<&str> = [
-                "-name", "-iname", "-path", "-ipath", "-regex", "-iregex", "-type", "-maxdepth",
-                "-mindepth", "-print", "-print0", "-ls", "-empty", "-size", "-mtime", "-mmin",
-                "-atime", "-amin", "-ctime", "-cmin", "-newer", "-anewer", "-cnewer", "-user",
-                "-group", "-perm", "-a", "-and", "-o", "-or", "-not", "-true", "-false",
-                "-readable", "-writable", "-executable", "-P", "-H", "-L",
-            ]
-            .into_iter()
-            .collect();
-            let looks_numeric = |arg: &str| {
-                arg.strip_prefix('-')
-                    .is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()))
-            };
-            if args.iter().any(|arg| {
-                arg.starts_with('-') && !known.contains(arg.as_str()) && !looks_numeric(arg)
-            }) {
-                return Assessment::ask("find 参数未被确认为只读");
-            }
-        }
-        "sed" => {
-            let rest: Vec<&String> = if args.first().map(String::as_str) == Some("-n") {
-                args[1..].iter().collect()
-            } else {
-                args.iter().collect()
-            };
-            let script_ok = rest.first().is_some_and(|script| is_line_range_print(script));
-            if !script_ok || rest[1..].iter().any(|arg| arg.starts_with('-')) {
-                return Assessment::ask("只自动放行 sed 的行范围打印；编辑、脚本及其他参数需要确认");
-            }
-        }
-        _ => {}
-    }
-
-    // Check every argument a literal path could hide in, including option values such as
-    // `--file=...`. `cat id_rsa` matters as much as `cat .ssh/id_rsa`, and printing
-    // commands carry data rather than paths, so they are exempt.
-    if !DATA_ARG_COMMANDS.contains(&name.as_str()) {
-        let mut pending: Option<Operation> = None;
-        for arg in &args {
-            if arg == "--" {
-                pending = None;
-                continue;
-            }
-            if let Some(operation) = pending
-                && !arg.starts_with('-') {
-                    let decision = assess_path(operation, arg, cwd);
-                    pending = None;
-                    if !decision.allows() {
-                        return decision;
-                    }
-                    continue;
-                }
-            pending = None;
-            if arg.starts_with('-') && !arg.starts_with("--")
-                && let Some((value, operation)) = glued_short_value(&name, arg) {
-                    if value.is_empty() {
-                        pending = Some(operation);
-                        continue;
-                    }
-                    let decision = assess_path(operation, &value, cwd);
-                    if !decision.allows() {
-                        return decision;
-                    }
-                    continue;
-                }
-            let values: Vec<&str> = if arg.starts_with('-') && !arg.starts_with("-/") && !arg.starts_with("-~") {
-                match arg.split_once('=') {
-                    Some((_, value)) => vec![value],
-                    None => Vec::new(),
-                }
-            } else {
-                vec![arg.as_str()]
-            };
-            for value in values {
-                if value.is_empty() {
-                    continue;
-                }
-                let decision = assess_path(Operation::Read, value, cwd);
-                if !decision.allows() {
-                    return decision;
-                }
-            }
-        }
+    if let Some(decision) = path_problem(&name, &args, cwd) {
+        return decision;
     }
 
     if name == "git" {
@@ -795,6 +799,70 @@ fn vet_segment(words: &[Word], cwd: &Path, dialect: Dialect) -> Assessment {
     Assessment::Allow {
         safe_command: Some(rewritten.iter().map(|w| shell_quote(w)).collect::<Vec<_>>().join(" ")),
     }
+}
+
+/// Check every argument a literal path could hide in, including option values such as
+/// `--file=...`.
+///
+/// `cat id_rsa` matters as much as `cat .ssh/id_rsa`, and a name that is only sensitive
+/// inside the home directory is judged against `cwd` — which for a `cd`-prefixed line is
+/// where that segment will really run. Printing commands
+/// ([`DATA_ARG_COMMANDS`]) carry data rather than paths and are exempt.
+///
+/// `Some(decision)` means an argument was refused; `None` means they all checked out.
+fn path_problem(name: &str, args: &[String], cwd: &Path) -> Option<Assessment> {
+// Check every argument a literal path could hide in, including option values such as
+// `--file=...`. `cat id_rsa` matters as much as `cat .ssh/id_rsa`, and printing
+// commands carry data rather than paths, so they are exempt.
+if !DATA_ARG_COMMANDS.contains(&name) {
+    let mut pending: Option<Operation> = None;
+    for arg in args {
+        if arg == "--" {
+            pending = None;
+            continue;
+        }
+        if let Some(operation) = pending
+            && !arg.starts_with('-') {
+                let decision = assess_path(operation, arg, cwd);
+                pending = None;
+                if !decision.allows() {
+                    return Some(decision);
+                }
+                continue;
+            }
+        pending = None;
+        if arg.starts_with('-') && !arg.starts_with("--")
+            && let Some((value, operation)) = glued_short_value(name, arg) {
+                if value.is_empty() {
+                    pending = Some(operation);
+                    continue;
+                }
+                let decision = assess_path(operation, &value, cwd);
+                if !decision.allows() {
+                    return Some(decision);
+                }
+                continue;
+            }
+        let values: Vec<&str> = if arg.starts_with('-') && !arg.starts_with("-/") && !arg.starts_with("-~") {
+            match arg.split_once('=') {
+                Some((_, value)) => vec![value],
+                None => Vec::new(),
+            }
+        } else {
+            vec![arg.as_str()]
+        };
+        for value in values {
+            if value.is_empty() {
+                continue;
+            }
+            let decision = assess_path(Operation::Read, value, cwd);
+            if !decision.allows() {
+                return Some(decision);
+            }
+        }
+    }
+}
+    None
 }
 
 /// `sed -n '1,10p' file`, `sed -n '5p' file`, `sed '1,$p' file`. Nothing else.
@@ -915,6 +983,52 @@ fn git_short_options_ok(options: &[String]) -> bool {
     true
 }
 
+/// Recognise `cd`, and resolve the directory the *rest* of the line will run in.
+///
+/// `cd` itself does nothing — it cannot read or write anything. What makes it worth
+/// handling is the segments after it: `cd /etc && cat shadow` reads `/etc/shadow`, and a
+/// check that resolved `shadow` against the project directory would call it safe while the
+/// shell read something else. So the tracked directory moves with the `cd`, and every later
+/// segment is vetted against where it will really run.
+///
+/// `None` means this is not a `cd`. `Some(Err)` asks the user.
+fn cd_target(words: &[Word], cwd: &Path, dialect: Dialect) -> Option<Result<PathBuf, String>> {
+    let (command, args) = words.split_first()?;
+    if command.value != "cd" || command.quoted {
+        return None;
+    }
+    let raw = match args {
+        // A bare `cd` goes home, which is knowable.
+        [] => "~".to_string(),
+        [only] => {
+            // `cd -` is the previous directory: it depends on what ran before, which this
+            // check cannot see.
+            if only.value == "-" {
+                return Some(Err("cd - 的目标取决于更早的命令，无法确认".into()));
+            }
+            only.value.clone()
+        }
+        _ => return Some(Err("cd 的参数未被确认为单个目录".into())),
+    };
+    let Some(expanded) = expand_home(&raw, dialect) else {
+        return Some(Err("cd 的参数含无法可靠解析的 shell 展开".into()));
+    };
+    let lexical = resolve_tool_path(&expanded, cwd);
+    let Ok(target) = canonical_path(&lexical, 0) else {
+        return Some(Err("cd 的目标路径无法可靠解析".into()));
+    };
+    if !target.is_dir() {
+        return Some(Err("cd 的目标不是目录".into()));
+    }
+    if lexical != target {
+        // The shell keeps the path it was handed while the files resolve through the link,
+        // so `cd link` followed by `cat ..` means one directory to zsh and another to this
+        // check. Refusing keeps the checked path and the executed path the same one.
+        return Some(Err("cd 的目标经过符号链接，其后的相对路径无法确认".into()));
+    }
+    Some(Ok(target))
+}
+
 /// Assess a whole command line, returning a rewritten equivalent when it is safe.
 pub fn assess_command(command: &str, cwd: &Path, dialect: Dialect) -> Assessment {
     if command.trim().is_empty() {
@@ -931,12 +1045,34 @@ pub fn assess_command(command: &str, cwd: &Path, dialect: Dialect) -> Assessment
         return Assessment::ask("未找到可执行命令");
     }
     let mut normalized: Vec<String> = Vec::new();
+    // Where the segments after this one will run. It only moves for a `cd`, and it is what
+    // keeps a relative path meaning the same thing here as it does to the shell.
+    let mut here = cwd.to_path_buf();
     for segment in &segments {
-        let decision = vet_segment(&segment.words, cwd, dialect);
+        if let Some(target) = cd_target(&segment.words, &here, dialect) {
+            let target = match target {
+                Ok(target) => target,
+                Err(reason) => return Assessment::ask(reason),
+            };
+            // Rewritten to the resolved absolute path, so the directory the shell enters is
+            // the one that was checked rather than a relative name that could mean another.
+            let mut rewritten = format!("cd {}", shell_quote(&target.to_string_lossy()));
+            for redirect in &segment.redirects {
+                rewritten.push(' ');
+                rewritten.push_str(redirect);
+            }
+            normalized.push(rewritten);
+            if let Some(operator) = &segment.operator {
+                normalized.push(operator.clone());
+            }
+            here = target;
+            continue;
+        }
+        let decision = vet_segment(&segment.words, &here, dialect);
         match decision {
             Assessment::Ask { reason } => return Assessment::ask(reason),
             Assessment::Allow { safe_command } => {
-                let rewritten = safe_command.unwrap_or_else(|| {
+                let mut rewritten = safe_command.unwrap_or_else(|| {
                     segment
                         .words
                         .iter()
@@ -944,6 +1080,14 @@ pub fn assess_command(command: &str, cwd: &Path, dialect: Dialect) -> Assessment
                         .collect::<Vec<_>>()
                         .join(" ")
                 });
+                // The descriptor redirects travel with the segment. They are part of the
+                // command the user sees in the transcript, and dropping them would change
+                // what runs; they were checked by the parser, which refuses any redirection
+                // that names a file.
+                for redirect in &segment.redirects {
+                    rewritten.push(' ');
+                    rewritten.push_str(redirect);
+                }
                 normalized.push(rewritten);
                 if let Some(operator) = &segment.operator {
                     normalized.push(operator.clone());
@@ -1038,6 +1182,101 @@ mod tests {
         assert!(reason("ls *.rs").contains("通配符"));
         assert!(reason("ls; rm -rf /").contains("删除"));
         assert!(reason("sleep 1 &").contains("后台"));
+        // A heredoc redirects stdin, so it is a real redirection and asks.
+        assert!(reason("python3 - <<EOF").contains("重定向"));
+    }
+
+    #[test]
+    fn descriptor_redirects_do_not_ask() {
+        // `2>&1` and `2>/dev/null` move or discard a descriptor. They are in a large share
+        // of the commands a model writes out of habit, and refusing them is what pushed a
+        // vetted `cargo test 2>&1` into a `python3 - <<EOF`.
+        assert!(allows("ls 2>&1"));
+        assert!(allows("cat notes.txt 2>/dev/null"));
+        assert!(allows("cat notes.txt > /dev/null"));
+        assert!(allows("cat notes.txt >&2"));
+        assert!(allows("cat notes.txt 2>&-"));
+        assert!(allows("ls 2>/dev/null; ls"));
+        // A redirect that names a file is still a write, and still asks.
+        assert!(reason("cat a > b").contains("重定向"));
+        assert!(reason("cat a >> b").contains("重定向"));
+        assert!(reason("cat a 2> b").contains("重定向"));
+        assert!(reason("cat a >& b").contains("重定向"));
+        assert!(reason("cat < a").contains("重定向"));
+        assert!(reason("echo a>f").contains("重定向"));
+    }
+
+    #[test]
+    fn the_allowed_rewrite_keeps_the_descriptor_redirect() {
+        // The command that runs has to be the command that was checked, or the transcript
+        // shows one thing and the shell does another.
+        match assess_command("cat notes.txt 2>&1", &cwd(), Dialect::Zsh) {
+            Assessment::Allow { safe_command: Some(command) } => {
+                assert!(command.ends_with("2>&1"), "{command}");
+            }
+            other => panic!("expected allow with rewrite, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inspection_commands_do_not_ask_but_keep_their_dangerous_options() {
+        // These cannot change anything, and asking about them every time was a question
+        // with one answer.
+        for command in [
+            "which cargo", "date", "date +%Y-%m-%d", "nproc", "uptime", "free -h", "ps aux",
+            "id", "whoami", "basename /a/b", "dirname /a/b", "column -t notes.txt", "lscpu",
+            "seq 1 5",
+        ] {
+            assert!(allows(command), "`{command}` should not ask");
+        }
+        // `basename` prints its argument rather than opening it, so a sensitive-looking
+        // name is not a leak here.
+        assert!(allows("basename /etc/shadow"));
+        // The options that do more than read still ask.
+        assert!(reason("date -s 2020-01-01").contains("系统时间"));
+        assert!(reason("date --set=now").contains("系统时间"));
+        assert!(reason("date -f /etc/passwd").contains("系统时间"));
+        // And a path argument is still checked, so these are not a way to read a secret.
+        assert!(reason("column -t /etc/shadow").contains("凭据"));
+        assert!(reason("lscpu /etc/shadow").contains("凭据"));
+        // `env` prints every variable, the provider key included, so it never joins this
+        // group however convenient it would be.
+        assert!(!allows("env"));
+    }
+
+    #[test]
+    fn cd_moves_what_later_segments_are_checked_against() {
+        let cwd = cwd();
+        std::fs::create_dir_all(cwd.join("sub")).unwrap();
+        // Inside the tree it is an ordinary helper, and the path it is given is resolved
+        // against the directory the shell will really be in.
+        assert!(allows("cd sub && ls"));
+        assert!(allows("cd . && ls"));
+        // Anything that could mean a different directory to the shell than to this check
+        // asks: `-` depends on earlier commands, two arguments is not a cd, a symlinked
+        // target changes how `..` resolves, and a missing directory cannot be checked.
+        assert!(reason("cd -").contains("更早的命令"));
+        assert!(reason("cd a b").contains("单个目录"));
+        assert!(reason("cd /nonexistent-pi-xyz").contains("不是目录"));
+    }
+
+    #[test]
+    fn cd_cannot_launder_a_sensitive_path() {
+        // The hole this guards: `cd ~` then a name that is only sensitive inside the home
+        // directory. Judged against the project it looks like any other relative name, so
+        // a check that forgot to move with the `cd` would call this safe while the shell
+        // read the file next to the API keys.
+        let home = home();
+        let sensitive = home.join(".pi/config.json");
+        assert!(
+            reason(&format!("cd {} && cat .pi/config.json", shell_quote(&home.to_string_lossy())))
+                .contains("凭据"),
+            "a cd was used to launder a path into a sensitive directory"
+        );
+        assert!(!allows("cd ~ && cat .ssh/id_rsa"));
+        // And the same name outside home is still an ordinary file.
+        assert!(allows("cat .pi/config.json"));
+        let _ = sensitive;
     }
 
     #[test]
