@@ -7,7 +7,7 @@
 use std::io::{IsTerminal, Write};
 use std::path::Path;
 
-use crossterm::{cursor, terminal};
+use crossterm::{cursor, event, terminal};
 
 use crate::util;
 
@@ -30,11 +30,16 @@ static RAW_HOLDERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUs
 
 impl RawGuard {
     pub(crate) fn enter() -> std::io::Result<Self> {
-        if RAW_HOLDERS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0
-            && let Err(err) = terminal::enable_raw_mode() {
+        if RAW_HOLDERS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            let result = terminal::enable_raw_mode().and_then(|()| {
+                crossterm::execute!(std::io::stdout(), event::EnableBracketedPaste)
+            });
+            if let Err(err) = result {
                 RAW_HOLDERS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = terminal::disable_raw_mode();
                 return Err(err);
             }
+        }
         Ok(RawGuard)
     }
 }
@@ -54,7 +59,7 @@ pub fn teardown() {
         return;
     }
     let mut out = std::io::stdout();
-    let _ = crossterm::execute!(out, cursor::Show);
+    let _ = crossterm::execute!(out, event::DisableBracketedPaste, cursor::Show);
     let _ = out.flush();
 }
 

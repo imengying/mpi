@@ -10,6 +10,7 @@ pub mod grep;
 pub mod ls;
 pub mod read;
 pub mod write;
+mod output;
 
 use std::path::Path;
 
@@ -167,6 +168,7 @@ pub async fn execute(
     name: &str,
     arguments: &serde_json::Value,
     cwd: &Path,
+    shell: &str,
 ) -> ToolOutput {
     // Timed here, around the tool itself, so every tool reports the same way and none can
     // forget to. Not around the render: the call is shown before the authorization panel
@@ -176,7 +178,10 @@ pub async fn execute(
         "read" => read::execute(arguments, cwd).await,
         "write" => write::execute(arguments, cwd).await,
         "edit" => edit::execute(arguments, cwd).await,
-        "bash" => bash::execute(arguments, cwd).await,
+        "bash" => match required_str(arguments, "command") {
+            Ok(command) => bash::execute_with_shell(command, cwd, shell).await,
+            Err(err) => Err(err),
+        },
         "grep" => grep::execute(arguments, cwd).await,
         "find" => find::execute(arguments, cwd).await,
         "ls" => ls::execute(arguments, cwd).await,

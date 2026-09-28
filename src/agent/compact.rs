@@ -1,16 +1,8 @@
 //! Context compaction.
 //!
-//! Four things in here are easy to get wrong and are therefore spelled out:
-//!
-//! * **What is kept.** A checkpoint is not "a summary string replacing history". It is
-//!   the full replacement message list, built by keeping every user message (the
-//!   *intent*, which is small and must not be lost) and dropping nearly all assistant
-//!   and tool traffic (the *process*, which is most of the bytes and is disposable).
-//! * **Where the cut goes.** Never on a tool result — that would leave an orphan result
-//!   with no call. Cutting on an assistant message with tool calls keeps its results.
-//! * **When it is not allowed.** Too little history, a stream in flight, or a compaction
-//!   already running are all errors with distinct messages, not silent no-ops.
-//! * **Recursion.** The summarisation request itself must never trigger a compaction.
+//! A checkpoint replaces a balanced prefix with a bounded summary, retaining recent
+//! messages and the active request (including images). Original records remain on disk.
+//! A failed, truncated or non-shrinking summary never replaces the live context.
 
 use crate::config::{Defaults, ModelConfig, Provider};
 use crate::llm::{Completion, Message, Request, StopReason, ToolSpec, client::Client};
@@ -64,6 +56,10 @@ pub enum CompactError {
     Truncated,
     #[error("摘要模型调用了工具，未写入检查点")]
     ToolCallInSummary,
+    #[error("摘要没有缩小上下文，保留原历史")]
+    NotSmaller,
+    #[error("摘要输入超过模型可用窗口")]
+    InputTooLarge,
     #[error("会话写入失败：{0}")]
     Session(String),
 }
@@ -91,8 +87,8 @@ pub fn threshold(context_window: u64, reserve: u64) -> u64 {
 }
 
 /// Convenience: the threshold for a model, with the reserve capped for small windows.
-pub fn threshold_for(context_window: u64) -> u64 {
-    threshold(context_window, reserve_for(context_window))
+pub fn threshold_for(context_window: u64, max_output: u64) -> u64 {
+    threshold(context_window, max_output.saturating_add(reserve_for(context_window)))
 }
 
 /// Estimate the tokens in a message list, preferring real usage when it is still valid.
@@ -171,7 +167,7 @@ pub fn find_cut_point(messages: &[Message], keep_recent_tokens: u64) -> Option<C
             (0..cut).rev().find(|index| is_turn_start(&messages[*index]))
         };
         // A cut inside the first turn would summarise nothing.
-        if turn_start == Some(0) {
+        if turn_start == Some(0) && cut == 1 {
             return None;
         }
         Some(CutPoint { first_kept: cut, turn_start })
@@ -193,11 +189,7 @@ pub fn find_cut_point(messages: &[Message], keep_recent_tokens: u64) -> Option<C
     None
 }
 
-/// The messages folded into the summary: everything before the cut.
-///
-/// A mid-turn cut does not lose the user message that opened that turn, even though it
-/// sits on the summarised side. [`replacement_history`] re-attaches every user message
-/// verbatim, so the intent survives both as prose in the summary and as the actual text.
+/// The prefix folded into the summary; the active request is retained for mid-turn cuts.
 pub fn messages_to_summarize(messages: &[Message], cut: CutPoint) -> Vec<Message> {
     messages[..cut.first_kept.min(messages.len())].to_vec()
 }
@@ -207,9 +199,7 @@ pub fn messages_to_keep(messages: &[Message], cut: CutPoint) -> Vec<Message> {
     messages[cut.first_kept.min(messages.len())..].to_vec()
 }
 
-/// Build the replacement history: **every user message from the summarised part**, plus
-/// the kept window. Assistant and tool traffic from the summarised part is dropped —
-/// that is what makes compaction actually shrink a session.
+/// One checkpoint, the active request when needed, and the untouched recent window.
 pub fn replacement_history(
     summarized: &[Message],
     kept: &[Message],
@@ -219,13 +209,11 @@ pub fn replacement_history(
     out.push(Message::user_text(format!(
         "以下是本次会话此前工作的上下文检查点，请把它当作已经发生过的历史继续工作。\n\n{summary}"
     )));
-    for message in summarized {
-        if is_user(message) {
-            let text = message.text();
-            if !text.trim().is_empty() {
-                out.push(Message::user_text(text));
-            }
-        }
+    // Keep the active turn's original request, including its images, only for a mid-turn cut.
+    if !kept.first().is_some_and(is_user)
+        && let Some(message) = summarized.iter().rev().find(|m| is_user(m))
+    {
+        out.push(message.clone());
     }
     out.extend(kept.iter().cloned());
     out
@@ -308,7 +296,7 @@ pub fn serialize_conversation(messages: &[Message]) -> String {
             Message::User { .. } => {
                 let text = message.text();
                 if !text.trim().is_empty() {
-                    parts.push(format!("[用户]: {text}"));
+                    parts.push(format!("[用户]: {}", truncate_chars(&text, ASSISTANT_TEXT_MAX_CHARS)));
                 }
             }
             Message::Assistant { .. } => {
@@ -336,7 +324,7 @@ pub fn serialize_conversation(messages: &[Message]) -> String {
                 let calls: Vec<String> = message
                     .tool_calls()
                     .into_iter()
-                    .map(|(_, name, arguments)| format!("{name}({arguments})"))
+                    .map(|(_, name, arguments)| format!("{name}({})", truncate_chars(&arguments.to_string(), TOOL_RESULT_MAX_CHARS)))
                     .collect();
                 if !calls.is_empty() {
                     parts.push(format!("[助手工具调用]: {}", calls.join("; ")));
@@ -365,8 +353,9 @@ fn truncate_chars(text: &str, max: usize) -> String {
     if text.chars().count() <= max {
         return text.to_string();
     }
-    let kept: String = text.chars().take(max).collect();
-    format!("{kept}\n[... 已截断]")
+    let head: String = text.chars().take(max * 3 / 4).collect();
+    let tail: String = text.chars().rev().take(max / 4).collect::<String>().chars().rev().collect();
+    format!("{head}\n[... 已截断中间内容]\n{tail}")
 }
 
 pub const SUMMARIZATION_SYSTEM_PROMPT: &str = "你是一个上下文摘要助手。读取用户与 AI 助手之间的对话，\
@@ -448,7 +437,6 @@ pub struct SummaryRequest<'a> {
     pub session_id: &'a str,
     pub previous_summary: Option<&'a str>,
     pub custom_instructions: Option<&'a str>,
-    pub level: &'a str,
 }
 
 /// Run the summarisation request. It goes through the same provider as everything else,
@@ -459,28 +447,40 @@ pub async fn summarize(
     summarized: &[Message],
     split_turn: bool,
 ) -> Result<(String, crate::config::Usage), CompactError> {
-    let conversation = serialize_conversation(summarized);
-    let prompt = summary_prompt(
-        &conversation,
-        request.custom_instructions,
-        request.previous_summary,
-        split_turn,
-    );
+    let mut model = request.model.clone();
+    model.search = false;
+    model.reasoning = false;
+    let window = model.context_window.unwrap_or(128_000);
+    model.max_tokens = Some(model.max_tokens().min(16_384).min(window / 4).max(1));
+    let previous = request.previous_summary.map(|s| truncate_chars(s, (window / 8) as usize));
+    let custom = request.custom_instructions.map(|s| truncate_chars(s, 2048));
+    let scaffold = summary_prompt("", custom.as_deref(), previous.as_deref(), split_turn);
+    let fixed = util::estimate_tokens(&scaffold) + util::estimate_tokens(SUMMARIZATION_SYSTEM_PROMPT);
+    let budget = window.saturating_sub(model.max_tokens()).saturating_sub(512).saturating_sub(fixed);
+    if budget == 0 { return Err(CompactError::InputTooLarge); }
+    // When a prior checkpoint is supplied separately, do not send its framing a second time.
+    let source: Vec<_> = summarized.iter().filter(|m| {
+        request.previous_summary.is_none() || !m.text().starts_with("以下是本次会话此前工作的上下文检查点")
+    }).cloned().collect();
+    let conversation = serialize_conversation(&source);
+    let conversation = if util::estimate_tokens(&conversation) > budget {
+        truncate_chars(&conversation, budget.saturating_sub(32) as usize)
+    } else { conversation };
+    let prompt = summary_prompt(&conversation, custom.as_deref(), previous.as_deref(), split_turn);
     let messages = vec![
         Message::System { content: SUMMARIZATION_SYSTEM_PROMPT.to_string() },
         Message::user_text(prompt),
     ];
+    if crate::llm::estimate_context(&messages, "") + model.max_tokens() >= window {
+        return Err(CompactError::InputTooLarge);
+    }
     let no_tools: Vec<ToolSpec> = Vec::new();
-    // The summary is not a turn of the conversation. Hosted search on it would spend a
-    // search on the summary itself, and the tool list would no longer match the session.
-    let mut model = request.model.clone();
-    model.search = false;
     let body = Request {
         model: &model,
         provider: request.provider,
         messages: &messages,
         tools: &no_tools,
-        level: request.level,
+        level: "",
         session_id: request.session_id,
         // A one-off summary must not write cache entries for the main conversation.
         cache_hints: false,
@@ -553,8 +553,7 @@ pub enum OverflowSignal {
 /// Detect an overflow from a finished turn.
 ///
 /// `context_window` is only consulted for the silent case; the length-cut check
-/// deliberately does **not** depend on it, because the whole point is that a provider can
-/// squeeze the output to nothing while the configured capacity still looks fine.
+/// requires evidence that the reserved output would exceed the context window.
 pub fn detect_overflow(
     completion: &Completion,
     context_window: Option<u64>,
@@ -575,21 +574,14 @@ pub fn detect_overflow(
     {
         return Some(OverflowSignal::SilentOverflow { prompt_tokens, context_window: window });
     }
-    if completion.stop_reason == StopReason::Length {
-        // Zero output is the classic "prompt ate the whole window" symptom. A non-zero but
-        // far-too-short answer counts too: the model was cut off early.
-        let output = completion.usage.output;
-        if output < max_tokens / 4 {
-            return Some(OverflowSignal::LengthCut { output_tokens: output, max_tokens });
-        }
+    if completion.stop_reason == StopReason::Length
+        && let Some(window) = context_window
+        && prompt_tokens.saturating_add(max_tokens) > window
+    {
+        return Some(OverflowSignal::LengthCut { output_tokens: completion.usage.output, max_tokens });
     }
-    None
-}
 
-/// Whether a finished response leaves nothing to retry: a successful turn cannot be
-/// "continued" by re-sending, so it is compacted without a retry.
-pub fn compact_without_retry(completion: &Completion) -> bool {
-    completion.stop_reason == StopReason::Stop
+    None
 }
 
 /// Tracks the one-retry-per-turn rule for the overflow path.
@@ -677,9 +669,6 @@ pub struct CompactionOutcome {
     pub read_files: Vec<String>,
     pub modified_files: Vec<String>,
     pub usage: crate::config::Usage,
-    pub tokens_before: u64,
-    /// Token estimate after the swap, so the caller can tell whether it actually helped.
-    pub tokens_after: u64,
 }
 
 /// How much of the summarised conversation may go into one summary request.
@@ -699,28 +688,22 @@ pub fn summary_budget_for(context_window: u64) -> u64 {
     // an unbounded request is the failure this exists to prevent.
     match context_window {
         0 => 120_000,
-        window => (window / 3).max(4_096),
+        window => (window / 3).max(1),
     }
 }
 
-/// Cut the messages to summarise down to `budget_tokens`, newest-first.
-///
-/// The oldest turns are dropped, because a summary of the recent history is worth more than
-/// one of the start of the session: the newest messages are what the next model continues
-/// from. What is dropped is *not* lost from the conversation — the checkpoint keeps every
-/// user message verbatim regardless (see [`replacement_history`]), so the intent of a
-/// dropped turn survives even when its prose does not reach the summariser.
-///
-/// Returns the messages to send and whether anything was dropped, so the caller can say so.
+/// Bound summary input by its serialized cost, preferring recent messages.
+/// Returns whether earlier messages were omitted; original records remain on disk.
 pub fn limit_for_summary(messages: &[Message], budget_tokens: u64) -> (Vec<Message>, bool) {
-    let total: u64 = messages.iter().map(Message::estimate_tokens).sum();
+    let cost = |message: &Message| util::estimate_tokens(&serialize_conversation(std::slice::from_ref(message)));
+    let total: u64 = messages.iter().map(cost).sum();
     if total <= budget_tokens {
         return (messages.to_vec(), false);
     }
     let mut kept: Vec<Message> = Vec::new();
     let mut used = 0u64;
     for message in messages.iter().rev() {
-        let tokens = message.estimate_tokens();
+        let tokens = cost(message);
         if used + tokens > budget_tokens && !kept.is_empty() {
             break;
         }
@@ -747,9 +730,7 @@ pub async fn run(
     messages: &[Message],
     system_prompt: &str,
     keep_recent_tokens: u64,
-    real_usage: Option<u64>,
 ) -> Result<CompactionOutcome, CompactError> {
-    let tokens_before = estimate_context(messages, system_prompt, real_usage);
     let mut file_ops = FileOps::default();
     for message in messages {
         file_ops.observe(message);
@@ -757,27 +738,23 @@ pub async fn run(
     // Bound the request itself, not just the caps inside it: a long session can still add up
     // to more than the model's window, and a summary request that does not fit cannot be
     // sent at all.
-    let SummaryPlan { cut, summarized, kept, request_tokens, .. } =
+    let SummaryPlan { cut, summarized, kept, .. } =
         plan_summary(messages, keep_recent_tokens, request.model.context_window)?;
-    debug_assert!(
-        request.model.context_window.is_none_or(|window| request_tokens < window),
-        "a summary request must fit the window: {request_tokens} >= {:?}",
-        request.model.context_window
-    );
     let (summary, usage) = summarize(client, request, &summarized, cut.is_split_turn()).await?;
     let (read_files, modified_files) = file_ops.lists();
     let summary = format!("{summary}{}", format_file_blocks(&read_files, &modified_files));
     let replacement = replacement_history(&summarized, &kept, &summary);
     let tokens_after = replacement.iter().map(Message::estimate_tokens).sum::<u64>()
         + util::estimate_tokens(system_prompt);
+    if tokens_after >= crate::llm::estimate_context(messages, system_prompt) {
+        return Err(CompactError::NotSmaller);
+    }
     Ok(CompactionOutcome {
         summary,
         replacement,
         read_files,
         modified_files,
         usage,
-        tokens_before,
-        tokens_after,
     })
 }
 
@@ -926,7 +903,7 @@ mod tests {
         let replacement = replacement_history(&summarized, &kept, "S");
         let user_texts: Vec<String> =
             replacement.iter().filter(|m| is_user(m)).map(Message::text).collect();
-        assert!(user_texts.iter().any(|t| t.starts_with("first")));
+        assert!(!user_texts.iter().any(|t| t.starts_with("first")));
         assert!(user_texts.iter().any(|t| t.starts_with("second")), "{user_texts:?}");
     }
 
@@ -956,7 +933,7 @@ mod tests {
     }
 
     #[test]
-    fn the_replacement_history_keeps_every_user_message() {
+    fn the_replacement_history_does_not_repeat_summarized_user_messages() {
         let summarized = vec![
             user("keep me"),
             call("c1", "read", "a.rs"),
@@ -968,8 +945,8 @@ mod tests {
         let replacement = replacement_history(&summarized, &kept, "SUMMARY");
         let text: Vec<String> = replacement.iter().map(Message::text).collect();
         assert!(text[0].contains("SUMMARY"));
-        assert!(text.iter().any(|t| t == "keep me"));
-        assert!(text.iter().any(|t| t == "keep me as well"));
+        assert!(!text.iter().any(|t| t == "keep me"));
+        assert!(!text.iter().any(|t| t == "keep me as well"));
         assert!(text.iter().any(|t| t == "recent question"));
         // Assistant and tool traffic from the summarised part is gone.
         assert!(!text.iter().any(|t| t.contains("noise")));
@@ -1134,7 +1111,7 @@ mod tests {
         // An undeclared window gets a fixed budget, not none: unbounded is the failure mode.
         assert!(summary_budget_for(0) > 0);
         // And a tiny window still gets something usable rather than zero.
-        assert_eq!(summary_budget_for(1_000), 4_096);
+        assert_eq!(summary_budget_for(1_000), 333);
     }
 
     #[test]
@@ -1243,7 +1220,7 @@ mod tests {
     }
 
     #[test]
-    fn a_length_cut_with_no_room_left_is_detected_without_knowing_the_window() {
+    fn a_length_cut_needs_evidence_of_context_pressure() {
         let completion = Completion {
             message: Message::Assistant { content: vec![], stop_reason: Some(StopReason::Length) },
             usage: Usage { input: 99_000, output: 0, cache_read: 0, cache_write: 0 },
@@ -1251,9 +1228,10 @@ mod tests {
             error: None,
         };
         assert_eq!(
-            detect_overflow(&completion, None, 8192),
+            detect_overflow(&completion, Some(100_000), 8192),
             Some(OverflowSignal::LengthCut { output_tokens: 0, max_tokens: 8192 })
         );
+        assert_eq!(detect_overflow(&completion, None, 8192), None);
     }
 
     #[test]
@@ -1276,7 +1254,7 @@ mod tests {
             error: None,
         };
         assert_eq!(detect_overflow(&completion, Some(200_000), 8192), None);
-        assert!(compact_without_retry(&completion));
+        assert_eq!(completion.stop_reason, StopReason::Stop);
     }
 
     #[test]
@@ -1310,15 +1288,15 @@ mod tests {
     #[test]
     fn the_threshold_leaves_room_for_the_answer() {
         assert_eq!(threshold(200_000, 16_384), 183_616);
-        assert_eq!(threshold_for(1_000_000), 983_616);
+        assert_eq!(threshold_for(1_000_000, 0), 983_616);
     }
 
     #[test]
     fn a_small_window_still_gets_a_usable_threshold() {
         // The nominal 16k reserve would saturate to zero here, so every turn would compact.
         assert_eq!(reserve_for(6_000), 1_500);
-        assert_eq!(threshold_for(6_000), 4_500);
-        assert!(threshold_for(4_000) > 0);
+        assert_eq!(threshold_for(6_000, 0), 4_500);
+        assert!(threshold_for(4_000, 0) > 0);
         // Below the nominal constant the cap does not apply.
         assert_eq!(reserve_for(1_000_000), 16_384);
     }

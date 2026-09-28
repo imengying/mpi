@@ -137,7 +137,6 @@ impl Agent {
             self.system_prompt = system_prompt_from(&self.cwd);
             let block = environment_block(&self.cwd, &self.session.header().id, &self.config.shell.path);
             self.session.push_message(Message::user_text(block), None, None)?;
-            self.gate.reset();
             self.screen.clear_transcript();
             // A new session starts with no history: the lines from the conversation just left
             // belong to it, not to this one, and offering them here would be recalling words
@@ -190,8 +189,7 @@ impl Agent {
             match Session::open(&target) {
                 Ok(session) => {
                     self.session = session;
-                    self.gate.reset();
-                    self.screen.clear_transcript();
+                            self.screen.clear_transcript();
                     // The switched-to session may have started under a different `AGENTS.md`,
                     // so the prompt is re-read here too.
                     self.system_prompt = system_prompt_from(&self.cwd);
@@ -344,16 +342,12 @@ impl Agent {
                     _ => None,
                 }
             });
-            let real_usage = self.session.last_usage.as_ref().map(|usage| {
-                usage.input + usage.output + usage.cache_read + usage.cache_write
-            });
             let request = SummaryRequest {
                 provider,
                 model,
                 session_id: &self.session.header().id,
                 previous_summary: previous.as_deref(),
                 custom_instructions: custom,
-                level: &self.level,
             };
             // The keep-recent window is scaled to the model's capacity: keeping a fixed 20k in a
             // 6k window would produce a checkpoint larger than the history it replaced.
@@ -367,7 +361,6 @@ impl Agent {
                 &messages,
                 self.system_prompt.as_deref().unwrap_or_default(),
                 keep_recent,
-                real_usage,
             )
             .await?;
             self.session
@@ -383,11 +376,7 @@ impl Agent {
             // The token counts are not restated: the footer carries the context gauge, and that is
             // the number the user is already reading. What the footer cannot say is that the
             // compaction did not help, because nothing shrank.
-            let note = if outcome.tokens_after >= outcome.tokens_before {
-                "已压缩（没有变小）"
-            } else {
-                "已压缩"
-            };
+            let note = "已压缩";
             self.screen
                 .push_lines(ui_compact::note_lines(note, crate::ui::screen::Style::new(Color::Dim)));
             Ok(())

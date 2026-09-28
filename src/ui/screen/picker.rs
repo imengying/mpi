@@ -131,6 +131,9 @@ impl Screen {
                 } else {
                     Style::plain()
                 };
+                let style = if title == "思考级别" {
+                    Style { fg: Color::reasoning(item), bold: selected, ..style }
+                } else { style };
                 lines.push(Line::new(util::pad(&text, self.width), style));
             }
             lines.push(Line::new(hint, Style::new(Color::Dim)));

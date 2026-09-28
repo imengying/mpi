@@ -559,7 +559,9 @@ pub struct WireUsage {
     #[serde(default)]
     completion_tokens: u64,
     #[serde(default)]
-    total_tokens: u64,
+    prompt_cache_hit_tokens: Option<u64>,
+    #[serde(default)]
+    prompt_cache_miss_tokens: Option<u64>,
     #[serde(default)]
     prompt_tokens_details: Option<PromptDetails>,
 }
@@ -625,14 +627,14 @@ impl Assembler {
     }
 
     pub(crate) fn set_usage(&mut self, usage: &WireUsage) {
-        let cached = usage.prompt_tokens_details.as_ref().map(|d| d.cached_tokens).unwrap_or(0);
+        let cached = usage.prompt_cache_hit_tokens
+            .or_else(|| usage.prompt_tokens_details.as_ref().map(|d| d.cached_tokens)).unwrap_or(0);
         self.usage = Usage {
-            input: usage.prompt_tokens.saturating_sub(cached),
+            input: usage.prompt_cache_miss_tokens.unwrap_or_else(|| usage.prompt_tokens.saturating_sub(cached)),
             output: usage.completion_tokens,
             cache_read: cached,
             cache_write: 0,
         };
-        let _ = usage.total_tokens;
     }
 
     pub fn finish(mut self) -> Completion {
@@ -671,7 +673,7 @@ impl Assembler {
                 };
             }
             None => match self.stop_reason.as_deref() {
-                Some("tool_calls") | Some("function_call") => StopReason::ToolUse,
+                Some("tool_calls") => StopReason::ToolUse,
                 Some("length") | Some("max_tokens") => StopReason::Length,
                 _ => {
                     if content.iter().any(|b| matches!(b, Block::ToolCall { .. })) {
@@ -790,8 +792,6 @@ struct FullMessage {
     #[serde(default)]
     tool_calls: Vec<FullToolCall>,
     #[serde(default)]
-    function_call: Option<FullFunctionCall>,
-    #[serde(default)]
     web_search: Vec<serde_json::Value>,
 }
 
@@ -831,10 +831,7 @@ impl FullResponse {
                 .or(message.reasoning)
                 .or(message.reasoning_text)
                 .unwrap_or_default();
-            let mut calls: Vec<FullToolCall> = message.tool_calls;
-            if let Some(function) = message.function_call {
-                calls.push(FullToolCall { id: None, function: Some(function) });
-            }
+            let calls: Vec<FullToolCall> = message.tool_calls;
             let delta = StreamDelta {
                 content: message.content.filter(|c| !c.is_empty()),
                 reasoning_content: (!thinking.is_empty()).then_some(thinking),
@@ -862,6 +859,20 @@ impl FullResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deepseek_cache_usage_is_counted_once() {
+        let usage: WireUsage = serde_json::from_value(serde_json::json!({
+            "prompt_tokens":10000,"prompt_cache_hit_tokens":9000,
+            "prompt_cache_miss_tokens":1000,"completion_tokens":200
+        })).unwrap();
+        let mut assembler = Assembler::default();
+        assembler.set_usage(&usage);
+        let completion = assembler.finish();
+        assert_eq!(completion.usage.input, 1000);
+        assert_eq!(completion.usage.cache_read, 9000);
+        assert_eq!(completion.usage.output, 200);
+    }
     use crate::config::{ModelConfig, Provider};
 
     fn request<'a>(model: &'a ModelConfig, provider: &'a Provider, messages: &'a [Message]) -> Request<'a> {

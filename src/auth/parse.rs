@@ -82,7 +82,7 @@ fn descriptor_redirect(chars: &[char], from: usize, fd: &str) -> Option<(usize, 
     }
     let target: String = chars[start..i].iter().collect();
     if target == "/dev/null" {
-        let arrows = if append { ">>" } else { "" };
+        let arrows = if append { ">" } else { "" };
         return Some((i, format!("{fd}{op}{arrows}/dev/null")));
     }
     None
@@ -275,7 +275,7 @@ pub fn parse_literal_commands(command: &str) -> Result<Vec<Segment>, String> {
     let had_final = flush_segment!(None);
     if !had_final
         && let Some(last) = segments.last()
-        && last.operator.is_some()
+        && last.operator.as_deref().is_some_and(|op| op != ";")
     {
         return Err("复合命令不完整".into());
     }
@@ -309,4 +309,3 @@ pub(crate) fn is_line_range_print(script: &str) -> bool {
         None => true,
     }
 }
-

@@ -33,6 +33,11 @@ fn api_of(provider: &Provider) -> Result<Api, LlmError> {
 }
 
 impl Client {
+    #[cfg(test)]
+    pub(crate) fn local_test_client() -> Self {
+        Self { http: reqwest::Client::builder().no_proxy().build().unwrap() }
+    }
+
     pub fn new() -> anyhow::Result<Self> {
         let http = reqwest::Client::builder()
             // Long generations: time out the connect and the gaps between chunks, never
@@ -100,7 +105,7 @@ impl Client {
             let text = response.text().await.unwrap_or_default();
             return Err(LlmError::Api { status: status.as_u16(), message: describe_error(&text) });
         }
-        let mut buffer = String::new();
+        let mut buffer = Vec::new();
         let mut assemblers = Assemblers::default();
         // Where the reasoning payloads about to arrive were issued from. A signature has to
         // be checked against the provider and model before being replayed, and this is the
@@ -115,22 +120,15 @@ impl Client {
             .await
             .map_err(|err| LlmError::Transport(err.to_string()))?
         {
-            // Valid UTF-8 is the common case; `from_utf8_lossy` allocates even then.
-            match std::str::from_utf8(&chunk) {
-                Ok(text) => buffer.push_str(text),
-                Err(_) => buffer.push_str(&String::from_utf8_lossy(&chunk)),
-            }
-            // Frames end at a blank line. `split_off` keeps the frame and returns the
-            // tail. `drain` + `collect` does the opposite: it copies the frame, then
-            // slides the rest of the buffer down a byte at a time.
-            while let Some(index) = buffer.find("\n\n") {
-                let rest = buffer.split_off(index + 2);
-                dispatch(&buffer, api, &mut assemblers, on_delta)?;
-                buffer = rest;
+            buffer.extend_from_slice(&chunk);
+            drain_sse(&mut buffer, api, &mut assemblers, on_delta)?;
+            if buffer.len() > 8 * 1024 * 1024 {
+                return Err(LlmError::Decode("SSE 单帧超过 8 MiB".into()));
             }
         }
-        if !buffer.trim().is_empty() {
-            dispatch(&buffer, api, &mut assemblers, on_delta)?;
+        if !buffer.is_empty() {
+            let frame = std::str::from_utf8(&buffer).map_err(|err| LlmError::Decode(err.to_string()))?;
+            dispatch(frame, api, &mut assemblers, on_delta)?;
         }
         Ok(match api {
             Api::AnthropicMessages => assemblers.anthropic.finish(),
@@ -293,9 +291,49 @@ fn parse_sse_frame(frame: &str, api: Api) -> Result<Option<Frame>, LlmError> {
     })
 }
 
+/// Decode only complete frames, so a transport chunk may split any UTF-8 code point.
+fn drain_sse(
+    buffer: &mut Vec<u8>, api: Api, assemblers: &mut Assemblers,
+    on_delta: &mut dyn FnMut(Delta),
+) -> Result<(), LlmError> {
+    let mut consumed = 0;
+    loop {
+        let rest = &buffer[consumed..];
+        let end = rest.iter().enumerate().find_map(|(i, b)| {
+            if *b != b'\n' { return None; }
+            if rest.get(i + 1) == Some(&b'\n') { return Some(i + 2); }
+            if rest.get(i + 1..i + 3) == Some(b"\r\n") { return Some(i + 3); }
+            None
+        });
+        let Some(end) = end else { break };
+        let frame = std::str::from_utf8(&rest[..end]).map_err(|err| LlmError::Decode(err.to_string()))?;
+        dispatch(frame, api, assemblers, on_delta)?;
+        consumed += end;
+    }
+    buffer.drain(..consumed);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn utf8_and_crlf_frames_survive_every_transport_boundary() {
+        let bytes = "data: {\"choices\":[{\"delta\":{\"content\":\"中文🙂\"}}]}\r\n\r\ndata: [DONE]\n\n".as_bytes();
+        for split in 0..=bytes.len() {
+            let mut buffer = Vec::new();
+            let mut assemblers = Assemblers::default();
+            let mut text = String::new();
+            let mut sink = |delta| if let Delta::Text(part) = delta { text.push_str(&part); };
+            for part in [&bytes[..split], &bytes[split..]] {
+                buffer.extend_from_slice(part);
+                drain_sse(&mut buffer, Api::OpenAiCompletions, &mut assemblers, &mut sink).unwrap();
+            }
+            assert!(buffer.is_empty());
+            assert_eq!(text, "中文🙂");
+        }
+    }
 
     #[test]
     fn error_bodies_are_unwrapped_from_their_envelope() {

@@ -42,6 +42,8 @@ impl Agent {
             // that answers "what was this session using".
             self.session.push_turn_context(&self.cwd, &self.model_spec, &self.level)?;
             self.retry.reset();
+            self.length_retries = 0;
+            self.continuing_output = false;
             // The spinner covers the whole turn, not one request: the model may think for a
             // while before its first token, and a command may run for minutes. Both are times
             // when nothing else on screen moves, and a mark that does not move cannot be told
@@ -90,18 +92,20 @@ impl Agent {
             // second time would copy every image in the context on the common path, where
             // compaction does not fire. After a compaction the list is stale and is rebuilt.
             let mut messages = self.session.context_messages();
+            let tools = tools::specs();
             // Threshold compaction runs before the request, using real usage when it is still
             // valid and an estimate otherwise.
             if let Some(window) = model.context_window {
-                let limit = compact::threshold_for(window);
-                let real_usage = self.session.last_usage.as_ref().map(|usage| {
-                    usage.input + usage.output + usage.cache_read + usage.cache_write
-                });
+                let limit = compact::threshold_for(window, model.max_tokens());
+                let real_usage = self.session.measured_context_tokens();
                 let used = compact::estimate_context(
                     &messages,
                     self.system_prompt.as_deref().unwrap_or_default(),
                     real_usage,
                 );
+                let used = used + if real_usage.is_none() {
+                    tools.iter().map(|tool| crate::util::estimate_tokens(&serde_json::to_string(tool).expect("tool schema"))).sum::<u64>()
+                } else { 0 };
                 if used > limit {
                     // No note here: the footer's own banner already says the context is near its
                     // limit and a compaction is running. It is the same sentence, on the row the
@@ -130,7 +134,11 @@ impl Agent {
             {
                 messages.push(Message::assistant_text("继续。"));
             }
-            let tools = tools::specs();
+            if self.continuing_output {
+                messages.push(Message::user_text(
+                    "上次响应因输出长度限制中断。请从中断处继续，不要重复已完成的内容；若工具调用未完整输出，它尚未执行，请重新发出完整调用。将较大的修改拆分成较小的工具调用。"
+                ));
+            }
             let level = self.level.clone();
             let session_id = self.session.header().id.clone();
             let request = Request {
@@ -197,7 +205,7 @@ impl Agent {
             // A stop keeps the half-written answer, because it is a real answer the user chose to
             // cut short; a failure discards it, because a half-written answer that was never
             // recorded must not stay on screen.
-            let completion = match outcome.result {
+            let mut completion = match outcome.result {
                 None => {
                     debug_assert!(outcome.stopped(), "no completion means the stream was stopped");
                     return self.finish_stopped().map(|()| TurnEnd::Done);
@@ -212,14 +220,20 @@ impl Agent {
                     return Err(err.into());
                 }
             };
-            self.screen.end_stream();
+            // Never execute or replay partial tool-call arguments from a length-cut stream.
+            if completion.stop_reason == StopReason::Length
+                && let Message::Assistant { content, .. } = &mut completion.message
+            {
+                content.retain(|block| !matches!(block, llm::Block::ToolCall { .. }));
+            }
 
             // An overflow can also arrive as a "successful" response: either the prompt alone
             // filled the window, or the server truncated it and left no room to answer. Both
             // are compacted here, before the message is recorded. No note: the compaction puts
             // its own banner in the footer, and it says exactly what happened.
             let overflow = compact::detect_overflow(&completion, model.context_window, model.max_tokens());
-            if overflow.is_some() {
+            if overflow.is_some() && completion.text().trim().is_empty() {
+                self.screen.discard_stream();
                 let retried = self.recover_overflow("").await?;
                 if let Some(end) = retried {
                     return Ok(end);
@@ -229,6 +243,7 @@ impl Agent {
                 return Ok(TurnEnd::Done);
             }
 
+            self.screen.end_stream();
             let citations = llm::citation_lines(&completion.message);
             if !citations.is_empty() {
                 let mut lines = Vec::new();
@@ -244,7 +259,6 @@ impl Agent {
 
             self.session
                 .push_message(completion.message.clone(), Some(completion.usage), Some(completion.stop_reason))?;
-            self.session.push_token_count(completion.usage)?;
             self.compaction.observe_usage();
             self.render_footer(None);
 
@@ -255,7 +269,7 @@ impl Agent {
                 ));
                 return Ok(TurnEnd::Done);
             }
-            Ok(self.after_completion(&completion))
+            self.after_completion(&completion)
         }
 
 
@@ -293,31 +307,120 @@ impl Agent {
 
 
         /// Decide what to do after a response that is not an overflow.
-        pub(super) fn after_completion(&mut self, completion: &llm::Completion) -> TurnEnd {
+        pub(super) fn after_completion(&mut self, completion: &llm::Completion) -> anyhow::Result<TurnEnd> {
             let calls = completion.tool_calls();
             // A hosted search that paused has to be sent back as-is. There is no local call
             // to run; doing so would invent a tool result the server did not ask for.
             if calls.is_empty() && completion.stop_reason == StopReason::Pause {
-                return TurnEnd::Continue;
+                return Ok(TurnEnd::Continue);
             }
             if calls.is_empty() {
-                // A length stop with no tool calls means the answer was cut off; say so rather
-                // than silently pretending it finished. "Continue" needs no spelling out.
                 if completion.stop_reason == StopReason::Length {
+                    if self.length_retries < 2 {
+                        self.length_retries += 1;
+                        self.continuing_output = true;
+                        self.screen.push_lines(ui_compact::note_lines(
+                            "输出被截断，正在继续…", crate::ui::screen::Style::new(Color::Dim),
+                        ));
+                        return Ok(TurnEnd::Continue);
+                    }
                     self.screen.push_lines(ui_compact::note_lines(
-                        "输出达到长度上限，回答可能不完整。",
+                        "连续输出达到上限，已保留生成内容；可继续提问或将任务拆小。",
                         crate::ui::screen::Style::new(Color::Yellow),
                     ));
                 }
-                return TurnEnd::Done;
+                self.continuing_output = false;
+                return Ok(TurnEnd::Done);
             }
+            self.continuing_output = false;
             // Tool calls are executed inline; the next request carries their results. Esc during
             // the calls ends the turn here: the results already produced are in the session, and
             // carrying on would run the very thing the user just stopped.
-            let stopped = self.execute_tools(&calls);
+            let stopped = self.execute_tools(&calls)?;
             if stopped {
-                return TurnEnd::Stopped;
+                return Ok(TurnEnd::Stopped);
             }
-            TurnEnd::Continue
+            Ok(TurnEnd::Continue)
         }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{BufRead, Read, Write};
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn length_cut_preserves_text_continues_and_never_executes_cut_tool_calls() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for turn in 0..2 {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                let mut socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(std::time::Instant::now() < deadline, "missing continuation request");
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                        Err(err) => panic!("{err}"),
+                    }
+                };
+                socket.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                let mut reader = std::io::BufReader::new(socket.try_clone().unwrap());
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" { break; }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    { length = value.trim().parse::<usize>().unwrap(); }
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                requests.push(serde_json::from_slice::<serde_json::Value>(&body).unwrap());
+                let delta = if turn == 0 {
+                    serde_json::json!({"content":"第一部分", "tool_calls":[{
+                        "index":0,"id":"cut-call","function":{"name":"write",
+                        "arguments":"{\"path\":\"must-not-exist\",\"content\":\"bad\"}"}
+                    }]})
+                } else { serde_json::json!({"content":"第二部分"}) };
+                let event = serde_json::json!({"choices":[{"delta":delta,"finish_reason":if turn == 0 {"length"} else {"stop"}}],
+                    "usage":{"prompt_tokens":100,"completion_tokens":128}});
+                let body = format!("data: {event}\n\ndata: [DONE]\n\n");
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+            requests
+        });
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "providers":[{"name":"test","api":"completions","base_url":format!("http://{address}/v1"),
+                "api_key":"local-test","models":[{"id":"m","max_tokens":128,"context_window":128000}]}],
+            "default_model":"test/m"
+        })).unwrap();
+        let dir = std::env::temp_dir().join(format!("pi-continuation-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir(&dir).unwrap();
+        let mut agent = Agent::new(config, dir.clone(), false).unwrap();
+        agent.client = Client::local_test_client();
+        agent.session = Session::create_in(&dir, &dir, "test/m").unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(15), agent.run_turn("完成任务"))
+            .await.unwrap().unwrap();
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1]["messages"].as_array().unwrap().iter()
+            .any(|m| m["content"].as_str().is_some_and(|s| s.contains("不要重复"))));
+        assert!(!dir.join("must-not-exist").exists());
+        let messages = agent.session.context_messages();
+        assert_eq!(messages.iter().filter(|m| matches!(m, Message::Assistant { .. })).count(), 2);
+        assert!(messages.iter().all(|m| m.tool_calls().is_empty()));
+        assert!(messages.iter().any(|m| m.text() == "第一部分"));
+        assert!(messages.iter().any(|m| m.text() == "第二部分"));
+        assert_eq!(agent.session.user_history(), vec!["完成任务"]);
+        assert_eq!(agent.session.totals.input, 200, "one usage record per response");
+        assert_eq!(agent.session.totals.output, 256);
+        drop(agent);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

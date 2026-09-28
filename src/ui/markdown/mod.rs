@@ -7,7 +7,7 @@
 //!
 //! It is not a CommonMark implementation and does not pretend to be: no footnotes, no raw
 //! HTML, no reference links. What it covers is what models actually emit — headings,
-//! emphasis, inline code, fenced code with shell/JSON highlighting, lists (nested, ordered,
+//! emphasis, inline code, fenced code, lists (nested, ordered,
 //! task), tables, quotes, rules and links.
 //!
 //! Three rules shape every decision here:
@@ -229,7 +229,7 @@ fn closes(open: &Fence, line: &str) -> bool {
 }
 
 fn looks_like_table_row(line: &str) -> bool {
-    line.trim_start().starts_with('|')
+    line.contains('|')
 }
 
 fn flush_table(lines: &mut Vec<Line>, table: &mut Vec<String>, width: usize) {
@@ -253,14 +253,13 @@ fn block_line(line: &str) -> Vec<Line> {
         return vec![Line::spans(inline(rest, heading_style(level)))];
     }
     // Quotes nest: `>> x` and `> > x` are both two levels deep, and the number of bars is
-    // how a reader sees the nesting without counting characters. The bar is green, which
-    // is the colour Codex uses for a block quote; the words stay in the terminal's own
-    // foreground so a quote is not the same grey as a hint.
+    // how a reader sees the nesting without counting characters. The bar stays muted;
+    // the words keep the terminal foreground so quoted content remains readable.
     let (level, body) = quote_depth(line);
     if level > 0 {
         let mut spans: Vec<Span> = Vec::new();
         for _ in 0..level {
-            spans.push(Span::new("│\u{a0}", Style::new(Color::Green)));
+            spans.push(Span::new("│\u{a0}", Style::new(Color::Dim)));
         }
         spans.extend(inline(body, Style::italic(Color::Text)));
         return vec![Line::hanging(spans, level * 2)];
@@ -273,7 +272,7 @@ fn block_line(line: &str) -> Vec<Line> {
         // The marker's own trailing space becomes the non-breaking one, so the marker and
         // the first word are one unbreakable run without changing the visible spacing.
         let glued = format!("{}\u{a0}", marker.trim_end());
-        let mut spans = vec![Span::new(glued, Style::new(Color::Cyan))];
+        let mut spans = vec![Span::new(glued, Style::new(Color::Dim))];
         spans.extend(inline(body, Style::plain()));
         return vec![Line::hanging(spans, hang)];
     }
@@ -309,20 +308,24 @@ fn is_rule(line: &str) -> bool {
 fn heading(line: &str) -> Option<(usize, &str)> {
     let hashes = line.chars().take_while(|c| *c == '#').count();
     if (1..=6).contains(&hashes) && line.chars().nth(hashes) == Some(' ') {
-        return Some((hashes, line[hashes + 1..].trim_end()));
+        let body = line[hashes + 1..].trim_end();
+        let without_hashes = body.trim_end_matches('#');
+        let body = if without_hashes.ends_with(char::is_whitespace) {
+            without_hashes.trim_end()
+        } else { body };
+        return Some((hashes, body));
     }
     None
 }
 
 /// Weight by level, the way Codex does: a title is underlined, a section is bold, and
-/// the rest step down. The colour stays the accent — a heading in the body colour
-/// disappears into the paragraph under it.
+/// the rest step down. Font weight supplies the hierarchy without colouring the prose.
 fn heading_style(level: usize) -> Style {
     match level {
-        1 => Style { bold: true, underline: true, ..Style::new(Color::Cyan) },
-        2 => Style::bold(Color::Cyan),
-        3 => Style { bold: true, italic: true, ..Style::new(Color::Cyan) },
-        _ => Style::italic(Color::Cyan),
+        1 => Style { bold: true, underline: true, ..Style::new(Color::Text) },
+        2 => Style::bold(Color::Text),
+        3 => Style { bold: true, italic: true, ..Style::new(Color::Text) },
+        _ => Style::italic(Color::Text),
     }
 }
 
@@ -379,16 +382,20 @@ pub(super) fn inline(text: &str, style: Style) -> Vec<Span> {
     let mut buf = String::new();
     let mut i = 0;
     while i < chars.len() {
+        if chars[i] == '\\' && chars.get(i + 1).is_some_and(char::is_ascii_punctuation) {
+            buf.push(chars[i + 1]);
+            i += 2;
+            continue;
+        }
         // `code` first, so marks inside it stay literal.
         if chars[i] == '`'
-            && let Some(end) = chars[i + 1..].iter().position(|c| *c == '`')
+            && let Some((code, next)) = code_span(&chars, i)
         {
             push(&mut spans, &mut buf, style);
-            let code: String = chars[i + 1..i + 1 + end].iter().collect();
             if !code.is_empty() {
-                spans.push(Span::new(code, Style::new(Color::Green)));
+                spans.push(Span::new(code, Style { fg: Color::Cyan, ..style }));
             }
-            i += end + 2;
+            i = next;
             continue;
         }
         // Images before links: `![alt](url)` starts with `[` one character in.
@@ -409,10 +416,7 @@ pub(super) fn inline(text: &str, style: Style) -> Vec<Span> {
         {
             push(&mut spans, &mut buf, style);
             if !label.is_empty() {
-                spans.push(Span::new(
-                    label.clone(),
-                    Style { fg: Color::Cyan, underline: true, ..style },
-                ));
+                spans.extend(inline(&label, Style { fg: Color::Cyan, underline: true, ..style }));
             }
             // The URL is shown when it says something the label does not; when the label
             // *is* the URL, there is nothing to add.
@@ -433,11 +437,11 @@ pub(super) fn inline(text: &str, style: Style) -> Vec<Span> {
             push(&mut spans, &mut buf, style);
             let inner: String = chars[i + marker.len()..end].iter().collect();
             let inner_style = match marker {
+                "***" | "___" => Style { bold: true, italic: true, ..style },
                 "**" | "__" => Style { bold: true, ..style },
                 "*" | "_" => Style { italic: true, ..style },
-                // Strikethrough has no terminal attribute; dim is what "crossed out" reads
-                // as once colour is all you have.
-                "~~" => Style { fg: Color::Dim, ..style },
+                // SGR 9 preserves the text while marking it as removed.
+                "~~" => Style { crossed_out: true, ..style },
                 // `==highlight==` has nowhere to go in a terminal palette either.
                 "==" => Style { underline: true, ..style },
                 _ => style,
@@ -459,9 +463,13 @@ pub(super) fn inline(text: &str, style: Style) -> Vec<Span> {
 
 /// A `**` / `__` / `*` / `_` / `~~` / `==` that has a matching closer, and where it starts.
 fn closer(chars: &[char], at: usize) -> Option<(&'static str, usize)> {
-    let marker = if starts_with(chars, at, &['*', '*']) {
+    let marker = if starts_with(chars, at, &['*', '*', '*']) {
+        "***"
+    } else if starts_with(chars, at, &['_', '_', '_']) && word_boundary(chars, at) {
+        "___"
+    } else if starts_with(chars, at, &['*', '*']) {
         "**"
-    } else if starts_with(chars, at, &['_', '_']) {
+    } else if starts_with(chars, at, &['_', '_']) && word_boundary(chars, at) {
         "__"
     } else if starts_with(chars, at, &['~', '~']) {
         "~~"
@@ -475,9 +483,16 @@ fn closer(chars: &[char], at: usize) -> Option<(&'static str, usize)> {
         return None;
     };
     let mark: Vec<char> = marker.chars().collect();
+    if chars.get(at + mark.len()).is_none_or(|c| c.is_whitespace()) {
+        return None;
+    }
     let mut j = at + mark.len();
     while j + mark.len() <= chars.len() {
-        if starts_with(chars, j, &mark) {
+        if chars[j] == '\\' {
+            j += 2;
+            continue;
+        }
+        if starts_with(chars, j, &mark) && !chars[j - 1].is_whitespace() {
             // `snake_case` and `__init__`: an underscore inside a word is not emphasis.
             if marker == "_" && j < chars.len() && chars.get(j + 1).is_some_and(|c| c.is_ascii_alphanumeric()) {
                 j += 1;
@@ -495,7 +510,26 @@ fn closer(chars: &[char], at: usize) -> Option<(&'static str, usize)> {
 }
 
 fn word_boundary(chars: &[char], at: usize) -> bool {
-    at == 0 || !chars[at - 1].is_ascii_alphanumeric()
+    at == 0 || !(chars[at - 1].is_alphanumeric() || chars[at - 1] == '_')
+}
+
+fn code_span(chars: &[char], at: usize) -> Option<(String, usize)> {
+    let count = chars[at..].iter().take_while(|c| **c == '`').count();
+    let mut end = at + count;
+    while end < chars.len() {
+        if chars[end] != '`' { end += 1; continue; }
+        let run = chars[end..].iter().take_while(|c| **c == '`').count();
+        if run == count {
+            let body: String = chars[at + count..end].iter().collect();
+            let body = body.replace('\n', " ");
+            let body = if body.starts_with(' ') && body.ends_with(' ') && !body.trim().is_empty() {
+                body[1..body.len() - 1].to_string()
+            } else { body };
+            return Some((body, end + count));
+        }
+        end += run;
+    }
+    None
 }
 
 /// `[label](url)` starting at `at`. Returns the label, the url, and the index after the link.
@@ -505,10 +539,27 @@ fn link_at(chars: &[char], at: usize) -> Option<(String, String, usize)> {
     if chars.get(label_end + 1) != Some(&'(') {
         return None;
     }
-    let url_end = chars[label_end + 2..].iter().position(|c| *c == ')')?;
-    let url_at = label_end + 2 + url_end;
+    let mut url_at = label_end + 2;
+    let mut depth = 1;
+    let angled = chars.get(url_at) == Some(&'<');
+    let mut angle_closed = !angled;
+    while url_at < chars.len() {
+        match chars[url_at] {
+            '\\' => { url_at += 2; continue; }
+            '>' if angled => angle_closed = true,
+            '(' if angle_closed => depth += 1,
+            ')' if angle_closed => {
+                depth -= 1;
+                if depth == 0 { break; }
+            }
+            _ => {}
+        }
+        url_at += 1;
+    }
+    if depth != 0 { return None; }
     let label: String = chars[at + 1..label_end].iter().collect();
     let url: String = chars[label_end + 2..url_at].iter().collect();
+    let url = url.trim().strip_prefix('<').and_then(|s| s.strip_suffix('>')).unwrap_or(url.trim()).to_string();
     Some((label, url, url_at + 1))
 }
 
@@ -547,6 +598,33 @@ use code::{push, render_table, starts_with};
 mod tests {
     use super::*;
 
+    #[test]
+    fn summaries_render_combined_emphasis_escapes_and_code_delimiters() {
+        let rows = render("### 完成 ###\n***已验证***：\\*原文\\*，`` `code` ``，~~旧版~~", 80);
+        assert_eq!(rows[0].text(), "完成");
+        assert_eq!(rows[1].text(), "已验证：*原文*，`code`，旧版");
+        assert!(span(&rows, "已验证").style.bold);
+        assert!(span(&rows, "已验证").style.italic);
+        assert!(span(&rows, "旧版").style.crossed_out);
+        assert_eq!(rendered("foo__bar__baz"), vec!["foo__bar__baz"]);
+    }
+
+    #[test]
+    fn summary_links_keep_parentheses_spaces_and_formatted_labels() {
+        let rows = render("[**文件**](</tmp/my project/a(b).rs:12>) [说明](https://example.com/a(b))", 100);
+        assert_eq!(rows[0].text(), "文件 (/tmp/my project/a(b).rs:12) 说明 (https://example.com/a(b))");
+        assert!(span(&rows, "文件").style.bold && span(&rows, "文件").style.underline);
+    }
+
+    #[test]
+    fn tables_measure_rendered_cells_and_keep_literal_pipes() {
+        let rows = render("结果 | 值\n--- | ---\n**通过** | `a|b`\n完成 | a\\|b", 120);
+        assert!(rows[0].text().starts_with('┌'));
+        let widths: Vec<_> = rows.iter().map(Line::width).collect();
+        assert!(widths.iter().all(|w| *w == widths[0]), "{widths:?}");
+        assert!(rows.iter().any(|r| r.text().contains("a|b")));
+    }
+
     
 
     fn rendered(input: &str) -> Vec<String> {
@@ -583,7 +661,7 @@ mod tests {
         let rows = render("see **bold** and `code` plus [docs](https://example.com)", 80);
         assert_eq!(rows[0].text(), "see bold and code plus docs (https://example.com)");
         assert!(span(&rows, "bold").style.bold);
-        assert_eq!(span(&rows, "code").style.fg, Color::Green);
+        assert_eq!(span(&rows, "code").style.fg, Color::Cyan);
         assert!(span(&rows, "docs").style.underline, "a link is underlined");
         assert_eq!(span(&rows, "docs").style.fg, Color::Cyan);
     }
@@ -750,7 +828,7 @@ mod tests {
         assert!(rows[0].spans[0].style.bold && rows[0].spans[0].style.underline, "h1 is underlined");
         assert!(rows[1].spans[0].style.bold && !rows[1].spans[0].style.underline, "h2 is bold only");
         assert!(rows[2].spans[0].style.bold && rows[2].spans[0].style.italic, "h3 steps down");
-        assert_eq!(rows[0].spans[0].style.fg, Color::Cyan);
+        assert_eq!(rows[0].spans[0].style.fg, Color::Text);
     }
 
     #[test]
@@ -759,7 +837,7 @@ mod tests {
         let said = span(&rows, "said");
         assert_ne!(said.style.fg, Color::Dim);
         assert!(said.style.italic);
-        assert!(rows[0].spans.iter().any(|s| s.text.starts_with('│') && s.style.fg == Color::Green));
+        assert!(rows[0].spans.iter().any(|s| s.text.starts_with('│') && s.style.fg == Color::Dim));
     }
 
 
@@ -794,7 +872,7 @@ mod tests {
     fn strikethrough_keeps_its_text() {
         let rows = render("~~gone~~ kept", 80);
         assert_eq!(rows[0].text(), "gone kept");
-        assert_eq!(span(&rows, "gone").style.fg, Color::Dim);
+        assert!(span(&rows, "gone").style.crossed_out);
     }
 
     #[test]

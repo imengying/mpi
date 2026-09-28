@@ -5,17 +5,15 @@
 //! gate refuses — silently approving a dangerous command in a headless run would defeat
 //! the whole point of the policy.
 //!
-//! Approval is bound to one call: the fingerprint of the arguments that were shown is
-//! remembered, and anything that changes after the user has looked is asked again.
+//! Every decision returns owned, vetted arguments for one execution.
 
 use std::path::Path;
-
-use sha2_shim::fingerprint;
 
 use crate::auth::policy::{self, Assessment, Dialect};
 use crate::ui::auth_panel::{self, PanelRequest};
 
 /// Why a call was refused, in the words the policy used.
+#[derive(Debug)]
 pub struct Refusal {
     pub reason: String,
 }
@@ -33,8 +31,6 @@ impl Refusal {
 }
 
 pub struct PermissionGate {
-    /// Arguments the user has already approved, keyed by tool-call id.
-    approvals: std::collections::HashMap<String, String>,
     /// When false the panel is never shown and everything risky is refused (headless).
     interactive: bool,
     dialect: Dialect,
@@ -42,57 +38,40 @@ pub struct PermissionGate {
 
 impl PermissionGate {
     pub fn new(interactive: bool, dialect: Dialect) -> Self {
-        PermissionGate { approvals: std::collections::HashMap::new(), interactive, dialect }
+        PermissionGate { interactive, dialect }
     }
 
-    pub fn dialect(&self) -> Dialect {
-        self.dialect
-    }
-
-    pub fn reset(&mut self) {
-        self.approvals.clear();
-    }
-
-    /// Decide whether `tool` may run with `input`. `Ok(())` means run; `Err(refusal)`
-    /// means the model gets the refusal text back as the tool result.
-    pub async fn check(
-        &mut self,
-        call_id: &str,
+    /// Return the exact arguments that may execute. No cached approval can be replayed.
+    pub fn check(
+        &self,
         tool: &str,
         input: &serde_json::Value,
         cwd: &Path,
-    ) -> Result<(), Refusal> {
-        let decision = policy::assess_tool(tool, input, cwd, self.dialect);
-        let Assessment::Ask { reason } = decision else {
-            return Ok(());
-        };
-        if !self.interactive {
-            return Err(Refusal { reason });
-        }
-        let fingerprint = fingerprint(tool, input, cwd);
-        if self.approvals.get(call_id) == Some(&fingerprint) {
-            return Ok(());
-        }
-        let body = panel_body(tool, input);
-        let decision = auth_panel::ask(PanelRequest { body });
-        if decision == auth_panel::Decision::Allow {
-            self.approvals.insert(call_id.to_string(), fingerprint);
-            Ok(())
-        } else {
-            self.approvals.remove(call_id);
-            Err(Refusal { reason })
+    ) -> Result<serde_json::Value, Refusal> {
+        match policy::assess_tool(tool, input, cwd, self.dialect) {
+            Assessment::Allow { safe_command } => {
+                let mut approved = input.clone();
+                if let Some(command) = safe_command {
+                    approved["command"] = command.into();
+                }
+                Ok(approved)
+            }
+            Assessment::Ask { reason } => {
+                if self.interactive && auth_panel::ask(PanelRequest {
+                    body: format!("{reason}\n\n{}", panel_body(tool, input)),
+                }) == auth_panel::Decision::Allow {
+                    Ok(input.clone())
+                } else {
+                    Err(Refusal { reason })
+                }
+            }
         }
     }
 
-    /// Called once a tool call has finished, so an approval cannot be replayed.
-    pub fn finish(&mut self, call_id: &str) {
-        self.approvals.remove(call_id);
-    }
 }
 
 /// What the panel shows: the command itself for `bash`, the resolved arguments for the
-/// file tools. The policy's own reason is deliberately *not* shown — it goes to the
-/// model through the refusal message, where it can be acted on.
+/// file tools. The caller prepends the policy reason so the user can assess the request.
 fn panel_body(tool: &str, input: &serde_json::Value) -> String {
     if tool == "bash"
         && let Some(command) = input.get("command").and_then(|v| v.as_str())
@@ -102,95 +81,44 @@ fn panel_body(tool: &str, input: &serde_json::Value) -> String {
     serde_json::to_string_pretty(input).unwrap_or_else(|_| input.to_string())
 }
 
-/// A small content hash. Implemented here rather than pulling in a digest crate: the
-/// value is only ever compared with itself inside one process.
-mod sha2_shim {
-    // FNV-1a over the canonical JSON, plus the length, is enough to notice that the
-    // arguments changed between the panel and the execution.
-    pub fn fingerprint(tool: &str, input: &serde_json::Value, cwd: &std::path::Path) -> String {
-        let mut hasher = Fnv::default();
-        hasher.write(tool.as_bytes());
-        hasher.write(cwd.to_string_lossy().as_bytes());
-        hasher.write(ordered(input).as_bytes());
-        format!("{:016x}", hasher.finish())
-    }
-
-    /// Serialise with sorted object keys so field order in the model's JSON does not
-    /// change the fingerprint.
-    fn ordered(value: &serde_json::Value) -> String {
-        match value {
-            serde_json::Value::Object(map) => {
-                let mut keys: Vec<&String> = map.keys().collect();
-                keys.sort();
-                let inner: Vec<String> =
-                    keys.into_iter().map(|k| format!("{k:?}:{}", ordered(&map[k]))).collect();
-                format!("{{{}}}", inner.join(","))
-            }
-            serde_json::Value::Array(items) => {
-                let inner: Vec<String> = items.iter().map(ordered).collect();
-                format!("[{}]", inner.join(","))
-            }
-            other => other.to_string(),
-        }
-    }
-
-    #[derive(Default)]
-    struct Fnv {
-        state: u64,
-    }
-
-    impl Fnv {
-        fn write(&mut self, bytes: &[u8]) {
-            if self.state == 0 {
-                self.state = 0xcbf2_9ce4_8422_2325;
-            }
-            for byte in bytes {
-                self.state ^= *byte as u64;
-                self.state = self.state.wrapping_mul(0x1000_0000_01b3);
-            }
-        }
-
-        fn finish(self) -> u64 {
-            self.state
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
+    fn execution_receives_the_vetted_absolute_command() {
+        let gate = PermissionGate::new(false, Dialect::Zsh);
+        let input = serde_json::json!({"command":"git --no-pager diff --stat"});
+        let approved = gate.check("bash", &input, &std::env::temp_dir()).unwrap();
+        let command = approved["command"].as_str().unwrap();
+        assert!(command.starts_with("'/usr/bin/git'"));
+        assert!(command.contains("'--no-ext-diff'"));
+        assert!(command.contains("'--no-textconv'"));
+        assert!(command.contains("core.hooksPath=/dev/null"));
+        assert_eq!(input["command"], "git --no-pager diff --stat");
+    }
+
+    #[test]
     fn safe_calls_pass_without_asking() {
-        let mut gate = PermissionGate::new(true, Dialect::Zsh);
+        let gate = PermissionGate::new(true, Dialect::Zsh);
         let cwd = std::env::temp_dir();
         let input = serde_json::json!({"command": "ls"});
-        let result = futures_lite_block(gate.check("1", "bash", &input, &cwd));
+        let result = gate.check("bash", &input, &cwd);
         assert!(result.is_ok());
     }
 
     #[test]
     fn headless_refuses_what_needs_approval() {
-        let mut gate = PermissionGate::new(false, Dialect::Zsh);
+        let gate = PermissionGate::new(false, Dialect::Zsh);
         let cwd = std::env::temp_dir();
         let input = serde_json::json!({"command": "rm -rf /"});
-        let error = futures_lite_block(gate.check("1", "bash", &input, &cwd)).unwrap_err();
+        let error = gate.check("bash", &input, &cwd).unwrap_err();
         assert!(error.message().starts_with("未获得用户授权，操作未执行（"));
         // The refusal says what happened and why, and no more. An instruction to the model
         // about not retrying used to be appended; it is the model's business and the user
         // had to read it in every refusal.
         assert!(!error.message().contains("请勿改写"));
         assert!(!error.message().contains("不要重试"));
-    }
-
-    #[test]
-    fn the_fingerprint_ignores_key_order() {
-        let cwd = std::env::temp_dir();
-        let a = serde_json::json!({"path": "x", "content": "y"});
-        let b: serde_json::Value = serde_json::from_str(r#"{"content":"y","path":"x"}"#).unwrap();
-        assert_eq!(fingerprint("write", &a, &cwd), fingerprint("write", &b, &cwd));
-        let c: serde_json::Value = serde_json::from_str(r#"{"content":"z","path":"x"}"#).unwrap();
-        assert_ne!(fingerprint("write", &a, &cwd), fingerprint("write", &c, &cwd));
     }
 
     #[test]
@@ -202,15 +130,4 @@ mod tests {
         assert!(body.contains("\"path\": \"a.txt\""));
     }
 
-    /// The gate is async only because the rest of the loop is; in tests it never awaits.
-    fn futures_lite_block<F: std::future::Future>(future: F) -> F::Output {
-        use std::task::{Context, Poll, Waker};
-        let mut future = Box::pin(future);
-        let waker = Waker::noop();
-        let mut context = Context::from_waker(waker);
-        match future.as_mut().poll(&mut context) {
-            Poll::Ready(value) => value,
-            Poll::Pending => panic!("the policy check must not await anything"),
-        }
-    }
 }

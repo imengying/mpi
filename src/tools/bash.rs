@@ -8,8 +8,6 @@
 use std::path::Path;
 use std::process::Stdio;
 
-use tokio::io::AsyncReadExt;
-
 use crate::llm::ToolSpec;
 use crate::tools::{Display, ToolOutput};
 
@@ -30,11 +28,6 @@ pub fn spec() -> ToolSpec {
     }
 }
 
-pub async fn execute(arguments: &serde_json::Value, cwd: &Path) -> Result<ToolOutput, String> {
-    let command = crate::tools::required_str(arguments, "command")?;
-    execute_with_shell(command, cwd, crate::config::DEFAULT_SHELL).await
-}
-
 /// Run `command` in `shell`, with the working directory set to `cwd`.
 pub async fn execute_with_shell(
     command: &str,
@@ -42,39 +35,27 @@ pub async fn execute_with_shell(
     shell: &str,
 ) -> Result<ToolOutput, String> {
     let shell = if shell.is_empty() { crate::config::DEFAULT_SHELL } else { shell };
+    let capture = super::output::Capture::new().map_err(|err| format!("创建输出文件失败：{err}"))?;
+    let stdout = capture.file.try_clone().map_err(|err| err.to_string())?;
+    let stderr = capture.file.try_clone().map_err(|err| err.to_string())?;
     let mut child = tokio::process::Command::new(shell)
         .arg("-c")
         .arg(command)
         .current_dir(cwd)
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
         .kill_on_drop(true)
         .spawn()
         .map_err(|err| format!("无法启动 {shell}：{err}"))?;
 
-    let mut stdout = String::new();
-    let mut stderr = String::new();
-    if let Some(mut pipe) = child.stdout.take() {
-        let _ = pipe.read_to_string(&mut stdout).await;
-    }
-    if let Some(mut pipe) = child.stderr.take() {
-        let _ = pipe.read_to_string(&mut stderr).await;
-    }
     let status = child
         .wait()
         .await
         .map_err(|err| format!("等待命令结束失败：{err}"))?;
     let code = status.code();
 
-    let mut body = crate::util::sanitize(&stdout);
-    if !stderr.trim().is_empty() {
-        if !body.is_empty() && !body.ends_with('\n') {
-            body.push('\n');
-        }
-        body.push_str(&crate::util::sanitize(&stderr));
-    }
-    let body = body.trim_end_matches('\n').to_string();
+    let (body, full_path) = capture.finish(true).map_err(|err| format!("读取命令输出失败：{err}"))?;
 
     let failed = code != Some(0);
     let mut content = String::new();
@@ -88,6 +69,9 @@ pub async fn execute_with_shell(
         None => content.push_str("[命令被信号终止]\n"),
     }
     let mut footer: Vec<String> = Vec::new();
+    if let Some(path) = full_path {
+        footer.push(format!("完整输出：{}", path.display()));
+    }
     if failed {
         footer.push(match code {
             Some(0) | None => "命令被信号终止".to_string(),
@@ -106,6 +90,28 @@ duration: None,
 mod tests {
     use super::*;
     use crate::tools::block;
+
+    #[test]
+    fn large_stderr_cannot_block_stdout_and_keeps_the_full_log() {
+        let out = block(async {
+            tokio::time::timeout(std::time::Duration::from_secs(5), execute_with_shell(
+                "printf '%*s' 262144 '' >&2; printf '\\nlast-output\\n'",
+                &std::env::temp_dir(), "/usr/bin/zsh",
+            )).await.expect("stderr must not deadlock the command").unwrap()
+        });
+        assert!(out.content.contains("last-output"));
+        assert!(out.content.len() <= crate::util::MAX_OUTPUT_BYTES);
+        let Display::Command { footer, .. } = out.display else { panic!("command display") };
+        let path = footer.iter().find_map(|line| line.strip_prefix("完整输出：")).unwrap();
+        assert!(std::fs::metadata(path).unwrap().len() > 262144);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn non_utf8_output_does_not_discard_the_rest_of_the_stream() {
+        let out = block(execute_with_shell("printf '\\377ok\\n'", &std::env::temp_dir(), "/usr/bin/zsh")).unwrap();
+        assert!(out.content.contains("ok"));
+    }
     
 
     #[test]

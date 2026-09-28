@@ -108,9 +108,9 @@ fn reading_secrets_asks_but_reading_source_does_not() {
 fn headless_refuses_rather_than_approving() {
     use mpi::auth::guard::PermissionGate;
     let dir = cwd();
-    let mut gate = PermissionGate::new(false, Dialect::Zsh);
+    let gate = PermissionGate::new(false, Dialect::Zsh);
     let input = serde_json::json!({"command": "rm -rf build"});
-    let refusal = futures_block(gate.check("c1", "bash", &input, &dir)).unwrap_err();
+    let refusal = gate.check("bash", &input, &dir).unwrap_err();
     // The refusal states what happened and why, and stops there: the trailing instruction
     // to the model about not retrying read as a scolding in the user's transcript.
     assert_eq!(
@@ -119,14 +119,6 @@ fn headless_refuses_rather_than_approving() {
     );
 }
 
-
-fn futures_block<F: std::future::Future>(future: F) -> F::Output {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap()
-        .block_on(future)
-}
 
 #[test]
 fn the_policy_reports_a_reason_for_every_refusal() {

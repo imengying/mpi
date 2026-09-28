@@ -20,6 +20,7 @@ pub struct Style {
     /// rendering `*this*` as grey — the previous stand-in — made emphasis look like a hint.
     pub italic: bool,
     pub underline: bool,
+    pub crossed_out: bool,
     pub bg: Bg,
 }
 
@@ -33,23 +34,23 @@ pub enum Bg {
 
 impl Style {
     pub const fn plain() -> Self {
-        Style { fg: Color::Text, bold: false, italic: false, underline: false, bg: Bg::None }
+        Style { fg: Color::Text, bold: false, italic: false, underline: false, crossed_out: false, bg: Bg::None }
     }
 
     pub const fn new(fg: Color) -> Self {
-        Style { fg, bold: false, italic: false, underline: false, bg: Bg::None }
+        Style { fg, bold: false, italic: false, underline: false, crossed_out: false, bg: Bg::None }
     }
 
     pub const fn bold(fg: Color) -> Self {
-        Style { fg, bold: true, italic: false, underline: false, bg: Bg::None }
+        Style { fg, bold: true, italic: false, underline: false, crossed_out: false, bg: Bg::None }
     }
 
     pub const fn italic(fg: Color) -> Self {
-        Style { fg, bold: false, italic: true, underline: false, bg: Bg::None }
+        Style { fg, bold: false, italic: true, underline: false, crossed_out: false, bg: Bg::None }
     }
 
     pub const fn with_bg(fg: Color, bg: Bg) -> Self {
-        Style { fg, bold: false, italic: false, underline: false, bg }
+        Style { fg, bold: false, italic: false, underline: false, crossed_out: false, bg }
     }
 }
 /// A run of characters sharing one style.

@@ -328,7 +328,9 @@ fn tail(raw: &str, lines: &[&str]) -> String {
 
 /// Estimated token count for a text blob (chars / 4).
 pub fn estimate_tokens(text: &str) -> u64 {
-    (text.chars().count() as u64).div_ceil(4)
+    let ascii = text.chars().filter(char::is_ascii).count() as u64;
+    let non_ascii = text.chars().filter(|c| !c.is_ascii()).count() as u64;
+    ascii.div_ceil(4) + non_ascii
 }
 
 #[cfg(test)]

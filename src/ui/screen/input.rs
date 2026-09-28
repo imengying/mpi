@@ -149,6 +149,13 @@ impl Screen {
         /// caller decides what a submitted line means: at the prompt it is the next turn, and
         /// during a turn it is a message queued behind the one in flight.
         pub fn absorb_event(&mut self, event: Event) -> Option<Action> {
+            if let Event::Paste(text) = event {
+                self.notice = None;
+                self.editing.get_or_insert_with(Editor::new).paste(&text);
+                self.sync_menu();
+                self.render();
+                return None;
+            }
             if let Event::Resize(_, _) = event {
                 self.refresh_size();
                 self.render();
@@ -253,9 +260,7 @@ impl Screen {
                             if let Ok(text) = image_input::read_clipboard_text()
                                 && let Some(editor) = &mut self.editing
                             {
-                                // One line at a time: the editor has no multiline buffer,
-                                // and a raw newline would break the layout.
-                                editor.insert(&text.replace(['\n', '\r'], " "));
+                                editor.paste(&text);
                             }
                         }
                         Err(err) => {

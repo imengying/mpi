@@ -175,26 +175,26 @@ impl Message {
     /// the observed cost of a typical screenshot.
     pub fn estimate_tokens(&self) -> u64 {
         const IMAGE_TOKENS: u64 = 1_200;
-        let mut chars = 0usize;
+        let mut tokens = 0u64;
         let mut images = 0u64;
         match self {
-            Message::System { content } | Message::Tool { content, .. } => chars += content.len(),
+            Message::System { content } | Message::Tool { content, .. } => tokens += util::estimate_tokens(content),
             Message::User { content } | Message::Assistant { content, .. } => {
                 for block in content {
                     match block {
-                        Block::Text { text } => chars += text.len(),
-                        Block::Thinking { thinking, .. } => chars += thinking.len(),
+                        Block::Text { text } => tokens += util::estimate_tokens(text),
+                        Block::Thinking { thinking, .. } => tokens += util::estimate_tokens(thinking),
                         Block::ToolCall { name, arguments, .. } => {
-                            chars += name.len() + arguments.to_string().len()
+                            tokens += util::estimate_tokens(name) + util::estimate_tokens(&arguments.to_string())
                         }
-                        Block::Hosted { payload, .. } => chars += payload.to_string().len(),
-                        Block::Citation { url, title } => chars += url.len() + title.len(),
+                        Block::Hosted { payload, .. } => tokens += util::estimate_tokens(&payload.to_string()),
+                        Block::Citation { url, title } => tokens += util::estimate_tokens(url) + util::estimate_tokens(title),
                         Block::Image { .. } => images += 1,
                     }
                 }
             }
         }
-        (chars as u64).div_ceil(4) + images * IMAGE_TOKENS
+        tokens + images * IMAGE_TOKENS + 4
     }
 }
 

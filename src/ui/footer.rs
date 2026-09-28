@@ -65,7 +65,7 @@ fn location_line(state: &FooterState<'_>, theme: &Theme, width: usize) -> Line {
         budget = budget.saturating_sub(util::width(&shown));
         shown
     };
-    let mut spans = vec![Span::new(cwd, Style::new(Color::Green))];
+    let mut spans = vec![Span::new(cwd, Style::new(Color::Text))];
     if let Some(branch) = branch {
         // " (" + branch + ")", and at least one column so an empty branch cannot produce "()".
         let room = budget.saturating_sub(3);
@@ -73,7 +73,7 @@ fn location_line(state: &FooterState<'_>, theme: &Theme, width: usize) -> Line {
             let shown = util::truncate(&branch, room, "…");
             budget = budget.saturating_sub(util::width(&shown) + 3);
             spans.push(Span::new(" (", Style::new(Color::Dim)));
-            spans.push(Span::new(shown, Style::new(Color::Magenta)));
+            spans.push(Span::new(shown, Style::new(Color::Dim)));
             spans.push(Span::new(")", Style::new(Color::Dim)));
         }
     }
@@ -113,20 +113,20 @@ fn stats_line(state: &FooterState<'_>, theme: &Theme, width: usize) -> Line {
     };
     let context_color = theme.context(percent);
 
-    let green = Style::new(Color::Green);
+    let muted = Style::new(Color::Dim);
     let left = format!(
         "↑ {}   ↓ {}   {CACHE_ICON} {hit}   {context_text}",
         util::fmt_tokens(state.totals.input, false),
         util::fmt_tokens(state.totals.output, false),
     );
     // Split the left half back into its four runs so each context field can carry its own
-    // colour: the three usage fields are green, the gauge changes with how full it is.
+    // colour: usage stays muted, while the gauge highlights warnings and errors.
     let mut spans = vec![
-        Span::new(format!("↑ {}", util::fmt_tokens(state.totals.input, false)), green),
+        Span::new(format!("↑ {}", util::fmt_tokens(state.totals.input, false)), muted),
         Span::new("   ", Style::plain()),
-        Span::new(format!("↓ {}", util::fmt_tokens(state.totals.output, false)), green),
+        Span::new(format!("↓ {}", util::fmt_tokens(state.totals.output, false)), muted),
         Span::new("   ", Style::plain()),
-        Span::new(format!("{CACHE_ICON} {hit}"), green),
+        Span::new(format!("{CACHE_ICON} {hit}"), muted),
         Span::new("   ", Style::plain()),
         Span::new(context_text.clone(), Style::new(context_color)),
     ];
@@ -153,7 +153,15 @@ fn stats_line(state: &FooterState<'_>, theme: &Theme, width: usize) -> Line {
             .saturating_sub(left_width)
             .saturating_sub(util::width(&rendered));
         spans.push(Span::plain(" ".repeat(gap)));
-        spans.push(Span::new(rendered, Style::new(Color::Cyan)));
+        let level = if state.level.is_empty() { "low" } else { state.level };
+        let suffix = format!(" • {level}");
+        if state.model.is_some_and(|model| model.reasoning) && rendered.ends_with(&suffix) {
+            spans.push(Span::new(rendered[..rendered.len() - suffix.len()].to_string(), Style::new(Color::Text)));
+            spans.push(Span::new(" • ", Style::new(Color::Dim)));
+            spans.push(Span::new(level, Style::new(Color::reasoning(level))));
+        } else {
+            spans.push(Span::new(rendered, Style::new(Color::Text)));
+        }
     }
     Line::spans(spans)
 }
@@ -186,6 +194,22 @@ mod tests {
     use super::*;
     use crate::ui::plain;
     use crate::ui::theme::ColorMode;
+
+    #[test]
+    fn reasoning_levels_have_distinct_accents_in_the_footer() {
+        let theme = Theme { mode: ColorMode::Ansi256 };
+        let model = model();
+        let mut state = state("/tmp");
+        state.model = Some(&model);
+        let mut colors = Vec::new();
+        for level in ["low", "medium", "high", "xhigh", "max"] {
+            state.level = level;
+            let rows = render(&state, &theme, 120);
+            let color = rows[1].spans.iter().find(|s| s.text == level).unwrap().style.fg;
+            assert!(!colors.contains(&color));
+            colors.push(color);
+        }
+    }
 
     fn model() -> ModelConfig {
         serde_json::from_str(r#"{"id":"deepseek-v4.1-flash","name":"deepseek-v4.1-flash","reasoning":true,"context_window":1000000}"#)
@@ -311,7 +335,7 @@ mod tests {
         state.context_tokens = Some(950_000);
         assert_eq!(gauge(&state), ("950k/1M".to_string(), Color::Red));
         state.context_tokens = Some(17_300);
-        assert_eq!(gauge(&state), ("17.3k/1M".to_string(), Color::Green));
+        assert_eq!(gauge(&state), ("17.3k/1M".to_string(), Color::Dim));
     }
 
     #[test]

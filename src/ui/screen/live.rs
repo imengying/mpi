@@ -419,6 +419,7 @@ impl Screen {
                 // reset is 39. Nesting them the other way round would have the colour reset also
                 // clear the weight of a bold heading.
                 let text = if span.style.italic { self.theme.italic(&text) } else { text };
+                let text = if span.style.crossed_out { format!("\u{1b}[9m{text}\u{1b}[29m") } else { text };
                 let text = if span.style.underline { self.theme.underline(&text) } else { text };
                 let text = if span.style.bold { self.theme.bold(&text) } else { text };
                 let text = match background {

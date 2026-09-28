@@ -3,6 +3,41 @@
 use super::*;
 use crate::ui::footer::FooterState;
 
+#[test]
+fn pasted_paragraphs_wait_for_enter_at_the_prompt_and_during_a_turn() {
+    for busy in [false, true] {
+        let mut screen = screen();
+        screen.begin_line();
+        if busy {
+            screen.set_working("工作中");
+        }
+        let text = "第一段\n\n第二段\n/exit\n";
+        assert!(screen.absorb_event(Event::Paste(text.into())).is_none());
+        assert_eq!(input(&screen), text);
+        assert!(screen.history.is_empty());
+        assert!(screen.pending.is_empty());
+        let action = screen.absorb_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter, KeyModifiers::NONE,
+        )));
+        assert!(matches!(action, Some(Action::Line(line)) if line == text));
+        assert_eq!(screen.history, vec![text.to_string()]);
+        assert_eq!(input(&screen), "");
+    }
+}
+
+#[test]
+fn pasting_newlines_does_not_accept_a_command_menu_entry() {
+    let mut screen = screen();
+    screen.begin_line();
+    set_input(&mut screen, "/");
+    screen.sync_menu();
+    assert!(screen.absorb_event(Event::Paste("model\n\n".into())).is_none());
+    assert!(screen.menu.is_empty());
+    assert!(matches!(screen.absorb_event(Event::Key(KeyEvent::new(
+        KeyCode::Enter, KeyModifiers::NONE,
+    ))), Some(Action::Line(line)) if line == "/model\n\n"));
+}
+
     fn screen() -> Screen {
         let mut screen = Screen::new();
         screen.interactive = false;

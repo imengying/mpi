@@ -126,6 +126,8 @@ pub struct Agent {
     level: String,
     compaction: CompactionState,
     retry: RetryBudget,
+    length_retries: u8,
+    continuing_output: bool,
     /// Set while a turn is streaming, so `/compact` can refuse instead of corrupting it.
     streaming: bool,
     /// The session's system message, read from `AGENTS.md` when the session started.
@@ -184,6 +186,8 @@ impl Agent {
             level,
             compaction: CompactionState::default(),
             retry: RetryBudget::default(),
+            length_retries: 0,
+            continuing_output: false,
             streaming: false,
             system_prompt,
             deleted: false,
@@ -193,10 +197,7 @@ impl Agent {
     /// Resume an existing session file.
     pub fn resume(config: Config, cwd: PathBuf, path: &Path, interactive: bool) -> anyhow::Result<Self> {
         let mut session = Session::open(path)?;
-        // The model and level come from the newest turn the session recorded, falling back to
-        // the header for a session old enough to predate turn contexts. Taking the header
-        // always would silently undo `/model`: the choice was made in the conversation and
-        // the conversation has to remember it.
+        // Use the newest recorded turn, or the header if no turn has started yet.
         let (recorded_model, recorded_level) = session.current_model().unwrap_or_default();
         let model_spec = match recorded_model {
             spec if !spec.is_empty() => spec,
@@ -293,6 +294,8 @@ impl Agent {
             level,
             compaction: CompactionState::default(),
             retry: RetryBudget::default(),
+            length_retries: 0,
+            continuing_output: false,
             streaming: false,
             system_prompt,
             deleted: false,

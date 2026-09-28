@@ -28,7 +28,7 @@ impl Screen {
             }
             // Once there is a space the command name is settled and the argument is being typed,
             // so the menu has nothing left to offer.
-            if rest.contains(' ') {
+            if rest.contains(char::is_whitespace) {
                 return Vec::new();
             }
             let prefix = rest.trim();
@@ -46,7 +46,7 @@ impl Screen {
                 return false;
             };
             let before: String = editing.text().chars().take(editing.caret()).collect();
-            !before.contains(' ')
+            !before.contains(char::is_whitespace)
         }
 
 
@@ -88,7 +88,7 @@ impl Screen {
             let Some(rest) = text.strip_prefix('/') else {
                 return false;
             };
-            if rest.contains(' ') || self.menu.is_empty() {
+            if rest.contains(char::is_whitespace) || self.menu.is_empty() {
                 return false;
             }
             let names: Vec<&str> = self.menu.iter().map(|(name, _)| name.as_str()).collect();

@@ -46,7 +46,7 @@ pub(super) fn render_table(rows: &[String], width: usize) -> Vec<Line> {
     // The second row has to be the separator, or these lines are not a table at all —
     // which is what keeps a half-streamed table from being eaten as one.
     let Some(header_align) = rows.get(1).and_then(|row| parse_separator(row)) else {
-        return rows.iter().map(|row| Line::spans(inline(row.trim_end(), Style::plain()))).collect();
+        return rows.iter().flat_map(|row| super::block_line(row.trim_end())).collect();
     };
     let header = split_row(&rows[0]);
     let mut aligns = header_align;
@@ -69,13 +69,13 @@ pub(super) fn render_table(rows: &[String], width: usize) -> Vec<Line> {
     let mut widths = vec![0usize; cols];
     for row in &table {
         for (index, cell) in row.iter().enumerate() {
-            widths[index] = widths[index].max(util::width(cell.trim()));
+            widths[index] = widths[index].max(cell_width(cell));
         }
     }
     // "│ " + cells joined by " │ " + " │" is 3 columns per cell plus 1.
     let overhead = 3 * cols + 1;
     let fits = width == 0 || widths.iter().sum::<usize>() + overhead <= width;
-    if width > 0 && (width > TABLE_MAX_WIDTH || !fits) {
+    if width > 0 && (widths.iter().sum::<usize>() + overhead > TABLE_MAX_WIDTH || !fits) {
         // Too wide for a table to be a table: plain rows, pipes removed, so nothing
         // pretends to be a grid.
         return table
@@ -103,7 +103,7 @@ pub(super) fn render_table(rows: &[String], width: usize) -> Vec<Line> {
         let mut spans: Vec<Span> = vec![Span::new("│", Style::new(Color::Dim))];
         for (index, w) in widths.iter().enumerate() {
             let cell = row.get(index).map(|c| c.trim()).unwrap_or("");
-            let pad = w.saturating_sub(util::width(cell));
+            let pad = w.saturating_sub(cell_width(cell));
             let (left, right) = match aligns.get(index).copied().unwrap_or(Align::Left) {
                 Align::Left => (0, pad),
                 Align::Right => (pad, 0),
@@ -160,5 +160,33 @@ fn split_row(row: &str) -> Vec<String> {
     let trimmed = row.trim();
     let inner = trimmed.strip_prefix('|').unwrap_or(trimmed);
     let inner = inner.strip_suffix('|').unwrap_or(inner);
-    inner.split('|').map(|cell| cell.trim().to_string()).collect()
+    let chars: Vec<char> = inner.chars().collect();
+    let mut cells = Vec::new();
+    let mut cell = String::new();
+    let mut index = 0;
+    while index < chars.len() {
+        if chars[index] == '\\' && chars.get(index + 1) == Some(&'|') {
+            cell.push('|');
+            index += 2;
+            continue;
+        }
+        if chars[index] == '`' && let Some((_, next)) = super::code_span(&chars, index) {
+            cell.extend(&chars[index..next]);
+            index = next;
+            continue;
+        }
+        if chars[index] == '|' {
+            cells.push(cell.trim().to_string());
+            cell.clear();
+        } else {
+            cell.push(chars[index]);
+        }
+        index += 1;
+    }
+    cells.push(cell.trim().to_string());
+    cells
+}
+
+fn cell_width(cell: &str) -> usize {
+    inline(cell.trim(), Style::plain()).iter().map(|span| util::width(&span.text)).sum()
 }

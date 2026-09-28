@@ -1,5 +1,5 @@
-//! The single dark theme. Colours are codex's semantics, hard-coded on purpose:
-//! pi has no theme switcher.
+//! A restrained, Codex-inspired terminal theme. Body text uses the user's foreground;
+//! accents identify actions and reasoning levels rather than colouring every field.
 
 /// `truecolor` vs 256-colour fallback is decided once per process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +47,15 @@ pub enum Color {
 }
 
 impl Color {
+    pub fn reasoning(level: &str) -> Self {
+        match level {
+            "medium" => Self::Cyan,
+            "high" => Self::Blue,
+            "xhigh" => Self::Magenta,
+            "max" => Self::Yellow,
+            _ => Self::Dim,
+        }
+    }
     /// `(r, g, b, ansi256_index)`, or `None` to leave the terminal's colour alone.
     fn rgb(self) -> Option<(u8, u8, u8, u8)> {
         Some(match self {
@@ -119,7 +128,10 @@ impl Theme {
     }
 
     pub fn bg_selected(&self, text: &str) -> String {
-        format!("\u{1b}[48;2;62;62;62m{text}\u{1b}[49m")
+        match self.mode {
+            ColorMode::True => format!("\u{1b}[48;2;48;48;48m{text}\u{1b}[49m"),
+            ColorMode::Ansi256 => format!("\u{1b}[48;5;236m{text}\u{1b}[49m"),
+        }
     }
 
     /// The context gauge changes colour as it fills.
@@ -129,7 +141,7 @@ impl Theme {
         } else if percent > 70.0 {
             Color::Yellow
         } else {
-            Color::Green
+            Color::Dim
         }
     }
 }

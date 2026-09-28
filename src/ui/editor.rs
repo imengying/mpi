@@ -47,6 +47,19 @@ pub(crate) fn input_layout(text: &str, width: usize, prompt_width: usize) -> Vec
     // under itself; the usable width is therefore the same on all of them.
     let room = width.saturating_sub(prompt_width).max(1);
     for (index, c) in text.chars().enumerate() {
+        if c == '\n' {
+            rows.push(InputRow {
+                prefix: String::new(),
+                text: std::mem::take(&mut current),
+                start,
+            });
+            if used == room {
+                rows.push(InputRow { prefix: String::new(), text: String::new(), start: index });
+            }
+            start = index + 1;
+            used = 0;
+            continue;
+        }
         let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
         if used + cw > room && used > 0 {
             rows.push(InputRow {
@@ -177,10 +190,14 @@ impl Editor {
 
     /// Insert at the caret, which then sits after the text just typed.
     pub fn insert(&mut self, text: &str) {
-        for (offset, c) in text.chars().enumerate() {
-            self.chars.insert(self.caret + offset, c);
-        }
+        self.chars.splice(self.caret..self.caret, text.chars());
         self.caret += text.chars().count();
+    }
+
+    /// Both clipboard paths insert one edit, preserving paragraphs without terminal controls.
+    pub fn paste(&mut self, text: &str) {
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        self.insert(&crate::util::sanitize(&text));
     }
 
     /// Backspace: remove the character *before* the caret, if there is one.
@@ -232,6 +249,36 @@ impl Editor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pasted_paragraphs_keep_breaks_and_insert_at_the_caret() {
+        let mut editor = Editor::from_text("前后");
+        editor.move_caret(-1);
+        editor.paste("甲\r\n\r\n乙\r丙\n");
+        assert_eq!(editor.text(), "前甲\n\n乙\n丙\n后");
+        assert_eq!(editor.caret(), 8);
+        editor.paste("\u{1b}[31m红\u{1b}[0m\t字");
+        assert_eq!(editor.text(), "前甲\n\n乙\n丙\n红    字后");
+    }
+
+    #[test]
+    fn paragraph_layout_tracks_blank_lines_and_caret_positions() {
+        let text = "你好\n\n世界\n";
+        let rows = input_layout(text, 7, 2);
+        assert_eq!(rows.iter().map(|r| r.text.as_str()).collect::<Vec<_>>(),
+                   vec!["你好", "", "世界", ""]);
+        assert_eq!(input_caret(&rows, 2), (0, 4));
+        assert_eq!(input_caret(&rows, 3), (1, 0));
+        assert_eq!(input_caret(&rows, 4), (2, 0));
+        assert_eq!(input_caret(&rows, 7), (3, 0));
+        let rows = input_layout("abcde\nf", 6, 2);
+        assert_eq!(rows.iter().map(|r| r.text.as_str()).collect::<Vec<_>>(),
+                   vec!["abcd", "e", "f"]);
+        assert_eq!(input_caret(&rows, 6), (2, 0));
+        let rows = input_layout("你好\n", 6, 2);
+        assert_eq!(input_caret(&rows, 2), (1, 0));
+        assert_eq!(input_caret(&rows, 3), (2, 0));
+    }
 
     #[test]
     fn left_and_right_step_by_character_and_stop_at_both_ends() {

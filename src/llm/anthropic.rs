@@ -151,13 +151,8 @@ pub fn build_request(req: &Request<'_>) -> MessagesRequest {
     let compat = provider.compat(model);
     let max_tokens = model.max_tokens();
     let plan = plan_thinking(model, req.level, max_tokens);
-    // Thinking tokens come out of `max_tokens`, so the budget has to be subtracted
-    // from it rather than sent on top.
+    // The API max_tokens includes both thinking and the visible answer.
     let thinking_budget = plan.budget_tokens.map(|b| b.min(max_tokens.saturating_sub(1024)));
-    let effective_max = match thinking_budget {
-        Some(budget) => max_tokens.saturating_sub(budget).max(1024),
-        None => max_tokens,
-    };
 
     let mut system = None;
     let mut messages: Vec<OutMessage> = Vec::new();
@@ -286,7 +281,7 @@ pub fn build_request(req: &Request<'_>) -> MessagesRequest {
 
     MessagesRequest {
         model: model.id.clone(),
-        max_tokens: effective_max,
+        max_tokens,
         system,
         messages,
         tools,
@@ -865,14 +860,14 @@ mod tests {
     }
 
     #[test]
-    fn thinking_budget_is_subtracted_from_max_tokens() {
+    fn thinking_budget_is_part_of_the_total_output_budget() {
         let (model, provider) = fixtures();
         let messages = vec![Message::user_text("hi")];
         let req = Request { model: &model, provider: &provider, messages: &messages, tools: &[], level: "high", session_id: "s", cache_hints: false };
         let body = serde_json::to_value(build_request(&req)).unwrap();
         let budget = body["thinking"]["budget_tokens"].as_u64().unwrap();
         assert_eq!(budget, 8000);
-        assert_eq!(body["max_tokens"], 8000);
+        assert_eq!(body["max_tokens"], 16000);
     }
 
     #[test]

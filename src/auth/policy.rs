@@ -100,25 +100,9 @@ pub enum Operation {
 // Path handling
 // ---------------------------------------------------------------------------
 
-/// Resolve a tool-supplied path the way the tools themselves do, including `~`,
-/// `@` prefixes and `file:` URLs.
+/// Resolve a literal tool path, supporting only the home-directory shorthand `~`.
 pub fn resolve_tool_path(input: &str, cwd: &Path) -> PathBuf {
-    let cleaned: String = input
-        .chars()
-        .map(|c| match c {
-            '\u{a0}' | '\u{2000}'..='\u{200a}' | '\u{202f}' | '\u{205f}' | '\u{3000}' => ' ',
-            other => other,
-        })
-        .collect();
-    let mut path = cleaned.as_str();
-    if let Some(rest) = path.strip_prefix('@') {
-        path = rest;
-    }
-    let owned;
-    if let Some(rest) = path.strip_prefix("file://") {
-        owned = rest.to_string();
-        path = &owned;
-    }
+    let path = input;
     let expanded = if path == "~" {
         home().to_string_lossy().to_string()
     } else if let Some(rest) = path.strip_prefix("~/") {
@@ -435,6 +419,9 @@ pub fn trusted_executable(command: &str) -> Option<PathBuf> {
             continue;
         }
         let Ok(resolved) = std::fs::canonicalize(&candidate) else { continue };
+        if resolved.file_name().and_then(|n| n.to_str()) != Some(name) {
+            continue;
+        }
         let trusted = resolved
             .parent()
             .map(|parent| TRUSTED_DIRS.iter().any(|dir| parent == Path::new(dir)))
@@ -519,13 +506,13 @@ fn known_short_options(args: &[String], simple: &str, value_taking: &str) -> boo
         if body.is_empty() {
             continue;
         }
-        let mut chars = body.chars();
-        let first = chars.next().unwrap();
-        if value_taking.contains(first) {
-            continue;
-        }
-        if !body.chars().all(|c| simple.contains(c)) {
-            return false;
+        for c in body.chars() {
+            if value_taking.contains(c) {
+                break;
+            }
+            if !simple.contains(c) {
+                return false;
+            }
         }
     }
     true
@@ -736,6 +723,12 @@ match name {
         if sets_or_reads {
             return Some("date 参数会设置系统时间或读取文件".to_string());
         }
+        if !known_long_options(args, &["--utc", "--universal", "--iso-8601", "--rfc-3339", "--rfc-email", "--help", "--version"])
+            || !known_short_options(args, "uR", "I")
+            || args.iter().any(|arg| !arg.starts_with('-') && !arg.starts_with('+'))
+        {
+            return Some("date 参数未被确认为仅显示时间".to_string());
+        }
     }
     _ => {}
 }
@@ -811,6 +804,9 @@ fn vet_segment(words: &[Word], cwd: &Path, dialect: Dialect) -> Assessment {
 ///
 /// `Some(decision)` means an argument was refused; `None` means they all checked out.
 fn path_problem(name: &str, args: &[String], cwd: &Path) -> Option<Assessment> {
+    if matches!(name, "rg" | "grep") {
+        return search_path_problem(name, args, cwd);
+    }
 // Check every argument a literal path could hide in, including option values such as
 // `--file=...`. `cat id_rsa` matters as much as `cat .ssh/id_rsa`, and printing
 // commands carry data rather than paths, so they are exempt.
@@ -862,11 +858,66 @@ if !DATA_ARG_COMMANDS.contains(&name) {
         }
     }
 }
+
+/// Search patterns and formatting options are data; pattern files and operands are paths.
+fn search_path_problem(name: &str, args: &[String], cwd: &Path) -> Option<Assessment> {
+    let mut pattern = false;
+    let mut files_only = false;
+    let mut positional = false;
+    let mut pending: Option<bool> = None; // true: path, false: literal data
+    for arg in args {
+        if let Some(path) = pending.take() {
+            if path {
+                let decision = assess_path(Operation::Read, arg, cwd);
+                if !decision.allows() { return Some(decision); }
+            }
+            continue;
+        }
+        if !positional && arg == "--" { positional = true; continue; }
+        if !positional && arg.starts_with("--") {
+            let (flag, value) = arg.split_once('=').map_or((arg.as_str(), None), |(k, v)| (k, Some(v)));
+            if flag == "--files" { files_only = true; }
+            if matches!(flag, "--regexp" | "--file") { pattern = true; }
+            let path = matches!(flag, "--file" | "--exclude-from");
+            let data = matches!(flag, "--regexp" | "--glob" | "--iglob" | "--type" | "--type-not"
+                | "--replace" | "--max-count" | "--max-columns" | "--maxdepth" | "--encoding"
+                | "--before-context" | "--after-context" | "--context" | "--include" | "--exclude"
+                | "--exclude-dir" | "--label");
+            if let Some(value) = value {
+                if !data {
+                    let decision = assess_path(Operation::Read, value, cwd);
+                    if !decision.allows() { return Some(decision); }
+                }
+            } else if path || data { pending = Some(path); }
+            continue;
+        }
+        if !positional && arg.starts_with('-') && arg != "-" {
+            let value_flags = if name == "rg" { "efgtrTABCm" } else { "efABCm" };
+            for (index, flag) in arg[1..].char_indices() {
+                if !value_flags.contains(flag) { continue; }
+                if matches!(flag, 'e' | 'f') { pattern = true; }
+                let value = &arg[1 + index + flag.len_utf8()..];
+                if value.is_empty() { pending = Some(flag == 'f'); }
+                else if flag == 'f' {
+                    let decision = assess_path(Operation::Read, value, cwd);
+                    if !decision.allows() { return Some(decision); }
+                }
+                break;
+            }
+            continue;
+        }
+        if !pattern && !files_only { pattern = true; continue; }
+        let decision = assess_path(Operation::Read, arg, cwd);
+        if !decision.allows() { return Some(decision); }
+    }
+    pending.map(|_| Assessment::ask("搜索选项缺少参数"))
+}
     None
 }
 
 /// `sed -n '1,10p' file`, `sed -n '5p' file`, `sed '1,$p' file`. Nothing else.
 fn vet_git(executable: &Path, args: &[String], cwd: &Path) -> Assessment {
+    let args = args.strip_prefix(&["--no-pager".to_string()]).unwrap_or(args);
     // Scan for the options that make git execute something else *before* choosing a
     // subcommand, because `git -c core.pager=evil log` would otherwise be reported as an
     // unknown subcommand and the real hazard would go unnamed.
@@ -1048,8 +1099,14 @@ pub fn assess_command(command: &str, cwd: &Path, dialect: Dialect) -> Assessment
     // Where the segments after this one will run. It only moves for a `cd`, and it is what
     // keeps a relative path meaning the same thing here as it does to the shell.
     let mut here = cwd.to_path_buf();
-    for segment in &segments {
+    for (index, segment) in segments.iter().enumerate() {
         if let Some(target) = cd_target(&segment.words, &here, dialect) {
+            // Pipelines and failure branches do not share one predictable working directory.
+            if index != 0 || segment.operator.as_deref().is_some_and(|op| op != "&&")
+                || segments.iter().any(|s| s.operator.as_deref() == Some("||"))
+            {
+                return Assessment::ask("只能自动确认命令开头通过 && 连接的目录切换");
+            }
             let target = match target {
                 Ok(target) => target,
                 Err(reason) => return Assessment::ask(reason),
@@ -1104,12 +1161,12 @@ pub fn assess_tool(name: &str, input: &serde_json::Value, cwd: &Path, dialect: D
     match name {
         "bash" => assess_command(string("command"), cwd, dialect),
         "write" | "edit" => {
-            let path = if string("path").is_empty() { string("file_path") } else { string("path") };
+            let path = string("path");
             assess_path(Operation::Write, path, cwd)
         }
         "read" | "grep" | "find" | "ls" => {
             let path = {
-                let explicit = if string("path").is_empty() { string("file_path") } else { string("path") };
+                let explicit = string("path");
                 if explicit.is_empty() {
                     cwd.to_string_lossy().to_string()
                 } else {
@@ -1125,6 +1182,35 @@ pub fn assess_tool(name: &str, input: &serde_json::Value, cwd: &Path, dialect: D
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_patterns_are_data_but_pattern_files_are_checked() {
+        for command in ["rg '.env' src", "rg -ne '.ssh/id_rsa' src", "grep -e /etc/shadow src/main.rs", "git --no-pager diff --stat", "pwd;"] {
+            assert!(allows(command), "{command}: {}", reason(command));
+        }
+        for command in ["rg -nf.env src", "rg -n -f .env src", "grep --exclude-from=.env hello .", "rg --files -- .env", "date --se=20260101", "date 010100002026"] {
+            assert!(!allows(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn directory_changes_cannot_escape_pipeline_or_failure_scopes() {
+        for command in ["cd /tmp | cat .env", "cd /tmp || cat .env", "echo ok | cd /tmp; cat .env"] {
+            assert!(!assess_command(command, Path::new("/"), Dialect::Zsh).allows(), "{command}");
+        }
+        assert!(assess_command("cd /tmp && pwd", Path::new("/"), Dialect::Zsh).allows());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_executable_alias_cannot_turn_a_reader_into_a_writer() {
+        let dir = std::env::temp_dir().join(format!("pi-executable-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir(&dir).unwrap();
+        let alias = dir.join("cat");
+        std::os::unix::fs::symlink("/usr/bin/rm", &alias).unwrap();
+        assert!(trusted_executable(alias.to_str().unwrap()).is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     fn cwd() -> PathBuf {
         std::env::temp_dir().join("pi-policy-cwd")

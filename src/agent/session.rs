@@ -28,7 +28,7 @@ pub struct SessionHeader {
 
 /// One line of the file. `type` is the discriminator, matching codex's shape.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Record {
     /// First line: id, time, cwd, model.
     SessionMeta {
@@ -46,8 +46,7 @@ pub enum Record {
         usage: Option<Usage>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         stop_reason: Option<StopReason>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        timestamp: Option<String>,
+        timestamp: String,
     },
     /// Per-turn environment snapshot. Never sent to the model as conversation.
     TurnContext {
@@ -56,15 +55,6 @@ pub enum Record {
         cwd: String,
         model: String,
         level: String,
-        timestamp: String,
-    },
-    /// Out-of-band event, including the per-request token count.
-    EventMsg {
-        parent_id: Option<String>,
-        id: String,
-        kind: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        usage: Option<Usage>,
         timestamp: String,
     },
     /// The session name. Appended, never a rewrite of the header.
@@ -97,7 +87,6 @@ impl Record {
             Record::SessionMeta { header, .. } => &header.id,
             Record::ResponseItem { id, .. }
             | Record::TurnContext { id, .. }
-            | Record::EventMsg { id, .. }
             | Record::SessionInfo { id, .. }
             | Record::Compacted { id, .. } => id,
         }
@@ -108,7 +97,6 @@ impl Record {
             Record::SessionMeta { .. } => None,
             Record::ResponseItem { parent_id, .. }
             | Record::TurnContext { parent_id, .. }
-            | Record::EventMsg { parent_id, .. }
             | Record::SessionInfo { parent_id, .. }
             | Record::Compacted { parent_id, .. } => parent_id.as_deref(),
         }
@@ -137,7 +125,6 @@ impl Record {
     pub fn usage(&self) -> Option<Usage> {
         match self {
             Record::ResponseItem { usage, .. }
-            | Record::EventMsg { usage, .. }
             | Record::Compacted { usage, .. } => *usage,
             _ => None,
         }
@@ -302,7 +289,7 @@ impl Session {
     /// assistant message an overflow recovery dropped.
     pub fn context_messages(&self) -> Vec<Message> {
         let start = self.last_checkpoint_index();
-        let mut messages: Vec<Message> = match start {
+        let messages: Vec<Message> = match start {
             Some(index) => {
                 let Record::Compacted { replacement_history, .. } = &self.records[index] else {
                     unreachable!()
@@ -317,24 +304,21 @@ impl Session {
             }
             None => self.records.iter().filter_map(Record::message).cloned().collect(),
         };
-        // A `dropped_assistant` marker removes the matching message by position, newest
-        // first, so the chain can be reconstructed without rewriting the file.
-        let dropped = self
-            .records
-            .iter()
-            .filter(|record| {
-                matches!(record, Record::EventMsg { kind, .. } if kind == "dropped_assistant")
-            })
-            .count();
-        for _ in 0..dropped {
-            if let Some(index) = messages
-                .iter()
-                .rposition(|message| matches!(message, Message::Assistant { .. }))
-            {
-                messages.remove(index);
-            }
-        }
+
         messages
+    }
+
+    /// Latest observed prompt+answer plus messages appended since that observation.
+    pub fn measured_context_tokens(&self) -> Option<u64> {
+        let usage = self.last_usage?;
+        if usage.input.saturating_add(usage.cache_read).saturating_add(usage.cache_write) == 0 {
+            return None;
+        }
+        let index = self.last_usage_index?;
+        let appended = self.records[index + 1..].iter().filter_map(Record::message)
+            .map(Message::estimate_tokens).sum::<u64>();
+        Some(usage.input.saturating_add(usage.output).saturating_add(usage.cache_read)
+            .saturating_add(usage.cache_write).saturating_add(appended))
     }
 
     pub fn last_checkpoint_index(&self) -> Option<usize> {
@@ -387,9 +371,7 @@ impl Session {
     /// session still offers the turns the summary folded away — they are what the user
     /// actually typed, which is what the arrows are for.
     ///
-    /// Multi-line input is stored as one message but the editor is single-line, so each line
-    /// becomes its own history entry: recalling a message that was typed over three lines
-    /// would otherwise drop a newline into a buffer that cannot hold one.
+    /// A multi-paragraph message stays one history entry.
     pub fn user_history(&self) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
         for record in &self.records {
@@ -397,11 +379,9 @@ impl Session {
             if !matches!(message, Message::User { .. }) || crate::agent::r#loop::is_environment_block(message) {
                 continue;
             }
-            for line in message.text().lines() {
-                if !line.trim().is_empty() {
-                    out.push(line.to_string());
-                }
-            }
+            let text = message.text();
+            if !text.trim().is_empty() { out.push(text); }
+
         }
         out
     }
@@ -412,15 +392,6 @@ impl Session {
             return Ok(());
         }
         let id = self.next_id();
-        let record = Record::SessionInfo {
-            parent_id: self.last_id.clone(),
-            id: id.clone(),
-            name: self.name(),
-            timestamp: now(),
-        };
-        let _ = record;
-        // `SessionInfo` carries only the name, so the directory update rides on the
-        // turn-context record, which is exactly what that record type exists for.
         let record = Record::TurnContext {
             parent_id: self.last_id.clone(),
             id: id.clone(),
@@ -503,7 +474,7 @@ impl Session {
             message,
             usage,
             stop_reason,
-            timestamp: Some(now()),
+            timestamp: now(),
         };
         self.append(record, id.clone())?;
         if let Some(usage) = usage {
@@ -522,19 +493,6 @@ impl Session {
             cwd: cwd.to_string_lossy().to_string(),
             model: model.to_string(),
             level: level.to_string(),
-            timestamp: now(),
-        };
-        self.append(record, id)
-    }
-
-    /// Record the token count a request actually used.
-    pub fn push_token_count(&mut self, usage: Usage) -> Result<(), SessionError> {
-        let id = self.next_id();
-        let record = Record::EventMsg {
-            parent_id: self.last_id.clone(),
-            id: id.clone(),
-            kind: "token_count".into(),
-            usage: Some(usage),
             timestamp: now(),
         };
         self.append(record, id)
@@ -570,38 +528,6 @@ impl Session {
         self.last_usage = None;
         self.last_usage_index = None;
         Ok(())
-    }
-
-    /// Remove the most recent assistant message from the live context.
-    ///
-    /// Used by the overflow path: a response that never completed must not be folded into
-    /// the summary. The record stays on disk — nothing rewrites history — but it is
-    /// excluded from the messages the model sees.
-    pub fn drop_last_assistant(&mut self) -> Result<(), SessionError> {
-        let Some(index) = self
-            .records
-            .iter()
-            .rposition(|record| matches!(record.message(), Some(Message::Assistant { .. })))
-        else {
-            return Ok(());
-        };
-        self.records.remove(index);
-        // Dropping the newest record invalidates the chain head and any usage reading that
-        // came from it.
-        self.last_id = self.records.last().map(|record| record.id().to_string());
-        self.recompute_usage();
-        self.last_usage = None;
-        self.last_usage_index = None;
-        // The exclusion has to survive a reopen, so it is recorded explicitly.
-        let id = self.next_id();
-        let record = Record::EventMsg {
-            parent_id: self.last_id.clone(),
-            id: id.clone(),
-            kind: "dropped_assistant".into(),
-            usage: None,
-            timestamp: now(),
-        };
-        self.append(record, id)
     }
 
     /// Delete the session file.
@@ -717,7 +643,7 @@ impl Session {
         // Usage recorded before the last checkpoint describes the *old*, larger context,
         // so it is not a valid reading for the threshold check.
         if let Some(checkpoint) = self.last_checkpoint_index()
-            && last_index.map(|index| index < checkpoint).unwrap_or(true)
+            && last_index.map(|index| index <= checkpoint).unwrap_or(true)
         {
             last_usage = None;
             last_index = None;
@@ -929,6 +855,25 @@ pub fn message_preview(message: &Message, width: usize) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn context_pressure_includes_new_input_and_ignores_summary_usage_after_reopen() {
+        let (mut session, dir) = temp_session("pressure");
+        session.push_message(Message::assistant_text("answer"), Some(Usage {
+            input:100,output:20,cache_read:50,cache_write:0,
+        }), Some(StopReason::Stop)).unwrap();
+        let input = Message::user_text("新的输入".repeat(1000));
+        let cost = input.estimate_tokens();
+        session.push_message(input, None, None).unwrap();
+        assert_eq!(session.measured_context_tokens(), Some(170 + cost));
+        session.push_compaction("manual", "summary", vec![Message::user_text("summary")],
+            vec![], vec![], Some(Usage { input:999,output:20,cache_read:0,cache_write:0 })).unwrap();
+        let path = session.path().to_path_buf();
+        drop(session);
+        let reopened = Session::open(&path).unwrap();
+        assert_eq!(reopened.measured_context_tokens(), None);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     fn temp_session(name: &str) -> (Session, PathBuf) {
         let dir = std::env::temp_dir().join(format!("pi-session-{}-{}", std::process::id(), name));
         let _ = std::fs::remove_dir_all(&dir);
@@ -981,7 +926,7 @@ mod tests {
         // Each line of a multi-line message is its own entry: the editor is single-line, so
         // recalling a message that was typed over two lines would drop a newline into a
         // buffer that cannot hold one.
-        assert_eq!(session.user_history(), vec!["第一行".to_string(), "第二行".to_string()]);
+        assert_eq!(session.user_history(), vec!["第一行\n第二行".to_string()]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1271,11 +1216,8 @@ mod tests {
     }
 
     #[test]
-    fn a_file_written_by_an_older_version_still_opens() {
-        // The compatibility that has to keep working is files already on disk. Records carry
-        // fields this version no longer writes — `format` on the header, the window chain on
-        // a checkpoint — and they must be ignored rather than fatal: a stricter reader would
-        // turn every existing session into "解析失败".
+    fn obsolete_session_fields_are_rejected() {
+        // Obsolete fields are rejected; the reader has no migration path.
         let dir = std::env::temp_dir().join(format!("pi-oldfile-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1293,19 +1235,13 @@ mod tests {
         )
         .unwrap();
 
-        let session = Session::open(&path).unwrap();
-        assert_eq!(session.header().model, "work/m");
-        // The checkpoint's (empty) replacement history is the context, and the user message
-        // before it is still on disk as a record.
-        assert!(session.records().iter().any(|r| matches!(r, Record::Compacted { .. })));
-        assert_eq!(session.user_history(), vec!["hi".to_string()]);
+        assert!(Session::open(&path).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_session_with_no_turn_context_has_no_recorded_model() {
-        // Sessions written before turn contexts existed still have to open, and the caller
-        // falls back to the header for them rather than getting an empty model.
+        // A current session may be saved before the first turn context is recorded.
         let (mut session, dir) = temp_session("no-turn-context");
         let path = session.path().to_path_buf();
         session.push_message(Message::user_text("hello"), None, None).unwrap();
@@ -1365,31 +1301,6 @@ mod tests {
         drop(session);
         let reopened = Session::open(&path).unwrap();
         assert_eq!(reopened.context_messages().len(), 2);
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn dropping_the_failed_assistant_survives_a_reopen() {
-        let (mut session, dir) = temp_session("drop");
-        session.push_message(Message::user_text("question"), None, None).unwrap();
-        session
-            .push_message(
-                Message::Assistant { content: vec![], stop_reason: Some(StopReason::Error) },
-                Some(Usage { input: 999_999, output: 0, cache_read: 0, cache_write: 0 }),
-                Some(StopReason::Error),
-            )
-            .unwrap();
-        assert_eq!(session.context_messages().len(), 2);
-        session.drop_last_assistant().unwrap();
-        let messages = session.context_messages();
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].text(), "question");
-        // The stale usage from the discarded response must not drive the threshold.
-        assert!(session.last_usage.is_none());
-        let path = session.path().to_path_buf();
-        drop(session);
-        let reopened = Session::open(&path).unwrap();
-        assert_eq!(reopened.context_messages().len(), 1);
         let _ = std::fs::remove_dir_all(dir);
     }
 

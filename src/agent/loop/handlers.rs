@@ -12,7 +12,7 @@ impl Agent {
         ///
         /// Returns `true` when Esc asked for the turn to stop; the calls already run keep their
         /// results, because the model has to see them as the results of the calls it made.
-        pub(super) fn execute_tools(&mut self, calls: &[(String, String, serde_json::Value)]) -> bool {
+        pub(super) fn execute_tools(&mut self, calls: &[(String, String, serde_json::Value)]) -> anyhow::Result<bool> {
             let cwd = self.cwd.clone();
             // Where the calls that never ran start, once Esc has stopped one of them.
             let mut skipped_from = None;
@@ -29,28 +29,26 @@ impl Agent {
                 // Otherwise the panel leaves the running line stranded above the call it
                 // belongs to.
                 self.screen.suspend_live();
-                let output = match block_on(self.gate.check(id, name, arguments, &cwd)) {
-                    Ok(()) => {
+                let output = match self.gate.check(name, arguments, &cwd) {
+                    Ok(approved) => {
                         // Approved: the wait is now the command's own, so the running line goes
                         // back up before it starts, and the spinner keeps turning for as long as
                         // it takes.
                         self.screen.set_running(running);
-                        let (result, stopped) = self.run_tool_until_stopped(name, arguments);
-                        self.gate.finish(id);
+                        let (result, stopped) = self.run_tool_until_stopped(name, &approved);
                         if stopped {
                             skipped_from = Some(index + 1);
                         }
                         result
                     }
                     Err(refusal) => {
-                        self.gate.finish(id);
                         // The refusal is echoed with the attempted call, so the transcript shows
                         // what the user declined rather than an anonymous failure.
                         ToolOutput::error_for(name, arguments, refusal.message())
                     }
                 };
                 self.screen.clear_running();
-                let _ = self.session.push_message(
+                self.session.push_message(
                     Message::Tool {
                         tool_call_id: id.clone(),
                         name: name.clone(),
@@ -58,7 +56,7 @@ impl Agent {
                     },
                     None,
                     None,
-                );
+                )?;
                 let block = ui_compact::tool_block(name, arguments, &output);
                 self.screen.push(block);
                 // The stopped call's own result is recorded above, like any other; only the
@@ -67,12 +65,12 @@ impl Agent {
                     break;
                 }
             }
-            let Some(next) = skipped_from else { return false };
+            let Some(next) = skipped_from else { return Ok(false) };
             // A call that never ran must still be answered: a tool call with no result makes the
             // next request invalid, and every provider rejects it. "The user stopped the turn" is
             // the honest reason to hand the model.
             for (id, name, _) in &calls[next..] {
-                let _ = self.session.push_message(
+                self.session.push_message(
                     Message::Tool {
                         tool_call_id: id.clone(),
                         name: name.clone(),
@@ -80,9 +78,9 @@ impl Agent {
                     },
                     None,
                     None,
-                );
+                )?;
             }
-            true
+            Ok(true)
         }
 
 
@@ -98,7 +96,7 @@ impl Agent {
         ) -> (ToolOutput, bool) {
             let cwd = self.cwd.clone();
             block_on(async {
-                let work = tools::execute(name, arguments, &cwd);
+                let work = tools::execute(name, arguments, &cwd, &self.config.shell.path);
                 tokio::pin!(work);
                 let mut ticker = ticker();
                 let mut stop_requested = false;
@@ -145,9 +143,7 @@ impl Agent {
                 return Ok(None);
             }
             self.retry.spend();
-            // Drop the failed assistant message before compacting: keeping it would fold a
-            // half-written answer into the summary.
-            self.session.drop_last_assistant()?;
+            // The failed response was never appended; previous successful calls must survive.
             if let Err(err) = self.compact(Reason::Overflow, None).await {
                 // The one thing left to say: the automatic recovery did not work, so what happens
                 // next is the user's call.
