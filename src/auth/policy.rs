@@ -402,6 +402,18 @@ const READ_COMMANDS: &[&str] = &[
 /// auto-approved, which is what stops PATH hijacking.
 const TRUSTED_DIRS: &[&str] = &["/usr/bin", "/bin"];
 
+fn trusted_executable_target(name: &str, resolved: &Path) -> bool {
+    let target_name = resolved.file_name().and_then(|n| n.to_str());
+    // Debian/Ubuntu's alternatives system resolves `which` to which.debianutils.
+    // Keep aliases explicit: accepting any renamed target could turn a reader into rm.
+    let same_command = target_name == Some(name)
+        || (name == "which" && target_name == Some("which.debianutils"));
+    same_command
+        && resolved.parent().is_some_and(|parent| {
+            TRUSTED_DIRS.iter().any(|dir| parent == Path::new(dir))
+        })
+}
+
 /// Trusted absolute path for a whitelisted command, or `None` when it is unavailable.
 pub fn trusted_executable(command: &str) -> Option<PathBuf> {
     let name = command.rsplit('/').next().unwrap_or(command);
@@ -419,14 +431,7 @@ pub fn trusted_executable(command: &str) -> Option<PathBuf> {
             continue;
         }
         let Ok(resolved) = std::fs::canonicalize(&candidate) else { continue };
-        if resolved.file_name().and_then(|n| n.to_str()) != Some(name) {
-            continue;
-        }
-        let trusted = resolved
-            .parent()
-            .map(|parent| TRUSTED_DIRS.iter().any(|dir| parent == Path::new(dir)))
-            .unwrap_or(false);
-        if !trusted {
+        if !trusted_executable_target(name, &resolved) {
             continue;
         }
         #[cfg(unix)]
@@ -1184,6 +1189,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn executable_targets_accept_only_known_system_aliases() {
+        for target in ["/usr/bin/which", "/bin/which", "/usr/bin/which.debianutils", "/bin/which.debianutils"] {
+            assert!(trusted_executable_target("which", Path::new(target)), "{target}");
+        }
+        for (name, target) in [
+            ("which", "/tmp/which.debianutils"),
+            ("which", "/usr/local/bin/which.debianutils"),
+            ("which", "/usr/bin/rm"),
+            ("which", "/usr/bin/which.unknown"),
+            ("cat", "/usr/bin/which.debianutils"),
+            ("cat", "/usr/bin/rm"),
+        ] {
+            assert!(!trusted_executable_target(name, Path::new(target)), "{name}: {target}");
+        }
+    }
+
+    #[test]
     fn search_patterns_are_data_but_pattern_files_are_checked() {
         for command in ["rg '.env' src", "rg -ne '.ssh/id_rsa' src", "grep -e /etc/shadow src/main.rs", "git --no-pager diff --stat", "pwd;"] {
             assert!(allows(command), "{command}: {}", reason(command));
@@ -1313,7 +1335,7 @@ mod tests {
             "id", "whoami", "basename /a/b", "dirname /a/b", "column -t notes.txt", "lscpu",
             "seq 1 5",
         ] {
-            assert!(allows(command), "`{command}` should not ask");
+            assert!(allows(command), "`{command}` should not ask: {}", reason(command));
         }
         // `basename` prints its argument rather than opening it, so a sensitive-looking
         // name is not a leak here.
