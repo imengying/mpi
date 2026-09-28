@@ -60,6 +60,7 @@ impl Client {
         req: &Request<'_>,
         on_delta: &mut dyn FnMut(Delta),
     ) -> Result<super::Completion, LlmError> {
+        super::validate_tool_history(req.messages)?;
         let provider = req.provider;
         let api = api_of(provider)?;
         let api_key = Self::api_key(provider)?;
@@ -137,39 +138,31 @@ impl Client {
         })
     }
 
-    /// One buffered completion, used for compaction summaries: they are never rendered
-    /// token by token and must not burn cache writes.
+    /// Buffered summary completion with the normal cache/routing identity and tools disabled.
     pub async fn complete(&self, req: &Request<'_>) -> Result<super::Completion, LlmError> {
+        super::validate_tool_history(req.messages)?;
         let provider = req.provider;
         let api = api_of(provider)?;
         let api_key = Self::api_key(provider)?;
-        let response = if api == Api::AnthropicMessages {
-            let mut body = anthropic::build_request(req);
-            body.stream = false;
-            let mut request = self
-                .http
-                .post(anthropic::endpoint(&provider.base_url))
-                .json(&body);
-            for (name, value) in
-                anthropic::headers(&api_key, provider.compat(req.model).supports_long_cache)
-            {
+        let body = summary_request_body(req)?;
+        let endpoint = match api {
+            Api::AnthropicMessages => anthropic::endpoint(&provider.base_url),
+            Api::OpenAiCompletions => openai::endpoint(&provider.base_url),
+            Api::OpenAiResponses => responses::endpoint(&provider.base_url),
+        };
+        let mut request = self.http.post(endpoint).json(&body);
+        if api == Api::AnthropicMessages {
+            for (name, value) in anthropic::headers(&api_key, provider.compat(req.model).supports_long_cache) {
                 request = request.header(name, value);
             }
-            request.send().await.map_err(|err| LlmError::Transport(err.to_string()))?
         } else {
-            let mut request = match api {
-                Api::OpenAiResponses => self
-                    .http
-                    .post(responses::endpoint(&provider.base_url))
-                    .json(&responses::build_request(req, false)),
-                _ => self
-                    .http
-                    .post(openai::endpoint(&provider.base_url))
-                    .json(&openai::build_request(req, false)),
-            };
             request = request.bearer_auth(&api_key);
-            request.send().await.map_err(|err| LlmError::Transport(err.to_string()))?
-        };
+        }
+        if provider.compat(req.model).send_session_affinity {
+            request = request.header("x-session-affinity", req.session_id)
+                .header("x-session-id", req.session_id);
+        }
+        let response = request.send().await.map_err(|err| LlmError::Transport(err.to_string()))?;
         let status = response.status();
         let text = response.text().await.map_err(|err| LlmError::Transport(err.to_string()))?;
         if !status.is_success() {
@@ -287,6 +280,37 @@ fn parse_sse_frame(frame: &str, api: Api) -> Result<Option<Frame>, LlmError> {
         Api::OpenAiCompletions => openai::parse_frame(&data)?.map(|c| Frame::OpenAi(Box::new(c))),
         Api::OpenAiResponses => {
             responses::parse_frame(&data)?.map(|e| Frame::Responses(Box::new(e)))
+        }
+    })
+}
+
+/// Serialize the same typed body as normal turns, preserving object-field ordering.
+#[derive(serde::Serialize)]
+#[serde(untagged)]
+pub enum SummaryBody {
+    Messages(anthropic::MessagesRequest),
+    Completions(openai::ChatRequest),
+    Responses(responses::ResponsesRequest),
+}
+
+/// Keep cached schemas while prohibiting tool invocation for the auxiliary request.
+pub fn summary_request_body(req: &Request<'_>) -> Result<SummaryBody, LlmError> {
+    Ok(match api_of(req.provider)? {
+        Api::AnthropicMessages => {
+            let mut body = anthropic::build_request(req);
+            body.stream = false;
+            body.prohibit_tools();
+            SummaryBody::Messages(body)
+        }
+        Api::OpenAiCompletions => {
+            let mut body = openai::build_request(req, false);
+            body.prohibit_tools();
+            SummaryBody::Completions(body)
+        }
+        Api::OpenAiResponses => {
+            let mut body = responses::build_request(req, false);
+            body.prohibit_tools();
+            SummaryBody::Responses(body)
         }
     })
 }

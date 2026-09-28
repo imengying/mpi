@@ -126,8 +126,6 @@ pub struct Agent {
     level: String,
     compaction: CompactionState,
     retry: RetryBudget,
-    length_retries: u8,
-    continuing_output: bool,
     /// Set while a turn is streaming, so `/compact` can refuse instead of corrupting it.
     streaming: bool,
     /// The session's system message, read from `AGENTS.md` when the session started.
@@ -186,8 +184,6 @@ impl Agent {
             level,
             compaction: CompactionState::default(),
             retry: RetryBudget::default(),
-            length_retries: 0,
-            continuing_output: false,
             streaming: false,
             system_prompt,
             deleted: false,
@@ -294,8 +290,6 @@ impl Agent {
             level,
             compaction: CompactionState::default(),
             retry: RetryBudget::default(),
-            length_retries: 0,
-            continuing_output: false,
             streaming: false,
             system_prompt,
             deleted: false,

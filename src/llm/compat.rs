@@ -46,7 +46,7 @@ impl SearchFormat {
 pub enum ThinkingFormat {
     /// `reasoning_effort: "<level>"` — OpenAI, Kimi and friends.
     Openai,
-    /// `thinking: {type: "enabled"}` plus a `thinking_token_budget`.
+    /// `thinking: {type: "enabled"}` plus `reasoning_effort`; no numeric CoT budget.
     Deepseek,
     /// `thinking: {type: "enabled"}` — Z.ai / GLM.
     Zai,

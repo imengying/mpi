@@ -228,23 +228,56 @@ fn openai_requests_carry_the_prompt_cache_key() {
 }
 
 #[test]
-fn a_summary_request_opts_out_of_the_cache() {
-    // Compaction must not write cache entries for the main conversation, so it drops both
-    // the cache key and the breakpoints.
+fn summary_requests_reuse_system_tools_and_the_selected_history_prefix() {
+    use mpi::agent::compact::{SummaryRequest, prepare_summary};
+    use mpi::llm::{StopReason, responses, client::summary_request_body};
     let (model, provider) = fixtures();
-    let tools: Vec<ToolSpec> = Vec::new();
-    let messages = vec![Message::System { content: "summary".into() }, Message::user_text("flatten")];
-    let request = Request {
-        model: &model,
-        provider: &provider,
-        messages: &messages,
-        tools: &tools,
-        level: "high",
-        session_id: "session-id",
-        cache_hints: false,
-    };
-    let body = serde_json::to_value(openai::build_request(&request, false)).unwrap();
-    assert!(body["prompt_cache_key"].is_null(), "{body}");
+    let tools = tools();
+    let prefix = vec![
+        Message::user_text("第一项任务"),
+        Message::Assistant { content:vec![
+            Block::Thinking { thinking:"保留这段原始推理".into(), signature:None },
+            Block::ToolCall { id:"c1".into(), name:"read".into(), arguments:serde_json::json!({"path":"a.rs"}) },
+        ], stop_reason:Some(StopReason::ToolUse) },
+        Message::Tool { tool_call_id:"c1".into(), name:"read".into(), content:"原始文件内容".into() },
+    ];
+    let original = prefix.clone();
+    let mut full_history = vec![Message::System { content:SYSTEM.into() }];
+    full_history.extend(prefix.clone());
+    full_history.push(Message::assistant_text("已完成"));
+    full_history.push(Message::user_text("最近任务"));
+    for api in ["completions", "messages", "responses"] {
+        let provider = Provider { api:api.into(), ..provider.clone() };
+        let settings = SummaryRequest {
+            provider:&provider, model:&model, tools:&tools, level:"max", session_id:"session-id",
+            system_prompt:Some(SYSTEM), custom_instructions:Some("保留待办"),
+        };
+        let prepared = prepare_summary(&settings, &prefix, true).unwrap();
+        assert!(prepared.reuses_history_prefix);
+        assert_eq!(&prepared.messages[1..1 + prefix.len()], prefix.as_slice());
+        assert!(prepared.messages.last().unwrap().text().contains("保留待办"));
+        let request = prepared.request(&settings);
+        let summary = serde_json::to_value(summary_request_body(&request).unwrap()).unwrap();
+        let normal = Request { model:&model, messages:&full_history, ..request };
+        let (normal, messages_key, system_key) = match api {
+            "completions" => (serde_json::to_value(openai::build_request(&normal, true)).unwrap(), "messages", "unused"),
+            "messages" => (serde_json::to_value(anthropic::build_request(&normal)).unwrap(), "messages", "system"),
+            _ => (serde_json::to_value(responses::build_request(&normal, true)).unwrap(), "input", "instructions"),
+        };
+        assert_eq!(normal["tools"], summary["tools"], "{api}: tools changed");
+        assert_eq!(normal[system_key], summary[system_key], "{api}: system changed");
+        let summary_messages = summary[messages_key].as_array().unwrap();
+        let main_messages = normal[messages_key].as_array().unwrap();
+        assert_eq!(&summary_messages[..summary_messages.len() - 1], &main_messages[..summary_messages.len() - 1], "{api}: history prefix changed");
+        assert_eq!(summary["prompt_cache_key"], normal["prompt_cache_key"]);
+        assert_eq!(summary["tool_choice"], if api == "messages" { serde_json::json!({"type":"none"}) } else { serde_json::json!("none") });
+        if api == "completions" {
+            assert_eq!(normal["thinking"], summary["thinking"]);
+            assert_eq!(normal["reasoning_effort"], summary["reasoning_effort"]);
+        }
+        assert_eq!(summary["stream"], false);
+    }
+    assert_eq!(prefix, original, "summary planning rewrote the source history");
 }
 
 #[test]

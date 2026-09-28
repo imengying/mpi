@@ -336,17 +336,14 @@ impl Agent {
                 .model()
                 .map_err(|err| CompactError::Summarize(err.to_string()))?;
             let messages = self.session.context_messages();
-            let previous = self.session.last_checkpoint_index().and_then(|index| {
-                match &self.session.records()[index] {
-                    crate::agent::session::Record::Compacted { summary, .. } => Some(summary.clone()),
-                    _ => None,
-                }
-            });
+            let tools = tools::specs();
             let request = SummaryRequest {
                 provider,
                 model,
                 session_id: &self.session.header().id,
-                previous_summary: previous.as_deref(),
+                system_prompt: self.system_prompt.as_deref(),
+                tools: &tools,
+                level: &self.level,
                 custom_instructions: custom,
             };
             // The keep-recent window is scaled to the model's capacity: keeping a fixed 20k in a

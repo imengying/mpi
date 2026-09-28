@@ -306,8 +306,37 @@ pub struct Request<'a> {
     pub tools: &'a [ToolSpec],
     pub level: &'a str,
     pub session_id: &'a str,
-    /// Disable the compression/compaction hints for side requests (summaries).
+    /// Emit provider cache markers and the session cache key, including for summaries.
     pub cache_hints: bool,
+}
+
+/// Validate the call/result sequence before routing, without rewriting durable history.
+pub fn validate_tool_history(messages: &[Message]) -> Result<(), LlmError> {
+    let mut pending = std::collections::HashMap::new();
+    for message in messages {
+        if let Message::Tool { tool_call_id, name, .. } = message {
+            match pending.remove(tool_call_id.as_str()) {
+                Some(expected) if expected == name.as_str() => {}
+                _ => return Err(LlmError::Decode(format!("工具结果 {tool_call_id} 没有匹配的调用"))),
+            }
+            continue;
+        }
+        if !pending.is_empty() {
+            return Err(LlmError::Decode("工具调用缺少结果，不能继续发送对话".into()));
+        }
+        for (id, name, _) in message.tool_calls() {
+            if id.is_empty() || name.is_empty() {
+                return Err(LlmError::Decode("历史工具调用的 id 或名称无效".into()));
+            }
+            if pending.insert(id, name).is_some() {
+                return Err(LlmError::Decode(format!("重复的工具调用 id：{id}")));
+            }
+        }
+    }
+    if !pending.is_empty() {
+        return Err(LlmError::Decode("对话末尾仍有未完成的工具调用".into()));
+    }
+    Ok(())
 }
 
 /// The hosted-search shape to send on this request, if the model asked for it and the
@@ -397,6 +426,27 @@ pub fn estimate_context(messages: &[Message], system: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_history_requires_one_immediate_result_per_call_without_mutating_messages() {
+        let call = |id: &str| Block::ToolCall { id:id.into(), name:"read".into(), arguments:serde_json::json!({"path":"a.rs"}) };
+        let assistant = |content| Message::Assistant { content, stop_reason:Some(StopReason::ToolUse) };
+        let result = |id: &str| Message::Tool { tool_call_id:id.into(), name:"read".into(), content:String::new() };
+        let history = vec![Message::user_text("read"), assistant(vec![call("a"), call("b")]), result("b"), result("a")];
+        let original = history.clone();
+        assert!(validate_tool_history(&history).is_ok());
+        assert_eq!(history, original);
+        for invalid in [
+            vec![result("a")],
+            vec![assistant(vec![call("a")])],
+            vec![assistant(vec![call("a")]), Message::user_text("next")],
+            vec![assistant(vec![call("a"), call("a")]), result("a")],
+            vec![assistant(vec![call("a")]), result("a"), result("a")],
+            vec![assistant(vec![call("a")]), Message::Tool { tool_call_id:"a".into(), name:"write".into(), content:String::new() }],
+        ] {
+            assert!(validate_tool_history(&invalid).is_err(), "{invalid:?}");
+        }
+    }
 
     fn model() -> ModelConfig {
         serde_json::from_str(r#"{"id":"m","reasoning":true,"max_tokens":100000}"#).unwrap()

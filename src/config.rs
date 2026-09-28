@@ -74,6 +74,10 @@ pub fn level_index(level: &str) -> Option<usize> {
 }
 
 impl ModelConfig {
+    fn is_deepseek(&self) -> bool {
+        self.id.rsplit('/').next().unwrap_or(&self.id).to_ascii_lowercase().starts_with("deepseek-")
+    }
+
     pub fn display_name(&self) -> &str {
         self.name.as_deref().unwrap_or(&self.id)
     }
@@ -502,6 +506,12 @@ impl Provider {
         // completions shape here keeps this total without inventing a protocol.
         let api = self.api().unwrap_or(crate::llm::Api::OpenAiCompletions);
         let mut compat = Compat::from_base_url(&self.base_url, api);
+        // Gateways host several model families on one URL. DeepSeek's reasoning protocol
+        // belongs to the model, so a neutral gateway must not drop its reasoning history.
+        if api == crate::llm::Api::OpenAiCompletions && model.is_deepseek() {
+            compat.thinking_format = crate::llm::compat::ThinkingFormat::Deepseek;
+            compat.requires_reasoning_content_on_assistant = true;
+        }
         if let Some(overrides) = &self.compat {
             compat.apply(overrides);
         }
@@ -802,6 +812,30 @@ pub fn read_dirs_index_for_test(root: &Path) -> BTreeMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gateway_models_select_their_own_reasoning_protocol_and_keep_overrides() {
+        use crate::llm::compat::ThinkingFormat;
+        let provider: Provider = serde_json::from_value(serde_json::json!({
+            "name":"gateway", "api":"completions", "base_url":"https://gateway.example/v1"
+        })).unwrap();
+        for id in ["deepseek-v4.1-flash", "deepseek-ai/DeepSeek-V4.1-Flash"] {
+            let model = ModelConfig { id:id.into(), ..Default::default() };
+            let compat = provider.compat(&model);
+            assert_eq!(compat.thinking_format, ThinkingFormat::Deepseek);
+            assert!(compat.requires_reasoning_content_on_assistant);
+        }
+        let mut model = ModelConfig { id:"deepseek-v4.1-flash".into(), ..Default::default() };
+        model.compat = Some(serde_json::from_value(serde_json::json!({
+            "thinking_format":"none", "requires_reasoning_content_on_assistant":false
+        })).unwrap());
+        let compat = provider.compat(&model);
+        assert_eq!(compat.thinking_format, ThinkingFormat::None);
+        assert!(!compat.requires_reasoning_content_on_assistant);
+        assert_eq!(provider.compat(&ModelConfig { id:"another-model".into(), ..Default::default() }).thinking_format, ThinkingFormat::Openai);
+        let provider = Provider { api:"responses".into(), ..provider };
+        assert!(!provider.compat(&ModelConfig { id:"deepseek-v4.1-flash".into(), ..Default::default() }).requires_reasoning_content_on_assistant);
+    }
 
     fn sample() -> Config {
         let raw = r#"{

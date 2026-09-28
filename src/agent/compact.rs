@@ -358,49 +358,22 @@ fn truncate_chars(text: &str, max: usize) -> String {
     format!("{head}\n[... 已截断中间内容]\n{tail}")
 }
 
-pub const SUMMARIZATION_SYSTEM_PROMPT: &str = "你是一个上下文摘要助手。读取用户与 AI 助手之间的对话，\
-按指定格式产出结构化摘要。不要继续对话，不要回答对话中的任何问题，只输出结构化摘要。";
-
-/// The initial seven-section prompt.
-pub fn summary_prompt(
-    conversation: &str,
-    custom: Option<&str>,
-    previous: Option<&str>,
-    split_turn: bool,
-) -> String {
-    let mut prompt = String::new();
-    prompt.push_str("<conversation>\n");
-    prompt.push_str(conversation);
-    prompt.push_str("\n</conversation>\n\n");
+/// The only new user-role item on the prefix-preserving summary path.
+pub fn summary_prompt(conversation: &str, custom: Option<&str>, split_turn: bool) -> String {
+    let mut prompt = String::from(
+        "请将此前对话整理成上下文检查点，供后续继续工作。不要继续执行原任务、不要调用工具或搜索。\n\n"
+    );
+    if !conversation.is_empty() {
+        prompt.push_str("以下是因输入预算限制整理的历史；请保留其中的原始任务、约束、决策和未完成事项。\n<conversation>\n");
+        prompt.push_str(conversation);
+        prompt.push_str("\n</conversation>\n\n");
+    }
     if split_turn {
-        prompt.push_str(
-            "注意：最后一条用户消息开启的那一轮还没有结束，只总结到它已经开始的部分，并在 Progress 的 In Progress 里写清这一步做到哪里。\n\n",
-        );
+        prompt.push_str("最后一条用户消息开启的那一轮还没有结束，在 Progress 的 In Progress 中写清当前进度。\n\n");
     }
-    if let Some(previous) = previous {
-        // Re-compaction merges into the previous summary instead of rewriting it.
-        prompt.push_str("<previous-summary>\n");
-        prompt.push_str(previous);
-        prompt.push_str("\n</previous-summary>\n\n");
-        prompt.push_str(
-            "上面的消息是需要合并进已有摘要的新对话。规则：\n\
-             - PRESERVE：完整保留已有摘要里的全部信息\n\
-             - ADD：把新消息里的进展、决策与上下文补进去\n\
-             - UPDATE：Progress 里已完成的事项从 In Progress 移到 Done\n\
-             - UPDATE：根据实际完成情况更新 Next Steps\n\
-             - PRESERVE：原样保留文件路径、函数名与报错信息\n\
-             - 已经不再相关的内容可以删除\n\n",
-        );
-    } else {
-        prompt.push_str(
-            "上面的消息是需要总结的对话。请产出一份结构化的上下文检查点摘要，供另一个模型接着工作。\n\n",
-        );
-    }
-    prompt.push_str("严格使用以下格式：\n\n");
+    prompt.push_str("如果历史已有检查点，将新进展合并进去，保留仍有效的约束、路径和待办，删除过时信息，不重复粘贴旧摘要。\n只输出简洁的结构化摘要，严格使用以下格式：\n\n");
     prompt.push_str(crate::config::SUMMARY_SECTIONS);
-    if let Some(custom) = custom
-        && !custom.trim().is_empty()
-    {
+    if let Some(custom) = custom.filter(|text| !text.trim().is_empty()) {
         prompt.push_str(&format!("\n\n额外关注：{custom}"));
     }
     prompt
@@ -408,6 +381,11 @@ pub fn summary_prompt(
 
 /// A summary that came back truncated must never be stored as a checkpoint.
 pub fn check_summary(completion: &Completion) -> Result<String, CompactError> {
+    if let Message::Assistant { content, .. } = &completion.message
+        && content.iter().any(|block| matches!(block, crate::llm::Block::ToolCall { .. } | crate::llm::Block::Hosted { .. }))
+    {
+        return Err(CompactError::ToolCallInSummary);
+    }
     match completion.stop_reason {
         StopReason::Error => Err(CompactError::Summarize(
             completion.error.clone().unwrap_or_else(|| "未知错误".into()),
@@ -435,59 +413,76 @@ pub struct SummaryRequest<'a> {
     pub provider: &'a Provider,
     pub model: &'a ModelConfig,
     pub session_id: &'a str,
-    pub previous_summary: Option<&'a str>,
+    pub system_prompt: Option<&'a str>,
+    pub tools: &'a [ToolSpec],
+    pub level: &'a str,
     pub custom_instructions: Option<&'a str>,
 }
 
-/// Run the summarisation request. It goes through the same provider as everything else,
-/// but never through the compaction path, so it cannot recurse.
-pub async fn summarize(
-    client: &Client,
-    request: SummaryRequest<'_>,
-    summarized: &[Message],
-    split_turn: bool,
-) -> Result<(String, crate::config::Usage), CompactError> {
-    let mut model = request.model.clone();
-    model.search = false;
-    model.reasoning = false;
+/// Owned request material. The source session is never changed while planning a summary.
+pub struct PreparedSummary {
+    pub model: ModelConfig,
+    pub messages: Vec<Message>,
+    pub reuses_history_prefix: bool,
+}
+
+impl PreparedSummary {
+    pub fn request<'a>(&'a self, settings: &'a SummaryRequest<'_>) -> Request<'a> {
+        Request {
+            model: &self.model, provider: settings.provider, messages: &self.messages,
+            tools: settings.tools, level: settings.level, session_id: settings.session_id,
+            cache_hints: true,
+        }
+    }
+}
+
+/// Prefer the untouched history prefix. Fall back only when that request cannot fit.
+pub fn prepare_summary(
+    settings: &SummaryRequest<'_>, summarized: &[Message], split_turn: bool,
+) -> Result<PreparedSummary, CompactError> {
+    crate::llm::validate_tool_history(summarized).map_err(|err| CompactError::Summarize(err.to_string()))?;
+    let mut model = settings.model.clone();
     let window = model.context_window.unwrap_or(128_000);
     model.max_tokens = Some(model.max_tokens().min(16_384).min(window / 4).max(1));
-    let previous = request.previous_summary.map(|s| truncate_chars(s, (window / 8) as usize));
-    let custom = request.custom_instructions.map(|s| truncate_chars(s, 2048));
-    let scaffold = summary_prompt("", custom.as_deref(), previous.as_deref(), split_turn);
-    let fixed = util::estimate_tokens(&scaffold) + util::estimate_tokens(SUMMARIZATION_SYSTEM_PROMPT);
-    let budget = window.saturating_sub(model.max_tokens()).saturating_sub(512).saturating_sub(fixed);
-    if budget == 0 { return Err(CompactError::InputTooLarge); }
-    // When a prior checkpoint is supplied separately, do not send its framing a second time.
-    let source: Vec<_> = summarized.iter().filter(|m| {
-        request.previous_summary.is_none() || !m.text().starts_with("以下是本次会话此前工作的上下文检查点")
-    }).cloned().collect();
-    let conversation = serialize_conversation(&source);
-    let conversation = if util::estimate_tokens(&conversation) > budget {
-        truncate_chars(&conversation, budget.saturating_sub(32) as usize)
-    } else { conversation };
-    let prompt = summary_prompt(&conversation, custom.as_deref(), previous.as_deref(), split_turn);
-    let messages = vec![
-        Message::System { content: SUMMARIZATION_SYSTEM_PROMPT.to_string() },
-        Message::user_text(prompt),
-    ];
-    if crate::llm::estimate_context(&messages, "") + model.max_tokens() >= window {
+    let tools_cost = settings.tools.iter().map(|tool| {
+        serde_json::to_string(tool).map(|text| util::estimate_tokens(&text))
+    }).collect::<Result<Vec<_>, _>>().map_err(|err| CompactError::Summarize(err.to_string()))?
+        .into_iter().sum::<u64>();
+    // Reserve room for protocol framing, tool-choice controls and the requested output.
+    let budget = window.saturating_sub(model.max_tokens()).saturating_sub(tools_cost).saturating_sub(512);
+    let system = settings.system_prompt.map(|content| Message::System { content: content.to_string() });
+    let directive = summary_prompt("", settings.custom_instructions, split_turn);
+    let fixed = system.as_ref().map_or(0, Message::estimate_tokens)
+        + Message::user_text(directive.clone()).estimate_tokens();
+    if fixed >= budget { return Err(CompactError::InputTooLarge); }
+    let history_cost = summarized.iter().map(Message::estimate_tokens).sum::<u64>();
+    let mut messages: Vec<Message> = system.into_iter().collect();
+    let reuses_history_prefix = history_cost.saturating_add(fixed) <= budget;
+    if reuses_history_prefix {
+        messages.extend_from_slice(summarized);
+        messages.push(Message::user_text(directive));
+    } else {
+        // Keep the system and tool prefix even when reasoning/images cannot fit. A single
+        // bounded history item avoids orphaning calls or duplicating previous checkpoints.
+        let conversation = serialize_conversation(summarized);
+        let room = budget.saturating_sub(fixed).saturating_sub(256) as usize;
+        let conversation = if util::estimate_tokens(&conversation) > room as u64 {
+            truncate_chars(&conversation, room)
+        } else { conversation };
+        messages.push(Message::user_text(summary_prompt(&conversation, settings.custom_instructions, split_turn)));
+    }
+    if crate::llm::estimate_context(&messages, "") > budget {
         return Err(CompactError::InputTooLarge);
     }
-    let no_tools: Vec<ToolSpec> = Vec::new();
-    let body = Request {
-        model: &model,
-        provider: request.provider,
-        messages: &messages,
-        tools: &no_tools,
-        level: "",
-        session_id: request.session_id,
-        // A one-off summary must not write cache entries for the main conversation.
-        cache_hints: false,
-    };
-    let completion = client
-        .complete(&body)
-        .await
+    Ok(PreparedSummary { model, messages, reuses_history_prefix })
+}
+
+/// Summary calls use the same routing, prompt, tools and effort, and never execute tools.
+pub async fn summarize(
+    client: &Client, settings: SummaryRequest<'_>, summarized: &[Message], split_turn: bool,
+) -> Result<(String, crate::config::Usage), CompactError> {
+    let prepared = prepare_summary(&settings, summarized, split_turn)?;
+    let completion = client.complete(&prepared.request(&settings)).await
         .map_err(|err| CompactError::Summarize(err.message()))?;
     let summary = check_summary(&completion)?;
     Ok((summary, completion.usage))
@@ -546,18 +541,14 @@ pub enum OverflowSignal {
     /// The request succeeded but the prompt alone filled (or overfilled) the window, which
     /// some gateways do silently.
     SilentOverflow { prompt_tokens: u64, context_window: u64 },
-    /// The server truncated the prompt to fit, leaving no room to answer.
-    LengthCut { output_tokens: u64, max_tokens: u64 },
 }
 
 /// Detect an overflow from a finished turn.
 ///
-/// `context_window` is only consulted for the silent case; the length-cut check
-/// requires evidence that the reserved output would exceed the context window.
+/// Output exhaustion is handled separately; a short answer is not proof of input overflow.
 pub fn detect_overflow(
     completion: &Completion,
     context_window: Option<u64>,
-    max_tokens: u64,
 ) -> Option<OverflowSignal> {
     if let Some(error) = &completion.error
         && looks_like_overflow(error)
@@ -573,12 +564,6 @@ pub fn detect_overflow(
         && prompt_tokens > window
     {
         return Some(OverflowSignal::SilentOverflow { prompt_tokens, context_window: window });
-    }
-    if completion.stop_reason == StopReason::Length
-        && let Some(window) = context_window
-        && prompt_tokens.saturating_add(max_tokens) > window
-    {
-        return Some(OverflowSignal::LengthCut { output_tokens: completion.usage.output, max_tokens });
     }
 
     None
@@ -625,43 +610,6 @@ pub fn plan(messages: &[Message], keep_recent_tokens: u64) -> Option<(CutPoint, 
     Some((cut, summarized, kept))
 }
 
-/// Decide what one summary request will contain: where the cut goes and what is sent.
-///
-/// Split out from [`run`] so the wiring — budget applied to the messages actually sent, not
-/// merely available as a helper — is what the tests exercise. Getting that wiring wrong is
-/// silent: the caps all look right and the request is still unbounded.
-pub struct SummaryPlan {
-    /// The messages folded into the summary.
-    pub summarized: Vec<Message>,
-    /// The messages kept verbatim after the checkpoint.
-    pub kept: Vec<Message>,
-    pub cut: CutPoint,
-    /// The oldest turns were left out to fit the model's window.
-    pub trimmed: bool,
-    /// What the request will cost, so the caller can act on it if it still does not fit.
-    pub request_tokens: u64,
-}
-
-/// Plan a summary request against the model's window.
-pub fn plan_summary(
-    messages: &[Message],
-    keep_recent_tokens: u64,
-    context_window: Option<u64>,
-) -> Result<SummaryPlan, CompactError> {
-    let Some((cut, summarized, kept)) = plan(messages, keep_recent_tokens) else {
-        return Err(CompactError::TooShort);
-    };
-    let budget = summary_budget_for(context_window.unwrap_or(0));
-    let (summarized, trimmed) = limit_for_summary(&summarized, budget);
-    // Measured through the same serialisation the request uses, so the number means what it
-    // says: the conversation text plus the fixed instructions around it.
-    let conversation = serialize_conversation(&summarized);
-    let request_tokens = util::estimate_tokens(&conversation)
-        + util::estimate_tokens(SUMMARIZATION_SYSTEM_PROMPT)
-        + util::estimate_tokens(crate::config::SUMMARY_SECTIONS);
-    Ok(SummaryPlan { summarized, kept, cut, trimmed, request_tokens })
-}
-
 /// Everything a compaction needs, so the caller in `loop.rs` stays readable.
 pub struct CompactionOutcome {
     pub summary: String,
@@ -671,59 +619,9 @@ pub struct CompactionOutcome {
     pub usage: crate::config::Usage,
 }
 
-/// How much of the summarised conversation may go into one summary request.
-///
-/// The request has to fit the model's own window along with the answer it is asked for. It
-/// is not "context_window minus reserve" but a good deal less: the summary is a *reduction*,
-/// and a summariser given the full window has to read all of it to produce a fraction of it.
-/// A third of the window leaves room for the seven-section answer and keeps the request
-/// comfortably inside the limit the provider enforces.
-///
-/// Without a bound the request is whatever the conversation happens to be, and a long session
-/// makes it larger than the window — the request to shrink the conversation is refused for
-/// being too large, and `/compact` is impossible exactly when it is needed. `/compact` on a
-/// real 1M-token session failed this way: `prompt is too long: 1113399 tokens > 1048576`.
-pub fn summary_budget_for(context_window: u64) -> u64 {
-    // A model with no declared window gets a conservative fixed budget rather than none:
-    // an unbounded request is the failure this exists to prevent.
-    match context_window {
-        0 => 120_000,
-        window => (window / 3).max(1),
-    }
-}
-
-/// Bound summary input by its serialized cost, preferring recent messages.
-/// Returns whether earlier messages were omitted; original records remain on disk.
-pub fn limit_for_summary(messages: &[Message], budget_tokens: u64) -> (Vec<Message>, bool) {
-    let cost = |message: &Message| util::estimate_tokens(&serialize_conversation(std::slice::from_ref(message)));
-    let total: u64 = messages.iter().map(cost).sum();
-    if total <= budget_tokens {
-        return (messages.to_vec(), false);
-    }
-    let mut kept: Vec<Message> = Vec::new();
-    let mut used = 0u64;
-    for message in messages.iter().rev() {
-        let tokens = cost(message);
-        if used + tokens > budget_tokens && !kept.is_empty() {
-            break;
-        }
-        used += tokens;
-        kept.push(message.clone());
-    }
-    kept.reverse();
-    // A cut that lands on a tool result would hand the summariser an orphan result with no
-    // call, the same pairing rule the checkpoint's own cut follows.
-    while kept.first().is_some_and(|m| matches!(m, Message::Tool { .. })) {
-        kept.remove(0);
-    }
-    (kept, true)
-}
-
 /// Run one compaction: cut, summarise, and assemble the replacement history.
 ///
-/// `previous_summary` comes from the last checkpoint so a re-compaction merges instead
-/// of starting over.
-#[allow(clippy::too_many_arguments)]
+/// Previous checkpoints already live in the selected history prefix.
 pub async fn run(
     client: &Client,
     request: SummaryRequest<'_>,
@@ -738,8 +636,7 @@ pub async fn run(
     // Bound the request itself, not just the caps inside it: a long session can still add up
     // to more than the model's window, and a summary request that does not fit cannot be
     // sent at all.
-    let SummaryPlan { cut, summarized, kept, .. } =
-        plan_summary(messages, keep_recent_tokens, request.model.context_window)?;
+    let (cut, summarized, kept) = plan(messages, keep_recent_tokens).ok_or(CompactError::TooShort)?;
     let (summary, usage) = summarize(client, request, &summarized, cut.is_split_turn()).await?;
     let (read_files, modified_files) = file_ops.lists();
     let summary = format!("{summary}{}", format_file_blocks(&read_files, &modified_files));
@@ -795,6 +692,124 @@ mod tests {
     use super::*;
     use crate::config::Usage;
     use crate::llm::Block;
+
+    #[tokio::test]
+    async fn compaction_sends_the_cached_prefix_and_session_headers_to_the_server() {
+        use std::io::{BufRead, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(std::time::Instant::now() < deadline, "summary request did not arrive");
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(err) => panic!("{err}"),
+                }
+            };
+            socket.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            let mut reader = std::io::BufReader::new(socket.try_clone().unwrap());
+            let mut headers = std::collections::HashMap::new();
+            loop {
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).unwrap() > 0);
+                if line == "\r\n" { break; }
+                if let Some((key, value)) = line.split_once(':') {
+                    headers.insert(key.to_ascii_lowercase(), value.trim().to_string());
+                }
+            }
+            let mut bytes = vec![0; headers["content-length"].parse::<usize>().unwrap()];
+            reader.read_exact(&mut bytes).unwrap();
+            let request: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let response = serde_json::json!({"choices":[{"message":{"content":"## Goal\n完成第一项任务"},"finish_reason":"stop"}],
+                "usage":{"prompt_tokens":10000,"prompt_cache_hit_tokens":9000,"prompt_cache_miss_tokens":1000,"completion_tokens":30}}).to_string();
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).unwrap();
+            (request, headers)
+        });
+        let provider: Provider = serde_json::from_value(serde_json::json!({
+            "api":"completions","base_url":format!("http://{address}/v1"),"api_key":"local-test",
+            "compat":{"send_session_affinity":true}
+        })).unwrap();
+        let model = ModelConfig { id:"deepseek-v4.1-flash".into(), reasoning:true,
+            max_tokens:Some(8000), context_window:Some(128000), ..Default::default() };
+        let tools = crate::tools::specs();
+        let source = vec![user("第一项任务"), assistant(&"工作细节".repeat(3000)), user("接下来做第二项任务")];
+        let original = source.clone();
+        let settings = SummaryRequest { provider:&provider, model:&model, tools:&tools, level:"max",
+            session_id:"summary-session", system_prompt:Some("固定系统提示"), custom_instructions:None };
+        let outcome = run(&Client::local_test_client(), settings, &source, "固定系统提示", 10).await.unwrap();
+        let (request, headers) = server.join().unwrap();
+        assert_eq!(headers["x-session-id"], "summary-session");
+        assert_eq!(headers["x-session-affinity"], "summary-session");
+        assert_eq!(request["prompt_cache_key"], "summary-session");
+        assert_eq!(request["tool_choice"], "none");
+        assert_eq!(request["tools"].as_array().unwrap().len(), tools.len());
+        assert_eq!(request["messages"][0]["content"], "固定系统提示");
+        assert_eq!(request["messages"][1]["content"], "第一项任务");
+        assert_eq!(request["messages"][2]["content"], source[1].text());
+        assert_eq!(request["reasoning_effort"], "max");
+        assert_eq!(outcome.usage.cache_read, 9000);
+        assert_eq!(outcome.replacement.last(), source.last());
+        assert_eq!(source, original);
+    }
+
+    #[test]
+    fn oversized_history_falls_back_without_changing_system_tools_or_recent_request() {
+        let provider = Provider { api:"completions".into(), ..Default::default() };
+        let model = ModelConfig { id:"deepseek-v4.1-flash".into(), reasoning:true,
+            context_window:Some(12_000), max_tokens:Some(4000), ..Default::default() };
+        let tools = crate::tools::specs();
+        let settings = SummaryRequest { provider:&provider, model:&model, session_id:"s",
+            system_prompt:Some("原系统提示"), tools:&tools, level:"max", custom_instructions:None };
+        let source = vec![Message::user_text("原始要求"), Message::Assistant {
+            content:vec![Block::Thinking { thinking:"推理".repeat(30_000), signature:None },
+                Block::Text { text:"首部结论".to_string() + &"过长说明".repeat(20_000) + "尾部待办" }],
+            stop_reason:Some(StopReason::Stop),
+        }];
+        let original = source.clone();
+        let plan = prepare_summary(&settings, &source, false).unwrap();
+        assert!(!plan.reuses_history_prefix);
+        assert_eq!(plan.messages[0].text(), "原系统提示");
+        let text = plan.messages.last().unwrap().text();
+        assert!(!text.contains("推理推理"));
+        assert!(text.contains("原始要求"));
+        assert!(text.contains("尾部待办"));
+        let tool_tokens: u64 = tools.iter().map(|t| util::estimate_tokens(&serde_json::to_string(t).unwrap())).sum();
+        assert!(crate::llm::estimate_context(&plan.messages, "") + tool_tokens + plan.model.max_tokens() + 512 <= 12_000);
+        assert_eq!(source, original);
+        assert_eq!(plan.request(&settings).tools, tools);
+        let recent = vec![Message::user_text("最近任务")];
+        let replacement = replacement_history(&source, &recent, "摘要");
+        assert_eq!(replacement.last(), recent.last());
+    }
+
+    #[test]
+    fn summary_preserves_absent_system_and_rejects_an_unfit_fixed_prefix() {
+        let provider = Provider { api:"completions".into(), ..Default::default() };
+        let model = ModelConfig { context_window:Some(8000), max_tokens:Some(2000), ..Default::default() };
+        let source = vec![Message::user_text("已有任务")];
+        let settings = SummaryRequest { provider:&provider, model:&model, session_id:"s", tools:&[],
+            system_prompt:None, level:"", custom_instructions:None };
+        let plan = prepare_summary(&settings, &source, false).unwrap();
+        assert!(plan.reuses_history_prefix);
+        assert!(plan.messages.iter().all(|m| !matches!(m, Message::System { .. })));
+        let small_model = ModelConfig { context_window:Some(100), ..model.clone() };
+        let settings = SummaryRequest { model:&small_model, ..settings };
+        assert!(matches!(prepare_summary(&settings, &source, false), Err(CompactError::InputTooLarge)));
+    }
+
+    #[test]
+    fn summary_never_accepts_tool_calls_even_with_a_success_stop() {
+        let completion = Completion { message:Message::Assistant {
+            content:vec![Block::ToolCall { id:"c1".into(), name:"write".into(), arguments:serde_json::json!({}) }],
+            stop_reason:Some(StopReason::Stop),
+        }, stop_reason:StopReason::Stop, usage:Usage::default(), error:None };
+        assert!(matches!(check_summary(&completion), Err(CompactError::ToolCallInSummary)));
+    }
 
     fn user(text: &str) -> Message {
         Message::user_text(text)
@@ -922,7 +937,7 @@ mod tests {
         // to the summariser so an unfinished step is described as such.
         let summarized = messages_to_summarize(&messages, cut);
         assert_eq!(summarized.len(), 3);
-        assert!(summary_prompt("C", None, None, cut.is_split_turn()).contains("还没有结束"));
+        assert!(summary_prompt("C", None, cut.is_split_turn()).contains("还没有结束"));
     }
 
     #[test]
@@ -1019,104 +1034,8 @@ mod tests {
     }
 
     #[test]
-    fn the_request_budget_keeps_the_newest_turns() {
-        // Over budget, the oldest turns go: a summary of the recent work is what the next
-        // model continues from. The user messages of the dropped turns are not lost from the
-        // conversation — the checkpoint keeps them verbatim.
-        let messages: Vec<Message> = (0..40)
-            .flat_map(|i| {
-                vec![
-                    user(&format!("question {i} {}", sized("x", 4_000))),
-                    Message::Assistant {
-                        content: vec![Block::Text { text: format!("answer {i}") }],
-                        stop_reason: Some(StopReason::Stop),
-                    },
-                ]
-            })
-            .collect();
-        let budget = summary_budget_for(60_000);
-        let (kept, trimmed) = limit_for_summary(&messages, budget);
-        assert!(trimmed, "this is over budget");
-        let text = serialize_conversation(&kept);
-        assert!(text.contains("question 39"), "the newest turn survives");
-        assert!(!text.contains("question 0 "), "the oldest turns are dropped: {budget}");
-        let used: u64 = kept.iter().map(Message::estimate_tokens).sum();
-        assert!(used <= budget, "the budget is respected: {used} > {budget}");
-        // Never starts on a tool result: the summariser must not see an orphan.
-        assert!(!matches!(kept.first(), Some(Message::Tool { .. })));
-    }
-
-    #[test]
-    fn a_request_that_fits_is_sent_whole() {
-        let messages = vec![user("short"), Message::Assistant {
-            content: vec![Block::Text { text: "reply".into() }],
-            stop_reason: Some(StopReason::Stop),
-        }];
-        let (kept, trimmed) = limit_for_summary(&messages, summary_budget_for(1_000_000));
-        assert!(!trimmed);
-        assert_eq!(kept.len(), messages.len());
-    }
-
-    #[test]
-    fn the_planned_request_fits_the_window() {
-        // The wiring is the part that broke in production: every cap can look right while the
-        // request that actually gets built is still unbounded. This measures the plan itself,
-        // through the same serialisation the request uses.
-        //
-        // A session shaped like the real one that failed — a lot of agent traffic, most of it
-        // reasoning — over a window of 1M tokens.
-        let window = 1_048_576u64;
-        let messages: Vec<Message> = (0..400)
-            .flat_map(|i| {
-                let mut content = vec![
-                    Block::Thinking { thinking: sized("scratch ", 30_000), signature: None },
-                    Block::Text { text: format!("step {i}") },
-                ];
-                content.push(Block::ToolCall {
-                    id: format!("c{i}"),
-                    name: "bash".into(),
-                    arguments: serde_json::json!({"command": sized("ls ", 1_000)}),
-                });
-                vec![
-                    user(&format!("task {i}")),
-                    Message::Assistant { content, stop_reason: Some(StopReason::Stop) },
-                    Message::Tool {
-                        tool_call_id: format!("c{i}"),
-                        name: "bash".into(),
-                        content: sized("output ", 20_000),
-                    },
-                ]
-            })
-            .collect();
-
-        let plan = plan_summary(&messages, keep_recent_for(window), Some(window)).unwrap();
-        let request_tokens = plan.request_tokens;
-        assert!(
-            request_tokens < window,
-            "the summary request must fit the window: {request_tokens} >= {window}"
-        );
-        // And the reasoning traces are not what it is made of.
-        let text = serialize_conversation(&plan.summarized);
-        assert!(!text.contains("scratch "), "no traces in the request");
-        assert!(text.contains("task 399"), "the newest work is covered");
-        // The fixture is over budget, so the cap is what makes the request fit.
-        assert!(plan.trimmed, "this session is over the summary budget");
-    }
-
-    #[test]
-    fn the_budget_leaves_room_for_the_answer() {
-        // A third of the window: the request has to fit alongside the summary it asks for.
-        assert_eq!(summary_budget_for(1_048_576), 349_525);
-        assert_eq!(summary_budget_for(60_000), 20_000);
-        // An undeclared window gets a fixed budget, not none: unbounded is the failure mode.
-        assert!(summary_budget_for(0) > 0);
-        // And a tiny window still gets something usable rather than zero.
-        assert_eq!(summary_budget_for(1_000), 333);
-    }
-
-    #[test]
     fn the_first_prompt_asks_for_the_seven_sections() {
-        let prompt = summary_prompt("CONVERSATION", None, None, false);
+        let prompt = summary_prompt("CONVERSATION", None, false);
         for section in [
             "## Goal",
             "## Constraints & Preferences",
@@ -1132,19 +1051,11 @@ mod tests {
     }
 
     #[test]
-    fn a_re_compaction_asks_to_preserve_the_previous_summary() {
-        let prompt = summary_prompt("NEW", Some("重点保留 API 设计"), Some("OLD SUMMARY"), false);
-        assert!(prompt.contains("<previous-summary>\nOLD SUMMARY\n</previous-summary>"));
-        assert!(prompt.contains("PRESERVE"));
-        assert!(prompt.contains("额外关注：重点保留 API 设计"));
-    }
-
-    #[test]
     fn a_split_turn_is_flagged_to_the_summariser() {
-        let prompt = summary_prompt("CONVERSATION", None, None, true);
+        let prompt = summary_prompt("CONVERSATION", None, true);
         assert!(prompt.contains("还没有结束"));
         assert!(prompt.contains("In Progress"));
-        let plain = summary_prompt("CONVERSATION", None, None, false);
+        let plain = summary_prompt("CONVERSATION", None, false);
         assert!(!plain.contains("还没有结束"));
     }
 
@@ -1201,7 +1112,7 @@ mod tests {
             stop_reason: StopReason::Error,
             error: Some("prompt is too long".into()),
         };
-        assert_eq!(detect_overflow(&completion, Some(200_000), 8192), Some(OverflowSignal::ExplicitError));
+        assert_eq!(detect_overflow(&completion, Some(200_000)), Some(OverflowSignal::ExplicitError));
     }
 
     #[test]
@@ -1214,13 +1125,13 @@ mod tests {
             error: None,
         };
         assert_eq!(
-            detect_overflow(&completion, Some(200_000), 8192),
+            detect_overflow(&completion, Some(200_000)),
             Some(OverflowSignal::SilentOverflow { prompt_tokens: 210_000, context_window: 200_000 })
         );
     }
 
     #[test]
-    fn a_length_cut_needs_evidence_of_context_pressure() {
+    fn output_exhaustion_is_not_context_overflow() {
         let completion = Completion {
             message: Message::Assistant { content: vec![], stop_reason: Some(StopReason::Length) },
             usage: Usage { input: 99_000, output: 0, cache_read: 0, cache_write: 0 },
@@ -1228,10 +1139,10 @@ mod tests {
             error: None,
         };
         assert_eq!(
-            detect_overflow(&completion, Some(100_000), 8192),
-            Some(OverflowSignal::LengthCut { output_tokens: 0, max_tokens: 8192 })
+            detect_overflow(&completion, Some(100_000)),
+            None
         );
-        assert_eq!(detect_overflow(&completion, None, 8192), None);
+        assert_eq!(detect_overflow(&completion, None), None);
     }
 
     #[test]
@@ -1242,7 +1153,7 @@ mod tests {
             stop_reason: StopReason::Length,
             error: None,
         };
-        assert_eq!(detect_overflow(&completion, Some(200_000), 8192), None);
+        assert_eq!(detect_overflow(&completion, Some(200_000)), None);
     }
 
     #[test]
@@ -1253,7 +1164,7 @@ mod tests {
             stop_reason: StopReason::Stop,
             error: None,
         };
-        assert_eq!(detect_overflow(&completion, Some(200_000), 8192), None);
+        assert_eq!(detect_overflow(&completion, Some(200_000)), None);
         assert_eq!(completion.stop_reason, StopReason::Stop);
     }
 

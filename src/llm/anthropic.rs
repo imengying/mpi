@@ -141,8 +141,22 @@ pub struct MessagesRequest {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<ToolEntry>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<ToolChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<ThinkingConfig>,
     pub stream: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ToolChoice {
+    #[serde(rename = "type")]
+    kind: &'static str,
+}
+
+impl MessagesRequest {
+    pub(crate) fn prohibit_tools(&mut self) {
+        if !self.tools.is_empty() { self.tool_choice = Some(ToolChoice { kind: "none" }); }
+    }
 }
 
 pub fn build_request(req: &Request<'_>) -> MessagesRequest {
@@ -285,6 +299,7 @@ pub fn build_request(req: &Request<'_>) -> MessagesRequest {
         system,
         messages,
         tools,
+        tool_choice: None,
         thinking: thinking_budget.map(|budget_tokens| ThinkingConfig { kind: "enabled", budget_tokens }),
         stream: true,
     }

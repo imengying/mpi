@@ -235,6 +235,14 @@ pub struct ChatRequest {
     enable_search: Option<bool>,
 }
 
+impl ChatRequest {
+    pub(crate) fn prohibit_tools(&mut self) {
+        if !self.tools.is_empty() { self.tool_choice = Some("none"); }
+        if let Some(toggle) = &mut self.enable_search { *toggle = false; }
+        if let Some(parameters) = &mut self.search_parameters { parameters.mode = "off"; }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct ThinkingToggle {
     #[serde(rename = "type")]
@@ -411,11 +419,15 @@ pub fn build_request(req: &Request<'_>, stream: bool) -> ChatRequest {
         // uncapped budget can leave no room for text or a tool call.
         match compat.thinking_format {
             ThinkingFormat::Qwen => request.thinking_budget = plan.budget_tokens,
-            ThinkingFormat::Openai | ThinkingFormat::Deepseek | ThinkingFormat::Zai => {
+            ThinkingFormat::Openai | ThinkingFormat::Zai => {
                 request.thinking_token_budget = plan.budget_tokens
             }
             _ => {}
         }
+    } else if compat.thinking_format == ThinkingFormat::Deepseek {
+        // DeepSeek can default to thinking even when no effort is supplied. Auxiliary
+        // summary requests explicitly disable it instead of starting another long CoT.
+        request.thinking = Some(ThinkingToggle { kind: "disabled", clear_thinking: None });
     }
 
     request
@@ -861,6 +873,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn deepseek_gateway_replays_thinking_across_tools_and_user_turns_without_invented_budgets() {
+        let provider: crate::config::Provider = serde_json::from_value(serde_json::json!({
+            "name":"work", "api":"completions", "base_url":"https://gateway.example/v1"
+        })).unwrap();
+        let mut model: crate::config::ModelConfig = serde_json::from_value(serde_json::json!({
+            "id":"deepseek-v4.1-flash", "reasoning":true,"max_tokens":128000
+        })).unwrap();
+        let thought = |text: &str| Block::Thinking { thinking:text.into(), signature:None };
+        let history = vec![
+            Message::user_text("第一项任务"),
+            Message::Assistant { content:vec![thought("已经确定方案，只需读取文件。"), Block::ToolCall {
+                id:"c1".into(), name:"read".into(), arguments:serde_json::json!({"path":"a.rs"}),
+            }], stop_reason:Some(StopReason::ToolUse) },
+            Message::Tool { tool_call_id:"c1".into(), name:"read".into(), content:"文件内容".into() },
+            Message::Assistant { content:vec![thought("确认完成。"), Block::Text {text:"已完成".into()}], stop_reason:Some(StopReason::Stop) },
+            Message::user_text("继续第二项任务"),
+        ];
+        let tools = crate::tools::specs();
+        let original = history.clone();
+        let body = serde_json::to_value(build_request(&Request {
+            tools:&tools, ..request(&model, &provider, &history)
+        }, true)).unwrap();
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["reasoning_effort"], "high");
+        assert_eq!(body["max_tokens"], 128000);
+        assert!(body.get("thinking_token_budget").is_none());
+        assert_eq!(body["messages"][1]["reasoning_content"], "已经确定方案，只需读取文件。");
+        assert_eq!(body["messages"][3]["reasoning_content"], "确认完成。");
+        assert_eq!(body["messages"][2]["tool_call_id"], "c1");
+        assert_eq!(history, original);
+
+        model.reasoning = false;
+        let body = serde_json::to_value(build_request(&request(&model, &provider, &history), true)).unwrap();
+        assert_eq!(body["thinking"]["type"], "disabled");
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
     fn deepseek_cache_usage_is_counted_once() {
         let usage: WireUsage = serde_json::from_value(serde_json::json!({
             "prompt_tokens":10000,"prompt_cache_hit_tokens":9000,
@@ -926,8 +976,8 @@ mod tests {
         let body = serde_json::to_value(build_request(&request(&model, &provider, &messages), true)).unwrap();
         assert_eq!(body["thinking"]["type"], "enabled");
         assert_eq!(body["reasoning_effort"], "high");
-        // 85% of max_tokens would swallow the answer, so the budget is clamped.
-        assert!(body["thinking_token_budget"].as_u64().unwrap() < 64000);
+        // DeepSeek exposes effort and a combined output cap, not this numeric CoT knob.
+        assert!(body.get("thinking_token_budget").is_none());
         // The replayed assistant message must carry reasoning_content.
         assert_eq!(body["messages"][1]["reasoning_content"], "why");
     }

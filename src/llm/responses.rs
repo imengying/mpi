@@ -182,6 +182,12 @@ pub struct ResponsesRequest {
     stream: bool,
 }
 
+impl ResponsesRequest {
+    pub(crate) fn prohibit_tools(&mut self) {
+        if !self.tools.is_empty() { self.tool_choice = Some("none"); }
+    }
+}
+
 /// Build the request body for one turn.
 pub fn build_request(req: &Request<'_>, stream: bool) -> ResponsesRequest {
     let model = req.model;
