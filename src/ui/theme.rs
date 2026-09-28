@@ -1,5 +1,5 @@
 //! A restrained, Codex-inspired terminal theme. Body text uses the user's foreground;
-//! accents identify actions and reasoning levels rather than colouring every field.
+//! accents identify status fields, actions and reasoning levels.
 
 /// `truecolor` vs 256-colour fallback is decided once per process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,7 +141,7 @@ impl Theme {
         } else if percent > 70.0 {
             Color::Yellow
         } else {
-            Color::Dim
+            Color::Green
         }
     }
 }

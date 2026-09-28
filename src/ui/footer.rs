@@ -36,7 +36,7 @@ pub struct FooterState<'a> {
 
 /// Build the two footer lines at `width` columns.
 pub fn render(state: &FooterState<'_>, theme: &Theme, width: usize) -> Vec<Line> {
-    let mut lines = vec![location_line(state, theme, width)];
+    let mut lines = vec![location_line(state, width)];
     if let Some(note) = state.busy {
         lines.push(Line::new(note, Style::new(Color::Yellow)));
     }
@@ -44,8 +44,7 @@ pub fn render(state: &FooterState<'_>, theme: &Theme, width: usize) -> Vec<Line>
     lines
 }
 
-fn location_line(state: &FooterState<'_>, theme: &Theme, width: usize) -> Line {
-    let _ = theme;
+fn location_line(state: &FooterState<'_>, width: usize) -> Line {
     let cwd = util::shorten_home(state.cwd, dirs::home_dir().as_deref());
     // The line is built to fit `width`: it is one row of the live region, and a row that the
     // terminal wraps on its own would throw the region's row count off by one — which shows up
@@ -65,7 +64,7 @@ fn location_line(state: &FooterState<'_>, theme: &Theme, width: usize) -> Line {
         budget = budget.saturating_sub(util::width(&shown));
         shown
     };
-    let mut spans = vec![Span::new(cwd, Style::new(Color::Text))];
+    let mut spans = vec![Span::new(cwd, Style::new(Color::Green))];
     if let Some(branch) = branch {
         // " (" + branch + ")", and at least one column so an empty branch cannot produce "()".
         let room = budget.saturating_sub(3);
@@ -73,7 +72,7 @@ fn location_line(state: &FooterState<'_>, theme: &Theme, width: usize) -> Line {
             let shown = util::truncate(&branch, room, "…");
             budget = budget.saturating_sub(util::width(&shown) + 3);
             spans.push(Span::new(" (", Style::new(Color::Dim)));
-            spans.push(Span::new(shown, Style::new(Color::Dim)));
+            spans.push(Span::new(shown, Style::new(Color::Magenta)));
             spans.push(Span::new(")", Style::new(Color::Dim)));
         }
     }
@@ -113,20 +112,20 @@ fn stats_line(state: &FooterState<'_>, theme: &Theme, width: usize) -> Line {
     };
     let context_color = theme.context(percent);
 
-    let muted = Style::new(Color::Dim);
+    let usage = Style::new(Color::Green);
     let left = format!(
         "↑ {}   ↓ {}   {CACHE_ICON} {hit}   {context_text}",
         util::fmt_tokens(state.totals.input, false),
         util::fmt_tokens(state.totals.output, false),
     );
     // Split the left half back into its four runs so each context field can carry its own
-    // colour: usage stays muted, while the gauge highlights warnings and errors.
+    // colour: usage keeps its theme accent, while the gauge highlights warnings and errors.
     let mut spans = vec![
-        Span::new(format!("↑ {}", util::fmt_tokens(state.totals.input, false)), muted),
+        Span::new(format!("↑ {}", util::fmt_tokens(state.totals.input, false)), usage),
         Span::new("   ", Style::plain()),
-        Span::new(format!("↓ {}", util::fmt_tokens(state.totals.output, false)), muted),
+        Span::new(format!("↓ {}", util::fmt_tokens(state.totals.output, false)), usage),
         Span::new("   ", Style::plain()),
-        Span::new(format!("{CACHE_ICON} {hit}"), muted),
+        Span::new(format!("{CACHE_ICON} {hit}"), usage),
         Span::new("   ", Style::plain()),
         Span::new(context_text.clone(), Style::new(context_color)),
     ];
@@ -154,13 +153,18 @@ fn stats_line(state: &FooterState<'_>, theme: &Theme, width: usize) -> Line {
             .saturating_sub(util::width(&rendered));
         spans.push(Span::plain(" ".repeat(gap)));
         let level = if state.level.is_empty() { "low" } else { state.level };
+        let model_color = if state.model.is_some_and(|model| model.reasoning) {
+            Color::reasoning(level)
+        } else {
+            Color::Cyan
+        };
         let suffix = format!(" • {level}");
         if state.model.is_some_and(|model| model.reasoning) && rendered.ends_with(&suffix) {
-            spans.push(Span::new(rendered[..rendered.len() - suffix.len()].to_string(), Style::new(Color::Text)));
+            spans.push(Span::new(rendered[..rendered.len() - suffix.len()].to_string(), Style::new(model_color)));
             spans.push(Span::new(" • ", Style::new(Color::Dim)));
             spans.push(Span::new(level, Style::new(Color::reasoning(level))));
         } else {
-            spans.push(Span::new(rendered, Style::new(Color::Text)));
+            spans.push(Span::new(rendered, Style::new(model_color)));
         }
     }
     Line::spans(spans)
@@ -335,7 +339,7 @@ mod tests {
         state.context_tokens = Some(950_000);
         assert_eq!(gauge(&state), ("950k/1M".to_string(), Color::Red));
         state.context_tokens = Some(17_300);
-        assert_eq!(gauge(&state), ("17.3k/1M".to_string(), Color::Dim));
+        assert_eq!(gauge(&state), ("17.3k/1M".to_string(), Color::Green));
     }
 
     #[test]
