@@ -3,6 +3,39 @@
 use super::*;
 use crate::ui::footer::FooterState;
 
+fn drain_queued(screen: &mut Screen) -> Vec<Queued> {
+    std::iter::from_fn(|| screen.pop_queued()).collect()
+}
+
+#[test]
+fn steering_preserves_submission_order_and_waits_behind_commands() {
+    let mut screen = screen_with_commands();
+    screen.interactive = false;
+    screen.queue(Queued::Message("不要提交".into(), Vec::new()));
+    screen.queue(Queued::Command("/model".into()));
+    screen.queue(Queued::Message("调整后的任务".into(), Vec::new()));
+    assert!(screen.has_steering());
+    assert_eq!(screen.take_steering(), [Queued::Message("不要提交".into(), Vec::new())]);
+    assert!(!screen.has_steering());
+    assert!(screen.take_steering().is_empty());
+    assert_eq!(drain_queued(&mut screen), [Queued::Command("/model".into()), Queued::Message("调整后的任务".into(), Vec::new())]);
+}
+
+#[test]
+fn draining_a_command_keeps_older_messages_ahead_of_new_steering() {
+    let mut screen = screen_with_commands();
+    screen.interactive = false;
+    screen.queue(Queued::Command("/model".into()));
+    screen.queue(Queued::Message("先前提交的补充".into(), Vec::new()));
+    assert_eq!(screen.pop_queued(), Some(Queued::Command("/model".into())));
+    screen.queue(Queued::Message("新提交的补充".into(), Vec::new()));
+    assert_eq!(screen.take_steering(), [
+        Queued::Message("先前提交的补充".into(), Vec::new()),
+        Queued::Message("新提交的补充".into(), Vec::new()),
+    ]);
+    assert!(screen.pop_queued().is_none());
+}
+
 #[test]
 fn an_error_exit_erases_the_composer_before_the_shell_resumes() {
     let captured = CapturedOutput::default();
@@ -1021,13 +1054,13 @@ fn a_line_submitted_mid_turn_is_held_as_what_it_is() {
     crate::agent::r#loop::queue_mid_turn(&mut screen, "hello".to_string(), Vec::new());
     crate::agent::r#loop::queue_mid_turn(&mut screen, "   ".to_string(), Vec::new());
 
-    let queued = screen.take_queued();
+    let queued = drain_queued(&mut screen);
     assert_eq!(queued.len(), 2, "a blank line is not queued: {queued:?}");
     assert_eq!(queued[0], Queued::Command("/model".to_string()));
     assert_eq!(queued[1], Queued::Message("hello".to_string(), Vec::new()));
 
     // Taking them empties the queue, so the next turn does not re-send them.
-    assert!(screen.take_queued().is_empty());
+    assert!(drain_queued(&mut screen).is_empty());
 }
 
 #[test]
@@ -1040,7 +1073,7 @@ fn a_queued_line_is_trimmed_the_way_the_prompt_trims_it() {
     crate::agent::r#loop::queue_mid_turn(&mut screen, "  /model  ".to_string(), Vec::new());
     crate::agent::r#loop::queue_mid_turn(&mut screen, "  hello  ".to_string(), Vec::new());
 
-    let queued = screen.take_queued();
+    let queued = drain_queued(&mut screen);
     assert_eq!(queued[0], Queued::Command("/model".to_string()));
     assert_eq!(queued[1], Queued::Message("hello".to_string(), Vec::new()));
 }
@@ -1052,7 +1085,7 @@ fn a_command_queued_mid_turn_never_becomes_a_message() {
     // command as something the user had said, and the command itself never ran.
     let mut screen = screen_with_commands();
     crate::agent::r#loop::queue_mid_turn(&mut screen, "/name x".to_string(), Vec::new());
-    let queued = screen.take_queued();
+    let queued = drain_queued(&mut screen);
     assert!(
         queued
             .iter()
@@ -1063,7 +1096,7 @@ fn a_command_queued_mid_turn_never_becomes_a_message() {
 
 #[test]
 fn a_paste_that_was_never_submitted_stays_with_the_draft() {
-    // `take_queued` used to sweep `pending_images` into the queue, which sent a
+    // `pop_queued` used to sweep `pending_images` into the queue, which sent a
     // screenshot the user was still composing and left the message it belonged to
     // without it. Images travel with the line on Enter, so the queue never owns them.
     let mut screen = screen_with_commands();
@@ -1075,7 +1108,7 @@ fn a_paste_that_was_never_submitted_stays_with_the_draft() {
     });
     crate::agent::r#loop::queue_mid_turn(&mut screen, "queued message".to_string(), Vec::new());
 
-    let queued = screen.take_queued();
+    let queued = drain_queued(&mut screen);
     assert_eq!(queued.len(), 1);
     assert_eq!(
         screen.pending_images.len(),

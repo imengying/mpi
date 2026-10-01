@@ -328,18 +328,15 @@ impl Agent {
                 level: &self.level,
                 custom_instructions: custom,
             };
-            // The keep-recent window is scaled to the model's capacity: keeping a fixed 20k in a
-            // 6k window would produce a checkpoint larger than the history it replaced.
-            let keep_recent = model
-                .context_window
-                .map(compact::keep_recent_for)
-                .unwrap_or(Defaults::KEEP_RECENT_TOKENS);
+            let budget = model.compaction_budget().map_err(CompactError::Summarize)?;
+            let facts = self.session.checkpoint_facts((model.context_window.unwrap_or(128_000) / 12).min(1024) as usize * 4);
             let outcome = compact::run(
                 &self.client,
                 request,
                 &messages,
                 self.system_prompt.as_deref().unwrap_or_default(),
-                keep_recent,
+                budget.keep_recent,
+                facts,
             )
             .await?;
             self.session

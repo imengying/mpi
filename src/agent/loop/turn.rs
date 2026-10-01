@@ -4,6 +4,28 @@ use super::*;
 
 impl Agent {
 
+        fn append_user_input(&mut self, input: &str, images: Vec<crate::image_input::PastedImage>) -> anyhow::Result<()> {
+            self.screen.push_lines(ui_compact::user_lines(input));
+            for image in &images {
+                self.screen.push_lines(ui_compact::note_lines(&image.label(), crate::ui::screen::Style::new(Color::Magenta)));
+            }
+            let mut content = Vec::new();
+            if !input.is_empty() { content.push(llm::Block::Text { text: input.to_string() }); }
+            content.extend(images.iter().map(crate::image_input::PastedImage::block));
+            self.session.push_message(Message::User { content }, None, None)?;
+            Ok(())
+        }
+
+        pub(super) fn accept_steering(&mut self) -> anyhow::Result<()> {
+            for item in self.screen.take_steering() {
+                if let crate::ui::screen::Queued::Message(text, images) = item {
+                    self.append_user_input(&text, images)?;
+                    self.retry.reset();
+                }
+            }
+            Ok(())
+        }
+
         /// Run one user turn to completion.
         pub async fn run_turn(&mut self, input: &str) -> anyhow::Result<()> {
             self.run_turn_with_images(input, Vec::new()).await
@@ -21,20 +43,7 @@ impl Agent {
             images: Vec<crate::image_input::PastedImage>,
         ) -> anyhow::Result<()> {
             self.screen.collapse_all();
-            self.screen.push_lines(ui_compact::user_lines(input));
-            for image in &images {
-                self.screen.push_lines(ui_compact::note_lines(
-                    &image.label(),
-                    crate::ui::screen::Style::new(Color::Magenta),
-                ));
-            }
-            let mut content: Vec<crate::llm::Block> = Vec::new();
-            if !input.is_empty() {
-                content.push(crate::llm::Block::Text { text: input.to_string() });
-            }
-            content.extend(images.iter().map(crate::image_input::PastedImage::block));
-            self.session
-                .push_message(Message::User { content }, None, None)?;
+            self.append_user_input(input, images)?;
             // Record the model and level this turn is about to run with, so resuming the session
             // continues with the model the user chose rather than the one the session happened to
             // be created with. It is written per turn because the choice can change between them:
@@ -49,8 +58,12 @@ impl Agent {
             self.screen.set_working(WORKING_LABEL);
 
             loop {
+                self.accept_steering()?;
                 match self.assistant_turn().await {
-                    Ok(TurnEnd::Done) => break,
+                    Ok(TurnEnd::Done) => {
+                        if self.screen.has_steering() { continue; }
+                        break;
+                    }
                     Ok(TurnEnd::Continue) => continue,
                     // Esc during a tool call: the results produced so far are already recorded,
                     // and the turn is over. Without the stop the loop would send them and ask the
@@ -93,30 +106,26 @@ impl Agent {
             let tools = tools::specs();
             // Threshold compaction runs before the request, using real usage when it is still
             // valid and an estimate otherwise.
-            if let Some(window) = model.context_window {
-                let limit = compact::threshold_for(window, model.max_tokens());
-                let real_usage = self.session.measured_context_tokens();
-                let used = compact::estimate_context(
-                    &messages,
-                    self.system_prompt.as_deref().unwrap_or_default(),
-                    real_usage,
-                );
-                let used = used + if real_usage.is_none() {
-                    tools.iter().map(|tool| crate::util::estimate_tokens(&serde_json::to_string(tool).expect("tool schema"))).sum::<u64>()
-                } else { 0 };
+            if model.context_window.is_some() {
+                let limit = model.compaction_budget().map_err(anyhow::Error::msg)?.threshold;
+                let used = self.context_tokens(&messages, &tools);
                 if used > limit {
-                    // No note here: the footer's own banner already says the context is near its
-                    // limit and a compaction is running. It is the same sentence, on the row the
-                    // user is looking at while the request is in flight.
-                    if let Err(err) = self.compact(Reason::Threshold, None).await {
-                        // A failed automatic compaction must not lose the turn; the request
-                        // may still fit, and if it does not the overflow path will try again.
-                        self.screen.push_lines(ui_compact::note_lines(
-                            &format!("自动压缩未完成：{err}"),
-                            crate::ui::screen::Style::new(Color::Yellow),
-                        ));
-                    }
+                    self.prune_context()?;
                     messages = self.session.context_messages();
+                    let used = self.context_tokens(&messages, &tools);
+                    if used <= limit {
+                        self.render_footer(None);
+                    } else {
+                        // The footer shows that compaction is running. A failure must not lose
+                        // the turn: the request may still fit, otherwise overflow recovery runs.
+                        if let Err(err) = self.compact(Reason::Threshold, None).await {
+                            self.screen.push_lines(ui_compact::note_lines(
+                                &format!("自动压缩未完成：{err}"),
+                                crate::ui::screen::Style::new(Color::Yellow),
+                            ));
+                        }
+                        messages = self.session.context_messages();
+                    }
                 }
             }
 
@@ -201,7 +210,7 @@ impl Agent {
             let completion = match outcome.result {
                 None => {
                     debug_assert!(outcome.stopped(), "no completion means the stream was stopped");
-                    return self.finish_stopped().map(|()| TurnEnd::Done);
+                    return self.finish_stopped().map(|()| TurnEnd::Stopped);
                 }
                 Some(Ok(completion)) => completion.checked(),
                 Some(Err(err)) => {
@@ -255,7 +264,7 @@ impl Agent {
                 ));
                 return Ok(TurnEnd::Done);
             }
-            self.after_completion(&completion)
+            self.after_completion(&completion).await
         }
 
 
@@ -281,19 +290,13 @@ impl Agent {
                 None,
                 Some(StopReason::Aborted),
             )?;
-            // The partial answer is on screen above this line, so "已停止" is enough to account
-            // for why it ends mid-sentence; how to carry on needs no instruction.
-            self.screen.push_lines(ui_compact::note_lines(
-                "已停止",
-                crate::ui::screen::Style::new(Color::Dim),
-            ));
             self.render_footer(None);
             Ok(())
         }
 
 
         /// Decide what to do after a response that is not an overflow.
-        pub(super) fn after_completion(&mut self, completion: &llm::Completion) -> anyhow::Result<TurnEnd> {
+        pub(super) async fn after_completion(&mut self, completion: &llm::Completion) -> anyhow::Result<TurnEnd> {
             if completion.stop_reason == StopReason::Error || completion.error.is_some() {
                 return Ok(TurnEnd::Done);
             }
@@ -317,7 +320,7 @@ impl Agent {
             // Tool calls are executed inline; the next request carries their results. Esc during
             // the calls ends the turn here: the results already produced are in the session, and
             // carrying on would run the very thing the user just stopped.
-            let stopped = self.execute_tools(&calls)?;
+            let stopped = self.execute_tools(&calls).await?;
             if stopped {
                 return Ok(TurnEnd::Stopped);
             }
@@ -482,7 +485,7 @@ mod tests {
             }], stop_reason:Some(StopReason::Length) },
             usage:crate::config::Usage::default(), stop_reason:StopReason::Length, error:None,
         };
-        assert!(matches!(agent.after_completion(&exhausted).unwrap(), TurnEnd::Done));
+        assert!(matches!(agent.after_completion(&exhausted).await.unwrap(), TurnEnd::Done));
         assert_eq!(agent.level, level, "do not silently downgrade the selected effort");
         drop(agent);
         std::fs::remove_dir_all(dir).unwrap();

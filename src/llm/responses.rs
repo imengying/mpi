@@ -267,11 +267,11 @@ pub fn build_request(req: &Request<'_>, stream: bool) -> ResponsesRequest {
                     }
                 }
             }
-            Message::Tool { tool_call_id, content, .. } => {
+            Message::Tool { tool_call_id, .. } => {
                 input.push(InputEntry::Item(InputItem {
                     kind: Some("function_call_output"),
                     call_id: Some(tool_call_id.clone()),
-                    output: Some(content.clone()),
+                    output: Some(message.text()),
                     ..InputItem::empty()
                 }));
             }
@@ -1142,6 +1142,7 @@ mod tests {
                 stop_reason: Some(StopReason::ToolUse),
             },
             Message::Tool {
+                status: crate::llm::ToolStatus::Success,
                 tool_call_id: "call_1".into(),
                 name: "read".into(),
                 content: "data".into(),

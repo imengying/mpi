@@ -98,6 +98,29 @@ pub enum Block {
     },
 }
 
+/// Durable execution facts, separate from the model's attempted tool call.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolStatus {
+    Success,
+    Error,
+    Cancelled,
+    Skipped,
+    Unknown,
+}
+
+impl ToolStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Success => "成功",
+            Self::Error => "失败",
+            Self::Cancelled => "已中止，可能已有部分效果",
+            Self::Skipped => "未执行",
+            Self::Unknown => "执行结果未知",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "role", rename_all = "snake_case")]
 pub enum Message {
@@ -116,6 +139,7 @@ pub enum Message {
         tool_call_id: String,
         name: String,
         content: String,
+        status: ToolStatus,
     },
 }
 
@@ -132,7 +156,10 @@ impl Message {
         let blocks = match self {
             Message::System { content } => return content.clone(),
             Message::User { content } | Message::Assistant { content, .. } => content,
-            Message::Tool { content, .. } => return content.clone(),
+            Message::Tool { content, status, .. } => return match status {
+                ToolStatus::Success => content.clone(),
+                _ => format!("[工具状态：{}]\n{content}", status.label()),
+            },
         };
         blocks
             .iter()
@@ -178,7 +205,8 @@ impl Message {
         let mut tokens = 0u64;
         let mut images = 0u64;
         match self {
-            Message::System { content } | Message::Tool { content, .. } => tokens += util::estimate_tokens(content),
+            Message::System { content } => tokens += util::estimate_tokens(content),
+            Message::Tool { .. } => tokens += util::estimate_tokens(&self.text()),
             Message::User { content } | Message::Assistant { content, .. } => {
                 for block in content {
                     match block {
@@ -489,7 +517,7 @@ mod tests {
     fn tool_history_requires_one_immediate_result_per_call_without_mutating_messages() {
         let call = |id: &str| Block::ToolCall { id:id.into(), name:"read".into(), arguments:serde_json::json!({"path":"a.rs"}) };
         let assistant = |content| Message::Assistant { content, stop_reason:Some(StopReason::ToolUse) };
-        let result = |id: &str| Message::Tool { tool_call_id:id.into(), name:"read".into(), content:String::new() };
+        let result = |id: &str| Message::Tool { status: crate::llm::ToolStatus::Success, tool_call_id:id.into(), name:"read".into(), content:String::new() };
         let history = vec![Message::user_text("read"), assistant(vec![call("a"), call("b")]), result("b"), result("a")];
         let original = history.clone();
         assert!(validate_tool_history(&history).is_ok());
@@ -500,7 +528,7 @@ mod tests {
             vec![assistant(vec![call("a")]), Message::user_text("next")],
             vec![assistant(vec![call("a"), call("a")]), result("a")],
             vec![assistant(vec![call("a")]), result("a"), result("a")],
-            vec![assistant(vec![call("a")]), Message::Tool { tool_call_id:"a".into(), name:"write".into(), content:String::new() }],
+            vec![assistant(vec![call("a")]), Message::Tool { status: crate::llm::ToolStatus::Success, tool_call_id:"a".into(), name:"write".into(), content:String::new() }],
         ] {
             assert!(validate_tool_history(&invalid).is_err(), "{invalid:?}");
         }

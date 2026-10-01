@@ -201,16 +201,8 @@ pub fn note_lines(text: &str, style: Style) -> Vec<Line> {
 pub fn replay_blocks(messages: &[crate::llm::Message]) -> Vec<crate::ui::screen::Block> {
     use crate::llm::{Block as MsgBlock, Message};
 
-    // Tool results, keyed by the call they belong to.
-    let mut results: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
-    for message in messages {
-        if let Message::Tool { tool_call_id, content, .. } = message {
-            results.insert(tool_call_id.as_str(), content.as_str());
-        }
-    }
-
     let mut out: Vec<crate::ui::screen::Block> = Vec::new();
-    for message in messages {
+    for (index, message) in messages.iter().enumerate() {
         // The environment block is bookkeeping that happens to be a user message. Filtered
         // here rather than by the caller so no replay path can forget and print it as
         // something the user said.
@@ -233,6 +225,13 @@ pub fn replay_blocks(messages: &[crate::llm::Message]) -> Vec<crate::ui::screen:
                 }
             }
             Message::Assistant { content, stop_reason } => {
+                // Call ids may be reused in later responses. Pair only this response's results.
+                let results: std::collections::HashMap<_, _> = messages[index + 1..].iter()
+                    .take_while(|message| matches!(message, Message::Tool { .. }))
+                    .filter_map(|message| match message {
+                        Message::Tool { tool_call_id, content, status, .. } => Some((tool_call_id.as_str(), (content.as_str(), *status))),
+                        _ => None,
+                    }).collect();
                 let mut lines: Vec<Line> = Vec::new();
                 let had_thinking = content.iter().any(|b| matches!(b, MsgBlock::Thinking { .. }));
                 if had_thinking { push_lines(&mut out, thinking_done_lines()); }
@@ -249,10 +248,12 @@ pub fn replay_blocks(messages: &[crate::llm::Message]) -> Vec<crate::ui::screen:
                             if !lines.is_empty() {
                                 push_lines(&mut out, std::mem::take(&mut lines));
                             }
-                            let content = results.get(id.as_str()).copied().unwrap_or("");
+                            let (content, status) = results.get(id.as_str()).copied().unwrap_or(("", crate::llm::ToolStatus::Unknown));
                             // A tool call keeps its own block, so the output is collapsed
                             // on resume exactly as it was when it ran.
-                            out.push(tool_block(name, arguments, &stored_output(name, arguments, content)));
+                            let mut output = stored_output(name, arguments, content);
+                            output.is_error = status != crate::llm::ToolStatus::Success;
+                            out.push(tool_block(name, arguments, &output));
                         }
                         MsgBlock::Hosted { .. } => {
                             if !announced_search {
@@ -458,6 +459,31 @@ fn theme_path(arguments: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replay_keeps_each_responses_status_even_when_call_ids_repeat() {
+        use crate::llm::{Block as MsgBlock, Message, StopReason, ToolStatus};
+        let call = || Message::Assistant {
+            content: vec![MsgBlock::ToolCall {
+                id: "same".into(), name: "read".into(), arguments: serde_json::json!({"path":"a.rs"}),
+            }], stop_reason: Some(StopReason::ToolUse),
+        };
+        let messages = vec![
+            call(),
+            Message::Tool { tool_call_id:"same".into(), name:"read".into(), content:"original data".into(), status:ToolStatus::Success },
+            Message::user_text("再读一次"),
+            call(),
+            Message::Tool { tool_call_id:"same".into(), name:"read".into(), content:"read failed".into(), status:ToolStatus::Error },
+        ];
+        crate::llm::validate_tool_history(&messages).unwrap();
+        let rendered: Vec<_> = replay_blocks(&messages).iter().map(|block| plain(&block.render(80)).join("\n")).collect();
+        assert!(rendered[0].contains("✓ 读取 a.rs"), "{}", rendered[0]);
+        assert!(rendered[0].contains("original data"));
+        assert!(!rendered[0].contains("read failed"));
+        let last = rendered.last().unwrap();
+        assert!(last.contains("× 读取 a.rs"), "{last}");
+        assert!(last.contains("read failed"));
+    }
     use crate::ui::screen::Bg;
     use crate::ui::plain;
 
@@ -512,6 +538,7 @@ mod tests {
                 stop_reason: Some(StopReason::ToolUse),
             },
             Message::Tool {
+                status: crate::llm::ToolStatus::Success,
                 tool_call_id: "c1".into(),
                 name: "bash".into(),
                 content: "hi\n".into(),

@@ -80,6 +80,15 @@ pub enum Record {
         usage: Option<Usage>,
         timestamp: String,
     },
+    /// Model-free context reduction. Original response items remain available for replay.
+    Pruned {
+        parent_id: Option<String>,
+        id: String,
+        replacement_history: Vec<Message>,
+        tool_results: usize,
+        saved_tokens: u64,
+        timestamp: String,
+    },
 }
 
 impl Record {
@@ -89,7 +98,8 @@ impl Record {
             Record::ResponseItem { id, .. }
             | Record::TurnContext { id, .. }
             | Record::SessionInfo { id, .. }
-            | Record::Compacted { id, .. } => id,
+            | Record::Compacted { id, .. }
+            | Record::Pruned { id, .. } => id,
         }
     }
 
@@ -99,7 +109,8 @@ impl Record {
             Record::ResponseItem { parent_id, .. }
             | Record::TurnContext { parent_id, .. }
             | Record::SessionInfo { parent_id, .. }
-            | Record::Compacted { parent_id, .. } => parent_id.as_deref(),
+            | Record::Compacted { parent_id, .. }
+            | Record::Pruned { parent_id, .. } => parent_id.as_deref(),
         }
     }
 
@@ -287,6 +298,7 @@ impl Session {
             session.push_message(Message::Tool {
                 tool_call_id,
                 name,
+                status: crate::llm::ToolStatus::Unknown,
                 content: "上次会话意外中断，此工具调用的执行结果未知。请先检查文件或实际状态，再决定是否重试。".into(),
             }, None, None)?;
         }
@@ -399,15 +411,39 @@ impl Session {
         &self.records
     }
 
+    /// Execution facts come from original records, including work before checkpoints.
+    pub fn file_operations(&self) -> crate::agent::compact::FileOps {
+        crate::agent::compact::FileOps::collect(self.records.iter().filter_map(Record::message))
+    }
+
+    /// Keep short user corrections verbatim across repeated summaries, within a fixed budget.
+    pub fn checkpoint_facts(&self, max_request_chars: usize) -> crate::agent::compact::CheckpointFacts {
+        let mut remaining = max_request_chars;
+        let mut requests = Vec::new();
+        for message in self.records.iter().rev().filter_map(Record::message) {
+            if !matches!(message, Message::User { .. }) || crate::agent::r#loop::is_environment_block(message) {
+                continue;
+            }
+            let text = message.text();
+            let chars = text.chars().count();
+            if chars == 0 || chars > remaining { continue; }
+            requests.push(text);
+            remaining -= chars;
+            if remaining == 0 || requests.len() == 8 { break; }
+        }
+        requests.reverse();
+        crate::agent::compact::CheckpointFacts { files: self.file_operations(), user_requests: requests }
+    }
+
     /// The conversation as the model should see it: everything after the last
-    /// checkpoint, using the checkpoint's replacement history in its place, minus any
-    /// assistant message an overflow recovery dropped.
+    /// checkpoint, using the checkpoint's replacement history in its place.
     pub fn context_messages(&self) -> Vec<Message> {
         let start = self.last_checkpoint_index();
         let messages: Vec<Message> = match start {
             Some(index) => {
-                let Record::Compacted { replacement_history, .. } = &self.records[index] else {
-                    unreachable!()
+                let replacement_history = match &self.records[index] {
+                    Record::Compacted { replacement_history, .. } | Record::Pruned { replacement_history, .. } => replacement_history,
+                    _ => unreachable!(),
                 };
                 let mut messages = replacement_history.clone();
                 for record in &self.records[index + 1..] {
@@ -439,7 +475,7 @@ impl Session {
     pub fn last_checkpoint_index(&self) -> Option<usize> {
         self.records
             .iter()
-            .rposition(|record| matches!(record, Record::Compacted { .. }))
+            .rposition(|record| matches!(record, Record::Compacted { .. } | Record::Pruned { .. }))
     }
 
     /// The directory in the newest turn context. A new session uses its header.
@@ -631,6 +667,22 @@ impl Session {
         self.append(record, id)?;
         // The new context is smaller than anything measured so far, so the old usage
         // must not be reused for the threshold check.
+        self.last_usage = None;
+        self.last_usage_index = None;
+        Ok(())
+    }
+
+    pub fn push_pruning(&mut self, outcome: crate::agent::compact::PruneOutcome) -> Result<(), SessionError> {
+        let id = self.next_id();
+        let record = Record::Pruned {
+            parent_id: self.last_id.clone(),
+            id: id.clone(),
+            replacement_history: outcome.replacement,
+            tool_results: outcome.tool_results,
+            saved_tokens: outcome.saved_tokens,
+            timestamp: now(),
+        };
+        self.append(record, id)?;
         self.last_usage = None;
         self.last_usage_index = None;
         Ok(())
@@ -972,6 +1024,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pruning_and_repeated_checkpoints_preserve_original_execution_facts() {
+        use crate::llm::ToolStatus;
+        let (mut session, dir) = temp_session("pruned-facts");
+        session.push_message(Message::user_text("不用 /copy，保留代码缩进"), None, None).unwrap();
+        session.push_message(Message::Assistant {
+            content: vec![Block::ToolCall { id: "c".into(), name: "edit".into(), arguments: serde_json::json!({"path":"a.rs"}) }],
+            stop_reason: Some(StopReason::ToolUse),
+        }, None, None).unwrap();
+        let original = "重要日志\n".repeat(4000);
+        session.push_message(Message::Tool { tool_call_id: "c".into(), name: "edit".into(), content: original.clone(), status: ToolStatus::Error }, None, None).unwrap();
+        let outcome = crate::agent::compact::prune_tool_results(&session.context_messages(), session.path()).unwrap();
+        session.push_pruning(outcome).unwrap();
+        assert!(session.measured_context_tokens().is_none());
+        assert!(session.context_messages()[2].text().contains("中间已裁剪"));
+        assert!(session.records().iter().filter_map(Record::message).any(|message| matches!(message, Message::Tool { content, status: ToolStatus::Error, .. } if content == &original)));
+        for round in 0..2 {
+            let facts = session.checkpoint_facts(4096);
+            assert_eq!(facts.user_requests, ["不用 /copy，保留代码缩进"]);
+            assert!(facts.files.lists().1.is_empty(), "failed edit must never become a modified file");
+            session.push_compaction("manual", &format!("summary {round}"), vec![Message::user_text("模型摘要没有保留用户原话")], vec![], vec![], None).unwrap();
+        }
+        let path = session.path().to_path_buf();
+        drop(session);
+        let resumed = Session::open(&path).unwrap();
+        assert_eq!(resumed.checkpoint_facts(4096).user_requests, ["不用 /copy，保留代码缩进"]);
+        assert!(resumed.file_operations().lists().1.is_empty());
+        assert_eq!(resumed.context_messages()[0].text(), "模型摘要没有保留用户原话");
+        drop(resumed);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn a_partial_tail_is_listed_and_repaired_before_appending() {
         let (session, dir) = temp_session_with_a_message("partial-tail");
         let path = session.path().to_path_buf();
@@ -1096,6 +1180,7 @@ mod tests {
         session
             .push_message(
                 Message::Tool {
+                    status: crate::llm::ToolStatus::Success,
                     tool_call_id: "first".into(),
                     name: "write".into(),
                     content: "写入成功".into(),
@@ -1242,6 +1327,7 @@ mod tests {
         session
             .push_message(
                 Message::Tool {
+                    status: crate::llm::ToolStatus::Success,
                     tool_call_id: "c1".into(),
                     name: "bash".into(),
                     content: "输出".into(),

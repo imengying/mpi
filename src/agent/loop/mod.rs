@@ -20,9 +20,9 @@ use crate::agent::compact::{self, CompactError, CompactionState, Reason, RetryBu
 use crate::agent::session::Session;
 use crate::auth::guard::PermissionGate;
 use crate::auth::policy;
-use crate::config::{Config, Defaults, ModelConfig, Provider};
+use crate::config::{Config, ModelConfig, Provider};
 use crate::llm::client::Client;
-use crate::llm::{self, Delta, Message, Request, StopReason};
+use crate::llm::{self, Delta, Message, Request, StopReason, ToolStatus};
 use crate::tools::{self, ToolOutput};
 use crate::ui::compact as ui_compact;
 use crate::ui::footer::{self, FooterState};
@@ -96,7 +96,7 @@ enum TurnEnd {
     Done,
     /// Tool results were produced; keep going.
     Continue,
-    /// The user stopped the turn with Esc while its tools were running.
+    /// The user stopped generation or tool execution with Esc.
     Stopped,
 }
 
@@ -411,11 +411,9 @@ impl Agent {
 
 /// Handle what the user did while a turn was running.
 ///
-/// Only a few things make sense mid-turn. A submitted line is *queued*, not run: the model is
-/// answering the previous message, and starting a second turn underneath it would interleave
-/// two conversations. Typing is taken by the composer and never reaches here.
+/// Submitted messages wait for a balanced tool/result boundary; commands wait for idle.
 ///
-/// Returns `true` when the caller must stop the turn: Esc is the one action that changes what
+    /// Returns `true` when the caller must stop the turn: Esc is the one action that changes what
 /// the running turn is doing, and it has to be acted on by whoever owns the request.
 fn on_turn_action(screen: &mut Screen, action: crate::ui::screen::Action) -> bool {
     use crate::ui::screen::Action;
@@ -433,15 +431,14 @@ fn on_turn_action(screen: &mut Screen, action: crate::ui::screen::Action) -> boo
     false
 }
 
-/// Hold a submitted line until the turn in flight is over.
+/// Hold submitted input until a safe boundary (or idle for commands).
 ///
 /// A line starting with `/` is a command, and commands are dispatched as commands, never as
 /// messages: `/model` is not something the user said to the model. It is the same rule the
 /// prompt applies — a slash command is text-only, so any image submitted with it is dropped
 /// rather than smuggled into the conversation as prose.
 ///
-/// Everything else is a message and waits as one, keeping its images: the pictures were
-/// pasted for that message, and the model has to see them with it.
+/// Messages keep their images when they steer the active task.
 pub(crate) fn queue_mid_turn(
     screen: &mut Screen,
     text: String,
@@ -462,22 +459,6 @@ pub(crate) fn queue_mid_turn(
     } else {
         screen.queue(Queued::Message(text.to_string(), images));
     }
-}
-
-/// Drive a future to completion on a private current-thread runtime.
-///
-/// Tool execution is synchronous by nature (spawn a process, read a file) while the agent
-/// loop is async. Rather than colour everything async, the points where sync code has
-/// to wait on async work go through here — and both of them complete without ever yielding
-/// to the outer runtime, so blocking the thread is safe and predictable.
-fn block_on<F: std::future::Future>(future: F) -> F::Output {
-    tokio::task::block_in_place(|| {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("a private runtime")
-            .block_on(future)
-    })
 }
 
 /// A ticker that fires every [`WORKING_INTERVAL`], starting one interval from now.

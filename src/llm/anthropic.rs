@@ -71,6 +71,7 @@ enum OutBlock {
     ToolResult {
         tool_use_id: String,
         content: String,
+        is_error: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
     },
@@ -242,12 +243,13 @@ pub fn build_request(req: &Request<'_>) -> MessagesRequest {
                     messages.push(OutMessage { role: "assistant", content: out });
                 }
             }
-            Message::Tool { tool_call_id, content, .. } => {
+            Message::Tool { tool_call_id, status, .. } => {
                 // Tool results are user-role blocks in the Anthropic shape, and all of
                 // them for one turn have to arrive together.
                 pending_results.push(OutBlock::ToolResult {
                     tool_use_id: tool_call_id.clone(),
-                    content: content.clone(),
+                    content: message.text(),
+                    is_error: *status != super::ToolStatus::Success,
                     cache_control: None,
                 });
             }
@@ -932,14 +934,17 @@ mod tests {
                 ],
                 stop_reason: Some(StopReason::ToolUse),
             },
-            Message::Tool { tool_call_id: "a".into(), name: "read".into(), content: "A".into() },
-            Message::Tool { tool_call_id: "b".into(), name: "read".into(), content: "B".into() },
+            Message::Tool { status: crate::llm::ToolStatus::Success, tool_call_id: "a".into(), name: "read".into(), content: "A".into() },
+            Message::Tool { status: crate::llm::ToolStatus::Error, tool_call_id: "b".into(), name: "read".into(), content: "B".into() },
         ];
         let req = Request { model: &model, provider: &provider, messages: &messages, tools: &[], level: "high", session_id: "s", cache_hints: false };
         let body = serde_json::to_value(build_request(&req)).unwrap();
         assert_eq!(body["messages"].as_array().unwrap().len(), 2);
         assert_eq!(body["messages"][1]["role"], "user");
         assert_eq!(body["messages"][1]["content"].as_array().unwrap().len(), 2);
+        assert_eq!(body["messages"][1]["content"][0]["is_error"], false);
+        assert_eq!(body["messages"][1]["content"][1]["is_error"], true);
+        assert!(body["messages"][1]["content"][1]["content"].as_str().unwrap().contains("失败"));
     }
 
     #[test]

@@ -63,6 +63,27 @@ pub struct ModelConfig {
     pub search: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compat: Option<CompatPatch>,
+    #[serde(skip_serializing_if = "CompactionConfig::is_default")]
+    pub compaction: CompactionConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct CompactionConfig {
+    pub reserve_tokens: Option<u64>,
+    pub keep_recent_tokens: Option<u64>,
+}
+
+impl CompactionConfig {
+    fn is_default(&self) -> bool {
+        self.reserve_tokens.is_none() && self.keep_recent_tokens.is_none()
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CompactionBudget {
+    pub threshold: u64,
+    pub keep_recent: u64,
 }
 
 /// Every thinking level pi knows about. `off` and `minimal` are deliberately absent:
@@ -84,6 +105,32 @@ impl ModelConfig {
 
     pub fn max_tokens(&self) -> u64 {
         self.max_tokens.unwrap_or(8192)
+    }
+
+    pub fn compaction_budget(&self) -> Result<CompactionBudget, String> {
+        if self.context_window.is_none() && !self.compaction.is_default() {
+            return Err("配置 compaction 时必须指定 context_window".into());
+        }
+        let window = self.context_window.unwrap_or(128_000);
+        let reserve = self.compaction.reserve_tokens
+            .unwrap_or(Defaults::RESERVE_TOKENS.min(window / 4));
+        // With an unknown window, only manual summaries use this fallback. Their output
+        // is capped at 16k; do not reject a model based on a window it never declared.
+        let output = if self.context_window.is_some() {
+            self.max_tokens()
+        } else {
+            self.max_tokens().min(16_384)
+        };
+        let reserved = output.checked_add(reserve)
+            .filter(|tokens| *tokens < window)
+            .ok_or_else(|| "max_tokens 与 reserve_tokens 之和必须小于 context_window".to_string())?;
+        let threshold = window - reserved;
+        let keep_recent = self.compaction.keep_recent_tokens
+            .unwrap_or(Defaults::KEEP_RECENT_TOKENS.min(window / 3).min(threshold / 2));
+        if keep_recent >= threshold {
+            return Err("keep_recent_tokens 必须小于压缩触发阈值".into());
+        }
+        Ok(CompactionBudget { threshold, keep_recent })
     }
 
     /// The levels this model actually supports, defaulting to all of them.
@@ -146,6 +193,8 @@ pub enum ConfigError {
     UnknownField(String),
     #[error("default_model「{0}」不是「<provider>/<model>」形式，或指向了未配置的模型")]
     BadDefaultModel(String),
+    #[error("provider「{provider}」的模型「{model}」上下文预算无效：{reason}")]
+    BadCompaction { provider: String, model: String, reason: String },
     #[error(
         "provider「{provider}」的模型「{model}」打开了 search，但这个接口没有可用的原生搜索写法。在 compat.search_format 里指定：responses 用 web_search 或 web_and_x，messages 用 anthropic，completions 用 xai、qwen 或 zhipu。DeepSeek 官方接口不能原生搜索，请把 search 设为 false"
     )]
@@ -164,7 +213,7 @@ mod fields {
     pub const SHELL: [&str; 1] = ["path"];
     pub const PROVIDER: [&str; 7] =
         ["name", "api", "base_url", "api_key_env", "api_key", "compat", "models"];
-    pub const MODEL: [&str; 8] = [
+    pub const MODEL: [&str; 9] = [
         "id",
         "name",
         "context_window",
@@ -173,7 +222,9 @@ mod fields {
         "thinking_levels",
         "search",
         "compat",
+        "compaction",
     ];
+    pub const COMPACTION: [&str; 2] = ["reserve_tokens", "keep_recent_tokens"];
     pub const COMPAT: [&str; 13] = [
         "max_tokens_field",
         "supports_developer_role",
@@ -274,6 +325,11 @@ fn check_unknown_fields(raw: &serde_json::Value) -> Result<(), ConfigError> {
                     &format!("provider「{name}」的模型「{id}」的 compat"),
                     &key,
                 ));
+            }
+            if let Some(compaction) = model.get("compaction").and_then(|value| value.as_object())
+                && let Some(key) = unknown_key(compaction, &fields::COMPACTION)
+            {
+                return Err(unknown_field_error(&format!("provider「{name}」的模型「{id}」的 compaction"), &key));
             }
         }
     }
@@ -390,6 +446,9 @@ impl Config {
                 return Err(ConfigError::NoProviders(path.to_path_buf()));
             }
             for model in &provider.models {
+                model.compaction_budget().map_err(|reason| ConfigError::BadCompaction {
+                    provider: provider.name.clone(), model: model.id.clone(), reason,
+                })?;
                 for level in &model.thinking_levels {
                     if level_index(level).is_none() {
                         return Err(ConfigError::BadLevel {
@@ -587,7 +646,7 @@ pub const SUMMARY_SECTIONS: &str = "## Goal
 
 每节保持简短。必须原样保留文件路径、函数名与报错信息。";
 
-/// Defaults written down in one place. None of these is configurable.
+/// Shared defaults; model compaction budgets may override the token values.
 pub struct Defaults;
 
 impl Defaults {
@@ -812,6 +871,33 @@ pub fn read_dirs_index_for_test(root: &Path) -> BTreeMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_budgets_reserve_output_and_scale_recent_context() {
+        let model = ModelConfig { context_window: Some(6000), max_tokens: Some(1000), ..Default::default() };
+        let budget = model.compaction_budget().unwrap();
+        assert_eq!(budget.threshold, 3500);
+        assert_eq!(budget.keep_recent, 1750);
+        let large = ModelConfig { context_window: Some(1_000_000), max_tokens: Some(64_000), ..Default::default() };
+        let budget = large.compaction_budget().unwrap();
+        assert_eq!(budget.threshold, 919_616);
+        assert_eq!(budget.keep_recent, 20_000);
+        let tuned = ModelConfig { compaction: CompactionConfig { reserve_tokens: Some(512), keep_recent_tokens: Some(1000) }, ..model.clone() };
+        assert_eq!(tuned.compaction_budget().unwrap().threshold, 4488);
+        assert_eq!(tuned.compaction_budget().unwrap().keep_recent, 1000);
+        for compaction in [
+            CompactionConfig { reserve_tokens: Some(5000), keep_recent_tokens: None },
+            CompactionConfig { reserve_tokens: Some(u64::MAX), keep_recent_tokens: None },
+            CompactionConfig { reserve_tokens: None, keep_recent_tokens: Some(3500) },
+        ] {
+            assert!(ModelConfig { compaction, ..model.clone() }.compaction_budget().is_err());
+        }
+        assert!(ModelConfig { context_window: None, ..tuned }.compaction_budget().is_err());
+        let unknown = ModelConfig { max_tokens: Some(200_000), ..Default::default() };
+        assert_eq!(unknown.compaction_budget().unwrap().keep_recent, 20_000);
+        let raw = serde_json::json!({"providers":[{"name":"p","models":[{"id":"m","compaction":{"keepRecentTokens":100}}]}]});
+        assert!(check_unknown_fields(&raw).is_err());
+    }
 
     #[test]
     fn gateway_models_select_their_own_reasoning_protocol_and_keep_overrides() {

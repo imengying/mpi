@@ -148,7 +148,7 @@ impl Screen {
     /// Returns `Some(action)` when the line was submitted, when the user asked to interrupt
     /// or to expand something, and `None` when the event only changed what is on screen. The
     /// caller decides what a submitted line means: at the prompt it is the next turn, and
-    /// during a turn it is a message queued behind the one in flight.
+    /// during a turn it waits for a safe execution boundary.
     pub fn absorb_event(&mut self, event: Event) -> Option<Action> {
         let action = self.handle_event(event);
         self.render();

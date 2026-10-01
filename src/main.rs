@@ -68,10 +68,8 @@ fn run(cli: Cli) -> anyhow::Result<()> {
 
     // The turn loop: read a line, dispatch a slash command or run a turn.
     //
-    // A turn can be handed more work while it runs — the user types into the input line and
-    // Enter queues the message — so each turn is followed by whatever was queued behind it,
-    // in the order it was typed. That is a loop rather than an `if`, because answering one
-    // queued message can take long enough to collect another.
+    // Submitted messages can steer the active turn at safe boundaries. Commands and any
+    // remaining submissions are drained in order when that turn finishes.
     loop {
         match agent.read_input() {
             Action::Line(line) => {
@@ -134,23 +132,17 @@ fn run(cli: Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Run one turn, then act on everything that was queued behind it.
-///
-/// The queue comes from the input line staying live during the turn: Enter there could not
-/// start a second turn underneath the one in flight, so the line was held instead. A queued
-/// message becomes a turn of its own; a queued command runs; both in the order they were
-/// typed, because that is the order the user wrote them in. The loop ends when a turn
-/// finishes with an empty queue — an answer can take long enough to collect more while it
-/// runs.
+/// Run a turn and drain submitted input in order. Messages can steer an active turn;
+/// commands wait for it to finish. Keep the backlog in the screen so newer steering
+/// cannot overtake older submissions held in a second queue.
 fn run_turn_and_drain(
     agent: &mut Agent,
     line: &str,
     images: Vec<mpi::image_input::PastedImage>,
 ) -> anyhow::Result<bool> {
     use mpi::ui::screen::Queued;
-    let mut queue: std::collections::VecDeque<Queued> = [Queued::Message(line.to_string(), images)]
-        .into();
-    while let Some(item) = queue.pop_front() {
+    let mut next = Some(Queued::Message(line.to_string(), images));
+    while let Some(item) = next {
         match item {
             Queued::Command(command) => {
                 // A command can end the session (`/exit`, `/delete`), and that decision was
@@ -173,7 +165,7 @@ fn run_turn_and_drain(
                 }
             }
         }
-        queue.extend(agent.screen.take_queued());
+        next = agent.screen.pop_queued();
     }
     Ok(true)
 }

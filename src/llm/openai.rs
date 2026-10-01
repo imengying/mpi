@@ -312,11 +312,11 @@ pub fn build_request(req: &Request<'_>, stream: bool) -> ChatRequest {
                 message.reasoning_content = reasoning_content;
                 messages.push(message);
             }
-            Message::Tool { tool_call_id, content, .. } => {
-                let mut message = ChatMessage::new("tool");
-                message.content = Some(ChatContent::Text(content.clone()));
-                message.tool_call_id = Some(tool_call_id.clone());
-                messages.push(message);
+            Message::Tool { tool_call_id, .. } => {
+                let mut result = ChatMessage::new("tool");
+                result.content = Some(ChatContent::Text(message.text()));
+                result.tool_call_id = Some(tool_call_id.clone());
+                messages.push(result);
             }
         }
     }
@@ -909,7 +909,7 @@ mod tests {
             Message::Assistant { content:vec![thought("已经确定方案，只需读取文件。"), Block::ToolCall {
                 id:"c1".into(), name:"read".into(), arguments:serde_json::json!({"path":"a.rs"}),
             }], stop_reason:Some(StopReason::ToolUse) },
-            Message::Tool { tool_call_id:"c1".into(), name:"read".into(), content:"文件内容".into() },
+            Message::Tool { status: crate::llm::ToolStatus::Success, tool_call_id:"c1".into(), name:"read".into(), content:"文件内容".into() },
             Message::Assistant { content:vec![thought("确认完成。"), Block::Text {text:"已完成".into()}], stop_reason:Some(StopReason::Stop) },
             Message::user_text("继续第二项任务"),
         ];

@@ -5,7 +5,7 @@
 //! compare them, because a comment claiming the prefix is stable proves nothing.
 
 use mpi::config::{Config, ModelConfig, Provider};
-use mpi::llm::{Block, Message, Request, ToolSpec, anthropic, openai};
+use mpi::llm::{Block, Message, Request, ToolSpec, ToolStatus, anthropic, openai};
 
 fn fixtures() -> (ModelConfig, Provider) {
     let config: Config = serde_json::from_str(
@@ -124,7 +124,7 @@ fn message_serialisation_order_is_fixed() {
             ],
             stop_reason: Some(mpi::llm::StopReason::ToolUse),
         },
-        Message::Tool { tool_call_id: "c1".into(), name: "read".into(), content: "data".into() },
+        Message::Tool { status: ToolStatus::Success, tool_call_id: "c1".into(), name: "read".into(), content: "data".into() },
     ];
     let first = serde_json::to_string(&body_of(&messages, &model, &provider)).unwrap();
     for _ in 0..5 {
@@ -134,6 +134,29 @@ fn message_serialisation_order_is_fixed() {
             "serialisation is not deterministic"
         );
     }
+}
+
+#[test]
+fn tool_outcomes_reach_all_protocols_without_rewriting_success_content() {
+    let (model, provider) = fixtures();
+    for status in [ToolStatus::Success, ToolStatus::Error, ToolStatus::Cancelled, ToolStatus::Skipped, ToolStatus::Unknown] {
+        let original = "原始内容\n    code\n";
+        let messages = vec![
+            Message::Assistant { content:vec![Block::ToolCall { id:"c".into(), name:"read".into(), arguments:serde_json::json!({"path":"a.rs"}) }], stop_reason:Some(mpi::llm::StopReason::ToolUse) },
+            Message::Tool { tool_call_id:"c".into(), name:"read".into(), content:original.into(), status },
+        ];
+        let request = Request { model:&model, provider:&provider, messages:&messages, tools:&[], level:"high", session_id:"s", cache_hints:false };
+        let chat = serde_json::to_value(openai::build_request(&request, true)).unwrap();
+        let responses = serde_json::to_value(mpi::llm::responses::build_request(&request, true)).unwrap();
+        let anthropic = serde_json::to_value(anthropic::build_request(&request)).unwrap();
+        let expected = if status == ToolStatus::Success { original.to_string() } else { format!("[工具状态：{}]\n{original}", status.label()) };
+        assert_eq!(chat["messages"][1]["content"], expected);
+        assert_eq!(responses["input"][1]["output"], expected);
+        assert_eq!(anthropic["messages"][1]["content"][0]["content"], expected);
+        assert_eq!(anthropic["messages"][1]["content"][0]["is_error"], status != ToolStatus::Success);
+        assert_eq!(messages[1].text(), expected);
+    }
+    assert!(serde_json::from_value::<Message>(serde_json::json!({"role":"tool","tool_call_id":"c","name":"read","content":"old result"})).is_err(), "execution status is required in the current session format");
 }
 
 #[test]
@@ -239,7 +262,7 @@ fn summary_requests_reuse_system_tools_and_the_selected_history_prefix() {
             Block::Thinking { thinking:"保留这段原始推理".into(), signature:None },
             Block::ToolCall { id:"c1".into(), name:"read".into(), arguments:serde_json::json!({"path":"a.rs"}) },
         ], stop_reason:Some(StopReason::ToolUse) },
-        Message::Tool { tool_call_id:"c1".into(), name:"read".into(), content:"原始文件内容".into() },
+        Message::Tool { status: ToolStatus::Success, tool_call_id:"c1".into(), name:"read".into(), content:"原始文件内容".into() },
     ];
     let original = prefix.clone();
     let mut full_history = vec![Message::System { content:SYSTEM.into() }];

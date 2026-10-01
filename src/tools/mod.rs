@@ -148,6 +148,10 @@ pub(crate) fn verb_for(name: &str) -> &'static str {
 pub const TOOL_ORDER: [&str; 7] =
     ["read", "write", "edit", "bash", "grep", "find", "ls"];
 
+pub(crate) fn is_parallel_read(name: &str) -> bool {
+    matches!(name, "read" | "grep" | "find" | "ls")
+}
+
 pub fn specs() -> Vec<ToolSpec> {
     vec![
         read::spec(),

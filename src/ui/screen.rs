@@ -72,7 +72,7 @@ pub enum Action {
 /// and a queued screenshot silently dropped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Queued {
-    /// A message: sent as the next turn, with whatever images came with it.
+    /// A message: applied at the next safe execution boundary, with its submitted images.
     Message(String, Vec<PastedImage>),
     /// A slash command: run once the turn in flight is over.
     Command(String),
@@ -524,22 +524,30 @@ impl Screen {
         self.render();
     }
 
-    /// Take what was submitted while the turn was running, in order.
-    ///
-    /// Taking them is what makes them real: the caller acts on them, and until then they
-    /// were only rows on screen.
+    /// Take the next submission without hiding the backlog from active-turn steering.
     ///
     /// Images are not touched here. They belong to the *line being written*, not to the
     /// queue: Enter hands them over with the line (see `handle_key`), and a paste that has
     /// not been submitted yet is part of the draft the user is still assembling. Sweeping
     /// them into the queue would send a screenshot the user was still composing, and leave
     /// the message it belonged to without it.
-    pub fn take_queued(&mut self) -> Vec<Queued> {
-        let queued = std::mem::take(&mut self.pending);
-        if !queued.is_empty() {
-            self.render();
-        }
-        queued
+    pub fn pop_queued(&mut self) -> Option<Queued> {
+        if self.pending.is_empty() { return None; }
+        let item = self.pending.remove(0);
+        self.render();
+        Some(item)
+    }
+
+    pub fn has_steering(&self) -> bool {
+        matches!(self.pending.first(), Some(Queued::Message(..)))
+    }
+
+    /// Commands remain idle-only and block later messages from overtaking them.
+    pub fn take_steering(&mut self) -> Vec<Queued> {
+        let count = self.pending.iter().take_while(|item| matches!(item, Queued::Message(..))).count();
+        let messages = self.pending.drain(..count).collect();
+        if count > 0 { self.render(); }
+        messages
     }
 }
 
