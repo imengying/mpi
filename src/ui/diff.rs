@@ -16,8 +16,7 @@ use similar::{ChangeTag, TextDiff};
 
 use crate::tools::Display;
 use crate::ui::screen::{Bg, Line, Span, Style};
-use crate::ui::theme::{Color, Theme};
-use crate::util;
+use crate::ui::theme::Color;
 
 /// Beyond these limits the diff is not worth the time it takes to compute, so the excerpt
 /// is taken from the changed region only instead of from a diff of the whole thing. The
@@ -302,9 +301,8 @@ fn num(value: Option<usize>) -> String {
 
 /// Turn a diff payload into styled lines: the counts row and the excerpt under it.
 ///
-/// Widths are measured in display columns, so the background tint reaches the edge of the
-/// terminal no matter what the diff contains.
-pub fn render(theme: &Theme, display: &Display, width: usize) -> Vec<Line> {
+/// Keep complete source lines; the screen handles width and native selection.
+pub fn render(display: &Display) -> Vec<Line> {
     let Display::Diff { diff, added, removed, .. } = display else {
         return Vec::new();
     };
@@ -315,20 +313,17 @@ pub fn render(theme: &Theme, display: &Display, width: usize) -> Vec<Line> {
         Span::plain(" "),
         Span::new(format!("−{removed}"), Style::new(Color::DiffRemovedText)),
     ]));
-    let rows: Vec<&str> = diff.split('\n').collect();
-    for row in &rows {
+    let diff = crate::util::sanitize(diff);
+    for row in diff.split('\n') {
         let marker = row.chars().next();
-        // No padding here: the screen pads to the terminal width with the row's background,
-        // which keeps the tint a solid bar without making the text any longer than it is.
-        let text = format!(" {}", util::truncate(row, width.saturating_sub(1), "…"));
-        let (style, fill) = match marker {
-            Some('+') => (Style::with_bg(Color::DiffAddedText, Bg::Added), Bg::Added),
-            Some('-') => (Style::with_bg(Color::DiffRemovedText, Bg::Removed), Bg::Removed),
-            _ => (Style::new(Color::Dim), Bg::None),
+        let text = format!(" {row}");
+        let style = match marker {
+            Some('+') => Style::with_bg(Color::DiffAddedText, Bg::Added),
+            Some('-') => Style::with_bg(Color::DiffRemovedText, Bg::Removed),
+            _ => Style::new(Color::Dim),
         };
-        out.push(Line::spans(vec![Span::with_fill(text, style, fill)]));
+        out.push(Line::new(text, style));
     }
-    let _ = theme;
     out
 }
 
@@ -592,11 +587,27 @@ mod tests {
     }
 
     #[test]
-    fn rendering_keeps_rows_within_the_width() {
+    fn rendering_keeps_long_source_lines_and_the_screen_wraps_them() {
         let display = for_edit("short\n", "a much longer replacement line that overflows\n");
-        let theme = Theme { mode: crate::ui::theme::ColorMode::True };
-        for line in render(&theme, &display, 20) {
+        let lines = render(&display);
+        assert!(lines.iter().any(|line| {
+            line.text().ends_with("a much longer replacement line that overflows")
+        }));
+        for line in crate::ui::text::Block::lines(lines).render(20) {
             assert!(line.width() <= 20, "too wide: {line:?}");
         }
+    }
+
+    #[test]
+    fn rendering_neutralizes_terminal_controls_without_losing_code_indentation() {
+        let display = Display::Diff {
+            diff: "+    1 │     let x = 1;\u{1b}]52;c;ZmFrZQ==\u{7}\n+    2 │ \tcall();\u{1b}[2J".into(),
+            added: 2,
+            removed: 0,
+        };
+        let lines = render(&display);
+        assert!(lines.iter().all(|line| !line.text().contains(['\u{1b}', '\u{7}'])));
+        assert!(lines[1].text().ends_with("    let x = 1;"));
+        assert!(lines[2].text().ends_with("    call();"));
     }
 }

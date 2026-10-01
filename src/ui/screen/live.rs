@@ -4,7 +4,7 @@ use super::*;
 use unicode_segmentation::UnicodeSegmentation;
 
 impl Screen {
-    pub(super) fn compose_live(&self) -> (Vec<Line>, Option<(usize, usize)>) {
+    pub(super) fn compose_live(&self) -> (Vec<HistoryRow<Line>>, Option<(usize, usize)>) {
         let budget = self.height.saturating_sub(1).max(1);
         let rendered_footer = self
             .footer_state
@@ -115,45 +115,55 @@ impl Screen {
             let first = wrapped
                 .len()
                 .saturating_sub(Defaults::THINKING_PREVIEW_LINES);
-            preview.extend(wrapped[first..].iter().map(|text| Line::dim(text.clone())));
+            preview.extend(
+                wrapped[first..]
+                    .iter()
+                    .map(|text| HistoryRow::hard(Line::dim(text.clone()))),
+            );
             while preview.len() < Defaults::THINKING_PREVIEW_LINES {
-                preview.push(Line::blank());
+                preview.push(HistoryRow::hard(Line::blank()));
             }
         }
         if let Some(answer) = &self.streaming_answer {
-            preview.extend(wrap_all(
+            preview.extend(crate::ui::text::history_rows(
                 &crate::ui::markdown::render(&answer[self.streaming_committed..], self.width),
                 self.width,
             ));
         }
         if let Some(spans) = &self.running_call {
-            preview.extend(wrap_line(&Line::spans(spans.clone()), self.width));
-            preview.push(Line::blank());
+            preview.extend(crate::ui::text::history_rows(
+                &[Line::spans(spans.clone())],
+                self.width,
+            ));
+            preview.push(HistoryRow::hard(Line::blank()));
         }
         let first = preview.len().saturating_sub(room);
         let mut lines = preview.split_off(first);
-        lines.extend(above);
+        lines.extend(above.into_iter().map(HistoryRow::hard));
         if working {
-            lines.push(Line::spans(vec![
+            lines.push(HistoryRow::hard(Line::spans(vec![
                 Span::new(
                     WORKING_FRAMES[self.working_frame % WORKING_FRAMES.len()],
                     Style::new(Color::Cyan),
                 ),
                 Span::plain(" "),
                 Span::new(self.working.clone().unwrap(), Style::new(Color::Blue)),
-            ]));
+            ])));
         }
         let cursor = caret.map(|(row, column)| (lines.len() + row, column));
-        lines.extend(composer);
-        lines.extend(footer.iter().cloned());
+        lines.extend(composer.into_iter().map(HistoryRow::hard));
+        lines.extend(footer.iter().cloned().map(HistoryRow::hard));
         if lines.is_empty() {
-            lines.push(Line::blank());
+            lines.push(HistoryRow::hard(Line::blank()));
         }
         let cursor = cursor.map(|(row, column)| (row, column.min(self.width.saturating_sub(1))));
         (
             lines
                 .iter()
-                .map(|line| clip_line(line, self.width))
+                .map(|row| HistoryRow {
+                    line: clip_line(&row.line, self.width),
+                    wrapped: row.wrapped,
+                })
                 .collect(),
             cursor,
         )
@@ -163,17 +173,19 @@ impl Screen {
         if self.interactive {
             self.draw_live();
         } else {
-            let lines = self.fresh_lines();
-            for line in lines {
-                let _ = writeln!(self.out, "{}", line.text());
+            for row in self.fresh_history() {
+                let _ = write!(self.out, "{}", row.line.text());
+                if !row.wrapped {
+                    let _ = writeln!(self.out);
+                }
             }
         }
     }
 
-    fn fresh_lines(&mut self) -> Vec<Line> {
+    fn fresh_history(&mut self) -> Vec<HistoryRow<Line>> {
         let mut lines: Vec<_> = self.blocks[self.printed..]
             .iter()
-            .flat_map(|block| block.render(self.width))
+            .flat_map(|block| block.history_rows(self.width))
             .collect();
         lines.append(&mut self.updates);
         self.printed = self.blocks.len();
@@ -206,20 +218,29 @@ impl Screen {
         let reflow = if self.viewport.needs_reflow(self.width, self.height) {
             self.blocks[..self.printed]
                 .iter()
-                .flat_map(|block| block.render(self.width))
-                .map(|line| self.paint(&line, self.width))
+                .flat_map(|block| block.history_rows(self.width))
+                .map(|row| HistoryRow {
+                    line: self.paint(&row.line),
+                    wrapped: row.wrapped,
+                })
                 .collect::<Vec<_>>()
         } else {
             Vec::new()
         };
         let history = self
-            .fresh_lines()
+            .fresh_history()
             .iter()
-            .map(|line| self.paint(line, self.width))
+            .map(|row| HistoryRow {
+                line: self.paint(&row.line),
+                wrapped: row.wrapped,
+            })
             .collect::<Vec<_>>();
         let rows = lines
             .iter()
-            .map(|line| self.paint(line, self.width))
+            .map(|row| HistoryRow {
+                line: self.paint(&row.line),
+                wrapped: row.wrapped,
+            })
             .collect();
         self.viewport
             .draw((self.width, self.height), rows, cursor, &history, &reflow)
@@ -253,25 +274,10 @@ impl Screen {
         self.streaming_committed = end;
     }
 
-    pub(super) fn paint(&self, line: &Line, pad_to: usize) -> String {
+    pub(super) fn paint(&self, line: &Line) -> String {
         let mut out = String::new();
-        let mut used = 0usize;
         for span in &line.spans {
-            let background = match span.style.bg {
-                Bg::None => None,
-                Bg::Added => Some(Bg::Added),
-                Bg::Removed => Some(Bg::Removed),
-                Bg::Selected => Some(Bg::Selected),
-            };
-            // A non-breaking space is a wrapping instruction, not a glyph: it kept a list
-            // marker with its text while the line was being broken, and the terminal gets a
-            // plain space now that the decision is made.
-            let text = if span.text.contains('\u{a0}') {
-                span.text.replace('\u{a0}', " ")
-            } else {
-                span.text.clone()
-            };
-            let text = self.theme.fg(span.style.fg, &text);
+            let text = self.theme.fg(span.style.fg, &span.text);
             // Order matters: SGR 1/3/4 are attributes that 22/23/24 turn off, and the colour
             // reset is 39. Nesting them the other way round would have the colour reset also
             // clear the weight of a bold heading.
@@ -295,26 +301,13 @@ impl Screen {
             } else {
                 text
             };
-            let text = match background {
-                Some(Bg::Added) => self.theme.bg_added(&text),
-                Some(Bg::Removed) => self.theme.bg_removed(&text),
-                Some(Bg::Selected) => self.theme.bg_selected(&text),
-                _ => text,
+            let text = match span.style.bg {
+                Bg::Added => self.theme.bg_added(&text),
+                Bg::Removed => self.theme.bg_removed(&text),
+                Bg::Selected => self.theme.bg_selected(&text),
+                Bg::None => text,
             };
-            used += util::width(&span.text);
             out.push_str(&text);
-        }
-        if let Some(fill) = line.spans.first().map(|span| span.style.bg)
-            && pad_to > used
-            && fill != Bg::None
-        {
-            let padding = " ".repeat(pad_to - used);
-            out.push_str(&match fill {
-                Bg::Added => self.theme.bg_added(&padding),
-                Bg::Removed => self.theme.bg_removed(&padding),
-                Bg::Selected => self.theme.bg_selected(&padding),
-                Bg::None => padding,
-            });
         }
         out
     }

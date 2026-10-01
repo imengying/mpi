@@ -6,7 +6,8 @@
 pub use crate::ui::editor::Editor;
 use crate::ui::editor::{common_prefix, input_caret, input_layout};
 pub use crate::ui::terminal::{clear_title, teardown, window_title};
-pub use crate::ui::text::{Bg, Block, Collapsible, Line, Span, Style, wrap_all, wrap_line};
+use crate::ui::text::HistoryRow;
+pub use crate::ui::text::{Bg, Block, Collapsible, Line, Span, Style};
 
 use std::io::{IsTerminal, Write};
 use std::path::Path;
@@ -96,7 +97,7 @@ pub struct Screen {
     /// expand/collapse can re-render one — but each is printed exactly once.
     printed: usize,
     /// An expanded/collapsed presentation waiting to be inserted into history.
-    updates: Vec<Line>,
+    updates: Vec<HistoryRow<Line>>,
     footer: Vec<Line>,
     footer_state: Option<crate::ui::footer::FooterState>,
     viewport: Viewport,
@@ -338,7 +339,7 @@ impl Screen {
         if let Block::Collapsible(collapsible) = &mut self.blocks[index] {
             collapsible.expanded = !collapsible.expanded;
         }
-        let lines = self.blocks[index].render(self.width);
+        let lines = self.blocks[index].history_rows(self.width);
         // Queue the new presentation so history insertion and the live frame stay atomic.
         self.updates.extend(lines);
         self.draw_live();

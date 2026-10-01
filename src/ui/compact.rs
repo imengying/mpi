@@ -15,7 +15,7 @@ use crate::config::Defaults;
 use crate::tools::{Display, ToolOutput};
 use crate::ui::diff;
 use crate::ui::screen::{Block, Line, Span, Style};
-use crate::ui::theme::{Color, Theme};
+use crate::ui::theme::Color;
 use crate::util;
 
 /// The mark for a call: still running, failed, or finished.
@@ -52,7 +52,6 @@ fn arguments_display(name: &str, arguments: &serde_json::Value) -> Display {
 
 /// Build a finished call with its header and outcome always visible.
 pub fn tool_block(name: &str, arguments: &serde_json::Value, output: &ToolOutput) -> Block {
-    let theme = Theme::default();
     let mut lines: Vec<Line> = Vec::new();
     let mut head = 1usize;
     let mut tail = 0usize;
@@ -90,7 +89,7 @@ pub fn tool_block(name: &str, arguments: &serde_json::Value, output: &ToolOutput
                 Span::new(theme_path(arguments), Style::new(Color::Cyan)),
             ]));
             // The `+3 −1` summary row belongs to the head: the counts are the point.
-            let mut rows = diff::render(&theme, &output.display, 120);
+            let mut rows = diff::render(&output.display);
             if !rows.is_empty() {
                 lines.push(rows.remove(0));
                 head = 2;

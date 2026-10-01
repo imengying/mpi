@@ -110,15 +110,6 @@ impl Span {
     pub fn plain(text: impl Into<String>) -> Self {
         Span::new(text, Style::plain())
     }
-
-    /// A run whose background is painted to `fill` columns beyond its own text, so a diff
-    /// row reads as a solid bar right up to the edge of the terminal.
-    pub fn with_fill(text: impl Into<String>, style: Style, fill: Bg) -> Span {
-        Span {
-            text: text.into(),
-            style: Style { bg: fill, ..style },
-        }
-    }
 }
 
 /// One transcript line, as styled runs. Wrapping happens on this structure, so the
@@ -126,21 +117,29 @@ impl Span {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Line {
     pub spans: Vec<Span>,
-    /// Columns to indent every row *after* the first one when this line wraps.
-    ///
-    /// Markdown sets it on a list item, so the second row lines up under the text rather
-    /// than under the bullet. It lives on the line — rather than being applied by whoever
-    /// wrapped it — so wrapping stays idempotent: a line that has already been wrapped and
-    /// is wrapped again (at a narrower width, on a resize) keeps its shape instead of
-    /// losing the indent on the second pass.
-    pub hang: usize,
+}
+
+/// One physical history row. A wrapped row continues without a source newline.
+/// The viewport writes continuations directly so native terminal selection can join them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct HistoryRow<T> {
+    pub line: T,
+    pub wrapped: bool,
+}
+
+impl<T> HistoryRow<T> {
+    pub fn hard(line: T) -> Self {
+        Self {
+            line,
+            wrapped: false,
+        }
+    }
 }
 
 impl Line {
     pub fn new(text: impl Into<String>, style: Style) -> Self {
         Line {
             spans: vec![Span::new(text, style)],
-            hang: 0,
         }
     }
 
@@ -166,21 +165,8 @@ impl Line {
         if spans.is_empty() {
             Line::blank()
         } else {
-            Line { spans, hang: 0 }
+            Line { spans }
         }
-    }
-
-    /// [`Line::spans`] with a hanging indent for its continuation rows.
-    pub fn hanging(spans: Vec<Span>, hang: usize) -> Self {
-        Line { spans, hang }.tidy_spans()
-    }
-
-    fn tidy_spans(mut self) -> Self {
-        self.spans.retain(|span| !span.text.is_empty());
-        if self.spans.is_empty() {
-            return Line::blank();
-        }
-        self
     }
 
     /// The visible text, with no styling. This is what tests and width checks use.
@@ -194,11 +180,6 @@ impl Line {
 
     pub fn is_empty(&self) -> bool {
         self.spans.iter().all(|span| span.text.is_empty())
-    }
-
-    /// Append another line's runs to this one.
-    pub fn extend(&mut self, other: Line) {
-        self.spans.extend(other.spans);
     }
 }
 
@@ -238,12 +219,18 @@ pub enum Block {
 }
 
 impl Collapsible {
-    /// How many rows this block reserves at each end, clamped to what it actually has so
-    /// a short block can never double-count a row.
-    fn split(&self, total: usize) -> (usize, usize) {
+    /// The retained prefix and suffix, with no overlap even for short blocks.
+    fn excerpt(&self, total: usize) -> (std::ops::Range<usize>, std::ops::Range<usize>) {
         let head = self.head.min(total);
         let tail = self.tail.min(total - head);
-        (head, tail)
+        if self.expanded || total <= head + tail + self.middle_head + self.preview {
+            (0..total, total..total)
+        } else {
+            (
+                0..head + self.middle_head,
+                total - tail - self.preview..total,
+            )
+        }
     }
 }
 
@@ -288,36 +275,39 @@ impl Block {
         })
     }
 
+    /// Text and style assertions inspect the same rows without viewport metadata.
+    #[cfg(test)]
     pub fn render(&self, width: usize) -> Vec<Line> {
+        self.history_rows(width)
+            .into_iter()
+            .map(|row| row.line)
+            .collect()
+    }
+
+    /// Finalized output uses terminal wrapping, without display-only indentation or
+    /// discarded break spaces. Keep physical rows only for viewport sizing and clipping.
+    pub(super) fn history_rows(&self, width: usize) -> Vec<HistoryRow<Line>> {
         match self {
-            Block::Lines(lines) => wrap_all(lines, width),
+            Block::Lines(lines) => history_rows(lines, width),
             Block::Markdown(text) => {
-                let mut lines = wrap_all(&crate::ui::markdown::render(text, width), width);
+                let mut lines = crate::ui::markdown::render(text, width);
                 if !lines.is_empty() {
                     lines.push(Line::blank());
                 }
-                lines
+                history_rows(&lines, width)
             }
             Block::Collapsible(block) => {
-                let wrapped = wrap_all(&block.lines, width);
-                let total = wrapped.len();
-                if block.expanded {
-                    return wrapped;
+                let rows = history_rows(&block.lines, width);
+                let (prefix, suffix) = block.excerpt(rows.len());
+                let gap = prefix.end < suffix.start;
+                let mut out = rows[prefix].to_vec();
+                if gap && let Some(last) = out.last_mut() {
+                    last.wrapped = false;
                 }
-                let (head, tail) = block.split(total);
-                if total <= head + tail + block.middle_head + block.preview {
-                    return wrapped;
+                out.extend_from_slice(&rows[suffix]);
+                if let Some(last) = out.last_mut() {
+                    last.wrapped = false;
                 }
-                let hidden = total - head - tail - block.middle_head - block.preview;
-                let mut out = wrapped[..head].to_vec();
-                // The start of the middle, then the end of it, then the always-visible tail.
-                out.extend(wrapped[head..head + block.middle_head].iter().cloned());
-                out.extend(
-                    wrapped[head + hidden + block.middle_head..total - tail]
-                        .iter()
-                        .cloned(),
-                );
-                out.extend(wrapped[total - tail..].iter().cloned());
                 out
             }
         }
@@ -327,91 +317,48 @@ impl Block {
         matches!(self, Block::Collapsible(_))
     }
 }
-/// Wrap one line to `width` columns, breaking at spaces and keeping every run's style.
-/// A word longer than the line is broken by character, which is the only case where a
-/// styled run is split mid-word.
-///
-/// The line's own `hang` is what its continuation rows are indented by, so wrapping an
-/// already-wrapped line at a different width gives the same shape rather than a shape that
-/// depends on how many times it was wrapped.
-pub fn wrap_line(line: &Line, width: usize) -> Vec<Line> {
+
+/// Split at the same column boundaries as terminal autowrap, preserving all spaces.
+pub(super) fn history_rows(lines: &[Line], width: usize) -> Vec<HistoryRow<Line>> {
     let width = width.max(1);
-    let hang = line.hang.min(width.saturating_sub(1));
-    // The first row has the full width; the rest lose the hang.
-    let cont_width = width.saturating_sub(hang).max(1);
-    let mut chars: Vec<(&str, Style)> = Vec::new();
-    for span in &line.spans {
-        for grapheme in span.text.graphemes(true) {
-            chars.push((grapheme, span.style));
-        }
-    }
-    if chars.is_empty() {
-        return vec![Line::blank()];
-    }
-    let mut rows: Vec<Vec<(&str, Style)>> = vec![Vec::new()];
-    let mut used = 0usize;
-    // (row, index within row) of the most recent break opportunity.
-    let mut last_space: Option<(usize, usize)> = None;
-    // Width available on the row currently being filled.
-    let mut limit = width;
-    for (c, style) in chars {
-        if c == "\n" {
-            rows.push(Vec::new());
-            used = 0;
-            limit = cont_width;
-            last_space = None;
-            continue;
-        }
-        let char_width = util::width(c);
-        if used > 0 && used + char_width > limit {
-            match last_space.take() {
-                Some((row, index)) if row + 1 == rows.len() => {
-                    // Break at the last space: everything after it moves down.
-                    let rest = rows[row].split_off(index + 1);
-                    // The space itself is dropped rather than left dangling.
-                    rows.last_mut().unwrap().pop();
-                    rows.push(rest);
-                    used = rows
-                        .last()
-                        .unwrap()
-                        .iter()
-                        .map(|(c, _)| util::width(c))
-                        .sum();
+    let mut out = Vec::new();
+    for line in lines {
+        let mut row = Vec::new();
+        let mut used = 0;
+        for span in &line.spans {
+            for grapheme in span.text.graphemes(true) {
+                if grapheme == "\n" || grapheme == "\r\n" {
+                    out.push(HistoryRow {
+                        line: Line::spans(coalesce(std::mem::take(&mut row))),
+                        wrapped: false,
+                    });
+                    used = 0;
+                    continue;
                 }
-                _ => {
-                    rows.push(Vec::new());
+                let cells = util::width(grapheme);
+                let (shown, cells) = if cells > width {
+                    ("…", 1)
+                } else {
+                    (grapheme, cells)
+                };
+                if used > 0 && used + cells > width {
+                    out.push(HistoryRow {
+                        line: Line::spans(coalesce(std::mem::take(&mut row))),
+                        wrapped: true,
+                    });
                     used = 0;
                 }
+                row.push((shown, span.style));
+                used += cells;
             }
-            limit = cont_width;
         }
-        // A regular space is a break opportunity; a non-breaking space is not, which is
-        // how a list marker stays with the first word of its item.
-        if c == " " {
-            last_space = Some((rows.len() - 1, rows.last().unwrap().len()));
-        }
-        let (shown, cells) = if char_width > limit && used == 0 {
-            ("…", 1)
-        } else {
-            (c, char_width)
-        };
-        used += cells;
-        rows.last_mut().unwrap().push((shown, style));
+        out.push(HistoryRow {
+            line: Line::spans(coalesce(row)),
+            wrapped: false,
+        });
     }
-    let mut lines: Vec<Line> = Vec::with_capacity(rows.len());
-    for (index, row) in rows.into_iter().enumerate() {
-        let mut spans = coalesce(row);
-        // The indent is painted as a plain run, but the rows carry the same `hang` as the
-        // row they came from, so a second pass knows what they already represent and does
-        // not indent them again.
-        if index > 0 && hang > 0 {
-            spans.insert(0, Span::plain(" ".repeat(hang)));
-        }
-        lines.push(Line { spans, hang });
-    }
-    lines
+    out
 }
-
 /// Merge adjacent characters that share a style back into runs.
 fn coalesce(row: Vec<(&str, Style)>) -> Vec<Span> {
     let mut spans: Vec<Span> = Vec::new();
@@ -423,17 +370,21 @@ fn coalesce(row: Vec<(&str, Style)>) -> Vec<Span> {
     }
     spans
 }
-/// Wrap a group of lines, flattening the result.
-pub fn wrap_all(lines: &[Line], width: usize) -> Vec<Line> {
-    lines
-        .iter()
-        .flat_map(|line| wrap_line(line, width))
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_wrapping_preserves_indentation_without_adding_continuation_spaces() {
+        let source = "   continuationlongword";
+        let rows = history_rows(&[Line::plain(source)], 12);
+        assert!(rows.iter().all(|row| row.line.width() <= 12));
+        assert_eq!(
+            rows.iter().map(|row| row.line.text()).collect::<String>(),
+            source
+        );
+        assert_eq!(rows[1].line.text(), "ionlongword");
+    }
 
     #[test]
     fn markdown_history_rebuilds_code_frames_at_the_new_width() {
@@ -509,11 +460,11 @@ mod tests {
     #[test]
     fn wrapping_measures_display_width_not_bytes() {
         let lines = vec![Line::plain("你好世界".repeat(6))];
-        let rendered = wrap_all(&lines, 20);
+        let rendered = history_rows(&lines, 20);
         assert!(rendered.len() > 1);
         for line in &rendered {
-            assert!(line.width() <= 20, "{line:?}");
-            assert_eq!(line.text(), line.text(), "no escapes may be embedded");
+            assert!(line.line.width() <= 20, "{line:?}");
+            assert!(!line.line.text().contains('\u{1b}'));
         }
     }
 
@@ -524,18 +475,18 @@ mod tests {
             Span::new(" ", Style::plain()),
             Span::new("log", Style::new(Color::Magenta)),
         ]);
-        let rows = wrap_line(&line, 80);
+        let rows = history_rows(&[line], 80);
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].text(), "git log");
-        assert_eq!(rows[0].spans[0].style.fg, Color::Output);
-        assert_eq!(rows[0].spans[2].style.fg, Color::Magenta);
+        assert_eq!(rows[0].line.text(), "git log");
+        assert_eq!(rows[0].line.spans[0].style.fg, Color::Output);
+        assert_eq!(rows[0].line.spans[2].style.fg, Color::Magenta);
     }
 
     #[test]
-    fn a_break_drops_the_space_at_the_wrap_point() {
-        let rows = wrap_line(&Line::plain("alpha beta gamma"), 11);
+    fn native_wrapping_keeps_spaces_at_the_wrap_boundary() {
+        let rows = history_rows(&[Line::plain("alpha beta gamma")], 11);
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].text(), "alpha beta");
-        assert_eq!(rows[1].text(), "gamma");
+        assert_eq!(rows[0].line.text(), "alpha beta ");
+        assert_eq!(rows[1].line.text(), "gamma");
     }
 }

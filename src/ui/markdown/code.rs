@@ -1,192 +1,139 @@
-//! Fenced-code layout and table layout.
-//!
-//! A fenced block is drawn as a frame around its text and nothing more. The text is passed
-//! through exactly as the model wrote it — no tokeniser, no colour — so what a reader copies
-//! out of a block is what the model produced, and a language this code has never heard of is
-//! no worse off than one it has.
+//! Code frames and table layout. Markdown syntax is handled by CommonMark once.
 
 use crate::ui::text::{Line, Span, Style};
 use crate::ui::theme::Color;
 use crate::util;
+use pulldown_cmark::Alignment;
+use unicode_segmentation::UnicodeSegmentation;
 
-use super::inline;
-
-/// How wide a table may get before the border is dropped.
-///
-/// A bordered table that has to wrap is worse than a plain one: the columns stop lining up
-/// exactly when the alignment was the reason for the border. Past this the rows are laid
-/// out as plain text with the pipes removed.
-const TABLE_MAX_WIDTH: usize = 100;
-
-/// Flush the pending run into `spans`, if there is one.
-pub(super) fn push(spans: &mut Vec<Span>, buf: &mut String, style: Style) {
-    if buf.is_empty() {
-        return;
-    }
-    spans.push(Span::new(std::mem::take(buf), style));
-}
-
-/// Whether `mark` appears at `at`.
-pub(super) fn starts_with(chars: &[char], at: usize, mark: &[char]) -> bool {
-    chars.get(at..at + mark.len()).is_some_and(|got| got == mark)
-}
-
-// ---------------------------------------------------------------------------
-// Tables
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Align {
-    Left,
-    Right,
-    Center,
-}
-
-pub(super) fn render_table(rows: &[String], width: usize) -> Vec<Line> {
-    // The second row has to be the separator, or these lines are not a table at all —
-    // which is what keeps a half-streamed table from being eaten as one.
-    let Some(header_align) = rows.get(1).and_then(|row| parse_separator(row)) else {
-        return rows.iter().flat_map(|row| super::block_line(row.trim_end())).collect();
-    };
-    let header = split_row(&rows[0]);
-    let mut aligns = header_align;
-    let mut body: Vec<Vec<String>> = Vec::new();
-    for row in &rows[2..] {
-        let cells = split_row(row);
-        // A row with more cells than the header adds columns the separator said nothing
-        // about; they are left aligned.
-        aligns.resize(aligns.len().max(cells.len()), Align::Left);
-        body.push(cells);
-    }
-    let cols = header.len().max(aligns.len());
-    if cols == 0 {
-        return Vec::new();
-    }
-    let mut table: Vec<Vec<String>> = vec![header];
-    table.extend(body);
-
-    // Natural width: the widest cell per column, header included.
-    let mut widths = vec![0usize; cols];
-    for row in &table {
-        for (index, cell) in row.iter().enumerate() {
-            widths[index] = widths[index].max(cell_width(cell));
-        }
-    }
-    // "│ " + cells joined by " │ " + " │" is 3 columns per cell plus 1.
-    let overhead = 3 * cols + 1;
-    let fits = width == 0 || widths.iter().sum::<usize>() + overhead <= width;
-    if width > 0 && (widths.iter().sum::<usize>() + overhead > TABLE_MAX_WIDTH || !fits) {
-        // Too wide for a table to be a table: plain rows, pipes removed, so nothing
-        // pretends to be a grid.
-        return table
-            .iter()
-            .enumerate()
-            .map(|(index, row)| {
-                let text = row.iter().map(|cell| cell.trim()).filter(|cell| !cell.is_empty()).collect::<Vec<_>>().join("  ");
-                let style = if index == 0 { Style::bold(Color::Text) } else { Style::plain() };
-                Line::spans(inline(&text, style))
-            })
-            .collect();
-    }
-
-    let border = |left: &str, mid: &str, right: &str| {
-        let mut text = String::from(left);
-        for (index, w) in widths.iter().enumerate() {
-            text.push_str(&"─".repeat(w + 2));
-            text.push_str(if index + 1 == widths.len() { right } else { mid });
-        }
-        Line::new(text, Style::new(Color::Dim))
-    };
-    let mut out = vec![border("┌", "┬", "┐")];
-    for (row_index, row) in table.iter().enumerate() {
-        let header_row = row_index == 0;
-        let mut spans: Vec<Span> = vec![Span::new("│", Style::new(Color::Dim))];
-        for (index, w) in widths.iter().enumerate() {
-            let cell = row.get(index).map(|c| c.trim()).unwrap_or("");
-            let pad = w.saturating_sub(cell_width(cell));
-            let (left, right) = match aligns.get(index).copied().unwrap_or(Align::Left) {
-                Align::Left => (0, pad),
-                Align::Right => (pad, 0),
-                Align::Center => (pad / 2, pad - pad / 2),
-            };
-            spans.push(Span::plain(" ".repeat(left + 1)));
-            // Cells are inline markdown like any other text.
-            let style = if header_row { Style::bold(Color::Text) } else { Style::plain() };
-            let mut cell_spans = inline(cell, style);
-            if header_row {
-                for span in &mut cell_spans {
-                    span.style.bold = true;
-                }
+pub(super) fn frame(language: &str, body: &str, width: usize) -> Vec<Line> {
+    let rows: Vec<_> = body
+        .strip_suffix('\n')
+        .unwrap_or(body)
+        .split('\n')
+        .collect();
+    let label = (!language.is_empty()).then(|| language.trim_end_matches(',').to_string());
+    let longest = rows.iter().map(|row| util::width(row)).max().unwrap_or(0);
+    let wanted = (longest + 3).max(label.as_ref().map_or(0, |label| util::width(label) + 4));
+    let bar_width = wanted.min(width.saturating_sub(1)).max(2);
+    let label = label.and_then(|label| {
+        let mut clipped = String::new();
+        for grapheme in label.graphemes(true) {
+            if util::width(&clipped) + util::width(grapheme) > bar_width.saturating_sub(4) {
+                break;
             }
-            spans.extend(cell_spans);
-            spans.push(Span::plain(" ".repeat(right + 1)));
-            spans.push(Span::new("│", Style::new(Color::Dim)));
+            clipped.push_str(grapheme);
         }
-        out.push(Line::spans(spans));
-        if header_row {
-            out.push(border("├", "┼", "┤"));
-        }
-    }
-    out.push(border("└", "┴", "┘"));
+        (!clipped.is_empty()).then_some(clipped)
+    });
+    let bar = |corner: char, label: Option<&str>| {
+        let mut spans = vec![Span::new(format!("{corner}─"), Style::new(Color::Dim))];
+        let used = if let Some(label) = label {
+            spans.push(Span::new(format!(" {label} "), Style::new(Color::Dim)));
+            2 + util::width(label) + 2
+        } else {
+            2
+        };
+        spans.push(Span::new(
+            "─".repeat(bar_width.saturating_sub(used)),
+            Style::new(Color::Dim),
+        ));
+        Line::spans(spans)
+    };
+    let mut out = vec![bar('┌', label.as_deref())];
+    out.extend(rows.into_iter().map(Line::plain));
+    out.push(bar('└', None));
     out
 }
 
-/// `|---|:--:|` → one alignment per column, or `None` when the row is not a separator.
-fn parse_separator(row: &str) -> Option<Vec<Align>> {
-    let cells = split_row(row);
-    if cells.is_empty() {
-        return None;
-    }
-    let mut out = Vec::with_capacity(cells.len());
-    for cell in cells {
-        let cell = cell.trim();
-        let left = cell.starts_with(':');
-        let right = cell.ends_with(':');
-        let dashes = cell.trim_matches(':');
-        if dashes.is_empty() || !dashes.chars().all(|c| c == '-') {
-            return None;
-        }
-        out.push(match (left, right) {
-            (true, true) => Align::Center,
-            (false, true) => Align::Right,
-            _ => Align::Left,
-        });
-    }
-    Some(out)
+pub(super) struct Table {
+    pub rows: Vec<Vec<Vec<Span>>>,
+    pub row: Vec<Vec<Span>>,
+    pub cell: Vec<Span>,
+    alignments: Vec<Alignment>,
 }
 
-/// Split `| a | b |` into its cells, tolerating a missing outer pipe.
-fn split_row(row: &str) -> Vec<String> {
-    let trimmed = row.trim();
-    let inner = trimmed.strip_prefix('|').unwrap_or(trimmed);
-    let inner = inner.strip_suffix('|').unwrap_or(inner);
-    let chars: Vec<char> = inner.chars().collect();
-    let mut cells = Vec::new();
-    let mut cell = String::new();
-    let mut index = 0;
-    while index < chars.len() {
-        if chars[index] == '\\' && chars.get(index + 1) == Some(&'|') {
-            cell.push('|');
-            index += 2;
-            continue;
+impl Table {
+    pub fn new(alignments: Vec<Alignment>) -> Self {
+        Self {
+            rows: Vec::new(),
+            row: Vec::new(),
+            cell: Vec::new(),
+            alignments,
         }
-        if chars[index] == '`' && let Some((_, next)) = super::code_span(&chars, index) {
-            cell.extend(&chars[index..next]);
-            index = next;
-            continue;
-        }
-        if chars[index] == '|' {
-            cells.push(cell.trim().to_string());
-            cell.clear();
-        } else {
-            cell.push(chars[index]);
-        }
-        index += 1;
     }
-    cells.push(cell.trim().to_string());
-    cells
+
+    pub fn render(self, width: usize) -> Vec<Line> {
+        let cols = self.alignments.len();
+        let mut widths = vec![0usize; cols];
+        for row in &self.rows {
+            for (col, cell) in row.iter().take(cols).enumerate() {
+                widths[col] = widths[col].max(cell_width(cell));
+            }
+        }
+        let total = widths.iter().sum::<usize>() + 3 * cols + 1;
+        if total > width || total > 100 {
+            let Some(header) = self.rows.first() else {
+                return Vec::new();
+            };
+            if self.rows.len() == 1 {
+                let mut spans = Vec::new();
+                for (index, cell) in header.iter().enumerate() {
+                    if index > 0 {
+                        spans.push(Span::plain("  "));
+                    }
+                    spans.extend(cell.clone());
+                }
+                return vec![Line::spans(spans)];
+            }
+            let mut lines = Vec::new();
+            for (index, row) in self.rows.iter().skip(1).enumerate() {
+                if index > 0 {
+                    lines.push(Line::blank());
+                }
+                for (col, cell) in row.iter().enumerate() {
+                    let mut spans = header.get(col).cloned().unwrap_or_default();
+                    spans.push(Span::plain(": "));
+                    spans.extend(cell.clone());
+                    lines.push(Line::spans(spans));
+                }
+            }
+            return lines;
+        }
+        let border = |left: &str, mid: &str, right: &str| {
+            let mut text = left.to_string();
+            for (col, width) in widths.iter().enumerate() {
+                text.push_str(&"─".repeat(width + 2));
+                text.push_str(if col + 1 == cols { right } else { mid });
+            }
+            Line::dim(text)
+        };
+        let mut lines = vec![border("┌", "┬", "┐")];
+        for (index, row) in self.rows.iter().enumerate() {
+            let mut spans = vec![Span::new("│", Style::new(Color::Dim))];
+            for (col, width) in widths.iter().enumerate() {
+                let cell = row.get(col).cloned().unwrap_or_default();
+                let padding = width.saturating_sub(cell_width(&cell));
+                let (left, right) = match self.alignments[col] {
+                    Alignment::Right => (padding, 0),
+                    Alignment::Center => (padding / 2, padding - padding / 2),
+                    _ => (0, padding),
+                };
+                spans.push(Span::plain(" ".repeat(left + 1)));
+                spans.extend(cell);
+                spans.push(Span::plain(" ".repeat(right + 1)));
+                spans.push(Span::new("│", Style::new(Color::Dim)));
+            }
+            lines.push(Line::spans(spans));
+            if index == 0 {
+                lines.push(border("├", "┼", "┤"));
+            }
+        }
+        lines.push(border("└", "┴", "┘"));
+        lines
+    }
 }
 
-fn cell_width(cell: &str) -> usize {
-    inline(cell.trim(), Style::plain()).iter().map(|span| util::width(&span.text)).sum()
+fn cell_width(cell: &[Span]) -> usize {
+    cell.iter().map(|span| util::width(&span.text)).sum()
 }

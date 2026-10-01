@@ -23,6 +23,7 @@ pub(crate) fn ensure_raw_mode() -> std::io::Result<()> {
     terminal::enable_raw_mode()?;
     let result = crossterm::execute!(
         std::io::stdout(),
+        terminal::EnableLineWrap,
         event::EnableBracketedPaste,
         event::PushKeyboardEnhancementFlags(
             event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES

@@ -1,636 +1,201 @@
-//! A small markdown renderer for assistant text.
-//!
-//! The model writes markdown; showing the marks (`**`, fences, `#`, `|`) as characters is
-//! what makes an answer look like a raw log. This turns the common forms into spans the
-//! screen already knows how to paint, and drops the punctuation that only told a machine
-//! what to do.
-//!
-//! It is not a CommonMark implementation and does not pretend to be: no footnotes, no raw
-//! HTML, no reference links. What it covers is what models actually emit — headings,
-//! emphasis, inline code, fenced code, lists (nested, ordered,
-//! task), tables, quotes, rules and links.
-//!
-//! Three rules shape every decision here:
-//!
-//! * **An unclosed mark stays literal.** A stream is rendered on every token, so eating a
-//!   `**` that has not closed yet would make the preview flicker between styled and plain as
-//!   the rest of the word arrives. Half a table is not a table either: it renders as text
-//!   until the `---` separator row shows up.
-//! * **Marks that only carry meaning are dropped; marks a reader needs are kept.** `**`
-//!   disappears and the text goes bold; `- ` stays, because it is how a list reads; `>`
-//!   becomes `│ `; a fence becomes a labelled bar. Nothing is added — no "1 of 3", no
-//!   "table starts here".
-//! * **Nothing interprets its own contents twice.** Text inside a fence, and inside inline
-//!   code, is never scanned for emphasis or links.
-//!
-//! **Wrapping is not done here.** Every consumer already wraps what it is given, and a
-//! renderer that wrapped its own output would be wrapped a second time — a second pass that
-//! cannot tell an indent it should keep from one it has already applied. Instead each line
-//! carries the indent its continuation rows want in [`Line::hang`], and the single wrap that
-//! happens later produces the right shape at whatever width it is given.
+//! CommonMark rendering for assistant answers, including summaries and restored sessions.
+//! Source remains Markdown; the screen handles terminal layout and native selection.
 
-use crate::ui::screen::{Line, Span, Style};
-use crate::ui::theme::Color;
+use crate::ui::text::Line;
 use crate::util;
+use pulldown_cmark::{Event, Options, Parser, TagEnd};
 
-/// Indent for a fenced block's body, so code is visibly set in from the prose.
-const CODE_INDENT: &str = "  ";
+mod code;
+mod render;
 
-/// Render `text` to lines, **unwrapped**.
-///
-/// Wrapping is left to [`crate::ui::screen::wrap_all`], which every consumer already calls:
-/// a markdown function that wrapped its own output would be wrapped a second time by the
-/// screen, and the second pass cannot tell an indent it should keep from one it has already
-/// applied. Instead each line carries the indent its continuation rows want in
-/// [`Line::hang`], and one wrap — wherever it happens — produces the right shape.
-///
-/// `width` is therefore used for one thing: deciding whether a table fits. A table has to
-/// commit to column widths while it is being built, and a table that is too wide for the
-/// terminal is laid out as plain rows instead.
+pub(super) const OPTIONS: Options = Options::ENABLE_TABLES
+    .union(Options::ENABLE_TASKLISTS)
+    .union(Options::ENABLE_STRIKETHROUGH);
+
+pub(super) fn parser(text: &str) -> Parser<'_> {
+    Parser::new_ext(text, OPTIONS)
+}
+
+/// Render logical lines; the screen preserves source breaks when the terminal wraps them.
 pub fn render(text: &str, width: usize) -> Vec<Line> {
-    // ANSI in the source is stripped: the styles below are the only colour this text may
-    // carry, and a model that emits escapes must not be able to paint the terminal.
-    let clean = util::sanitize(text);
-    let mut lines: Vec<Line> = Vec::new();
-    // A fence's body is buffered so its frame can be sized to the widest line. An open
-    // fence is `Some`, and the body is flushed when the closing marker arrives (or at the
-    // end of the text, since the tail of a stream is an unterminated fence).
-    let mut fence: Option<(Fence, Vec<String>)> = None;
-    let mut table: Vec<String> = Vec::new();
-
-    for raw in clean.split('\n') {
-        // Inside a fence everything is code: no headings, no emphasis, no tables.
-        if let Some((open, body)) = &mut fence {
-            if closes(open, raw) {
-                if let Some((open, body)) = fence.take() {
-                    lines.extend(open.frame(&body, width));
-                }
-            } else {
-                body.push(raw.trim_end().to_string());
-            }
-            continue;
-        }
-        if let Some(open) = Fence::open(raw) {
-            flush_table(&mut lines, &mut table, width);
-            fence = Some((open, Vec::new()));
-            continue;
-        }
-        // A `|`-row is only a table once the separator confirms it, so the rows are
-        // collected and rendered together.
-        if looks_like_table_row(raw) {
-            table.push(raw.to_string());
-            continue;
-        }
-        flush_table(&mut lines, &mut table, width);
-        lines.extend(block_line(raw.trim_end()));
-    }
-    // An unterminated fence is the tail of a stream: the closing marker has not arrived.
-    // The block is still drawn, because the alternative is showing nothing and then having
-    // a whole code block appear at once when the fence closes.
-    if let Some((open, body)) = fence.take() {
-        lines.extend(open.frame(&body, width));
-    }
-    flush_table(&mut lines, &mut table, width);
-
-    // Trailing blank lines are dropped: the transcript adds its own spacing, and a run of
-    // them at the end reads as a gap the answer did not ask for.
-    while lines.last().is_some_and(is_blank_line) {
-        lines.pop();
-    }
-    // Runs of blank lines collapse to one: models use blank lines as punctuation, and three
-    // of them in a row are three times the pause.
-    let mut out: Vec<Line> = Vec::with_capacity(lines.len());
-    let mut pending_blank = false;
-    for line in lines {
-        if is_blank_line(&line) {
-            pending_blank = true;
-            continue;
-        }
-        if pending_blank && !out.is_empty() {
-            out.push(Line::blank());
-        }
-        pending_blank = false;
-        out.push(line);
-    }
-    out
+    render::render(&util::sanitize(text), width)
 }
 
-fn is_blank_line(line: &Line) -> bool {
-    line.spans.iter().all(|span| span.text.trim().is_empty())
-}
-
-/// Blank-terminated blocks outside a code fence can leave the live preview.
+/// Only commit complete top-level blocks. Blank lines inside lists, quotes and code
+/// do not prove those containers have ended. Reference links may be defined later.
 pub(crate) fn stable_prefix(text: &str) -> usize {
-    let mut fence: Option<Fence> = None;
-    let mut offset = 0;
+    let mut unresolved = usize::MAX;
+    let mut callback = |link: pulldown_cmark::BrokenLink<'_>| {
+        unresolved = unresolved.min(link.span.start);
+        None
+    };
+    let parsed = Parser::new_with_broken_link_callback(text, OPTIONS, Some(&mut callback));
+    if parsed.reference_definitions().iter().next().is_some() {
+        return 0;
+    }
+    let mut depth = 0;
+    let mut blocks = Vec::new();
+    for (event, range) in parsed.into_offset_iter() {
+        match event {
+            Event::Start(_) => depth += 1,
+            Event::End(tag) => {
+                depth -= 1;
+                if depth == 0 {
+                    blocks.push((tag, range));
+                }
+            }
+            Event::Rule => blocks.push((TagEnd::Paragraph, range)),
+            _ => {}
+        }
+    }
     let mut stable = 0;
-    for line in text.split_inclusive('\n') {
-        if !line.ends_with('\n') { break; }
-        offset += line.len();
-        let raw = line.trim_end_matches('\n');
-        if let Some(open) = &fence {
-            if closes(open, raw) { fence = None; }
-        } else if let Some(open) = Fence::open(raw) {
-            fence = Some(open);
-        } else if raw.trim().is_empty() {
-            stable = offset;
+    for (index, (tag, range)) in blocks.iter().enumerate() {
+        if range.end > unresolved {
+            break;
+        }
+        if index + 1 == blocks.len()
+            && matches!(
+                tag,
+                TagEnd::List(_) | TagEnd::BlockQuote(_) | TagEnd::CodeBlock | TagEnd::Table
+            )
+        {
+            break;
+        }
+        if matches!(tag, TagEnd::List(_))
+            && blocks
+                .get(index + 1)
+                .is_some_and(|(_, next)| !text[next.start..].contains('\n'))
+        {
+            break;
+        }
+        let mut end = range.end;
+        for line in text[range.end..].split_inclusive('\n') {
+            if !line.ends_with('\n') || !line.trim().is_empty() {
+                break;
+            }
+            end += line.len();
+        }
+        if text[..end]
+            .trim_end_matches([' ', '\t', '\r'])
+            .ends_with("\n\n")
+        {
+            stable = end;
         }
     }
     stable
 }
 
-/// One line of a fenced block. The indent is part of the line, and `hang` matches it so a
-/// wrapped code line lines up under the code rather than under the frame.
-///
-/// The text is passed through untouched. Colour here would have to come from a tokeniser,
-/// and a tokeniser that is wrong about a language is worse than none: it repaints code the
-/// reader is trying to check, and it cannot know which of the languages a model invents a
-/// fence is even asking for.
-fn paint_code(raw: &[String]) -> Vec<Line> {
-    raw.iter()
-        .map(|line| {
-            let spans = vec![Span::new(CODE_INDENT, Style::plain()), Span::plain(line.clone())];
-            Line::hanging(spans, CODE_INDENT.len())
-        })
-        .collect()
-}
-
-// ---------------------------------------------------------------------------
-// Blocks
-// ---------------------------------------------------------------------------
-
-/// A fence that is open, and what its info string said.
-#[derive(Debug)]
-struct Fence {
-    lang: Option<String>,
-    marker: char,
-    /// The opening marker's length: a ```` ```` ```` fence is not closed by ```` ``` ````.
-    marker_len: usize,
-}
-
-impl Fence {
-    fn open(line: &str) -> Option<Self> {
-        let trimmed = line.trim_start();
-        let marker = trimmed.chars().next()?;
-        if marker != '`' && marker != '~' {
-            return None;
-        }
-        let marker_len = trimmed.chars().take_while(|c| *c == marker).count();
-        if marker_len < 3 {
-            return None;
-        }
-        // The info string is a language in practice. The first word is taken so
-        // `rust,ignore` and `sh title=x` still name one.
-        let info = trimmed[marker_len..].trim();
-        let lang = info
-            .split_whitespace()
-            .next()
-            .unwrap_or("")
-            .trim_end_matches(',')
-            .to_string();
-        Some(Fence {
-            lang: (!lang.is_empty()).then_some(lang),
-            marker,
-            marker_len,
-        })
-    }
-
-    /// The whole block: an opening bar, the code, and a closing bar of the same width.
-    ///
-    /// A fence's backticks are punctuation for a parser, and leaving them on screen makes a
-    /// code block look like a log line. The bar carries what a reader needs from that line —
-    /// that this is code, and in which language — and nothing else.
-    ///
-    /// Both bars are the same length on purpose: the pair reads as a frame around the code,
-    /// and a frame that does not close is worse than no frame. Its length comes from the
-    /// longest line, so a block of short commands is not wrapped in sixty columns of rule.
-    fn frame(&self, raw: &[String], width: usize) -> Vec<Line> {
-        let body = paint_code(raw);
-        let longest = body.iter().map(Line::width).max().unwrap_or(0);
-        let label = self.label();
-        let label_width = label.as_ref().map_or(0, |label| util::width(label));
-        // The corner, the label, and a little air past the widest line.
-        let wanted = longest.max(label_width) + 3;
-        let bar_width = wanted.min(width.saturating_sub(1)).max(2);
-        let mut out = Vec::with_capacity(body.len() + 2);
-        out.push(self.bar('┌', bar_width, label.as_deref()));
-        out.extend(body.iter().cloned());
-        // The language is named once, on the bar that opens the block: repeating it on the
-        // way out adds nothing a reader is still looking for by then.
-        out.push(self.bar('└', bar_width, None));
-        out
-    }
-
-    /// `─ lang ` when the fence named one, `None` otherwise.
-    fn label(&self) -> Option<String> {
-        self.lang.as_ref().map(|lang| format!("─ {lang} "))
-    }
-
-    /// One bar of exactly `total` columns, with `label` after the corner when given.
-    fn bar(&self, corner: char, total: usize, label: Option<&str>) -> Line {
-        let label = util::truncate(label.unwrap_or(""), total.saturating_sub(1), "");
-        let rule = "─".repeat(total.saturating_sub(1 + util::width(&label)));
-        let mut spans = vec![Span::new(corner.to_string(), Style::new(Color::Dim))];
-        // The language is what the bar is for. The rule stays quiet; the name takes the
-        // accent, the way Codex paints a fence's info string in the theme accent.
-        if !label.is_empty() {
-            spans.push(Span::new(label, Style::new(Color::Cyan)));
-        }
-        spans.push(Span::new(rule, Style::new(Color::Dim)));
-        Line::spans(spans)
-    }
-}
-
-/// Whether `line` closes the open fence: same marker, at least as long, nothing else on it.
-fn closes(open: &Fence, line: &str) -> bool {
-    let trimmed = line.trim();
-    let count = trimmed.chars().take_while(|c| *c == open.marker).count();
-    count >= open.marker_len && trimmed[count..].trim().is_empty()
-}
-
-fn looks_like_table_row(line: &str) -> bool {
-    line.contains('|')
-}
-
-fn flush_table(lines: &mut Vec<Line>, table: &mut Vec<String>, width: usize) {
-    if table.is_empty() {
-        return;
-    }
-    let collected = std::mem::take(table);
-    lines.extend(render_table(&collected, width));
-}
-
-fn block_line(line: &str) -> Vec<Line> {
-    if line.trim().is_empty() {
-        return vec![Line::blank()];
-    }
-    if is_rule(line) {
-        return vec![Line::new("─".repeat(24), Style::new(Color::Dim))];
-    }
-    if let Some((level, rest)) = heading(line) {
-        // Codex weights a heading by its level instead of painting every one the same:
-        // the title is underlined, the next is bold, and the smaller ones step down.
-        return vec![Line::spans(inline(rest, heading_style(level)))];
-    }
-    // Quotes nest: `>> x` and `> > x` are both two levels deep, and the number of bars is
-    // how a reader sees the nesting without counting characters. The bar stays muted;
-    // the words keep the terminal foreground so quoted content remains readable.
-    let (level, body) = quote_depth(line);
-    if level > 0 {
-        let mut spans: Vec<Span> = Vec::new();
-        for _ in 0..level {
-            spans.push(Span::new("│\u{a0}", Style::new(Color::Dim)));
-        }
-        spans.extend(inline(body, Style::italic(Color::Text)));
-        return vec![Line::hanging(spans, level * 2)];
-    }
-    if let Some((marker, body)) = list_item(line) {
-        let hang = util::width(&marker);
-        // The marker is glued to the first word with a non-breaking space, so a narrow
-        // terminal cannot leave a bullet alone on a row with its text underneath — which is
-        // what a plain space does, and it reads as a lost item.
-        // The marker's own trailing space becomes the non-breaking one, so the marker and
-        // the first word are one unbreakable run without changing the visible spacing.
-        let glued = format!("{}\u{a0}", marker.trim_end());
-        let mut spans = vec![Span::new(glued, Style::new(Color::Dim))];
-        spans.extend(inline(body, Style::plain()));
-        return vec![Line::hanging(spans, hang)];
-    }
-    vec![Line::spans(inline(line, Style::plain()))]
-}
-
-/// `>`, `>>`, `> >` → the depth and the text after the markers.
-fn quote_depth(line: &str) -> (usize, &str) {
-    let mut rest = line.trim_start();
-    let mut level = 0;
-    while let Some(after) = rest.strip_prefix('>') {
-        rest = after.strip_prefix(' ').unwrap_or(after);
-        level += 1;
-        // Bounded so a line of `>`s cannot spin here.
-        if level >= 32 {
-            break;
-        }
-    }
-    (level, rest)
-}
-
-fn is_rule(line: &str) -> bool {
-    let trimmed = line.trim();
-    // Separated markers count: `- - -` and `* * *` are rules in every dialect.
-    let bare: String = trimmed.chars().filter(|c| *c != ' ').collect();
-    bare.len() >= 3
-        && bare
-            .chars()
-            .next()
-            .is_some_and(|first| matches!(first, '-' | '*' | '_') && bare.chars().all(|c| c == first))
-}
-
-fn heading(line: &str) -> Option<(usize, &str)> {
-    let hashes = line.chars().take_while(|c| *c == '#').count();
-    if (1..=6).contains(&hashes) && line.chars().nth(hashes) == Some(' ') {
-        let body = line[hashes + 1..].trim_end();
-        let without_hashes = body.trim_end_matches('#');
-        let body = if without_hashes.ends_with(char::is_whitespace) {
-            without_hashes.trim_end()
-        } else { body };
-        return Some((hashes, body));
-    }
-    None
-}
-
-/// Weight by level, the way Codex does: a title is underlined, a section is bold, and
-/// the rest step down. Font weight supplies the hierarchy without colouring the prose.
-fn heading_style(level: usize) -> Style {
-    match level {
-        1 => Style { bold: true, underline: true, ..Style::new(Color::Text) },
-        2 => Style::bold(Color::Text),
-        3 => Style { bold: true, italic: true, ..Style::new(Color::Text) },
-        _ => Style::italic(Color::Text),
-    }
-}
-
-/// `"- item"` / `"1. item"` / `"- [x] done"` → the marker to draw and the body.
-///
-/// The indent is kept in the marker so nesting survives, and an ordered list keeps its
-/// numbers: replacing them with bullets would drop the thing the writer chose to say.
-fn list_item(line: &str) -> Option<(String, &str)> {
-    let indent_len = line.len() - line.trim_start().len();
-    let indent = &line[..indent_len];
-    let rest = &line[indent_len..];
-    // Markdown nests by two spaces or a tab. Deeper levels are clamped so a pathological
-    // indent cannot push the text off the right edge.
-    let depth = (indent.replace('\t', "  ").len() / 2).min(4);
-    let pad = "  ".repeat(depth);
-    let bytes = rest.as_bytes();
-    if bytes.len() >= 2 && matches!(bytes[0], b'-' | b'*' | b'+') && bytes[1] == b' ' {
-        let body = &rest[2..];
-        let (box_mark, body) = task_marker(body);
-        let marker = match box_mark {
-            Some(mark) => format!("{pad}{mark} "),
-            None => format!("{pad}• "),
-        };
-        return Some((marker, body));
-    }
-    let digits = rest.chars().take_while(|c| c.is_ascii_digit()).count();
-    if digits > 0 && digits < 6 {
-        let after = &rest[digits..];
-        if let Some(body) = after.strip_prefix(". ").or_else(|| after.strip_prefix(") ")) {
-            return Some((format!("{pad}{}. ", &rest[..digits]), body));
-        }
-    }
-    None
-}
-
-/// `"[ ] x"` / `"[x] x"` → the box to draw and the text after it.
-fn task_marker(body: &str) -> (Option<&'static str>, &str) {
-    if let Some(rest) = body.strip_prefix("[ ] ") {
-        return (Some("☐"), rest);
-    }
-    if let Some(rest) = body.strip_prefix("[x] ").or_else(|| body.strip_prefix("[X] ")) {
-        return (Some("☑"), rest);
-    }
-    (None, body)
-}
-
-// ---------------------------------------------------------------------------
-// Inline
-// ---------------------------------------------------------------------------
-
-pub(super) fn inline(text: &str, style: Style) -> Vec<Span> {
-    let chars: Vec<char> = text.chars().collect();
-    let mut spans = Vec::new();
-    let mut buf = String::new();
-    let mut i = 0;
-    while i < chars.len() {
-        if chars[i] == '\\' && chars.get(i + 1).is_some_and(char::is_ascii_punctuation) {
-            buf.push(chars[i + 1]);
-            i += 2;
-            continue;
-        }
-        // `code` first, so marks inside it stay literal.
-        if chars[i] == '`'
-            && let Some((code, next)) = code_span(&chars, i)
-        {
-            push(&mut spans, &mut buf, style);
-            if !code.is_empty() {
-                spans.push(Span::new(code, Style { fg: Color::Cyan, ..style }));
-            }
-            i = next;
-            continue;
-        }
-        // Images before links: `![alt](url)` starts with `[` one character in.
-        if chars[i] == '!'
-            && chars.get(i + 1) == Some(&'[')
-            && let Some((alt, _, next)) = link_at(&chars, i + 1)
-        {
-            push(&mut spans, &mut buf, style);
-            spans.push(Span::new("🖼 ", Style::new(Color::Dim)));
-            if !alt.is_empty() {
-                spans.push(Span::new(alt, Style::new(Color::Dim)));
-            }
-            i = next;
-            continue;
-        }
-        if chars[i] == '['
-            && let Some((label, url, next)) = link_at(&chars, i)
-        {
-            push(&mut spans, &mut buf, style);
-            if !label.is_empty() {
-                spans.extend(inline(&label, Style { fg: Color::Cyan, underline: true, ..style }));
-            }
-            // The URL is shown when it says something the label does not; when the label
-            // *is* the URL, there is nothing to add.
-            if !url.is_empty() && url != label {
-                spans.push(Span::plain(" "));
-                spans.push(Span::new(format!("({url})"), Style::new(Color::Dim)));
-            }
-            i = next;
-            continue;
-        }
-        if let Some((url, next)) = bare_url(&chars, i) {
-            push(&mut spans, &mut buf, style);
-            spans.push(Span::new(url, Style { underline: true, ..style }));
-            i = next;
-            continue;
-        }
-        if let Some((marker, end)) = closer(&chars, i) {
-            push(&mut spans, &mut buf, style);
-            let inner: String = chars[i + marker.len()..end].iter().collect();
-            let inner_style = match marker {
-                "***" | "___" => Style { bold: true, italic: true, ..style },
-                "**" | "__" => Style { bold: true, ..style },
-                "*" | "_" => Style { italic: true, ..style },
-                // SGR 9 preserves the text while marking it as removed.
-                "~~" => Style { crossed_out: true, ..style },
-                // `==highlight==` has nowhere to go in a terminal palette either.
-                "==" => Style { underline: true, ..style },
-                _ => style,
-            };
-            // Inner marks are rendered too, so `**bold with \`code\`**` keeps both.
-            spans.extend(inline(&inner, inner_style));
-            i = end + marker.len();
-            continue;
-        }
-        buf.push(chars[i]);
-        i += 1;
-    }
-    push(&mut spans, &mut buf, style);
-    if spans.is_empty() {
-        spans.push(Span::plain(String::new()));
-    }
-    spans
-}
-
-/// A `**` / `__` / `*` / `_` / `~~` / `==` that has a matching closer, and where it starts.
-fn closer(chars: &[char], at: usize) -> Option<(&'static str, usize)> {
-    let marker = if starts_with(chars, at, &['*', '*', '*']) {
-        "***"
-    } else if starts_with(chars, at, &['_', '_', '_']) && word_boundary(chars, at) {
-        "___"
-    } else if starts_with(chars, at, &['*', '*']) {
-        "**"
-    } else if starts_with(chars, at, &['_', '_']) && word_boundary(chars, at) {
-        "__"
-    } else if starts_with(chars, at, &['~', '~']) {
-        "~~"
-    } else if starts_with(chars, at, &['=', '=']) {
-        "=="
-    } else if chars[at] == '*' {
-        "*"
-    } else if chars[at] == '_' && word_boundary(chars, at) {
-        "_"
-    } else {
-        return None;
-    };
-    let mark: Vec<char> = marker.chars().collect();
-    if chars.get(at + mark.len()).is_none_or(|c| c.is_whitespace()) {
-        return None;
-    }
-    let mut j = at + mark.len();
-    while j + mark.len() <= chars.len() {
-        if chars[j] == '\\' {
-            j += 2;
-            continue;
-        }
-        if starts_with(chars, j, &mark) && !chars[j - 1].is_whitespace() {
-            // `snake_case` and `__init__`: an underscore inside a word is not emphasis.
-            if marker == "_" && j < chars.len() && chars.get(j + 1).is_some_and(|c| c.is_ascii_alphanumeric()) {
-                j += 1;
-                continue;
-            }
-            // An empty pair (`****`) is not emphasis, it is four asterisks.
-            if j == at + mark.len() {
-                return None;
-            }
-            return Some((marker, j));
-        }
-        j += 1;
-    }
-    None
-}
-
-fn word_boundary(chars: &[char], at: usize) -> bool {
-    at == 0 || !(chars[at - 1].is_alphanumeric() || chars[at - 1] == '_')
-}
-
-fn code_span(chars: &[char], at: usize) -> Option<(String, usize)> {
-    let count = chars[at..].iter().take_while(|c| **c == '`').count();
-    let mut end = at + count;
-    while end < chars.len() {
-        if chars[end] != '`' { end += 1; continue; }
-        let run = chars[end..].iter().take_while(|c| **c == '`').count();
-        if run == count {
-            let body: String = chars[at + count..end].iter().collect();
-            let body = body.replace('\n', " ");
-            let body = if body.starts_with(' ') && body.ends_with(' ') && !body.trim().is_empty() {
-                body[1..body.len() - 1].to_string()
-            } else { body };
-            return Some((body, end + count));
-        }
-        end += run;
-    }
-    None
-}
-
-/// `[label](url)` starting at `at`. Returns the label, the url, and the index after the link.
-fn link_at(chars: &[char], at: usize) -> Option<(String, String, usize)> {
-    let close = chars[at + 1..].iter().position(|c| *c == ']')?;
-    let label_end = at + 1 + close;
-    if chars.get(label_end + 1) != Some(&'(') {
-        return None;
-    }
-    let mut url_at = label_end + 2;
-    let mut depth = 1;
-    let angled = chars.get(url_at) == Some(&'<');
-    let mut angle_closed = !angled;
-    while url_at < chars.len() {
-        match chars[url_at] {
-            '\\' => { url_at += 2; continue; }
-            '>' if angled => angle_closed = true,
-            '(' if angle_closed => depth += 1,
-            ')' if angle_closed => {
-                depth -= 1;
-                if depth == 0 { break; }
-            }
-            _ => {}
-        }
-        url_at += 1;
-    }
-    if depth != 0 { return None; }
-    let label: String = chars[at + 1..label_end].iter().collect();
-    let url: String = chars[label_end + 2..url_at].iter().collect();
-    let url = url.trim().strip_prefix('<').and_then(|s| s.strip_suffix('>')).unwrap_or(url.trim()).to_string();
-    Some((label, url, url_at + 1))
-}
-
-/// A bare `http(s)://…` / `www.…` starting at `at`, and the index after it.
-///
-/// Trailing punctuation is excluded: in "see https://x.dev." the full stop belongs to the
-/// sentence, and underlining it makes the link look like it has a typo.
-fn bare_url(chars: &[char], at: usize) -> Option<(String, usize)> {
-    if !starts_with(chars, at, &['h', 't', 't', 'p']) && !starts_with(chars, at, &['w', 'w', 'w']) {
-        return None;
-    }
-    // Only at a word boundary, or a `xhttps://` would be highlighted from its `h`.
-    if at > 0 && (chars[at - 1].is_alphanumeric() || chars[at - 1] == '/') {
-        return None;
-    }
-    let mut end = at;
-    while end < chars.len() && !chars[end].is_whitespace() {
-        end += 1;
-    }
-    while end > at
-        && matches!(chars[end - 1], '.' | ',' | ';' | '!' | '?' | ')' | ']' | '"' | '\'')
-    {
-        end -= 1;
-    }
-    if end.saturating_sub(at) < 5 || !chars[at..end].contains(&'.') {
-        return None;
-    }
-    Some((chars[at..end].iter().collect(), end))
-}
-
-mod code;
-
-use code::{push, render_table, starts_with};
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::text::{Span, Style};
+    use crate::ui::theme::Color;
+
+    #[test]
+    fn commonmark_summaries_keep_setext_titles_reference_links_and_entities() {
+        let rows = render(
+            "完成\n====\n\n**结果 *已验证*** &amp; &#x4e2d;\n\n[说明][doc]\n\n[doc]: https://example.com/a(b) \"标题\"",
+            80,
+        );
+        assert_eq!(visible(&rows[0]), "完成");
+        assert!(rows[0].spans[0].style.bold && rows[0].spans[0].style.underline);
+        assert!(rendered_rows(&rows).contains(&"结果 已验证 & 中".to_string()));
+        assert!(span(&rows, "已验证").style.bold && span(&rows, "已验证").style.italic);
+        assert!(rendered_rows(&rows).contains(&"说明 (https://example.com/a(b))".to_string()));
+        assert!(
+            !rendered_rows(&rows)
+                .iter()
+                .any(|line| line.contains("[doc]:"))
+        );
+    }
+
+    #[test]
+    fn lists_keep_continuation_paragraphs_and_nested_code_in_their_container() {
+        let source = "1. first\n   continuation\n\n   second paragraph\n\n   ```rs\n   let x = 1;\n   ```\n\n   - nested\n\n2. second";
+        let rows = render(source, 40);
+        let text = rendered_rows(&rows);
+        assert!(text.contains(&"   continuation".to_string()), "{text:?}");
+        assert!(
+            text.contains(&"   second paragraph".to_string()),
+            "{text:?}"
+        );
+        assert!(text.contains(&"let x = 1;".to_string()), "{text:?}");
+        assert!(text.contains(&"   • nested".to_string()), "{text:?}");
+        assert!(text.contains(&"2. second".to_string()), "{text:?}");
+    }
+
+    #[test]
+    fn streaming_does_not_split_lists_or_lose_forward_reference_definitions() {
+        for source in [
+            "1. first\n\n   continuation\n\n2. second\n\n",
+            "> first\n>\n> second\n\n",
+            "[说明][doc]\n\n另一个段落\n\n[doc]: https://example.com\n\n",
+        ] {
+            assert_eq!(stable_prefix(source), 0, "{source}");
+        }
+        let source = "Intro\n\n    let x = 1;\n";
+        assert_eq!(&source[..stable_prefix(source)], "Intro\n\n");
+        assert!(
+            render(&source[stable_prefix(source)..], 80)[0]
+                .text()
+                .starts_with('┌')
+        );
+    }
+
+    #[test]
+    fn raw_html_lines_are_safe_and_narrow_tables_keep_header_value_pairs() {
+        let rows = render("<div>\nhello\n</div>\n", 40);
+        assert!(rows.iter().all(|row| !row.text().contains('\n')));
+        let rows = render(
+            "| name | result |\n| --- | --- |\n| 中文项目 | **passed** |",
+            12,
+        );
+        assert_eq!(
+            rendered_rows(&rows),
+            vec!["name: 中文项目", "result: passed"]
+        );
+        assert!(
+            rows[1]
+                .spans
+                .iter()
+                .any(|span| span.text == "passed" && span.style.bold)
+        );
+    }
+
+    #[test]
+    fn short_code_frames_align_and_narrow_header_only_tables_keep_column_separation() {
+        for width in [8, 20, 80] {
+            let rows = render("```very-long-language-name\nx\n```", width);
+            assert_eq!(rows[0].width(), rows.last().unwrap().width());
+            assert!(rows[0].width() <= width);
+        }
+        let rows = render("| long first | long second |\n| --- | --- |", 12);
+        assert_eq!(rendered_rows(&rows), vec!["long first  long second"]);
+    }
 
     #[test]
     fn stable_stream_blocks_hold_open_fences_and_partial_tables() {
-        for text in ["段落\n\n尾", "段落\n\n```rs\nfirst\n\nsecond\n", "段落\n\n| A | B |\n| - | - |\n"] {
+        for text in [
+            "段落\n\n尾",
+            "段落\n\n```rs\nfirst\n\nsecond\n",
+            "段落\n\n| A | B |\n| - | - |\n",
+        ] {
             assert_eq!(&text[..stable_prefix(text)], "段落\n\n");
         }
         let closed = "段落\n\n~~~~\n\ncode\n~~~~\n\n尾";
-        assert_eq!(&closed[..stable_prefix(closed)], "段落\n\n~~~~\n\ncode\n~~~~\n\n");
+        assert_eq!(
+            &closed[..stable_prefix(closed)],
+            "段落\n\n~~~~\n\ncode\n~~~~\n\n"
+        );
         assert_eq!(stable_prefix("尚未结束的段落"), 0);
     }
 
     #[test]
     fn summaries_render_combined_emphasis_escapes_and_code_delimiters() {
-        let rows = render("### 完成 ###\n***已验证***：\\*原文\\*，`` `code` ``，~~旧版~~", 80);
+        let rows = render(
+            "### 完成 ###\n***已验证***：\\*原文\\*，`` `code` ``，~~旧版~~",
+            80,
+        );
         assert_eq!(rows[0].text(), "完成");
         assert_eq!(rows[1].text(), "已验证：*原文*，`code`，旧版");
         assert!(span(&rows, "已验证").style.bold);
@@ -641,8 +206,14 @@ mod tests {
 
     #[test]
     fn summary_links_keep_parentheses_spaces_and_formatted_labels() {
-        let rows = render("[**文件**](</tmp/my project/a(b).rs:12>) [说明](https://example.com/a(b))", 100);
-        assert_eq!(rows[0].text(), "文件 (/tmp/my project/a(b).rs:12) 说明 (https://example.com/a(b))");
+        let rows = render(
+            "[**文件**](</tmp/my project/a(b).rs:12>) [说明](https://example.com/a(b))",
+            100,
+        );
+        assert_eq!(
+            rows[0].text(),
+            "文件 (/tmp/my project/a(b).rs:12) 说明 (https://example.com/a(b))"
+        );
         assert!(span(&rows, "文件").style.bold && span(&rows, "文件").style.underline);
     }
 
@@ -654,8 +225,6 @@ mod tests {
         assert!(widths.iter().all(|w| *w == widths[0]), "{widths:?}");
         assert!(rows.iter().any(|r| r.text().contains("a|b")));
     }
-
-    
 
     fn rendered(input: &str) -> Vec<String> {
         render(input, 80).iter().map(visible).collect()
@@ -674,10 +243,8 @@ mod tests {
         rows.iter().map(visible).collect()
     }
 
-    /// The text as the terminal receives it: a non-breaking space is a wrapping hint, and
-    /// the screen paints it as an ordinary space.
     fn visible(line: &Line) -> String {
-        line.text().replace('\u{a0}', " ")
+        line.text()
     }
 
     #[test]
@@ -688,8 +255,14 @@ mod tests {
 
     #[test]
     fn emphasis_code_and_links_lose_their_marks() {
-        let rows = render("see **bold** and `code` plus [docs](https://example.com)", 80);
-        assert_eq!(rows[0].text(), "see bold and code plus docs (https://example.com)");
+        let rows = render(
+            "see **bold** and `code` plus [docs](https://example.com)",
+            80,
+        );
+        assert_eq!(
+            rows[0].text(),
+            "see bold and code plus docs (https://example.com)"
+        );
         assert!(span(&rows, "bold").style.bold);
         assert_eq!(span(&rows, "code").style.fg, Color::Cyan);
         assert!(span(&rows, "docs").style.underline, "a link is underlined");
@@ -703,7 +276,11 @@ mod tests {
         let rows = render("an *emphasis* here", 80);
         let emphasis = span(&rows, "emphasis");
         assert!(emphasis.style.italic, "{emphasis:?}");
-        assert_ne!(emphasis.style.fg, Color::Dim, "emphasis must not be painted as a hint");
+        assert_ne!(
+            emphasis.style.fg,
+            Color::Dim,
+            "emphasis must not be painted as a hint"
+        );
     }
 
     #[test]
@@ -719,7 +296,7 @@ mod tests {
         let rows = render("```rs\nlet x = **no**;\n```", 80);
         // The body is one row, and the `**` is still there: inside a fence nothing is
         // scanned for emphasis.
-        assert_eq!(rendered_rows(&rows)[1], "  let x = **no**;");
+        assert_eq!(rendered_rows(&rows)[1], "let x = **no**;");
     }
 
     #[test]
@@ -729,7 +306,10 @@ mod tests {
         // screen is what made a code block read as a log line.
         assert!(!text.iter().any(|row| row.contains("```")), "{text:?}");
         let open = &text[1];
-        assert!(open.starts_with("┌─ bash"), "the language labels the block: {open:?}");
+        assert!(
+            open.starts_with("┌─ bash"),
+            "the language labels the block: {open:?}"
+        );
         assert_eq!(text[2].trim(), "echo hi", "{text:?}");
         assert!(text[3].starts_with('└'), "{text:?}");
     }
@@ -773,10 +353,6 @@ mod tests {
         assert!(text.iter().all(|row| !row.contains("```")), "{text:?}");
     }
 
-
-
-
-
     #[test]
     fn a_table_gets_a_border_and_alignment() {
         let rows = render("| lang | year |\n|:-----|-----:|\n| rust | 2015 |", 80);
@@ -816,17 +392,6 @@ mod tests {
         assert_eq!(text[0], "• top");
         assert_eq!(text[1], "  • nested");
         assert_eq!(text[2], "    • deeper");
-        // A wrapped item lines up under its text, not under the bullet. The indent is on the
-        // line itself (`hang`), so whichever pass wraps it produces the same shape.
-        assert_eq!(rows[1].hang, 4, "the marker's width is the hang");
-        let long = render("  - a nested item long enough that it has to wrap at this width", 30);
-        let wrapped = crate::ui::screen::wrap_line(&long[0], 30);
-        assert!(wrapped.len() > 1, "it wrapped: {:?}", long[0].text());
-        assert!(
-            wrapped[1].text().starts_with("    "),
-            "continuation lines up under the text: {:?}",
-            wrapped[1].text()
-        );
     }
 
     #[test]
@@ -855,9 +420,18 @@ mod tests {
     fn headings_are_emphasised() {
         let rows = render("# Title\n## Sub\n### Smaller", 80);
         assert_eq!(rendered_rows(&rows), vec!["Title", "Sub", "Smaller"]);
-        assert!(rows[0].spans[0].style.bold && rows[0].spans[0].style.underline, "h1 is underlined");
-        assert!(rows[1].spans[0].style.bold && !rows[1].spans[0].style.underline, "h2 is bold only");
-        assert!(rows[2].spans[0].style.bold && rows[2].spans[0].style.italic, "h3 steps down");
+        assert!(
+            rows[0].spans[0].style.bold && rows[0].spans[0].style.underline,
+            "h1 is underlined"
+        );
+        assert!(
+            rows[1].spans[0].style.bold && !rows[1].spans[0].style.underline,
+            "h2 is bold only"
+        );
+        assert!(
+            rows[2].spans[0].style.bold && rows[2].spans[0].style.italic,
+            "h3 steps down"
+        );
         assert_eq!(rows[0].spans[0].style.fg, Color::Text);
     }
 
@@ -867,13 +441,13 @@ mod tests {
         let said = span(&rows, "said");
         assert_ne!(said.style.fg, Color::Dim);
         assert!(said.style.italic);
-        assert!(rows[0].spans.iter().any(|s| s.text.starts_with('│') && s.style.fg == Color::Dim));
+        assert!(
+            rows[0]
+                .spans
+                .iter()
+                .any(|s| s.text.starts_with('│') && s.style.fg == Color::Dim)
+        );
     }
-
-
-
-
-
 
     #[test]
     fn rules_lose_their_syntax() {
@@ -883,7 +457,7 @@ mod tests {
         }
         // But a rule inside a fenced block is code.
         let rows = render("```\n---\n```", 80);
-        assert_eq!(rendered_rows(&rows)[1], "  ---");
+        assert_eq!(rendered_rows(&rows)[1], "---");
     }
 
     #[test]
@@ -925,7 +499,10 @@ mod tests {
         let rows = render("![a chart](https://x/y.png)", 80);
         let text = rows[0].text();
         assert!(text.contains("a chart"), "{text}");
-        assert!(!text.contains("https://x/y.png"), "the url is not shown: {text}");
+        assert!(
+            !text.contains("https://x/y.png"),
+            "the url is not shown: {text}"
+        );
     }
 
     #[test]
@@ -939,8 +516,8 @@ mod tests {
         (1..=text.len())
             .filter(|end| text.is_char_boundary(*end))
             .map(|end| {
-                let lines = crate::ui::screen::wrap_all(&render(&text[..end], 60), 60);
-                lines.iter().map(Line::text).collect()
+                let lines = crate::ui::text::history_rows(&render(&text[..end], 60), 60);
+                lines.iter().map(|row| row.line.text()).collect()
             })
             .collect()
     }
@@ -954,10 +531,17 @@ mod tests {
         // frame has the same one, growing only at the bottom.
         let mut seen: Option<Vec<String>> = None;
         for frame in frames("| a | b |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |\n") {
-            let grid: Vec<String> = frame.iter().filter(|row| row.starts_with('│')).cloned().collect();
+            let grid: Vec<String> = frame
+                .iter()
+                .filter(|row| row.starts_with('│'))
+                .cloned()
+                .collect();
             if grid.is_empty() {
                 // Not a table yet: the pipes are still text, which is readable either way.
-                assert!(!frame.iter().any(|row| row.starts_with('┌')), "border without cells: {frame:?}");
+                assert!(
+                    !frame.iter().any(|row| row.starts_with('┌')),
+                    "border without cells: {frame:?}"
+                );
                 continue;
             }
             match &seen {
@@ -975,7 +559,9 @@ mod tests {
                     // as its characters arrive — that is the point of streaming — but the
                     // pipes must not move, because that is the grid re-spacing itself.
                     for (was, now) in previous.iter().zip(&grid) {
-                        let bars = |row: &String| row.match_indices('│').map(|(at, _)| at).collect::<Vec<_>>();
+                        let bars = |row: &String| {
+                            row.match_indices('│').map(|(at, _)| at).collect::<Vec<_>>()
+                        };
                         assert_eq!(bars(was), bars(now), "columns moved: {was:?} -> {now:?}");
                     }
                 }
@@ -1005,28 +591,12 @@ mod tests {
         // item rather than a list. The marker is glued to the first word instead.
         let source = "- a list item long enough to need wrapping at a narrow width";
         for width in [28usize, 20, 16] {
-            let lines = crate::ui::screen::wrap_all(&render(source, width), width);
+            let lines = crate::ui::text::history_rows(&render(source, width), width);
             assert!(
-                lines[0].text().trim_end().len() > 1,
+                lines[0].line.text().trim_end().len() > 1,
                 "width {width}: the bullet is alone: {:?}",
-                lines.iter().map(Line::text).collect::<Vec<_>>()
+                lines.iter().map(|row| row.line.text()).collect::<Vec<_>>()
             );
-        }
-    }
-
-    #[test]
-    fn wrapping_the_same_line_twice_gives_the_same_shape() {
-        // The screen wraps whatever it is given, and it may be given a line that markdown
-        // already wrapped (a resize, or a block re-rendered at a new width). Wrapping has to
-        // be idempotent, or a list item loses its indent on the second pass — the "at forty"
-        // row that started at column zero instead of lining up under the text.
-        let source = "- a list item that is definitely long enough to wrap at this width\n\n> and a quote long enough to wrap too";
-        for width in [24usize, 40] {
-            let once = crate::ui::screen::wrap_all(&render(source, width), width);
-            let twice: Vec<String> =
-                crate::ui::screen::wrap_all(&once, width).iter().map(Line::text).collect();
-            let once_text: Vec<String> = once.iter().map(Line::text).collect();
-            assert_eq!(once_text, twice, "wrapping twice changed the shape at width {width}");
         }
     }
 
@@ -1034,8 +604,12 @@ mod tests {
     fn nothing_wraps_past_its_width_once_the_screen_has_wrapped_it() {
         let source = "- a list item long enough to wrap\n\n> a quote that also wraps around\n\n| a | b |\n|---|---|\n| one | two |";
         for width in [20usize, 40, 80] {
-            for line in crate::ui::screen::wrap_all(&render(source, width), width) {
-                assert!(util::width(&line.text()) <= width, "{width}: {:?}", line.text());
+            for line in crate::ui::text::history_rows(&render(source, width), width) {
+                assert!(
+                    util::width(&line.line.text()) <= width,
+                    "{width}: {:?}",
+                    line.line.text()
+                );
             }
         }
     }

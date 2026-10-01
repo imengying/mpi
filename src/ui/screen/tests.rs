@@ -75,6 +75,35 @@ fn streaming_blocks_enter_scrollback_once_and_keep_the_draft_fixed() {
     assert!(!scrollback.contains("draft"));
 }
 
+#[test]
+fn streamed_summaries_and_restored_markdown_have_the_same_layout() {
+    let fixtures = [
+        "Intro\n\n1. first\n\n   continuation\n\n   - nested\n\n2. second\n\nDone",
+        "Intro\n\n[说明][doc]\n\n**完成**\n\n[doc]: https://example.com\n",
+        "Intro\n\n    let x = 1;\n\n| A | B |\n| - | - |\n| 中文 | **完成** |\n\nDone",
+    ];
+    for source in fixtures {
+        let mut screen = screen();
+        screen.interactive = true;
+        screen.out = Box::new(std::io::sink());
+        screen.begin_stream();
+        for character in source.chars() {
+            screen.push_text(&character.to_string());
+            screen.render();
+        }
+        assert_eq!(screen.end_stream().0, source);
+        for width in [12, 40, 80] {
+            let streamed: Vec<HistoryRow<Line>> = screen
+                .blocks
+                .iter()
+                .flat_map(|block| block.history_rows(width))
+                .collect();
+            let restored = Block::markdown(source).history_rows(width);
+            assert_eq!(streamed, restored, "width {width}, {source:?}");
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 struct CapturedOutput(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
 
@@ -91,6 +120,178 @@ impl Write for CapturedOutput {
 impl CapturedOutput {
     fn take(&self) -> Vec<u8> {
         std::mem::take(&mut *self.0.lock().unwrap())
+    }
+}
+
+fn selected_code(terminal: &vt100::Screen) -> String {
+    let (height, width) = terminal.size();
+    let rows = terminal.rows(0, width).collect::<Vec<_>>();
+    let first = rows
+        .iter()
+        .position(|row| row.contains('┌'))
+        .expect("code frame")
+        + 1;
+    let last = rows
+        .iter()
+        .position(|row| row.contains('└'))
+        .expect("code frame end")
+        - 1;
+    assert!(last < usize::from(height));
+    terminal.contents_between(first as u16, 0, last as u16, width)
+}
+
+#[test]
+fn native_code_selection_keeps_source_newlines_and_indentation_while_streaming_and_after_resize() {
+    // vt100 intentionally treats a wide character in the last column as a hard wrap.
+    // Native Unicode output is checked separately without that emulator assumption.
+    let body = "fn main() {\n    let text = \"words with    spaces that wrap\";\n    if ready {\n        emit(text);\n    }\n\n}";
+    let mut screen = screen();
+    let captured = CapturedOutput::default();
+    screen.out = Box::new(captured.clone());
+    screen.interactive = true;
+    screen.height = 48;
+    screen.width = 16;
+    set_input(&mut screen, "draft");
+    screen.set_footer(vec![Line::plain("stats")]);
+    screen.working = Some(WORKING_LABEL.into());
+    screen.begin_stream();
+    screen.push_text(&format!("```rs\n{body}\n```"));
+    let mut terminal = vt100::Parser::new(48, 16, 500);
+    for width in [16, 11, 32] {
+        screen.width = width;
+        terminal.screen_mut().set_size(48, width as u16);
+        screen.render();
+        terminal.process(&captured.take());
+        assert_eq!(
+            selected_code(terminal.screen()),
+            body,
+            "streaming, width {width}"
+        );
+        screen.tick_working();
+        terminal.process(&captured.take());
+        assert_eq!(
+            selected_code(terminal.screen()),
+            body,
+            "spinner, width {width}"
+        );
+    }
+    screen.end_stream();
+    terminal.process(&captured.take());
+    assert_eq!(selected_code(terminal.screen()), body, "completed");
+    for width in [12, 23, 40, 80] {
+        screen.width = width;
+        terminal.screen_mut().set_size(48, width as u16);
+        screen.render();
+        terminal.process(&captured.take());
+        assert_eq!(
+            selected_code(terminal.screen()),
+            body,
+            "completed, width {width}"
+        );
+        assert!(!terminal.screen().alternate_screen());
+        assert_eq!(
+            terminal.screen().mouse_protocol_mode(),
+            vt100::MouseProtocolMode::None
+        );
+    }
+}
+
+#[test]
+fn native_selection_joins_visual_folds_but_keeps_explicit_prose_line_breaks() {
+    let source = "first words with    spaces wrapping\nsecond original line";
+    let mut screen = screen();
+    let captured = CapturedOutput::default();
+    screen.out = Box::new(captured.clone());
+    screen.interactive = true;
+    screen.height = 24;
+    set_input(&mut screen, "draft");
+    screen.push(Block::markdown(source));
+    let mut terminal = vt100::Parser::new(24, 40, 100);
+    for width in [40, 16, 11, 24] {
+        screen.width = width;
+        terminal.screen_mut().set_size(24, width as u16);
+        screen.render();
+        terminal.process(&captured.take());
+        let rows = terminal.screen().rows(0, width as u16).collect::<Vec<_>>();
+        let start = rows
+            .iter()
+            .position(|row| row.starts_with("first"))
+            .unwrap();
+        let end = rows
+            .iter()
+            .skip(start)
+            .position(|row| row.is_empty())
+            .unwrap()
+            + start
+            - 1;
+        assert_eq!(
+            terminal
+                .screen()
+                .contents_between(start as u16, 0, end as u16, width as u16),
+            source,
+            "width {width}: {rows:?}"
+        );
+    }
+}
+
+#[test]
+fn native_code_selection_in_lists_and_quotes_keeps_only_the_code_indentation() {
+    let body = "fn work() {\n    do_work();\n}";
+    let listed = body
+        .lines()
+        .map(|line| format!("  {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let quoted = body
+        .lines()
+        .map(|line| format!("> {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for source in [
+        format!("- item\n\n  ```rs\n{listed}\n  ```"),
+        format!("> ```rs\n{quoted}\n> ```"),
+    ] {
+        let mut screen = screen();
+        screen.width = 12;
+        screen.interactive = true;
+        screen.out = Box::new(std::io::sink());
+        screen.push(Block::markdown(source));
+        let mut terminal = vt100::Parser::new(24, 12, 100);
+        terminal.process(screen.live_frame().as_bytes());
+        assert_eq!(selected_code(terminal.screen()), body);
+    }
+}
+
+#[test]
+fn piped_output_keeps_source_lines_without_terminal_width_folds() {
+    let captured = CapturedOutput::default();
+    let mut screen = screen();
+    screen.out = Box::new(captured.clone());
+    screen.interactive = false;
+    screen.width = 12;
+    let source = "first words with    spaces and 中文 wrapping\n    original indentation";
+    screen.push_lines(vec![Line::plain(source)]);
+    screen.flush();
+    assert_eq!(
+        String::from_utf8(captured.take()).unwrap(),
+        format!("{source}\n")
+    );
+}
+
+#[test]
+fn native_unicode_history_has_no_inserted_breaks_spaces_or_background_padding() {
+    for width in [11, 16, 23] {
+        let source = format!("{}中文 👩‍💻 continued with    spaces", "x".repeat(width - 1));
+        let mut screen = screen();
+        screen.width = width;
+        screen.interactive = true;
+        screen.out = Box::new(std::io::sink());
+        screen.push_lines(vec![Line::new(
+            &source,
+            Style::with_bg(Color::DiffAddedText, Bg::Added),
+        )]);
+        let output = util::strip_ansi(&screen.live_frame());
+        assert!(output.contains(&source), "width {width}: {output:?}");
     }
 }
 
@@ -122,7 +323,7 @@ fn large_pastes_queues_images_and_menus_fit_even_small_terminals() {
                 "{width}×{height}: {} rows",
                 lines.len()
             );
-            assert!(lines.iter().all(|line| line.width() <= width));
+            assert!(lines.iter().all(|line| line.line.width() <= width));
             let (row, column) = cursor.unwrap();
             assert!(row < lines.len() && column < width);
             set_input(&mut screen, "/");
@@ -228,9 +429,9 @@ fn the_status_reflows_without_new_model_output_after_a_resize() {
         busy: None,
     });
     screen.width = 80;
-    let wide = screen.compose_live().0.last().unwrap().text();
+    let wide = screen.compose_live().0.last().unwrap().line.text();
     screen.width = 20;
-    let narrow = screen.compose_live().0.last().unwrap().text();
+    let narrow = screen.compose_live().0.last().unwrap().line.text();
     assert!(wide.contains("example-model"));
     assert!(narrow.contains("example"), "{narrow}");
     assert!(util::width(&narrow) <= 20);
@@ -418,15 +619,16 @@ fn the_working_spinner_sits_above_the_input_and_moves() {
     let (lines, _) = screen.compose_live();
     let input = lines
         .iter()
-        .position(|line| line.text().starts_with('›'))
+        .position(|line| line.line.text().starts_with('›'))
         .unwrap();
-    let text: Vec<String> = lines.iter().map(Line::text).collect();
+    let text: Vec<String> = lines.iter().map(|row| row.line.text()).collect();
     assert_eq!(input, 1, "the spinner is one row: {text:?}");
     assert_eq!(
-        lines[0].text(),
+        lines[0].line.text(),
         format!("{} {}", WORKING_FRAMES[0], WORKING_LABEL)
     );
     let label = lines[0]
+        .line
         .spans
         .iter()
         .find(|span| span.text == WORKING_LABEL)
@@ -442,13 +644,13 @@ fn the_working_spinner_sits_above_the_input_and_moves() {
     screen.tick_working();
     let (lines, _) = screen.compose_live();
     assert_eq!(
-        lines[0].text(),
+        lines[0].line.text(),
         format!("{} {}", WORKING_FRAMES[0], WORKING_LABEL)
     );
     screen.tick_working();
     let (lines, _) = screen.compose_live();
     assert_eq!(
-        lines[0].text(),
+        lines[0].line.text(),
         format!("{} {}", WORKING_FRAMES[1], WORKING_LABEL)
     );
 }
@@ -460,9 +662,9 @@ fn the_spinner_is_gone_once_the_turn_ends() {
     screen.working = Some(WORKING_LABEL.to_string());
     screen.clear_working();
     let (lines, _) = screen.compose_live();
-    let text: Vec<String> = lines.iter().map(Line::text).collect();
+    let text: Vec<String> = lines.iter().map(|row| row.line.text()).collect();
     assert!(
-        lines[0].text().starts_with('›'),
+        lines[0].line.text().starts_with('›'),
         "the input is the first row again: {text:?}"
     );
 }
@@ -603,13 +805,13 @@ fn the_cursor_lands_after_the_buffer_not_below_the_footer() {
     assert_eq!(column, 2 + 3);
     // The row holds the input line — not the footer, which is below it.
     assert!(
-        lines[row].text().starts_with("› /mo"),
+        lines[row].line.text().starts_with("› /mo"),
         "{:?}",
-        lines[row].text()
+        lines[row].line.text()
     );
     assert!(row + 1 < lines.len());
     assert!(
-        lines[row + 1].text().contains("/model"),
+        lines[row + 1].line.text().contains("/model"),
         "the menu goes under the input"
     );
 }
@@ -625,7 +827,7 @@ fn the_caret_sits_where_the_buffer_put_it() {
     caret_back(&mut screen, 6);
     let (lines, cursor) = screen.compose_live();
     let (row, column) = cursor.unwrap();
-    assert_eq!(lines[row].text(), "› helo world");
+    assert_eq!(lines[row].line.text(), "› helo world");
     assert_eq!(
         column,
         2 + 4,
@@ -642,7 +844,7 @@ fn a_wide_character_is_one_step_and_two_columns() {
     caret_back(&mut screen, 1);
     let (lines, cursor) = screen.compose_live();
     let (row, column) = cursor.unwrap();
-    assert_eq!(lines[row].text(), "› 你好");
+    assert_eq!(lines[row].line.text(), "› 你好");
     assert_eq!(column, 2 + 2, "one character back is two display columns");
 }
 
@@ -658,7 +860,7 @@ fn the_wrapped_caret_follows_the_text_to_the_next_row() {
     let (lines, cursor) = screen.compose_live();
     let (row, column) = cursor.unwrap();
     assert_eq!(
-        lines[row].text(),
+        lines[row].line.text(),
         "  klm",
         "a full row puts the caret on the next one"
     );
@@ -1056,7 +1258,7 @@ fn a_row_filled_to_the_edge_gets_a_row_for_the_caret() {
     let (lines, cursor) = screen.compose_live();
     let (row, column) = cursor.unwrap();
     assert_eq!(
-        lines[row].text(),
+        lines[row].line.text(),
         "  ",
         "the caret sits on its own row below"
     );
@@ -1104,7 +1306,7 @@ fn the_erase_step_lands_on_the_first_live_row() {
     let (lines, cursor) = screen.compose_live();
     let (row, _) = cursor.unwrap();
     assert_eq!(row, 0, "images render below the input line, not above it");
-    assert!(lines[0].text().starts_with("› hi"));
+    assert!(lines[0].line.text().starts_with("› hi"));
 }
 
 #[test]
@@ -1118,7 +1320,7 @@ fn the_cursor_follows_the_last_wrapped_row() {
     // would be if the input were being scrolled sideways.
     assert_eq!(row, 2);
     assert_eq!(
-        lines[row].text(),
+        lines[row].line.text(),
         "  uvwxyz",
         "the continuation row keeps its indent"
     );
@@ -1205,16 +1407,16 @@ fn collapsing_all_resets_expansion() {
 }
 
 #[test]
-fn painted_output_is_exactly_the_requested_width() {
+fn colored_output_keeps_its_text_without_synthetic_padding() {
     let screen = screen();
     let line = Line::spans(vec![Span::new(
         "added",
         Style::with_bg(Color::DiffAddedText, Bg::Added),
     )]);
-    let painted = screen.paint(&line, 40);
-    assert_eq!(util::width(&util::strip_ansi(&painted)), 40);
+    let painted = screen.paint(&line);
+    assert_eq!(util::strip_ansi(&painted), "added");
     // Re-measuring the raw string would be wrong, which is the whole reason spans exist.
-    assert!(painted.len() > 40);
+    assert!(painted.len() > 5);
 }
 
 #[test]
@@ -1290,12 +1492,12 @@ fn no_live_row_is_wider_than_the_terminal() {
     let check = |screen: &Screen, what: &str| {
         let (lines, _) = screen.compose_live();
         for (index, line) in lines.iter().enumerate() {
-            let width = line.width();
+            let width = line.line.width();
             assert!(
                 width <= screen.width,
                 "{what}: row {index} is {width} cells wide in a {} cell screen: {:?}",
                 screen.width,
-                line.text()
+                line.line.text()
             );
         }
     };
@@ -1458,7 +1660,7 @@ fn the_thinking_preview_only_keeps_the_last_two_lines() {
     screen.streaming_thinking = Some("a\nb\nc\nd\ne".to_string());
     let (live, _) = screen.compose_live();
     assert!(live.len() <= 2, "{live:?}");
-    assert!(live.iter().any(|line| line.text().contains('e')));
+    assert!(live.iter().any(|line| line.line.text().contains('e')));
 }
 
 #[test]
@@ -1466,5 +1668,5 @@ fn ansi_in_streamed_text_is_neutralised_before_display() {
     let mut screen = screen();
     screen.streaming_answer = Some("\u{1b}[31mred\u{1b}[0m".into());
     let (live, _) = screen.compose_live();
-    assert!(live.iter().all(|line| !line.text().contains('\u{1b}')));
+    assert!(live.iter().all(|line| !line.line.text().contains('\u{1b}')));
 }

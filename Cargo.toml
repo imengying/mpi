@@ -26,6 +26,7 @@ thiserror = "2.0"
 dirs = "7.0"
 unicode-width = "0.2"
 unicode-segmentation = "1.13"
+pulldown-cmark = { version = "0.13.4", default-features = false }
 similar = "3.2"
 uuid = { version = "1.26", features = ["v7"] }
 # Clipboard image input. Pixels are re-encoded as PNG; a JPEG/TIFF stack is never

@@ -1,12 +1,13 @@
 //! A bottom-anchored inline viewport; finalized output stays in native scrollback.
 
+use crate::ui::text::HistoryRow;
 use std::fmt::Write;
 
 #[derive(Default)]
 pub(super) struct Viewport {
     size: Option<(usize, usize)>,
     top: usize,
-    rows: Vec<String>,
+    rows: Vec<HistoryRow<String>>,
     cursor: Option<(usize, usize)>,
     invalidated: bool,
 }
@@ -21,10 +22,10 @@ impl Viewport {
     pub(super) fn draw(
         &mut self,
         size: (usize, usize),
-        rows: Vec<String>,
+        rows: Vec<HistoryRow<String>>,
         cursor: Option<(usize, usize)>,
-        history: &[String],
-        reflow: &[String],
+        history: &[HistoryRow<String>],
+        reflow: &[HistoryRow<String>],
     ) -> String {
         let (width, height) = size;
         let top = height.saturating_sub(rows.len());
@@ -37,12 +38,14 @@ impl Viewport {
             frame.push_str(&"\r\n".repeat(height));
         } else if resized {
             // Rebuild visible history at the new width without replaying it into scrollback.
-            frame.push_str("\x1b[H\x1b[2J");
+            frame.push_str("\x1b[H\x1b[J");
             let start = reflow.len().saturating_sub(top);
             let padding = top.saturating_sub(reflow.len());
-            for (index, line) in reflow[start..].iter().enumerate() {
-                move_to(&mut frame, padding + index, 0);
-                frame.push_str(line);
+            for (index, row) in reflow[start..].iter().enumerate() {
+                if index == 0 || !reflow[start + index - 1].wrapped {
+                    move_to(&mut frame, padding + index, 0);
+                }
+                frame.push_str(&row.line);
             }
         } else if moved {
             move_to(&mut frame, self.top, 0);
@@ -61,23 +64,37 @@ impl Viewport {
         if !history.is_empty() {
             move_to(&mut frame, top, 0);
             frame.push_str("\x1b[J");
-            for (index, line) in history.iter().enumerate() {
-                if index > 0 {
+            for (index, row) in history.iter().enumerate() {
+                if index > 0 && !history[index - 1].wrapped {
                     frame.push_str("\r\n");
                 }
-                frame.push_str(line);
+                frame.push_str(&row.line);
             }
             // Advance through blank rows, leaving the last history row above the viewport.
             frame.push_str(&"\r\n\x1b[K".repeat(rows.len().max(1)));
         }
 
         let repaint = moved || self.invalidated || !history.is_empty();
-        for (index, line) in rows.iter().enumerate() {
-            if repaint || self.rows.get(index) != Some(line) {
-                move_to(&mut frame, top + index, 0);
-                frame.push_str("\x1b[2K");
-                frame.push_str(line);
+        let mut index = 0;
+        while index < rows.len() {
+            let start = index;
+            while index + 1 < rows.len() && rows[index].wrapped {
+                index += 1;
             }
+            let end = index + 1;
+            if repaint || self.rows.get(start..end) != Some(&rows[start..end]) {
+                // Clear the whole logical line first, then write it without cursor moves
+                // at soft boundaries. Cursor-addressed repainting loses native wrap flags.
+                for row in start..end {
+                    move_to(&mut frame, top + row, 0);
+                    frame.push_str("\x1b[K");
+                }
+                move_to(&mut frame, top + start, 0);
+                for row in &rows[start..end] {
+                    frame.push_str(&row.line);
+                }
+            }
+            index = end;
         }
         if cursor.is_some() != self.cursor.is_some() || self.invalidated || self.size.is_none() {
             frame.push_str(if cursor.is_some() {
@@ -128,8 +145,14 @@ fn move_to(frame: &mut String, row: usize, column: usize) {
 mod tests {
     use super::*;
 
-    fn rows(text: &[&str]) -> Vec<String> {
-        text.iter().map(|text| (*text).to_owned()).collect()
+    fn rows(text: &[&str]) -> Vec<HistoryRow<String>> {
+        text.iter()
+            .map(|text| HistoryRow::hard((*text).to_owned()))
+            .collect()
+    }
+
+    fn history(text: &[&str]) -> Vec<HistoryRow<String>> {
+        rows(text)
     }
 
     #[test]
@@ -140,7 +163,10 @@ mod tests {
         let base = rows(&["working", "draft", "directory", "stats"]);
         for count in [0, 1, 40] {
             let history = (0..count)
-                .map(|index| format!("output {index}"))
+                .map(|index| HistoryRow {
+                    line: format!("output {index}"),
+                    wrapped: false,
+                })
                 .collect::<Vec<_>>();
             terminal.process(
                 view.draw((24, 12), base.clone(), Some((1, 5)), &history, &[])
@@ -172,7 +198,7 @@ mod tests {
             rows(&["draft", "stats"]),
         ] {
             let history = if view.size.is_none() {
-                rows(&["answer"])
+                history(&["answer"])
             } else {
                 Vec::new()
             };
@@ -182,7 +208,16 @@ mod tests {
             );
             let visible = terminal.screen().contents();
             assert!(visible.contains("answer"), "{visible}");
-            assert!(visible.ends_with(&live.join("\n")), "{visible}");
+            assert!(
+                visible.ends_with(
+                    &live
+                        .iter()
+                        .map(|row| row.line.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                ),
+                "{visible}"
+            );
         }
     }
 
@@ -204,6 +239,48 @@ mod tests {
     }
 
     #[test]
+    fn native_selection_keeps_a_hard_boundary_across_a_collapsed_gap() {
+        use crate::ui::text::{Block, Line};
+        let source = "0123456789abcdefghijABCDEFGHIJ";
+        let mut block = Block::collapsible(vec![Line::plain(source)], 1, 0, 1);
+        for expanded in [false, true] {
+            if let Block::Collapsible(inner) = &mut block {
+                inner.expanded = expanded;
+            }
+            let history = block
+                .history_rows(10)
+                .into_iter()
+                .map(|row| HistoryRow {
+                    line: row.line.text(),
+                    wrapped: row.wrapped,
+                })
+                .collect::<Vec<_>>();
+            let mut terminal = vt100::Parser::new(12, 10, 100);
+            let mut view = Viewport::default();
+            terminal.process(
+                view.draw(
+                    (10, 12),
+                    rows(&["draft", "stats"]),
+                    Some((0, 0)),
+                    &history,
+                    &[],
+                )
+                .as_bytes(),
+            );
+            assert_eq!(
+                terminal
+                    .screen()
+                    .contents_between(10 - history.len() as u16, 0, 9, 10),
+                if expanded {
+                    source
+                } else {
+                    "0123456789\nABCDEFGHIJ"
+                }
+            );
+        }
+    }
+
+    #[test]
     fn resize_reflows_visible_history_and_reanchors_the_cursor() {
         let mut terminal = vt100::Parser::new(12, 24, 100);
         let mut view = Viewport::default();
@@ -215,7 +292,7 @@ mod tests {
                 rows(&["draft", "stats"]),
                 Some((0, 5)),
                 &[],
-                &rows(&["history", "tail"]),
+                &history(&["history", "tail"]),
             );
             terminal.process(frame.as_bytes());
             assert!(terminal.screen().contents().ends_with("tail\ndraft\nstats"));
