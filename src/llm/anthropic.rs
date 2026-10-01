@@ -509,6 +509,7 @@ pub struct Assembler {
     search_notice: crate::llm::SearchNotice,
     usage: Usage,
     stop_reason: Option<String>,
+    saw_message_stop: bool,
     error: Option<String>,
     /// Where a search block was issued, so the next turn only sends it back to that model.
     provider: String,
@@ -661,6 +662,7 @@ impl Assembler {
                     self.set_usage(usage);
                 }
             }
+            "message_stop" => self.saw_message_stop = true,
             _ => {}
         }
     }
@@ -718,6 +720,29 @@ impl Assembler {
             stop_reason,
             error: None,
         }
+    }
+
+    pub fn finish_stream(self) -> Completion {
+        let confirmed = self.saw_message_stop
+            && matches!(
+                self.stop_reason.as_deref(),
+                Some(
+                    "end_turn"
+                        | "stop_sequence"
+                        | "tool_use"
+                        | "max_tokens"
+                        | "pause_turn"
+                        | "refusal"
+                )
+            );
+        let completion = self.finish();
+        if completion.error.is_some() {
+            return completion.checked();
+        }
+        if !confirmed {
+            return completion.failed("流式响应未收到完整的 message_stop 和 stop_reason");
+        }
+        completion.checked()
     }
 }
 

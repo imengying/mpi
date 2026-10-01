@@ -10,7 +10,7 @@
 
 use crate::ui::theme::Color;
 use crate::util;
-use unicode_width::UnicodeWidthChar;
+use unicode_segmentation::UnicodeSegmentation;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Style {
@@ -34,23 +34,58 @@ pub enum Bg {
 
 impl Style {
     pub const fn plain() -> Self {
-        Style { fg: Color::Text, bold: false, italic: false, underline: false, crossed_out: false, bg: Bg::None }
+        Style {
+            fg: Color::Text,
+            bold: false,
+            italic: false,
+            underline: false,
+            crossed_out: false,
+            bg: Bg::None,
+        }
     }
 
     pub const fn new(fg: Color) -> Self {
-        Style { fg, bold: false, italic: false, underline: false, crossed_out: false, bg: Bg::None }
+        Style {
+            fg,
+            bold: false,
+            italic: false,
+            underline: false,
+            crossed_out: false,
+            bg: Bg::None,
+        }
     }
 
     pub const fn bold(fg: Color) -> Self {
-        Style { fg, bold: true, italic: false, underline: false, crossed_out: false, bg: Bg::None }
+        Style {
+            fg,
+            bold: true,
+            italic: false,
+            underline: false,
+            crossed_out: false,
+            bg: Bg::None,
+        }
     }
 
     pub const fn italic(fg: Color) -> Self {
-        Style { fg, bold: false, italic: true, underline: false, crossed_out: false, bg: Bg::None }
+        Style {
+            fg,
+            bold: false,
+            italic: true,
+            underline: false,
+            crossed_out: false,
+            bg: Bg::None,
+        }
     }
 
     pub const fn with_bg(fg: Color, bg: Bg) -> Self {
-        Style { fg, bold: false, italic: false, underline: false, crossed_out: false, bg }
+        Style {
+            fg,
+            bold: false,
+            italic: false,
+            underline: false,
+            crossed_out: false,
+            bg,
+        }
     }
 }
 /// A run of characters sharing one style.
@@ -66,7 +101,10 @@ pub struct Span {
 
 impl Span {
     pub fn new(text: impl Into<String>, style: Style) -> Self {
-        Span { text: text.into(), style }
+        Span {
+            text: text.into(),
+            style,
+        }
     }
 
     pub fn plain(text: impl Into<String>) -> Self {
@@ -76,7 +114,10 @@ impl Span {
     /// A run whose background is painted to `fill` columns beyond its own text, so a diff
     /// row reads as a solid bar right up to the edge of the terminal.
     pub fn with_fill(text: impl Into<String>, style: Style, fill: Bg) -> Span {
-        Span { text: text.into(), style: Style { bg: fill, ..style } }
+        Span {
+            text: text.into(),
+            style: Style { bg: fill, ..style },
+        }
     }
 }
 
@@ -97,7 +138,10 @@ pub struct Line {
 
 impl Line {
     pub fn new(text: impl Into<String>, style: Style) -> Self {
-        Line { spans: vec![Span::new(text, style)], hang: 0 }
+        Line {
+            spans: vec![Span::new(text, style)],
+            hang: 0,
+        }
     }
 
     pub fn plain(text: impl Into<String>) -> Self {
@@ -115,7 +159,10 @@ impl Line {
     /// Build a line from already-styled runs. Empty runs are dropped, and a line with no
     /// runs left is blank rather than an empty row with a style.
     pub fn spans(spans: Vec<Span>) -> Self {
-        let spans: Vec<Span> = spans.into_iter().filter(|span| !span.text.is_empty()).collect();
+        let spans: Vec<Span> = spans
+            .into_iter()
+            .filter(|span| !span.text.is_empty())
+            .collect();
         if spans.is_empty() {
             Line::blank()
         } else {
@@ -186,6 +233,7 @@ pub struct Collapsible {
 #[derive(Debug, Clone)]
 pub enum Block {
     Lines(Vec<Line>),
+    Markdown(String),
     Collapsible(Collapsible),
 }
 
@@ -202,6 +250,10 @@ impl Collapsible {
 impl Block {
     pub fn lines(lines: Vec<Line>) -> Self {
         Block::Lines(lines)
+    }
+
+    pub fn markdown(text: impl Into<String>) -> Self {
+        Block::Markdown(text.into())
     }
 
     /// A block whose tail is shown by default and which Ctrl+O expands. The first `head`
@@ -226,12 +278,26 @@ impl Block {
         middle_head: usize,
         preview: usize,
     ) -> Self {
-        Block::Collapsible(Collapsible { lines, head, tail, middle_head, preview, expanded: false })
+        Block::Collapsible(Collapsible {
+            lines,
+            head,
+            tail,
+            middle_head,
+            preview,
+            expanded: false,
+        })
     }
 
     pub fn render(&self, width: usize) -> Vec<Line> {
         match self {
             Block::Lines(lines) => wrap_all(lines, width),
+            Block::Markdown(text) => {
+                let mut lines = wrap_all(&crate::ui::markdown::render(text, width), width);
+                if !lines.is_empty() {
+                    lines.push(Line::blank());
+                }
+                lines
+            }
             Block::Collapsible(block) => {
                 let wrapped = wrap_all(&block.lines, width);
                 let total = wrapped.len();
@@ -245,10 +311,12 @@ impl Block {
                 let hidden = total - head - tail - block.middle_head - block.preview;
                 let mut out = wrapped[..head].to_vec();
                 // The start of the middle, then the end of it, then the always-visible tail.
+                out.extend(wrapped[head..head + block.middle_head].iter().cloned());
                 out.extend(
-                    wrapped[head..head + block.middle_head].iter().cloned(),
+                    wrapped[head + hidden + block.middle_head..total - tail]
+                        .iter()
+                        .cloned(),
                 );
-                out.extend(wrapped[head + hidden + block.middle_head..total - tail].iter().cloned());
                 out.extend(wrapped[total - tail..].iter().cloned());
                 out
             }
@@ -271,30 +339,30 @@ pub fn wrap_line(line: &Line, width: usize) -> Vec<Line> {
     let hang = line.hang.min(width.saturating_sub(1));
     // The first row has the full width; the rest lose the hang.
     let cont_width = width.saturating_sub(hang).max(1);
-    let mut chars: Vec<(char, Style)> = Vec::new();
+    let mut chars: Vec<(&str, Style)> = Vec::new();
     for span in &line.spans {
-        for c in span.text.chars() {
-            chars.push((c, span.style));
+        for grapheme in span.text.graphemes(true) {
+            chars.push((grapheme, span.style));
         }
     }
     if chars.is_empty() {
         return vec![Line::blank()];
     }
-    let mut rows: Vec<Vec<(char, Style)>> = vec![Vec::new()];
+    let mut rows: Vec<Vec<(&str, Style)>> = vec![Vec::new()];
     let mut used = 0usize;
     // (row, index within row) of the most recent break opportunity.
     let mut last_space: Option<(usize, usize)> = None;
     // Width available on the row currently being filled.
     let mut limit = width;
     for (c, style) in chars {
-        if c == '\n' {
+        if c == "\n" {
             rows.push(Vec::new());
             used = 0;
             limit = cont_width;
             last_space = None;
             continue;
         }
-        let char_width = UnicodeWidthChar::width(c).unwrap_or(0);
+        let char_width = util::width(c);
         if used > 0 && used + char_width > limit {
             match last_space.take() {
                 Some((row, index)) if row + 1 == rows.len() => {
@@ -303,7 +371,12 @@ pub fn wrap_line(line: &Line, width: usize) -> Vec<Line> {
                     // The space itself is dropped rather than left dangling.
                     rows.last_mut().unwrap().pop();
                     rows.push(rest);
-                    used = rows.last().unwrap().iter().map(|(c, _)| UnicodeWidthChar::width(*c).unwrap_or(0)).sum();
+                    used = rows
+                        .last()
+                        .unwrap()
+                        .iter()
+                        .map(|(c, _)| util::width(c))
+                        .sum();
                 }
                 _ => {
                     rows.push(Vec::new());
@@ -314,11 +387,16 @@ pub fn wrap_line(line: &Line, width: usize) -> Vec<Line> {
         }
         // A regular space is a break opportunity; a non-breaking space is not, which is
         // how a list marker stays with the first word of its item.
-        if c == ' ' {
+        if c == " " {
             last_space = Some((rows.len() - 1, rows.last().unwrap().len()));
         }
-        used += char_width;
-        rows.last_mut().unwrap().push((c, style));
+        let (shown, cells) = if char_width > limit && used == 0 {
+            ("…", 1)
+        } else {
+            (c, char_width)
+        };
+        used += cells;
+        rows.last_mut().unwrap().push((shown, style));
     }
     let mut lines: Vec<Line> = Vec::with_capacity(rows.len());
     for (index, row) in rows.into_iter().enumerate() {
@@ -335,24 +413,39 @@ pub fn wrap_line(line: &Line, width: usize) -> Vec<Line> {
 }
 
 /// Merge adjacent characters that share a style back into runs.
-fn coalesce(row: Vec<(char, Style)>) -> Vec<Span> {
+fn coalesce(row: Vec<(&str, Style)>) -> Vec<Span> {
     let mut spans: Vec<Span> = Vec::new();
     for (c, style) in row {
         match spans.last_mut() {
-            Some(last) if last.style == style => last.text.push(c),
-            _ => spans.push(Span::new(c.to_string(), style)),
+            Some(last) if last.style == style => last.text.push_str(c),
+            _ => spans.push(Span::new(c, style)),
         }
     }
     spans
 }
 /// Wrap a group of lines, flattening the result.
 pub fn wrap_all(lines: &[Line], width: usize) -> Vec<Line> {
-    lines.iter().flat_map(|line| wrap_line(line, width)).collect()
+    lines
+        .iter()
+        .flat_map(|line| wrap_line(line, width))
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn markdown_history_rebuilds_code_frames_at_the_new_width() {
+        let block = Block::markdown(
+            "```rust\nlet long = something_long_that_needs_wrapping();\n```\n\n下一段",
+        );
+        for width in [1, 8, 20, 80] {
+            let rendered = block.render(width);
+            assert!(rendered.iter().all(|line| line.width() <= width));
+            assert!(rendered.last().unwrap().is_empty());
+        }
+    }
 
     #[test]
     fn a_collapsible_block_keeps_only_its_excerpt() {
@@ -367,7 +460,6 @@ mod tests {
         assert!(!rendered.iter().any(|line| line.text().contains("收起")));
     }
 
-
     #[test]
     fn expanding_shows_everything_and_short_blocks_are_left_alone() {
         let mut block = Block::collapsible(
@@ -381,9 +473,13 @@ mod tests {
             collapsible.expanded = true;
         }
         assert_eq!(block.render(40).len(), 4);
-        assert!(!block.render(40).iter().any(|line| line.text().contains("收起")));
+        assert!(
+            !block
+                .render(40)
+                .iter()
+                .any(|line| line.text().contains("收起"))
+        );
     }
-
 
     #[test]
     fn the_always_visible_head_survives_collapsing() {
@@ -398,7 +494,6 @@ mod tests {
         assert_eq!(rendered[4].text(), "row 11");
     }
 
-
     #[test]
     fn an_always_visible_tail_keeps_the_outcome_in_view() {
         let mut lines: Vec<Line> = (0..12).map(|i| Line::plain(format!("row {i}"))).collect();
@@ -411,7 +506,6 @@ mod tests {
         assert!(text.last().unwrap().contains("退出码 3"), "{text:?}");
     }
 
-
     #[test]
     fn wrapping_measures_display_width_not_bytes() {
         let lines = vec![Line::plain("你好世界".repeat(6))];
@@ -422,7 +516,6 @@ mod tests {
             assert_eq!(line.text(), line.text(), "no escapes may be embedded");
         }
     }
-
 
     #[test]
     fn wrapping_keeps_every_run_style() {
@@ -437,7 +530,6 @@ mod tests {
         assert_eq!(rows[0].spans[0].style.fg, Color::Output);
         assert_eq!(rows[0].spans[2].style.fg, Color::Magenta);
     }
-
 
     #[test]
     fn a_break_drops_the_space_at_the_wrap_point() {

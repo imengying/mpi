@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use crate::agent::compact::{self, CompactError, CompactionState, Reason, RetryBudget, SummaryRequest};
 use crate::agent::session::Session;
 use crate::auth::guard::PermissionGate;
-use crate::auth::policy::{self, Dialect};
+use crate::auth::policy;
 use crate::config::{Config, Defaults, ModelConfig, Provider};
 use crate::llm::client::Client;
 use crate::llm::{self, Delta, Message, Request, StopReason};
@@ -137,6 +137,32 @@ pub struct Agent {
     deleted: bool,
 }
 
+fn restored_selection(config: &Config, session: &Session) -> anyhow::Result<(String, String)> {
+    let (recorded_model, recorded_level) = session
+        .current_model()
+        .unwrap_or_else(|| (session.header().model.clone(), String::new()));
+    let (model_spec, recorded_level) = if config.find(&recorded_model).is_some() {
+        (recorded_model, recorded_level)
+    } else {
+        (
+            config
+                .default_model
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("配置里没有可用的模型"))?,
+            String::new(),
+        )
+    };
+    let (_, model) = config
+        .find(&model_spec)
+        .ok_or_else(|| anyhow::anyhow!("模型「{model_spec}」不存在"))?;
+    let level = if recorded_level.is_empty() {
+        model.levels().first().cloned().unwrap_or_default()
+    } else {
+        llm::clamp_level(model, &recorded_level).0
+    };
+    Ok((model_spec, level))
+}
+
 impl Agent {
     pub fn new(config: Config, cwd: PathBuf, interactive: bool) -> anyhow::Result<Self> {
         let model_spec = config
@@ -193,31 +219,7 @@ impl Agent {
     /// Resume an existing session file.
     pub fn resume(config: Config, cwd: PathBuf, path: &Path, interactive: bool) -> anyhow::Result<Self> {
         let mut session = Session::open(path)?;
-        // Use the newest recorded turn, or the header if no turn has started yet.
-        let (recorded_model, recorded_level) = session.current_model().unwrap_or_default();
-        let model_spec = match recorded_model {
-            spec if !spec.is_empty() => spec,
-            _ => session.header().model.clone(),
-        };
-        let model_spec = if config.find(&model_spec).is_some() {
-            model_spec
-        } else {
-            config
-                .default_model
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("配置里没有可用的模型"))?
-        };
-        // The level is only meaningful for the model it was recorded with, and a config edit
-        // can remove it; clamping against the model being resumed keeps a level that no
-        // longer exists from being sent.
-        let level = {
-            let (_, model) = config.find(&model_spec).unwrap();
-            if recorded_level.is_empty() {
-                model.levels().first().cloned().unwrap_or_default()
-            } else {
-                crate::llm::clamp_level(model, &recorded_level).0
-            }
-        };
+        let (model_spec, level) = restored_selection(&config, &session)?;
         let dialect = policy::configured_dialect(&config.shell.path);
         let client = Client::new()?;
         let mut screen = Screen::new();
@@ -237,13 +239,19 @@ impl Agent {
         // questions would look like the answers were lost. Environment blocks are skipped —
         // they are bookkeeping, and the newest one is written back below if the directory
         // changed.
-        for block in ui_compact::replay_blocks(&session.context_messages(), screen.width()) {
+        for block in ui_compact::replay_blocks(&session.context_messages()) {
             screen.push(block);
         }
         // The arrows reach back into the conversation, not just into this process: Up on a
         // resumed session has to find the message that was typed before the resume, or the
         // turns already in the file look like they were never typed.
         screen.seed_history(session.user_history());
+        for note in session.recovery_notes() {
+            screen.push_lines(ui_compact::note_lines(
+                note,
+                crate::ui::screen::Style::new(Color::Yellow),
+            ));
+        }
         // The working directory travels with the session: the newest environment block names
         // it, so running the tools somewhere else would make the transcript lie about where
         // it is. The header records where the session *started*, which is not the same thing
@@ -302,6 +310,31 @@ impl Agent {
         Ok(agent)
     }
 
+    fn restore_session(&mut self, session: Session) -> anyhow::Result<()> {
+        let (model_spec, level) = restored_selection(&self.config, &session)?;
+        self.session = session;
+        self.model_spec = model_spec;
+        self.level = level;
+        self.compaction = CompactionState::default();
+        self.retry = RetryBudget::default();
+        self.deleted = false;
+        self.system_prompt = system_prompt_from(&self.cwd);
+        self.screen.clear_transcript();
+        for block in
+            ui_compact::replay_blocks(&self.session.context_messages())
+        {
+            self.screen.push(block);
+        }
+        self.screen.seed_history(self.session.user_history());
+        for note in self.session.recovery_notes() {
+            self.screen.push_lines(ui_compact::note_lines(
+                note,
+                crate::ui::screen::Style::new(Color::Yellow),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn model_spec(&self) -> &str {
         &self.model_spec
     }
@@ -346,20 +379,19 @@ impl Agent {
         });
         let context_window = model.and_then(|model| model.context_window);
         let state = FooterState {
-            cwd: &self.cwd,
+            cwd: self.cwd.clone(),
             branch: footer::git_branch(&self.cwd),
             session_name: self.session.name(),
             totals: self.session.totals,
             cache_hit_rate: cache_hit,
             context_tokens: if self.compaction.tokens_unknown { None } else { context_tokens },
             context_window,
-            model,
-            level: &level,
+            model: model.cloned(),
+            level,
             compacting: self.compaction.running,
-            busy,
+            busy: busy.map(str::to_owned),
         };
-        let lines = footer::render(&state, &self.screen.theme, self.screen.width());
-        self.screen.set_footer(lines);
+        self.screen.set_footer_state(state);
         // The session name and directory both live in the footer, so the window title is
         // refreshed wherever the footer is — including a session switch.
         self.screen.set_title(self.session.name().as_deref(), &self.cwd);
@@ -395,10 +427,8 @@ fn on_turn_action(screen: &mut Screen, action: crate::ui::screen::Action) -> boo
         Action::ToggleExpand => {
             let _ = screen.toggle_last_collapsible();
         }
-        Action::Stop => return true,
-        // Ctrl+C / Ctrl+D during a turn do nothing: Ctrl+C clears the input line, and the
-        // request itself is stopped with Esc, which is the key that says what it wants.
-        Action::Interrupt | Action::Eof => {}
+        Action::Stop | Action::Interrupt => return true,
+        Action::Eof => {}
     }
     false
 }
@@ -506,11 +536,6 @@ fn drain_deltas(screen: &mut Screen, deltas: &mut tokio::sync::mpsc::UnboundedRe
     apply_deltas(screen, first, deltas);
 }
 
-/// Exposed for tests: the dialect pi will hand to the policy.
-pub fn dialect_for(config: &Config) -> Dialect {
-    policy::configured_dialect(&config.shell.path)
-}
-
 /// `AGENTS.md` filenames, in the order pi looks for them.
 const AGENTS_FILES: &[&str] = &["AGENTS.md", "AGENTS.MD"];
 /// The project root: the nearest directory at or above `cwd` that holds a `.git`, or `cwd`
@@ -565,6 +590,38 @@ mod turn;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn switching_sessions_restores_the_target_model_and_level() {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "providers":[{"name":"test", "api":"completions", "base_url":"http://127.0.0.1", "api_key":"unused", "models":[
+                {"id":"first", "reasoning":true}, {"id":"second", "reasoning":true}
+            ]}], "default_model":"test/first"
+        })).unwrap();
+        let dir = std::env::temp_dir().join(format!("pi-model-restore-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir(&dir).unwrap();
+        let mut session = Session::create_in(&dir, &dir, "test/first").unwrap();
+        let path = session.path().to_path_buf();
+        session
+            .push_message(Message::user_text("之前的任务"), None, None)
+            .unwrap();
+        session
+            .push_turn_context(&dir, "test/second", "high")
+            .unwrap();
+        drop(session);
+        let mut agent = Agent::new(config.clone(), dir.clone(), false).unwrap();
+        agent
+            .restore_session(Session::open(&path).unwrap())
+            .unwrap();
+        assert_eq!(agent.model_spec, "test/second");
+        assert_eq!(agent.level, "high");
+        drop(agent);
+        let resumed = Agent::resume(config, dir.clone(), &path, false).unwrap();
+        assert_eq!(resumed.model_spec, "test/second");
+        assert_eq!(resumed.level, "high");
+        drop(resumed);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn there_is_no_built_in_prompt() {
@@ -676,9 +733,9 @@ mod tests {
     fn the_dialect_comes_from_the_configured_shell() {
         let mut config = Config::default();
         config.shell.path = "/usr/bin/zsh".into();
-        assert_eq!(dialect_for(&config), Dialect::Zsh);
+        assert_eq!(policy::configured_dialect(&config.shell.path), policy::Dialect::Zsh);
         config.shell.path = "/bin/bash".into();
-        assert_eq!(dialect_for(&config), Dialect::Bash);
+        assert_eq!(policy::configured_dialect(&config.shell.path), policy::Dialect::Bash);
     }
 
 }

@@ -262,6 +262,52 @@ pub struct Completion {
 }
 
 impl Completion {
+    /// Keep useful partial prose, but never replay or execute unconfirmed tool state.
+    pub(crate) fn failed(mut self, error: impl Into<String>) -> Self {
+        self.stop_reason = StopReason::Error;
+        self.error = Some(error.into());
+        if let Message::Assistant {
+            content,
+            stop_reason,
+        } = &mut self.message
+        {
+            *stop_reason = Some(StopReason::Error);
+            content.retain(|block| !matches!(block, Block::ToolCall { .. } | Block::Hosted { .. }));
+            for block in content {
+                if let Block::Thinking { signature, .. } = block {
+                    *signature = None;
+                }
+            }
+        }
+        self
+    }
+
+    pub(crate) fn checked(mut self) -> Self {
+        if self.stop_reason == StopReason::Error || self.error.is_some() {
+            let error = self
+                .error
+                .take()
+                .unwrap_or_else(|| "上游未正常完成响应".into());
+            return self.failed(error);
+        }
+        if self.stop_reason == StopReason::Length {
+            if let Message::Assistant { content, .. } = &mut self.message {
+                content.retain(|block| !matches!(block, Block::ToolCall { .. }));
+            }
+        } else {
+            if !self.message.tool_calls().is_empty() && self.stop_reason != StopReason::ToolUse {
+                return self.failed("上游未确认工具调用的执行状态");
+            }
+            let mut ids = std::collections::HashSet::new();
+            if self.message.tool_calls().iter().any(|(id, name, args)| {
+                id.is_empty() || name.is_empty() || !args.is_object() || !ids.insert(*id)
+            }) {
+                return self.failed("上游返回了不完整或重复的工具调用");
+            }
+        }
+        self
+    }
+
     pub fn text(&self) -> String {
         self.message.text()
     }
@@ -312,13 +358,27 @@ pub struct Request<'a> {
 
 /// Validate the call/result sequence before routing, without rewriting durable history.
 pub fn validate_tool_history(messages: &[Message]) -> Result<(), LlmError> {
-    let mut pending = std::collections::HashMap::new();
+    if !pending_tool_calls(messages)?.is_empty() {
+        return Err(LlmError::Decode("对话末尾仍有未完成的工具调用".into()));
+    }
+    Ok(())
+}
+
+/// Validate all completed turns and return only unfinished calls at the history's tail.
+pub(crate) fn pending_tool_calls(messages: &[Message]) -> Result<Vec<(String, String)>, LlmError> {
+    let mut pending: Vec<(String, String)> = Vec::new();
     for message in messages {
-        if let Message::Tool { tool_call_id, name, .. } = message {
-            match pending.remove(tool_call_id.as_str()) {
-                Some(expected) if expected == name.as_str() => {}
-                _ => return Err(LlmError::Decode(format!("工具结果 {tool_call_id} 没有匹配的调用"))),
-            }
+        if let Message::Tool {
+            tool_call_id, name, ..
+        } = message
+        {
+            let index = pending
+                .iter()
+                .position(|(id, expected)| id == tool_call_id && expected == name)
+                .ok_or_else(|| {
+                    LlmError::Decode(format!("工具结果 {tool_call_id} 没有匹配的调用"))
+                })?;
+            pending.remove(index);
             continue;
         }
         if !pending.is_empty() {
@@ -328,15 +388,13 @@ pub fn validate_tool_history(messages: &[Message]) -> Result<(), LlmError> {
             if id.is_empty() || name.is_empty() {
                 return Err(LlmError::Decode("历史工具调用的 id 或名称无效".into()));
             }
-            if pending.insert(id, name).is_some() {
+            if pending.iter().any(|(pending_id, _)| pending_id == id) {
                 return Err(LlmError::Decode(format!("重复的工具调用 id：{id}")));
             }
+            pending.push((id.to_string(), name.to_string()));
         }
     }
-    if !pending.is_empty() {
-        return Err(LlmError::Decode("对话末尾仍有未完成的工具调用".into()));
-    }
-    Ok(())
+    Ok(pending)
 }
 
 /// The hosted-search shape to send on this request, if the model asked for it and the

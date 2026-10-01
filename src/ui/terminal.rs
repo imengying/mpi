@@ -14,76 +14,45 @@ use crate::util;
 /// The name the window title leads with, as pi uses `π`.
 pub const APP_TITLE: &str = "π";
 
-/// Raw mode, held by every part of the UI that needs it.
-///
-/// The count is the whole point. The prompt needs raw mode; so do the pickers and the
-/// authorization panel, and those run *inside* a turn. With a plain guard each of them would
-/// switch raw mode off on the way out, and the prompt would then be reading a terminal that
-/// echoes and line-buffers — which is why typing during a turn used to go nowhere: the bytes
-/// were swallowed by the line discipline until the next prompt asked for a line.
-///
-/// So the mode belongs to the program, not to the read: it goes on at the first request and
-/// off when the process tears down. The count exists so the nesting is not a lie.
-pub struct RawGuard;
-
-static RAW_HOLDERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-impl RawGuard {
-    pub(crate) fn enter() -> std::io::Result<Self> {
-        if RAW_HOLDERS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
-            let result = terminal::enable_raw_mode().and_then(|()| {
-                crossterm::execute!(std::io::stdout(), event::EnableBracketedPaste)
-            });
-            if let Err(err) = result {
-                RAW_HOLDERS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                let _ = terminal::disable_raw_mode();
-                return Err(err);
-            }
-        }
-        Ok(RawGuard)
+/// Raw mode belongs to the interactive session and ends at teardown.
+/// Nested pickers and approval panels reuse it without changing its lifetime.
+pub(crate) fn ensure_raw_mode() -> std::io::Result<()> {
+    if terminal::is_raw_mode_enabled()? {
+        return Ok(());
     }
-}
-
-impl Drop for RawGuard {
-    fn drop(&mut self) {
-        // The mode is not switched off here: see `RawGuard` above. It is released once, at
-        // teardown, so a picker closing does not take the prompt's raw mode with it.
-        RAW_HOLDERS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    terminal::enable_raw_mode()?;
+    let result = crossterm::execute!(
+        std::io::stdout(),
+        event::EnableBracketedPaste,
+        event::PushKeyboardEnhancementFlags(
+            event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        )
+    );
+    if result.is_err() {
+        let _ = terminal::disable_raw_mode();
     }
+    result
 }
 
 /// Leave the terminal clean when pi exits. Piped output gets no escape sequences.
 pub fn teardown() {
+    let active = terminal::is_raw_mode_enabled().unwrap_or(false);
     let _ = terminal::disable_raw_mode();
-    if !std::io::stdout().is_terminal() {
+    if !active || !std::io::stdout().is_terminal() {
         return;
     }
     let mut out = std::io::stdout();
-    let _ = crossterm::execute!(out, event::DisableBracketedPaste, cursor::Show);
+    let _ = crossterm::execute!(
+        out,
+        event::PopKeyboardEnhancementFlags,
+        event::DisableBracketedPaste,
+        cursor::Show,
+        terminal::EndSynchronizedUpdate
+    );
     let _ = out.flush();
 }
 
-/// The window title: `π - <session name> - <project>`, or `π - <project>` when the session
-/// has no name yet.
-///
-/// The project is the **name** of its root directory, not the path it lives at. A terminal
-/// tab is a few centimetres wide, and `π - ~/文档/mpi` spends most of them on a location the
-/// user already knows — they are looking for which project, not where it is. A session name
-/// still takes precedence: it is what the user chose to call this conversation.
-///
-/// Control characters are flattened: a session name is user input, and a newline or an
-/// escape byte in it would break out of the OSC sequence and let the rest be interpreted
-/// The window title: `π - <session name> - <project>`, or `π - <project>` when the session
-/// has no name yet.
-///
-/// The project is the **name** of its root directory, not the path it lives at. A terminal
-/// tab is a few centimetres wide, and `π - ~/文档/mpi` spends most of them on a location the
-/// user already knows — they are looking for which project, not where it is. A session name
-/// still takes precedence: it is what the user chose to call this conversation.
-///
-/// Control characters are flattened: a session name is user input, and a newline or an
-/// escape byte in it would break out of the OSC sequence and let the rest be interpreted
-/// as terminal commands.
+/// Set the tab title from the session name or project basename, stripping controls.
 pub fn window_title(name: Option<&str>, cwd: &Path) -> String {
     let mut title = String::from(APP_TITLE);
     let name = name.map(str::trim).filter(|name| !name.is_empty());

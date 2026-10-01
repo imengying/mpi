@@ -18,34 +18,35 @@ use crate::ui::theme::{CACHE_ICON, Color, Theme};
 use crate::util;
 
 /// Everything the footer needs, gathered once per render.
-pub struct FooterState<'a> {
-    pub cwd: &'a Path,
+#[derive(Clone)]
+pub struct FooterState {
+    pub cwd: std::path::PathBuf,
     pub branch: Option<String>,
     pub session_name: Option<String>,
     pub totals: Usage,
     pub cache_hit_rate: Option<f64>,
     pub context_tokens: Option<u64>,
     pub context_window: Option<u64>,
-    pub model: Option<&'a ModelConfig>,
-    pub level: &'a str,
+    pub model: Option<ModelConfig>,
+    pub level: String,
     /// A compaction is running: the count is not trustworthy yet.
     pub compacting: bool,
     /// Shown while a turn is in flight.
-    pub busy: Option<&'a str>,
+    pub busy: Option<String>,
 }
 
 /// Build the two footer lines at `width` columns.
-pub fn render(state: &FooterState<'_>, theme: &Theme, width: usize) -> Vec<Line> {
+pub fn render(state: &FooterState, theme: &Theme, width: usize) -> Vec<Line> {
     let mut lines = vec![location_line(state, width)];
-    if let Some(note) = state.busy {
+    if let Some(note) = &state.busy {
         lines.push(Line::new(note, Style::new(Color::Yellow)));
     }
     lines.push(stats_line(state, theme, width));
     lines
 }
 
-fn location_line(state: &FooterState<'_>, width: usize) -> Line {
-    let cwd = util::shorten_home(state.cwd, dirs::home_dir().as_deref());
+fn location_line(state: &FooterState, width: usize) -> Line {
+    let cwd = util::shorten_home(&state.cwd, dirs::home_dir().as_deref());
     // The line is built to fit `width`: it is one row of the live region, and a row that the
     // terminal wraps on its own would throw the region's row count off by one — which shows up
     // as the whole footer creeping down the screen, a row per redraw.
@@ -82,13 +83,16 @@ fn location_line(state: &FooterState<'_>, width: usize) -> Line {
         let room = budget.saturating_sub(3).min(Defaults::SESSION_NAME_WIDTH);
         if room > 0 {
             spans.push(Span::new(" • ", Style::new(Color::Dim)));
-            spans.push(Span::new(util::truncate(&name, room, "…"), Style::new(Color::Text)));
+            spans.push(Span::new(
+                util::truncate(&name, room, "…"),
+                Style::new(Color::Text),
+            ));
         }
     }
     Line::spans(spans)
 }
 
-fn stats_line(state: &FooterState<'_>, theme: &Theme, width: usize) -> Line {
+fn stats_line(state: &FooterState, theme: &Theme, width: usize) -> Line {
     let hit = match state.cache_hit_rate {
         Some(rate) => format!("{rate:.1}%"),
         None => "—".to_string(),
@@ -121,22 +125,42 @@ fn stats_line(state: &FooterState<'_>, theme: &Theme, width: usize) -> Line {
     // Split the left half back into its four runs so each context field can carry its own
     // colour: usage keeps its theme accent, while the gauge highlights warnings and errors.
     let mut spans = vec![
-        Span::new(format!("↑ {}", util::fmt_tokens(state.totals.input, false)), usage),
+        Span::new(
+            format!("↑ {}", util::fmt_tokens(state.totals.input, false)),
+            usage,
+        ),
         Span::new("   ", Style::plain()),
-        Span::new(format!("↓ {}", util::fmt_tokens(state.totals.output, false)), usage),
+        Span::new(
+            format!("↓ {}", util::fmt_tokens(state.totals.output, false)),
+            usage,
+        ),
         Span::new("   ", Style::plain()),
         Span::new(format!("{CACHE_ICON} {hit}"), usage),
         Span::new("   ", Style::plain()),
         Span::new(context_text.clone(), Style::new(context_color)),
     ];
-    let left_width = util::width(&left);
+    let mut left_width = util::width(&left);
+
+    if left_width + 4 > width {
+        let context = util::truncate(
+            &context_text,
+            width.saturating_sub(3).min(width / 2).max(1),
+            "…",
+        );
+        left_width = util::width(&context);
+        spans = vec![Span::new(context, Style::new(context_color))];
+    }
 
     let mut model = String::new();
-    if let Some(model_config) = state.model {
+    if let Some(model_config) = &state.model {
         model = util::one_line(model_config.display_name());
         // A model that cannot reason gets no suffix at all.
         if model_config.reasoning {
-            let level = if state.level.is_empty() { "low" } else { state.level };
+            let level = if state.level.is_empty() {
+                "low"
+            } else {
+                &state.level
+            };
             model = format!("{model} • {level}");
         }
     }
@@ -152,15 +176,23 @@ fn stats_line(state: &FooterState<'_>, theme: &Theme, width: usize) -> Line {
             .saturating_sub(left_width)
             .saturating_sub(util::width(&rendered));
         spans.push(Span::plain(" ".repeat(gap)));
-        let level = if state.level.is_empty() { "low" } else { state.level };
-        let model_color = if state.model.is_some_and(|model| model.reasoning) {
+        let level = if state.level.is_empty() {
+            "low"
+        } else {
+            &state.level
+        };
+        let model_color = if state.model.as_ref().is_some_and(|model| model.reasoning) {
             Color::reasoning(level)
         } else {
             Color::Cyan
         };
         let suffix = format!(" • {level}");
-        if state.model.is_some_and(|model| model.reasoning) && rendered.ends_with(&suffix) {
-            spans.push(Span::new(rendered[..rendered.len() - suffix.len()].to_string(), Style::new(model_color)));
+        if state.model.as_ref().is_some_and(|model| model.reasoning) && rendered.ends_with(&suffix)
+        {
+            spans.push(Span::new(
+                rendered[..rendered.len() - suffix.len()].to_string(),
+                Style::new(model_color),
+            ));
             spans.push(Span::new(" • ", Style::new(Color::Dim)));
             spans.push(Span::new(level, Style::new(Color::reasoning(level))));
         } else {
@@ -201,15 +233,23 @@ mod tests {
 
     #[test]
     fn reasoning_levels_have_distinct_accents_in_the_footer() {
-        let theme = Theme { mode: ColorMode::Ansi256 };
+        let theme = Theme {
+            mode: ColorMode::Ansi256,
+        };
         let model = model();
         let mut state = state("/tmp");
-        state.model = Some(&model);
+        state.model = Some(model.clone());
         let mut colors = Vec::new();
         for level in ["low", "medium", "high", "xhigh", "max"] {
-            state.level = level;
+            state.level = level.into();
             let rows = render(&state, &theme, 120);
-            let color = rows[1].spans.iter().find(|s| s.text == level).unwrap().style.fg;
+            let color = rows[1]
+                .spans
+                .iter()
+                .find(|s| s.text == level)
+                .unwrap()
+                .style
+                .fg;
             assert!(!colors.contains(&color));
             colors.push(color);
         }
@@ -220,17 +260,22 @@ mod tests {
             .unwrap()
     }
 
-    fn state(cwd: &str) -> FooterState<'_> {
+    fn state(cwd: &str) -> FooterState {
         FooterState {
-            cwd: Path::new(cwd),
+            cwd: cwd.into(),
             branch: Some("main".into()),
             session_name: Some("会话示例".into()),
-            totals: Usage { input: 173_000, output: 173_000, cache_read: 0, cache_write: 0 },
+            totals: Usage {
+                input: 173_000,
+                output: 173_000,
+                cache_read: 0,
+                cache_write: 0,
+            },
             cache_hit_rate: Some(99.5),
             context_tokens: Some(17_300),
             context_window: Some(1_000_000),
             model: None,
-            level: "high",
+            level: "high".into(),
             compacting: false,
             busy: None,
         }
@@ -238,10 +283,12 @@ mod tests {
 
     #[test]
     fn the_stats_line_matches_the_specified_layout() {
-        let theme = Theme { mode: ColorMode::True };
+        let theme = Theme {
+            mode: ColorMode::True,
+        };
         let model_config = model();
         let mut state = state("/tmp/中文目录");
-        state.model = Some(&model_config);
+        state.model = Some(model_config);
         let lines = render(&state, &theme, 120);
         let text = &plain(&lines)[1];
         assert!(
@@ -251,13 +298,16 @@ mod tests {
         assert!(text.ends_with("deepseek-v4.1-flash • high"), "{text:?}");
         assert_eq!(util::width(text), 120);
         // At least two columns of clearance before the right-aligned model name.
-        let gap = text.find("deepseek").unwrap() - text.find("17.3k/1M").unwrap() - "17.3k/1M".len();
+        let gap =
+            text.find("deepseek").unwrap() - text.find("17.3k/1M").unwrap() - "17.3k/1M".len();
         assert!(gap >= 2, "only {gap} columns of gap");
     }
 
     #[test]
     fn the_location_line_shows_directory_branch_and_name() {
-        let theme = Theme { mode: ColorMode::Ansi256 };
+        let theme = Theme {
+            mode: ColorMode::Ansi256,
+        };
         let home = dirs::home_dir().unwrap();
         let nested = home.join("文档/pi-custom");
         let nested_text = nested.to_string_lossy().to_string();
@@ -274,7 +324,9 @@ mod tests {
         // This row is part of the live region, and a row the terminal wraps by itself throws
         // the region's row count off — the footer then creeps down the screen, a row per
         // redraw, which reads as the footer repeating itself. So the line is built to fit.
-        let theme = Theme { mode: ColorMode::Ansi256 };
+        let theme = Theme {
+            mode: ColorMode::Ansi256,
+        };
         let mut state = state("/tmp");
         state.branch = Some("feature/一个很长的分支名字用来撑破这一行".repeat(3));
         state.session_name = Some("会话名字同样可以很长".repeat(5));
@@ -296,11 +348,13 @@ mod tests {
 
     #[test]
     fn a_non_reasoning_model_gets_no_level_suffix() {
-        let theme = Theme { mode: ColorMode::Ansi256 };
+        let theme = Theme {
+            mode: ColorMode::Ansi256,
+        };
         let plain_model: ModelConfig =
             serde_json::from_str(r#"{"id":"plain-model","reasoning":false}"#).unwrap();
         let mut state = state("/tmp");
-        state.model = Some(&plain_model);
+        state.model = Some(plain_model);
         let lines = render(&state, &theme, 120);
         assert!(plain(&lines)[1].ends_with("plain-model"));
         assert!(!plain(&lines)[1].contains("•"));
@@ -308,7 +362,9 @@ mod tests {
 
     #[test]
     fn an_unknown_context_window_renders_as_a_question_mark() {
-        let theme = Theme { mode: ColorMode::Ansi256 };
+        let theme = Theme {
+            mode: ColorMode::Ansi256,
+        };
         let mut state = state("/tmp");
         state.context_window = None;
         state.context_tokens = None;
@@ -317,7 +373,9 @@ mod tests {
 
     #[test]
     fn a_running_compaction_hides_the_stale_token_count() {
-        let theme = Theme { mode: ColorMode::Ansi256 };
+        let theme = Theme {
+            mode: ColorMode::Ansi256,
+        };
         let mut state = state("/tmp");
         state.compacting = true;
         let text = plain(&render(&state, &theme, 120))[1].clone();
@@ -327,11 +385,18 @@ mod tests {
 
     #[test]
     fn the_context_field_warns_and_then_errors() {
-        let theme = Theme { mode: ColorMode::True };
+        let theme = Theme {
+            mode: ColorMode::True,
+        };
         let mut state = state("/tmp");
-        let gauge = |state: &FooterState<'_>| {
+        let gauge = |state: &FooterState| {
             let line = render(state, &theme, 120)[1].clone();
-            let span = line.spans.iter().find(|span| span.text.contains('/')).unwrap().clone();
+            let span = line
+                .spans
+                .iter()
+                .find(|span| span.text.contains('/'))
+                .unwrap()
+                .clone();
             (span.text, span.style.fg)
         };
         state.context_tokens = Some(750_000);
@@ -344,7 +409,9 @@ mod tests {
 
     #[test]
     fn no_cache_data_reads_as_a_dash() {
-        let theme = Theme { mode: ColorMode::Ansi256 };
+        let theme = Theme {
+            mode: ColorMode::Ansi256,
+        };
         let mut state = state("/tmp");
         state.cache_hit_rate = None;
         assert!(plain(&render(&state, &theme, 120))[1].contains("\u{f1632} —"));
@@ -352,13 +419,18 @@ mod tests {
 
     #[test]
     fn the_session_name_is_truncated_to_the_configured_width() {
-        let theme = Theme { mode: ColorMode::Ansi256 };
+        let theme = Theme {
+            mode: ColorMode::Ansi256,
+        };
         let long = "名".repeat(100);
         let mut state = state("/tmp");
         state.session_name = Some(long);
         let text = plain(&render(&state, &theme, 200))[0].clone();
         let name = text.split("• ").nth(1).unwrap();
-        assert!(util::width(name) <= Defaults::SESSION_NAME_WIDTH + 1, "{name:?}");
+        assert!(
+            util::width(name) <= Defaults::SESSION_NAME_WIDTH + 1,
+            "{name:?}"
+        );
     }
 
     #[test]
@@ -380,10 +452,12 @@ mod tests {
 
     #[test]
     fn a_busy_note_only_adds_a_row_when_present() {
-        let theme = Theme { mode: ColorMode::Ansi256 };
+        let theme = Theme {
+            mode: ColorMode::Ansi256,
+        };
         let mut state = state("/tmp");
         assert_eq!(render(&state, &theme, 120).len(), 2);
-        state.busy = Some("等待用户授权");
+        state.busy = Some("等待用户授权".into());
         assert_eq!(render(&state, &theme, 120).len(), 3);
     }
 }

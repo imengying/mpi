@@ -66,7 +66,7 @@ pub enum Dialect {
 }
 
 impl Dialect {
-    /// pi always runs zsh; the bash branch exists for tests and future shells.
+    /// Select the expansion rules of the configured shell.
     pub fn for_shell_path(path: &str) -> Dialect {
         let name = path.rsplit('/').next().unwrap_or(path);
         let name = name.strip_suffix(".exe").unwrap_or(name);
@@ -112,9 +112,9 @@ pub fn resolve_tool_path(input: &str, cwd: &Path) -> PathBuf {
     };
     let candidate = PathBuf::from(expanded);
     if candidate.is_absolute() {
-        normalize(&candidate)
+        candidate
     } else {
-        normalize(&cwd.join(candidate))
+        cwd.join(candidate)
     }
 }
 
@@ -146,27 +146,45 @@ pub fn canonical_path(path: &Path, depth: usize) -> std::io::Result<PathBuf> {
     if depth > 80 {
         return Err(std::io::Error::other("路径或符号链接层级过深"));
     }
-    let absolute = if path.is_absolute() { normalize(path) } else { normalize(&std::env::current_dir()?.join(path)) };
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
     match std::fs::canonicalize(&absolute) {
         Ok(resolved) => Ok(resolved),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            if let Ok(meta) = std::fs::symlink_metadata(&absolute)
-                && meta.file_type().is_symlink()
-                && let Ok(target) = std::fs::read_link(&absolute)
-            {
-                let next = if target.is_absolute() {
-                    target
-                } else {
-                    absolute.parent().unwrap_or(Path::new("/")).join(target)
-                };
-                return canonical_path(&next, depth + 1);
-            }
-            match absolute.parent() {
-                Some(parent) if parent != absolute => {
-                    Ok(canonical_path(parent, depth + 1)?.join(absolute.file_name().unwrap_or_default()))
+            // Resolve links before processing `..`, including when a write's leaf is new.
+            let mut resolved = PathBuf::new();
+            for component in absolute.components() {
+                match component {
+                    Component::CurDir => {}
+                    Component::ParentDir => {
+                        resolved.pop();
+                    }
+                    Component::Normal(part) => {
+                        let next = resolved.join(part);
+                        match std::fs::symlink_metadata(&next) {
+                            Ok(meta) if meta.file_type().is_symlink() => {
+                                let target = std::fs::read_link(&next)?;
+                                let target = if target.is_absolute() {
+                                    target
+                                } else {
+                                    resolved.join(target)
+                                };
+                                resolved = canonical_path(&target, depth + 1)?;
+                            }
+                            Ok(_) => resolved = next,
+                            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                                resolved = next
+                            }
+                            Err(err) => return Err(err),
+                        }
+                    }
+                    other => resolved.push(other.as_os_str()),
                 }
-                _ => Ok(absolute),
             }
+            Ok(resolved)
         }
         Err(err) => Err(err),
     }
@@ -274,7 +292,7 @@ fn sensitive(path: &Path) -> bool {
             _ => None,
         })
         .collect();
-    if segments.iter().any(|part| SENSITIVE_DIRS.iter().any(|d| d == part)) {
+    if segments.iter().any(|part| SENSITIVE_DIRS.iter().any(|d| d.eq_ignore_ascii_case(part))) {
         return true;
     }
     let name = basename(path);
@@ -288,7 +306,7 @@ fn sensitive(path: &Path) -> bool {
     if text.ends_with("/shadow") || text.ends_with("/gshadow") {
         return true;
     }
-    if text.contains("/proc/self/environ") || text.contains("/proc/self/mem") {
+    if path.starts_with("/proc") && matches!(name.as_str(), "environ" | "mem") {
         return true;
     }
     // The remaining rules only apply inside the user's own home directory.
@@ -314,6 +332,75 @@ fn sensitive(path: &Path) -> bool {
         }
     }
     false
+}
+
+/// Exclusions for recursive content searches, shared by the native and shell tools.
+/// These are appended after user globs so a broad include cannot restore secret files.
+pub(crate) fn search_exclusions(ripgrep: bool) -> Vec<String> {
+    let mut patterns: Vec<String> = SENSITIVE_NAMES.iter().map(|s| s.to_string()).collect();
+    patterns.extend(
+        [
+            ".env.*",
+            "id_*",
+            "service*account*.json",
+            "shadow",
+            "gshadow",
+            "environ",
+            "mem",
+        ]
+        .map(str::to_string),
+    );
+    patterns.extend(SENSITIVE_SUFFIXES.iter().map(|s| format!("*.{s}")));
+    patterns.extend(
+        [
+            ".claude.json",
+            ".aider.conf.yml",
+            "auth.json",
+            "oauth_creds.json",
+            "oauth-creds.json",
+            "credentials",
+            "credentials.json",
+            "credentialsdb",
+            "token.json",
+            "login.keyring",
+            "keyring.*",
+        ]
+        .map(str::to_string),
+    );
+    let mut dirs: Vec<String> = SENSITIVE_DIRS.iter().map(|s| s.to_string()).collect();
+    dirs.extend(
+        HOME_PATHS
+            .iter()
+            .map(|s| s.rsplit('/').next().unwrap().to_string()),
+    );
+    if ripgrep {
+        patterns.extend(dirs);
+        patterns
+            .into_iter()
+            .flat_map(|pattern| ["--iglob".into(), format!("!{pattern}")])
+            .collect()
+    } else {
+        // GNU grep has no case-insensitive glob flag. Character classes give the same rule.
+        let insensitive = |s: String| {
+            s.chars()
+                .map(|c| {
+                    if c.is_ascii_alphabetic() {
+                        format!("[{}{}]", c.to_ascii_lowercase(), c.to_ascii_uppercase())
+                    } else {
+                        c.to_string()
+                    }
+                })
+                .collect::<String>()
+        };
+        patterns
+            .into_iter()
+            .map(|p| format!("--exclude={}", insensitive(p)))
+            .chain(
+                dirs.into_iter()
+                    .map(|p| format!("--exclude-dir={}", insensitive(p))),
+            )
+            .collect()
+    }
 }
 
 /// Path check for `read`, `write` and `edit`.
@@ -598,145 +685,412 @@ fn shell_quote(value: &str) -> String {
 /// `args` has already had `~` expanded and dialect rewrites resolved. `Some(reason)` asks
 /// the user; `None` means the command's options were all recognised.
 fn option_problem(name: &str, args: &[String]) -> Option<String> {
-if name == "rg"
-    && args
-        .iter()
-        .any(|arg| arg.starts_with("--pre=") || arg == "--pre" || arg.starts_with("--hostname-bin"))
-{
-    return Some("搜索参数会启动外部程序".to_string());
-}
-if name == "find"
-    && args.iter().any(|arg| {
-        matches!(
-            arg.as_str(),
-            "-exec" | "-execdir" | "-ok" | "-okdir" | "-delete" | "-fprint" | "-fprint0"
-                | "-fprintf" | "-fls"
-        )
-    })
-{
-    return Some("find 参数会执行命令、删除或写入文件".to_string());
-}
-if name == "sort"
-    && args.iter().any(|arg| {
-        matches!(arg.as_str(), "--output" | "--compress-program")
-            || arg.starts_with("--output=")
-            || arg.starts_with("--compress-program=")
-            || (arg.starts_with('-') && !arg.starts_with("--") && arg[1..].contains('o'))
-    })
-{
-    return Some("sort 参数会写入文件或执行外部程序".to_string());
-}
-if name == "file"
-    && args.iter().any(|arg| arg.starts_with("--uncompress") || (arg.starts_with('-') && !arg.starts_with("--") && (arg.contains('z') || arg.contains('Z'))))
-{
-    return Some("file 解压参数可能调用外部程序".to_string());
-}
+    if matches!(name, "rg" | "grep")
+        && args.iter().any(|arg| {
+            matches!(arg.as_str(), "--follow" | "--dereference-recursive")
+                || (arg.starts_with('-')
+                    && !arg.starts_with("--")
+                    && arg[1..].contains(if name == "rg" { 'L' } else { 'R' }))
+        })
+    {
+        return Some("搜索会跟随符号链接，可能读取敏感文件".into());
+    }
+    if name == "grep" && std::env::var_os("POSIXLY_CORRECT").is_some() {
+        return Some("当前环境会改变 grep 参数解析，需要确认".into());
+    }
+    if name == "ps" {
+        let mut value = false;
+        for arg in args {
+            if value {
+                if arg.to_ascii_lowercase().contains("env") {
+                    return Some("ps 参数会显示进程环境变量".into());
+                }
+                value = false;
+                continue;
+            }
+            if arg.starts_with("--") {
+                let (flag, data) = arg
+                    .split_once('=')
+                    .map_or((arg.as_str(), None), |(a, b)| (a, Some(b)));
+                if ![
+                    "--pid",
+                    "--ppid",
+                    "--user",
+                    "--User",
+                    "--group",
+                    "--Group",
+                    "--format",
+                    "--sort",
+                    "--no-headers",
+                    "--headers",
+                    "--forest",
+                    "--help",
+                    "--version",
+                ]
+                .contains(&flag)
+                {
+                    return Some("ps 参数未被确认为不含环境变量".into());
+                }
+                if let Some(data) = data {
+                    if data.to_ascii_lowercase().contains("env") {
+                        return Some("ps 参数会显示进程环境变量".into());
+                    }
+                } else {
+                    value = matches!(
+                        flag,
+                        "--pid"
+                            | "--ppid"
+                            | "--user"
+                            | "--User"
+                            | "--group"
+                            | "--Group"
+                            | "--format"
+                            | "--sort"
+                    );
+                }
+            } else if let Some(body) = arg.strip_prefix('-') {
+                for (index, flag) in body.char_indices() {
+                    if "opPuUgGt".contains(flag) {
+                        let data = &body[index + flag.len_utf8()..];
+                        if data.to_ascii_lowercase().contains("env") {
+                            return Some("ps 参数会显示进程环境变量".into());
+                        }
+                        value = data.is_empty();
+                        break;
+                    }
+                    if !"aAdefHlLNwxy".contains(flag) {
+                        return Some("ps 参数未被确认为不含环境变量".into());
+                    }
+                }
+            } else if arg.chars().all(|c| "auxwflhT".contains(c)) && !arg.is_empty() {
+                // BSD's bare `e` prints the environment; GNU `-e` only selects all processes.
+            } else if !arg.chars().all(|c| c.is_ascii_digit() || c == ',') {
+                return Some("ps 参数未被确认为不含环境变量".into());
+            }
+        }
+        if value {
+            return Some("ps 选项缺少参数".into());
+        }
+    }
+    if name == "rg"
+        && args.iter().any(|arg| {
+            arg.starts_with("--pre=") || arg == "--pre" || arg.starts_with("--hostname-bin")
+        })
+    {
+        return Some("搜索参数会启动外部程序".to_string());
+    }
+    if name == "find"
+        && args.iter().any(|arg| {
+            matches!(
+                arg.as_str(),
+                "-exec"
+                    | "-execdir"
+                    | "-ok"
+                    | "-okdir"
+                    | "-delete"
+                    | "-fprint"
+                    | "-fprint0"
+                    | "-fprintf"
+                    | "-fls"
+            )
+        })
+    {
+        return Some("find 参数会执行命令、删除或写入文件".to_string());
+    }
+    if name == "sort"
+        && args.iter().any(|arg| {
+            matches!(arg.as_str(), "--output" | "--compress-program")
+                || arg.starts_with("--output=")
+                || arg.starts_with("--compress-program=")
+                || (arg.starts_with('-') && !arg.starts_with("--") && arg[1..].contains('o'))
+        })
+    {
+        return Some("sort 参数会写入文件或执行外部程序".to_string());
+    }
+    if name == "file"
+        && args.iter().any(|arg| {
+            arg.starts_with("--uncompress")
+                || (arg.starts_with('-')
+                    && !arg.starts_with("--")
+                    && (arg.contains('z') || arg.contains('Z')))
+        })
+    {
+        return Some("file 解压参数可能调用外部程序".to_string());
+    }
 
-match name {
-    "sort" => {
-        if !known_long_options(
-            args,
-            &[
-                "--numeric-sort", "--general-numeric-sort", "--human-numeric-sort",
-                "--version-sort", "--reverse", "--unique", "--stable", "--ignore-case",
-                "--ignore-leading-blanks", "--field-separator", "--key", "--check",
-                "--help", "--version",
-            ],
-        ) || !known_short_options(args, "nNgGhHrVuMsbfcdm", "kt")
-        {
-            return Some("sort 参数未被确认为只读".to_string());
+    match name {
+        "grep" => {
+            if !known_long_options(
+                args,
+                &[
+                    "--extended-regexp",
+                    "--fixed-strings",
+                    "--basic-regexp",
+                    "--perl-regexp",
+                    "--regexp",
+                    "--file",
+                    "--ignore-case",
+                    "--no-ignore-case",
+                    "--word-regexp",
+                    "--line-regexp",
+                    "--invert-match",
+                    "--no-messages",
+                    "--binary-files",
+                    "--text",
+                    "--directories",
+                    "--devices",
+                    "--recursive",
+                    "--include",
+                    "--exclude",
+                    "--exclude-from",
+                    "--exclude-dir",
+                    "--files-without-match",
+                    "--files-with-matches",
+                    "--count",
+                    "--max-count",
+                    "--byte-offset",
+                    "--line-number",
+                    "--with-filename",
+                    "--no-filename",
+                    "--label",
+                    "--only-matching",
+                    "--quiet",
+                    "--silent",
+                    "--line-buffered",
+                    "--null",
+                    "--null-data",
+                    "--before-context",
+                    "--after-context",
+                    "--context",
+                    "--group-separator",
+                    "--no-group-separator",
+                    "--color",
+                    "--colour",
+                    "--help",
+                    "--version",
+                ],
+            ) || !known_short_options(args, "EFGPiwyxvnsbHhZoclLqrsIazUV", "efmABCdD")
+            {
+                return Some("grep 参数未被确认为只读".into());
+            }
         }
+        "sort" => {
+            if !known_long_options(
+                args,
+                &[
+                    "--numeric-sort",
+                    "--general-numeric-sort",
+                    "--human-numeric-sort",
+                    "--version-sort",
+                    "--reverse",
+                    "--unique",
+                    "--stable",
+                    "--ignore-case",
+                    "--ignore-leading-blanks",
+                    "--field-separator",
+                    "--key",
+                    "--check",
+                    "--help",
+                    "--version",
+                ],
+            ) || !known_short_options(args, "nNgGhHrVuMsbfcdm", "kt")
+            {
+                return Some("sort 参数未被确认为只读".to_string());
+            }
+        }
+        "file" => {
+            if !known_long_options(
+                args,
+                &[
+                    "--brief",
+                    "--mime",
+                    "--mime-type",
+                    "--mime-encoding",
+                    "--dereference",
+                    "--separator",
+                    "--keep-going",
+                    "--version",
+                    "--help",
+                ],
+            ) || !known_short_options(args, "bikLNprsv0", "fm")
+            {
+                return Some("file 参数未被确认为只读".to_string());
+            }
+        }
+        "rg" => {
+            if !known_long_options(
+                args,
+                &[
+                    "--files",
+                    "--hidden",
+                    "--no-ignore",
+                    "--no-ignore-vcs",
+                    "--no-ignore-parent",
+                    "--no-ignore-global",
+                    "--glob",
+                    "--iglob",
+                    "--type",
+                    "--type-not",
+                    "--type-list",
+                    "--line-number",
+                    "--no-line-number",
+                    "--count",
+                    "--count-matches",
+                    "--with-filename",
+                    "--no-filename",
+                    "--ignore-case",
+                    "--smart-case",
+                    "--case-sensitive",
+                    "--fixed-strings",
+                    "--word-regexp",
+                    "--line-regexp",
+                    "--invert-match",
+                    "--max-count",
+                    "--max-depth",
+                    "--max-filesize",
+                    "--context",
+                    "--before-context",
+                    "--after-context",
+                    "--color",
+                    "--colors",
+                    "--heading",
+                    "--no-heading",
+                    "--sort",
+                    "--sortr",
+                    "--stats",
+                    "--json",
+                    "--only-matching",
+                    "--replace",
+                    "--trim",
+                    "--pcre2",
+                    "--multiline",
+                    "--multiline-dotall",
+                    "--follow",
+                    "--files-without-match",
+                    "--files-with-matches",
+                    "--null",
+                    "--null-data",
+                    "--text",
+                    "--regexp",
+                    "--file",
+                    "--quiet",
+                    "--encoding",
+                    "--no-messages",
+                    "--version",
+                    "--help",
+                    "--crlf",
+                ],
+            ) || !known_short_options(args, "nHhIilLovswxUaFcqSPz0u", "egftTrABCm")
+            {
+                return Some("rg 参数未被确认为只读".to_string());
+            }
+        }
+        "find" => {
+            let known: HashSet<&str> = [
+                "-name",
+                "-iname",
+                "-path",
+                "-ipath",
+                "-regex",
+                "-iregex",
+                "-type",
+                "-maxdepth",
+                "-mindepth",
+                "-print",
+                "-print0",
+                "-ls",
+                "-empty",
+                "-size",
+                "-mtime",
+                "-mmin",
+                "-atime",
+                "-amin",
+                "-ctime",
+                "-cmin",
+                "-newer",
+                "-anewer",
+                "-cnewer",
+                "-user",
+                "-group",
+                "-perm",
+                "-a",
+                "-and",
+                "-o",
+                "-or",
+                "-not",
+                "-true",
+                "-false",
+                "-readable",
+                "-writable",
+                "-executable",
+                "-P",
+                "-H",
+                "-L",
+            ]
+            .into_iter()
+            .collect();
+            let looks_numeric = |arg: &str| {
+                arg.strip_prefix('-').is_some_and(|rest| {
+                    !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit())
+                })
+            };
+            if args.iter().any(|arg| {
+                arg.starts_with('-') && !known.contains(arg.as_str()) && !looks_numeric(arg)
+            }) {
+                return Some("find 参数未被确认为只读".to_string());
+            }
+        }
+        "sed" => {
+            let rest: Vec<&String> = if args.first().map(String::as_str) == Some("-n") {
+                args[1..].iter().collect()
+            } else {
+                args.iter().collect()
+            };
+            let script_ok = rest
+                .first()
+                .is_some_and(|script| is_line_range_print(script));
+            if !script_ok || rest[1..].iter().any(|arg| arg.starts_with('-')) {
+                return Some(
+                    "只自动放行 sed 的行范围打印；编辑、脚本及其他参数需要确认".to_string(),
+                );
+            }
+        }
+        "date" => {
+            // `date -s` sets the system clock and `date -f` reads a file as input; every
+            // other option only formats the current time, which cannot change anything.
+            // This one is a block-list rather than an allow-list because `date` takes a
+            // format string as a bare argument (`date +%Y-%m-%d`), so an allow-list would
+            // have to enumerate every date format a caller might want.
+            let sets_or_reads = args.iter().any(|arg| {
+                matches!(arg.as_str(), "-s" | "--set" | "-f" | "--file")
+                    || arg.starts_with("--set=")
+                    || arg.starts_with("--file=")
+                    || (arg.starts_with("-s") && arg.len() > 2 && !arg.starts_with("--"))
+            });
+            if sets_or_reads {
+                return Some("date 参数会设置系统时间或读取文件".to_string());
+            }
+            if !known_long_options(
+                args,
+                &[
+                    "--utc",
+                    "--universal",
+                    "--iso-8601",
+                    "--rfc-3339",
+                    "--rfc-email",
+                    "--help",
+                    "--version",
+                ],
+            ) || !known_short_options(args, "uR", "I")
+                || args
+                    .iter()
+                    .any(|arg| !arg.starts_with('-') && !arg.starts_with('+'))
+            {
+                return Some("date 参数未被确认为仅显示时间".to_string());
+            }
+        }
+        _ => {}
     }
-    "file" => {
-        if !known_long_options(
-            args,
-            &[
-                "--brief", "--mime", "--mime-type", "--mime-encoding", "--dereference",
-                "--separator", "--keep-going", "--version", "--help",
-            ],
-        ) || !known_short_options(args, "bikLNprsv0", "fm")
-        {
-            return Some("file 参数未被确认为只读".to_string());
-        }
-    }
-    "rg" => {
-        if !known_long_options(
-            args,
-            &[
-                "--files", "--hidden", "--no-ignore", "--no-ignore-vcs", "--no-ignore-parent",
-                "--no-ignore-global", "--glob", "--iglob", "--type", "--type-not",
-                "--type-list", "--line-number", "--no-line-number", "--count",
-                "--count-matches", "--with-filename", "--no-filename", "--ignore-case",
-                "--smart-case", "--case-sensitive", "--fixed-strings", "--word-regexp",
-                "--line-regexp", "--invert-match", "--max-count", "--max-depth",
-                "--max-filesize", "--context", "--before-context", "--after-context",
-                "--color", "--colors", "--heading", "--no-heading", "--sort", "--sortr",
-                "--stats", "--json", "--only-matching", "--replace", "--trim", "--pcre2",
-                "--multiline", "--multiline-dotall", "--follow", "--files-without-match",
-                "--files-with-matches", "--null", "--null-data", "--text", "--regexp",
-                "--file", "--quiet", "--encoding", "--no-messages", "--version", "--help",
-                "--crlf",
-            ],
-        ) || !known_short_options(args, "nHhIilLovswxUaFcqSPz0u", "egftTrABCm")
-        {
-            return Some("rg 参数未被确认为只读".to_string());
-        }
-    }
-    "find" => {
-        let known: HashSet<&str> = [
-            "-name", "-iname", "-path", "-ipath", "-regex", "-iregex", "-type", "-maxdepth",
-            "-mindepth", "-print", "-print0", "-ls", "-empty", "-size", "-mtime", "-mmin",
-            "-atime", "-amin", "-ctime", "-cmin", "-newer", "-anewer", "-cnewer", "-user",
-            "-group", "-perm", "-a", "-and", "-o", "-or", "-not", "-true", "-false",
-            "-readable", "-writable", "-executable", "-P", "-H", "-L",
-        ]
-        .into_iter()
-        .collect();
-        let looks_numeric = |arg: &str| {
-            arg.strip_prefix('-')
-                .is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()))
-        };
-        if args.iter().any(|arg| {
-            arg.starts_with('-') && !known.contains(arg.as_str()) && !looks_numeric(arg)
-        }) {
-            return Some("find 参数未被确认为只读".to_string());
-        }
-    }
-    "sed" => {
-        let rest: Vec<&String> = if args.first().map(String::as_str) == Some("-n") {
-            args[1..].iter().collect()
-        } else {
-            args.iter().collect()
-        };
-        let script_ok = rest.first().is_some_and(|script| is_line_range_print(script));
-        if !script_ok || rest[1..].iter().any(|arg| arg.starts_with('-')) {
-            return Some("只自动放行 sed 的行范围打印；编辑、脚本及其他参数需要确认".to_string());
-        }
-    }
-    "date" => {
-        // `date -s` sets the system clock and `date -f` reads a file as input; every
-        // other option only formats the current time, which cannot change anything.
-        // This one is a block-list rather than an allow-list because `date` takes a
-        // format string as a bare argument (`date +%Y-%m-%d`), so an allow-list would
-        // have to enumerate every date format a caller might want.
-        let sets_or_reads = args.iter().any(|arg| {
-            matches!(arg.as_str(), "-s" | "--set" | "-f" | "--file")
-                || arg.starts_with("--set=")
-                || arg.starts_with("--file=")
-                || (arg.starts_with("-s") && arg.len() > 2 && !arg.starts_with("--"))
-        });
-        if sets_or_reads {
-            return Some("date 参数会设置系统时间或读取文件".to_string());
-        }
-        if !known_long_options(args, &["--utc", "--universal", "--iso-8601", "--rfc-3339", "--rfc-email", "--help", "--version"])
-            || !known_short_options(args, "uR", "I")
-            || args.iter().any(|arg| !arg.starts_with('-') && !arg.starts_with('+'))
-        {
-            return Some("date 参数未被确认为仅显示时间".to_string());
-        }
-    }
-    _ => {}
-}
     None
 }
 
@@ -791,6 +1145,71 @@ fn vet_segment(words: &[Word], cwd: &Path, dialect: Dialect) -> Assessment {
 
     if name == "git" {
         return vet_git(&executable, &args, cwd);
+    }
+    if matches!(name.as_str(), "rg" | "grep") {
+        let mut pending = false;
+        let mut boundary = args.len();
+        for (index, arg) in args.iter().enumerate() {
+            if pending {
+                pending = false;
+                continue;
+            }
+            if arg == "--" {
+                boundary = index;
+                break;
+            }
+            if arg.starts_with("--") {
+                pending = !arg.contains('=')
+                    && matches!(
+                        arg.as_str(),
+                        "--regexp"
+                            | "--file"
+                            | "--glob"
+                            | "--iglob"
+                            | "--type"
+                            | "--type-not"
+                            | "--replace"
+                            | "--max-count"
+                            | "--max-columns"
+                            | "--max-depth"
+                            | "--max-filesize"
+                            | "--context"
+                            | "--before-context"
+                            | "--after-context"
+                            | "--colors"
+                            | "--sort"
+                            | "--sortr"
+                            | "--encoding"
+                            | "--include"
+                            | "--exclude"
+                            | "--exclude-dir"
+                            | "--exclude-from"
+                            | "--label"
+                            | "--binary-files"
+                            | "--directories"
+                            | "--devices"
+                            | "--group-separator"
+                    )
+                    || (name == "rg" && arg == "--color");
+            } else if let Some(body) = arg.strip_prefix('-') {
+                for (offset, flag) in body.char_indices() {
+                    if (if name == "rg" {
+                        "efgtTrABCm"
+                    } else {
+                        "efABCmdD"
+                    })
+                    .contains(flag)
+                    {
+                        pending = offset + flag.len_utf8() == body.len();
+                        break;
+                    }
+                }
+            }
+        }
+        args.splice(boundary..boundary, search_exclusions(name == "rg"));
+        if name == "rg" {
+            args.insert(0, "--no-config".into());
+        }
     }
     let mut rewritten = vec![executable.to_string_lossy().to_string()];
     rewritten.extend(args);
@@ -866,6 +1285,8 @@ if !DATA_ARG_COMMANDS.contains(&name) {
 
 /// Search patterns and formatting options are data; pattern files and operands are paths.
 fn search_path_problem(name: &str, args: &[String], cwd: &Path) -> Option<Assessment> {
+    let default_root = assess_path(Operation::Read, &cwd.to_string_lossy(), cwd);
+    if !default_root.allows() { return Some(default_root); }
     let mut pattern = false;
     let mut files_only = false;
     let mut positional = false;
@@ -885,7 +1306,9 @@ fn search_path_problem(name: &str, args: &[String], cwd: &Path) -> Option<Assess
             if matches!(flag, "--regexp" | "--file") { pattern = true; }
             let path = matches!(flag, "--file" | "--exclude-from");
             let data = matches!(flag, "--regexp" | "--glob" | "--iglob" | "--type" | "--type-not"
-                | "--replace" | "--max-count" | "--max-columns" | "--maxdepth" | "--encoding"
+                | "--replace" | "--max-count" | "--max-columns" | "--max-depth" | "--max-filesize" | "--encoding"
+                | "--color" | "--colour" | "--colors" | "--sort" | "--sortr"
+                | "--binary-files" | "--directories" | "--devices" | "--group-separator"
                 | "--before-context" | "--after-context" | "--context" | "--include" | "--exclude"
                 | "--exclude-dir" | "--label");
             if let Some(value) = value {
@@ -893,11 +1316,13 @@ fn search_path_problem(name: &str, args: &[String], cwd: &Path) -> Option<Assess
                     let decision = assess_path(Operation::Read, value, cwd);
                     if !decision.allows() { return Some(decision); }
                 }
-            } else if path || data { pending = Some(path); }
+            } else if (path || data) && (name != "grep" || !matches!(flag, "--color" | "--colour")) {
+                pending = Some(path);
+            }
             continue;
         }
         if !positional && arg.starts_with('-') && arg != "-" {
-            let value_flags = if name == "rg" { "efgtrTABCm" } else { "efABCm" };
+            let value_flags = if name == "rg" { "efgtrTABCm" } else { "efABCmdD" };
             for (index, flag) in arg[1..].char_indices() {
                 if !value_flags.contains(flag) { continue; }
                 if matches!(flag, 'e' | 'f') { pattern = true; }
@@ -1076,7 +1501,7 @@ fn cd_target(words: &[Word], cwd: &Path, dialect: Dialect) -> Option<Result<Path
     if !target.is_dir() {
         return Some(Err("cd 的目标不是目录".into()));
     }
-    if lexical != target {
+    if normalize(&lexical) != target {
         // The shell keeps the path it was handed while the files resolve through the link,
         // so `cd link` followed by `cat ..` means one directory to zsh and another to this
         // check. Refusing keeps the checked path and the executed path the same one.
@@ -1187,6 +1612,45 @@ pub fn assess_tool(name: &str, input: &serde_json::Value, cwd: &Path, dialect: D
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_environments_need_approval() {
+        for command in [
+            "ps eww -p 1",
+            "ps auxe",
+            "ps --environment",
+            "ps -eo environ",
+            "ps --format=pid,env",
+            "cat /proc/1/environ",
+            "grep --fi .env needle .",
+        ] {
+            assert!(!allows(command), "{command}");
+        }
+        for command in ["ps aux", "ps -eo pid,cmd", "ps -p 1 -o pid,comm"] {
+            assert!(allows(command), "{command}: {}", reason(command));
+        }
+        assert!(!allows("rg --follow needle ."));
+        assert!(!allows("grep -R needle ."));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parent_components_are_resolved_after_symlinks() {
+        let dir = std::env::temp_dir().join(format!("pi-path-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(dir.join(".ssh/child")).unwrap();
+        std::fs::write(dir.join(".ssh/fixture.txt"), "secret").unwrap();
+        std::os::unix::fs::symlink(dir.join(".ssh/child"), dir.join("alias")).unwrap();
+        assert_eq!(
+            canonical_path(&resolve_tool_path("alias/../fixture.txt", &dir), 0).unwrap(),
+            dir.join(".ssh/fixture.txt")
+        );
+        for operation in [Operation::Read, Operation::Write] {
+            assert!(!assess_path(operation, "alias/../fixture.txt", &dir).allows());
+            assert!(!assess_path(operation, "alias/../new.txt", &dir).allows());
+        }
+        assert!(!assess_command("cat alias/../fixture.txt", &dir, Dialect::Zsh).allows());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn executable_targets_accept_only_known_system_aliases() {

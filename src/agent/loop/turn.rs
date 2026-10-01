@@ -198,12 +198,12 @@ impl Agent {
             // A stop keeps the half-written answer, because it is a real answer the user chose to
             // cut short; a failure discards it, because a half-written answer that was never
             // recorded must not stay on screen.
-            let mut completion = match outcome.result {
+            let completion = match outcome.result {
                 None => {
                     debug_assert!(outcome.stopped(), "no completion means the stream was stopped");
                     return self.finish_stopped().map(|()| TurnEnd::Done);
                 }
-                Some(Ok(completion)) => completion,
+                Some(Ok(completion)) => completion.checked(),
                 Some(Err(err)) => {
                     // Nothing is committed, so the discarded preview leaves no trace.
                     self.screen.discard_stream();
@@ -213,13 +213,6 @@ impl Agent {
                     return Err(err.into());
                 }
             };
-            // Never execute or replay partial tool-call arguments from a length-cut stream.
-            if completion.stop_reason == StopReason::Length
-                && let Message::Assistant { content, .. } = &mut completion.message
-            {
-                content.retain(|block| !matches!(block, llm::Block::ToolCall { .. }));
-            }
-
             // An overflow can also arrive as a "successful" response: either the prompt alone
             // filled the window, or the server truncated it and left no room to answer. Both
             // are compacted here, before the message is recorded. No note: the compaction puts
@@ -301,6 +294,9 @@ impl Agent {
 
         /// Decide what to do after a response that is not an overflow.
         pub(super) fn after_completion(&mut self, completion: &llm::Completion) -> anyhow::Result<TurnEnd> {
+            if completion.stop_reason == StopReason::Error || completion.error.is_some() {
+                return Ok(TurnEnd::Done);
+            }
             // A max-token finish is terminal, as in harness: preserve the partial output,
             // but do not invent another user turn or execute a potentially cut tool call.
             if completion.stop_reason == StopReason::Length {
@@ -333,6 +329,84 @@ impl Agent {
 mod tests {
     use super::*;
     use std::io::{BufRead, Read, Write};
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn premature_eof_and_transport_failures_preserve_prose_without_executing_tools() {
+        for failure in ["eof", "transport", "in-band", "decode"] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = std::io::BufReader::new(socket.try_clone().unwrap());
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        length = value.trim().parse::<usize>().unwrap();
+                    }
+                }
+                reader.read_exact(&mut vec![0; length]).unwrap();
+                let event = serde_json::json!({"choices":[{"delta":{"content":"保留正文", "reasoning_content":"保留思考", "tool_calls":[{
+                    "index":0,"id":"unconfirmed","function":{"name":"write","arguments":"{\"path\":\"must-not-exist\",\"content\":\"bad\"}"}
+                }]}}]});
+                let mut body = format!("data: {event}\n\n");
+                if failure == "in-band" {
+                    body.push_str("data: {\"error\":{\"message\":\"upstream failed\"}}\n\n");
+                }
+                if failure == "decode" {
+                    body.push_str("data: broken-json\n\n");
+                }
+                let declared = body.len() + if failure == "transport" { 100 } else { 0 };
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {declared}\r\nConnection: close\r\n\r\n{body}").unwrap();
+                socket.flush().unwrap();
+            });
+            let config: Config = serde_json::from_value(serde_json::json!({
+                "providers":[{"name":"test","api":"completions","base_url":format!("http://{address}/v1"), "api_key":"local-test", "models":[{"id":"m","context_window":128000}]}],
+                "default_model":"test/m"
+            })).unwrap();
+            let dir = std::env::temp_dir().join(format!("pi-unconfirmed-{}", uuid::Uuid::now_v7()));
+            std::fs::create_dir(&dir).unwrap();
+            let mut agent = Agent::new(config, dir.clone(), false).unwrap();
+            agent.client = Client::local_test_client();
+            agent.session = Session::create_in(&dir, &dir, "test/m").unwrap();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                agent.run_turn("处理任务"),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            server.join().unwrap();
+            assert!(!dir.join("must-not-exist").exists(), "{failure}");
+            let messages = agent.session.context_messages();
+            llm::validate_tool_history(&messages).unwrap();
+            let assistant = messages
+                .iter()
+                .find(|m| matches!(m, Message::Assistant { .. }))
+                .unwrap();
+            assert_eq!(assistant.text(), "保留正文", "{failure}");
+            assert_eq!(assistant.thinking(), "保留思考", "{failure}");
+            assert!(assistant.tool_calls().is_empty());
+            assert!(matches!(
+                assistant,
+                Message::Assistant {
+                    stop_reason: Some(StopReason::Error),
+                    ..
+                }
+            ));
+            drop(agent);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn length_cut_preserves_text_ends_the_turn_and_never_executes_cut_tool_calls() {

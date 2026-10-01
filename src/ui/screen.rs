@@ -1,39 +1,24 @@
-//! The terminal view: a scrolling transcript with a pinned two-line footer.
-//!
-//! The transcript is kept in memory as *unstyled* lines and re-rendered on every change,
-//! so collapse/expand and terminal resizes simply rebuild the visible tail. Only the rows
-//! pi owns are redrawn — the cursor moves up over them and the rest of the scrollback is
-//! left alone, which is what keeps "the chat scrolls up" behaviour working.
-//!
-//! Input is read in raw mode because Ctrl+O (expand/collapse) never reaches the process in
-//! canonical mode. What the line editor offers is deliberately small: editing, history and
-//! the few control keys pi defines.
+//! Native scrollback above a bottom-anchored composer and status area.
 
 // The rendered-line model and the line editor live in their own modules; re-exported here
 // because every consumer already says `ui::screen::Line` and `ui::screen::Editor`, and the
 // screen is what they mean by "the terminal part of the UI".
 pub use crate::ui::editor::Editor;
-pub use crate::ui::terminal::{RawGuard, clear_title, teardown, window_title};
 use crate::ui::editor::{common_prefix, input_caret, input_layout};
+pub use crate::ui::terminal::{clear_title, teardown, window_title};
 pub use crate::ui::text::{Bg, Block, Collapsible, Line, Span, Style, wrap_all, wrap_line};
 
 use std::io::{IsTerminal, Write};
 use std::path::Path;
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
-use crossterm::{cursor, queue, terminal};
+use crossterm::{cursor, terminal};
 
 use crate::config::Defaults;
 use crate::image_input::{self, PastedImage};
 use crate::ui::theme::{Color, Theme};
+use crate::ui::viewport::Viewport;
 use crate::util;
-
-/// The name the window title leads with, as pi uses `π`.
-///
-/// The terminal title is the one piece of chrome the terminal draws itself, so it stays
-/// visible when a long output has scrolled the footer away.
-pub const APP_TITLE: &str = "π";
 
 /// What the spinner says while a turn is in flight. pi's word, kept as-is: it is the
 /// label the user already recognises, and it is not translated.
@@ -53,7 +38,6 @@ pub const WORKING_INTERVAL: std::time::Duration = std::time::Duration::from_mill
 /// Oldest entries fall off the front, so what is kept is what is still plausible.
 const HISTORY_LIMIT: usize = 200;
 
-
 /// What the user did at the prompt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
@@ -62,7 +46,7 @@ pub enum Action {
     /// user message so the text and the pictures stay together.
     LineWithImages(String, Vec<PastedImage>),
     ToggleExpand,
-    /// Ctrl+C on an empty line, or Ctrl+D.
+    /// Ctrl+C on an empty line: exit at the prompt, interrupt a running turn.
     Interrupt,
     /// Esc while a turn is in flight: stop it.
     ///
@@ -103,7 +87,7 @@ impl Queued {
 }
 
 pub struct Screen {
-    out: std::io::Stdout,
+    out: Box<dyn Write + Send + Sync>,
     pub theme: Theme,
     width: usize,
     height: usize,
@@ -111,11 +95,11 @@ pub struct Screen {
     /// How many blocks have already been written to the terminal. Blocks are kept — so an
     /// expand/collapse can re-render one — but each is printed exactly once.
     printed: usize,
+    /// An expanded/collapsed presentation waiting to be inserted into history.
+    updates: Vec<Line>,
     footer: Vec<Line>,
-    /// Rows the *live* region (streaming preview plus footer) currently occupies. Only
-    /// these are ever redrawn: committed transcript stays in the terminal's scrollback,
-    /// which is what makes the history scrollable with the terminal's own keys.
-    live_rows: usize,
+    footer_state: Option<crate::ui::footer::FooterState>,
+    viewport: Viewport,
     /// The line editor's current text, echoed in the live region.
     editing: Option<Editor>,
     history: Vec<String>,
@@ -132,6 +116,9 @@ pub struct Screen {
     /// Streaming preview: thinking tail plus the answer so far.
     streaming_thinking: Option<String>,
     streaming_answer: Option<String>,
+    /// Bytes already emitted as complete Markdown blocks during this stream.
+    streaming_committed: usize,
+    thinking_committed: bool,
     /// The spinner's label while a turn is in flight, and which frame of the animation it
     /// is on.
     ///
@@ -150,22 +137,9 @@ pub struct Screen {
     running_call: Option<Vec<Span>>,
     /// Whether stdout is a terminal at all.
     interactive: bool,
-    /// Whether the terminal cursor is currently shown, so an unchanged state is not written
-    /// again on every frame.
-    cursor_shown: Option<bool>,
     /// What was last written as the window title, so an unchanged title is not rewritten on
     /// every frame.
     title: Option<String>,
-    /// Where the cursor was left inside the live region, as a row index, or `None` when it
-    /// was left just past the end. Needed to erase the region from the right place.
-    cursor_row: Option<usize>,
-    /// The column the cursor was parked on, so a spinner tick can put it back without
-    /// redrawing the rows under the spinner.
-    cursor_col: usize,
-    /// The live lines last painted. A spinner tick compares against this and, when nothing
-    /// else moved, rewrites only the spinner row. Clearing the whole region on every frame
-    /// is what made the input line and the footer flicker.
-    last_live: Vec<Line>,
     /// A one-off line shown under the input, e.g. a failed paste. Cleared on the next edit.
     notice: Option<String>,
     /// Lines submitted while a turn was running, shown above the input until they are sent.
@@ -199,6 +173,15 @@ impl Default for Screen {
     }
 }
 
+impl Drop for Screen {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            self.erase_live();
+            let _ = self.out.flush();
+        }
+    }
+}
+
 impl Screen {
     /// Register the commands the input area completes and the menu lists.
     ///
@@ -222,7 +205,10 @@ impl Screen {
     /// the front to the same cap `remember` enforces: the newest entries are the ones a
     /// recalled line is likely to be.
     pub fn seed_history(&mut self, lines: impl IntoIterator<Item = String>) {
-        self.history = lines.into_iter().filter(|line| !line.trim().is_empty()).collect();
+        self.history = lines
+            .into_iter()
+            .filter(|line| !line.trim().is_empty())
+            .collect();
         if self.history.len() > HISTORY_LIMIT {
             let excess = self.history.len() - HISTORY_LIMIT;
             self.history.drain(..excess);
@@ -235,14 +221,16 @@ impl Screen {
         let theme = Theme::default();
         let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
         let mut screen = Screen {
-            out: std::io::stdout(),
+            out: Box::new(std::io::stdout()),
             theme,
             width: 80,
             height: 24,
             blocks: Vec::new(),
             printed: 0,
+            updates: Vec::new(),
             footer: Vec::new(),
-            live_rows: 0,
+            footer_state: None,
+            viewport: Viewport::default(),
             editing: None,
             history: Vec::new(),
             history_index: None,
@@ -252,12 +240,10 @@ impl Screen {
             working_frame: 0,
             running_call: None,
             streaming_answer: None,
+            streaming_committed: 0,
+            thinking_committed: false,
             interactive,
-            cursor_shown: None,
             title: None,
-            cursor_row: None,
-            cursor_col: 0,
-            last_live: Vec::new(),
             notice: None,
             pending: Vec::new(),
             pending_images: Vec::new(),
@@ -299,8 +285,8 @@ impl Screen {
 
     pub fn refresh_size(&mut self) {
         if let Ok((cols, rows)) = terminal::size() {
-            self.width = cols.max(20) as usize;
-            self.height = rows.max(6) as usize;
+            self.width = cols.max(1) as usize;
+            self.height = rows.max(1) as usize;
         }
     }
 
@@ -353,7 +339,8 @@ impl Screen {
             collapsible.expanded = !collapsible.expanded;
         }
         let lines = self.blocks[index].render(self.width);
-        self.write_lines(&lines, true);
+        // Queue the new presentation so history insertion and the live frame stay atomic.
+        self.updates.extend(lines);
         self.draw_live();
         true
     }
@@ -384,12 +371,16 @@ impl Screen {
     pub fn clear_transcript(&mut self) {
         self.blocks.clear();
         self.printed = 0;
+        self.updates.clear();
         self.streaming_answer = None;
         self.streaming_thinking = None;
+        self.streaming_committed = 0;
+        self.thinking_committed = false;
         self.running_call = None;
         self.working = None;
         self.editing = None;
         self.erase_live();
+        self.viewport.clear();
         if self.interactive {
             let _ = crossterm::execute!(self.out, terminal::Clear(terminal::ClearType::All));
             let _ = crossterm::execute!(self.out, cursor::MoveTo(0, 0));
@@ -401,9 +392,8 @@ impl Screen {
 
     /// Take the live region down so someone else can draw on the terminal.
     ///
-    /// Used before the authorization panel, which writes straight to stdout and moves the
-    /// cursor itself: from that point `live_rows`/`cursor_row` no longer describe the screen,
-    /// and a later erase would climb from the wrong row and leave the old region behind.
+    /// The authorization panel temporarily covers part of the transcript. Invalidating the
+    /// viewport restores visible history when the panel closes.
     /// Caller must [`Screen::render`] afterwards to put the region back.
     pub fn suspend_live(&mut self) {
         self.erase_live();
@@ -437,9 +427,7 @@ impl Screen {
             return;
         }
         self.working_frame = (self.working_frame + 1) % WORKING_FRAMES.len();
-        if !self.repaint_spinner() {
-            self.render();
-        }
+        self.render();
     }
 
     /// Show the tool call that is now running, as a single live line.
@@ -464,6 +452,8 @@ impl Screen {
     pub fn begin_stream(&mut self) {
         self.streaming_thinking = None;
         self.streaming_answer = Some(String::new());
+        self.streaming_committed = 0;
+        self.thinking_committed = false;
     }
 
     /// Append to the thinking preview. No redraw: the caller drains a burst of deltas and
@@ -485,6 +475,8 @@ impl Screen {
     pub fn discard_stream(&mut self) {
         self.streaming_answer = None;
         self.streaming_thinking = None;
+        self.streaming_committed = 0;
+        self.thinking_committed = false;
         self.erase_live();
         let _ = self.out.flush();
     }
@@ -494,20 +486,15 @@ impl Screen {
     pub fn end_stream(&mut self) -> (String, String) {
         let answer = self.streaming_answer.take().unwrap_or_default();
         let thinking = self.streaming_thinking.take().unwrap_or_default();
-        let mut lines = Vec::new();
-        if !thinking.trim().is_empty() {
-            lines.extend(crate::ui::compact::thinking_done_lines());
+        if !thinking.trim().is_empty() && !self.thinking_committed {
+            self.push_lines(crate::ui::compact::thinking_done_lines());
         }
-        if !answer.trim().is_empty() {
-            // Rendered at the width that is current *now*, which is the width the answer
-            // will keep: committed lines live in the terminal's scrollback, and scrollback
-            // cannot be re-flowed.
-            lines.extend(crate::ui::markdown::render(&answer, self.width));
-            lines.push(Line::blank());
+        let tail = &answer[self.streaming_committed..];
+        if !tail.trim().is_empty() {
+            self.blocks.push(Block::markdown(tail));
         }
-        if !lines.is_empty() {
-            self.blocks.push(Block::lines(lines));
-        }
+        self.streaming_committed = 0;
+        self.thinking_committed = false;
         self.flush();
         (answer, thinking)
     }
@@ -516,6 +503,12 @@ impl Screen {
 
     pub fn set_footer(&mut self, lines: Vec<Line>) {
         self.footer = lines;
+        self.footer_state = None;
+    }
+
+    pub fn set_footer_state(&mut self, state: crate::ui::footer::FooterState) {
+        self.footer.clear();
+        self.footer_state = Some(state);
     }
 
     // -- pickers ------------------------------------------------------------
@@ -547,43 +540,6 @@ impl Screen {
         }
         queued
     }
-}
-
-
-/// A convenience wrapper for the home directory shortcut.
-/// The row that is the working spinner, if this frame has one.
-fn spinner_row(lines: &[Line], label: &str) -> Option<usize> {
-    lines.iter().position(|line| {
-        let spans = &line.spans;
-        spans.len() >= 3
-            && WORKING_FRAMES.contains(&spans[0].text.as_str())
-            && spans[1].text == " "
-            && spans[2].text == label
-    })
-}
-
-/// The first row that has to be repainted, or `None` when a full redraw is needed instead.
-///
-/// A tick may repaint the rows from here through the spinner — and nothing below it, which is
-/// where the input line and its caret live. Everything above the spinner is fair game: the
-/// thinking preview is rewritten on every tick by design. The rule is that no row *below* the
-/// spinner may differ, because painting those is what erases and redraws the caret.
-fn dirty_top(previous: &[Line], next: &[Line], spinner: usize) -> Option<usize> {
-    if previous.len() != next.len() || spinner >= next.len() {
-        return None;
-    }
-    // Anything below the spinner moving means the input or footer changed: full redraw.
-    if previous[spinner + 1..] != next[spinner + 1..] {
-        return None;
-    }
-    // From the top down, the first row that differs is where repainting starts.
-    Some(
-        previous[..spinner]
-            .iter()
-            .zip(&next[..spinner])
-            .position(|(old, new)| old != new)
-            .unwrap_or(spinner),
-    )
 }
 
 mod input;

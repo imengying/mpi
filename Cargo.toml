@@ -25,6 +25,7 @@ anyhow = "1.0"
 thiserror = "2.0"
 dirs = "7.0"
 unicode-width = "0.2"
+unicode-segmentation = "1.13"
 similar = "3.2"
 uuid = { version = "1.26", features = ["v7"] }
 # Clipboard image input. Pixels are re-encoded as PNG; a JPEG/TIFF stack is never
@@ -33,6 +34,12 @@ arboard = { version = "3.6", features = ["wayland-data-control"] }
 # Already in the tree via reqwest; declared because the image path needs it directly.
 base64 = "0.23"
 png = "0.18"
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1", features = ["process"] }
+
+[dev-dependencies]
+vt100 = "0.16.2"
 
 [profile.release]
 # Shipping profile in the shape fast CLIs use: full opts, thin LTO, one codegen

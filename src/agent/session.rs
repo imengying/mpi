@@ -5,12 +5,13 @@
 //! environment never enters the transcript (and never disturbs the prompt-cache prefix)
 //! and is not treated as conversation by compaction.
 //!
-//! The file *is* the session. Nothing rewrites earlier bytes — the name is appended as
+//! The file *is* the session. Normal writes append records; recovery may remove an
+//! interrupted final record while holding the writer lock. The name is appended as
 //! its own `session_info` record, and a compaction appends a `compacted` checkpoint
 //! rather than replacing history. A session therefore only grows by "user messages +
 //! the most recent window + checkpoints", not by the whole transcript.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -131,16 +132,44 @@ impl Record {
     }
 }
 
-/// Where a session's records live.
-///
-/// Three states, and the difference between the first two is the whole point: a session
-/// that has not happened yet must leave no file behind, and a session the user deleted must
-/// never get one again. `Option<File>` could not tell those apart.
+/// An append handle whose writer lock is released even if a child inherited its descriptor.
+struct SessionFile(std::fs::File);
+
+impl SessionFile {
+    fn lock(file: std::fs::File) -> std::io::Result<Self> {
+        file.try_lock()
+            .map_err(|err| std::io::Error::other(format!("会话正在使用或无法加锁：{err}")))?;
+        Ok(Self(file))
+    }
+}
+
+impl std::ops::Deref for SessionFile {
+    type Target = std::fs::File;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for SessionFile {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for SessionFile {
+    fn drop(&mut self) {
+        // A concurrent fork may inherit the descriptor until exec. Explicitly unlocking
+        // releases our writer lock even while that temporary duplicate is still alive.
+        let _ = self.0.unlock();
+    }
+}
+
+/// Where a session's records live: buffered, saved, or permanently deleted.
 enum Storage {
     /// No file yet. Records are held in memory until the session becomes a conversation.
     Buffered,
     /// The file exists and is open for appending.
-    Open(std::fs::File),
+    Open(SessionFile),
     /// The file is gone. Nothing may create it again.
     Deleted,
 }
@@ -168,6 +197,7 @@ pub struct Session {
     /// threshold check can use real numbers instead of an estimate.
     pub last_usage: Option<Usage>,
     pub last_usage_index: Option<usize>,
+    recovery_notes: Vec<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -222,23 +252,98 @@ impl Session {
             totals: Usage::default(),
             last_usage: None,
             last_usage_index: None,
+            recovery_notes: Vec::new(),
         })
     }
 
     /// Open an existing session file and replay it.
     pub fn open(path: &Path) -> Result<Self, SessionError> {
-        let file = std::fs::File::open(path)?;
-        let reader = BufReader::new(file);
+        let mut file = SessionFile::lock(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .append(true)
+                .open(path)?,
+        )?;
+        let (mut session, valid_len, partial_tail, needs_newline) = Self::snapshot(path, &file)?;
+        let pending = crate::llm::pending_tool_calls(&session.context_messages())
+            .map_err(|err| SessionError::Parse(err.to_string()))?;
+        if partial_tail {
+            file.set_len(valid_len)?;
+            file.sync_data()?;
+            session
+                .recovery_notes
+                .push("已恢复会话；末尾未写完整的记录已移除。".into());
+        } else if needs_newline {
+            file.write_all(b"\n")?;
+            file.sync_data()?;
+        }
+        session.storage = Storage::Open(file);
+        if !pending.is_empty() {
+            session.recovery_notes.push(
+                "上次会话中有工具调用未记录结果，已标记为执行结果未知；请先检查实际状态。".into(),
+            );
+        }
+        for (tool_call_id, name) in pending {
+            session.push_message(Message::Tool {
+                tool_call_id,
+                name,
+                content: "上次会话意外中断，此工具调用的执行结果未知。请先检查文件或实际状态，再决定是否重试。".into(),
+            }, None, None)?;
+        }
+        Ok(session)
+    }
+
+    /// Read-only listing shares recovery parsing, but never locks or repairs a live file.
+    fn snapshot(
+        path: &Path,
+        file: &std::fs::File,
+    ) -> Result<(Self, u64, bool, bool), SessionError> {
+        let mut reader = BufReader::new(file.try_clone()?);
+        reader.seek(SeekFrom::Start(0))?;
         let mut records: Vec<Record> = Vec::new();
-        for (number, line) in reader.lines().enumerate() {
-            let line = line?;
-            if line.trim().is_empty() {
+        let mut line = Vec::new();
+        let mut number = 0;
+        let mut valid_len = 0u64;
+        let mut partial_tail = false;
+        let mut needs_newline = false;
+        loop {
+            line.clear();
+            if reader.read_until(b'\n', &mut line)? == 0 {
+                break;
+            }
+            number += 1;
+            let terminated = line.ends_with(b"\n");
+            if line.iter().all(u8::is_ascii_whitespace) {
+                valid_len += line.len() as u64;
+                needs_newline = !terminated;
                 continue;
             }
-            let record: Record = serde_json::from_str(&line).map_err(|err| {
-                SessionError::Parse(format!("{} 第 {} 行：{err}", path.display(), number + 1))
-            })?;
-            records.push(record);
+            match serde_json::from_slice::<Record>(&line) {
+                Ok(record) => {
+                    records.push(record);
+                    valid_len += line.len() as u64;
+                    needs_newline = !terminated;
+                }
+                Err(err)
+                    if !terminated
+                        && !records.is_empty()
+                        && (err.is_eof()
+                            || std::str::from_utf8(&line).is_err_and(|e| {
+                                e.error_len().is_none()
+                                    && serde_json::from_slice::<Record>(&line[..e.valid_up_to()])
+                                        .is_err_and(|err| err.is_eof())
+                            })) =>
+                {
+                    partial_tail = true;
+                    break;
+                }
+                Err(err) => {
+                    return Err(SessionError::Parse(format!(
+                        "{} 第 {number} 行：{err}",
+                        path.display()
+                    )));
+                }
+            }
         }
         let header = records
             .iter()
@@ -255,16 +360,26 @@ impl Session {
             cwd,
             // A resumed session is a live one: if it is continued in another directory its
             // file follows, the same as a session that was never interrupted.
-            register_under: Some(crate::config::sessions_root()),
-            storage: Storage::Open(std::fs::OpenOptions::new().append(true).open(path)?),
+            register_under: path
+                .starts_with(crate::config::sessions_root())
+                .then(crate::config::sessions_root),
+            storage: Storage::Buffered,
             last_id,
             records,
             totals: Usage::default(),
             last_usage: None,
             last_usage_index: None,
+            recovery_notes: Vec::new(),
         };
+        session.cwd = session
+            .current_cwd()
+            .unwrap_or_else(|| PathBuf::from(&session.header.cwd));
         session.recompute_usage();
-        Ok(session)
+        Ok((session, valid_len, partial_tail, needs_newline))
+    }
+
+    pub fn recovery_notes(&self) -> &[String] {
+        &self.recovery_notes
     }
 
     pub fn header(&self) -> &SessionHeader {
@@ -327,21 +442,11 @@ impl Session {
             .rposition(|record| matches!(record, Record::Compacted { .. }))
     }
 
-    /// The working directory named by the newest environment block in the context.
-    ///
-    /// `header.cwd` is what the session *started* with and never changes; after a resume in
-    /// a different directory it is the environment block, not the header, that says where
-    /// the work is happening now.
+    /// The directory in the newest turn context. A new session uses its header.
     pub fn current_cwd(&self) -> Option<PathBuf> {
-        self.context_messages().iter().rev().find_map(|message| {
-            crate::agent::r#loop::is_environment_block(message)
-                .then(|| {
-                    message
-                        .text()
-                        .lines()
-                        .find_map(|line| line.strip_prefix("工作目录: ").map(PathBuf::from))
-                })
-                .flatten()
+        self.records.iter().rev().find_map(|record| match record {
+            Record::TurnContext { cwd, .. } => Some(PathBuf::from(cwd)),
+            _ => None,
         })
     }
 
@@ -352,8 +457,7 @@ impl Session {
     /// to a model the user had moved off. The turn contexts record what each turn actually
     /// ran with, so the newest one is the answer.
     ///
-    /// `None` for a session whose turns predate this record, or that never got past its first
-    /// message — the caller falls back to the header, which is then the honest answer.
+    /// `None` until the first turn or model selection is recorded.
     pub fn current_model(&self) -> Option<(String, String)> {
         self.records.iter().rev().find_map(|record| match record {
             Record::TurnContext { model, level, .. } if !model.is_empty() => {
@@ -386,22 +490,24 @@ impl Session {
         out
     }
 
-    /// Point the session header at `cwd`. The header line itself is never rewritten: the
-    /// update is appended as a `session_info` record, like the session name.
-    pub fn relocate(&mut self, cwd: &Path) -> Result<(), SessionError> {        if self.header.cwd == cwd.to_string_lossy() {
+    /// Record a new working directory while preserving the latest model and level.
+    pub fn relocate(&mut self, cwd: &Path) -> Result<(), SessionError> {
+        if self.cwd == cwd {
             return Ok(());
         }
+        let (model, level) = self
+            .current_model()
+            .unwrap_or_else(|| (self.header.model.clone(), String::new()));
         let id = self.next_id();
         let record = Record::TurnContext {
             parent_id: self.last_id.clone(),
             id: id.clone(),
             cwd: cwd.to_string_lossy().to_string(),
-            model: self.header.model.clone(),
-            level: String::new(),
+            model,
+            level,
             timestamp: now(),
         };
         self.append(record, id)?;
-        self.header.cwd = cwd.to_string_lossy().to_string();
         self.cwd = cwd.to_path_buf();
         // The file moves with it. A session is about the directory it is being continued in,
         // and the store says which directory that is — leaving the file behind would make it
@@ -568,10 +674,11 @@ impl Session {
         match &mut self.storage {
             Storage::Buffered => {}
             Storage::Open(file) => {
-                let line = serde_json::to_string(&record)
+                let mut line = serde_json::to_vec(&record)
                     .map_err(|err| SessionError::Parse(err.to_string()))?;
-                writeln!(file, "{line}")?;
-                file.flush()?;
+                line.push(b'\n');
+                file.write_all(&line)?;
+                file.sync_data()?;
             }
             Storage::Deleted => return Err(SessionError::Deleted),
         }
@@ -605,16 +712,20 @@ impl Session {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.create_new(true).read(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = SessionFile::lock(options.open(&self.path)?)?;
         for record in &self.records {
             let line = serde_json::to_string(record)
                 .map_err(|err| SessionError::Parse(err.to_string()))?;
             writeln!(file, "{line}")?;
         }
-        file.flush()?;
+        file.sync_data()?;
         self.storage = Storage::Open(file);
         Ok(())
     }
@@ -791,7 +902,12 @@ pub fn list_in(dir: &Path) -> Vec<SessionSummary> {
         }
         let Ok(meta) = entry.metadata() else { continue };
         let modified = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
-        let Ok(session) = Session::open(&path) else { continue };
+        let Ok(file) = std::fs::File::open(&path) else {
+            continue;
+        };
+        let Ok((session, ..)) = Session::snapshot(&path, &file) else {
+            continue;
+        };
         // The environment block is the first *user* message in the conversation, but it is
         // bookkeeping rather than something the user said, so it counts for neither the
         // message total nor the snippet.
@@ -854,6 +970,225 @@ pub fn message_preview(message: &Message, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_partial_tail_is_listed_and_repaired_before_appending() {
+        let (session, dir) = temp_session_with_a_message("partial-tail");
+        let path = session.path().to_path_buf();
+        drop(session);
+        let original = std::fs::read(&path).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{\"type\":\"response_item\",\"id\":\"cut")
+            .unwrap();
+        assert_eq!(
+            list_in(&dir).len(),
+            1,
+            "a damaged final write must remain discoverable"
+        );
+        assert!(
+            std::fs::metadata(&path).unwrap().len() > original.len() as u64,
+            "listing must not mutate files"
+        );
+        let mut resumed = Session::open(&path).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert!(!resumed.recovery_notes().is_empty());
+        resumed
+            .push_message(Message::user_text("继续"), None, None)
+            .unwrap();
+        drop(resumed);
+        let reopened = Session::open(&path).unwrap();
+        assert_eq!(reopened.user_history(), vec!["你好", "继续"]);
+        drop(reopened);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn complete_invalid_records_and_interior_damage_are_not_discarded() {
+        for (index, tail) in [
+            b"{\"type\":\"unknown\"}".as_slice(),
+            b"{\"type\":\"response_item\",\n",
+            b"broken\n{}\n",
+            b"broken\xe4",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (session, dir) = temp_session_with_a_message(&format!("invalid-tail-{index}"));
+            let path = session.path().to_path_buf();
+            drop(session);
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(tail)
+                .unwrap();
+            let original = std::fs::read(&path).unwrap();
+            assert!(Session::open(&path).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_write_cut_inside_a_utf8_character_can_be_recovered() {
+        let (mut session, dir) = temp_session_with_a_message("partial-utf8");
+        let path = session.path().to_path_buf();
+        session.push_message(Message::user_text("中文"), None, None).unwrap();
+        drop(session);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let cut = bytes.windows("中".len()).position(|part| part == "中".as_bytes()).unwrap() + 1;
+        bytes.truncate(cut);
+        std::fs::write(&path, bytes).unwrap();
+        let resumed = Session::open(&path).unwrap();
+        assert_eq!(resumed.user_history(), vec!["你好"]);
+        assert!(!resumed.recovery_notes().is_empty());
+        drop(resumed);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_unterminated_valid_record_gets_a_newline_before_the_next_write() {
+        let (session, dir) = temp_session_with_a_message("no-final-newline");
+        let path = session.path().to_path_buf();
+        drop(session);
+        let mut bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes.pop(), Some(b'\n'));
+        std::fs::write(&path, bytes).unwrap();
+        let mut resumed = Session::open(&path).unwrap();
+        resumed
+            .push_message(Message::user_text("继续"), None, None)
+            .unwrap();
+        drop(resumed);
+        let resumed = Session::open(&path).unwrap();
+        assert_eq!(resumed.user_history(), vec!["你好", "继续"]);
+        drop(resumed);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn unfinished_tool_results_are_marked_unknown_once() {
+        let (mut session, dir) = temp_session_with_a_message("pending-tools");
+        let path = session.path().to_path_buf();
+        session
+            .push_message(
+                Message::Assistant {
+                    content: vec![
+                        Block::ToolCall {
+                            id: "first".into(),
+                            name: "write".into(),
+                            arguments: serde_json::json!({"path":"marker","content":"data"}),
+                        },
+                        Block::ToolCall {
+                            id: "second".into(),
+                            name: "read".into(),
+                            arguments: serde_json::json!({"path":"marker"}),
+                        },
+                    ],
+                    stop_reason: Some(StopReason::ToolUse),
+                },
+                None,
+                Some(StopReason::ToolUse),
+            )
+            .unwrap();
+        session
+            .push_message(
+                Message::Tool {
+                    tool_call_id: "first".into(),
+                    name: "write".into(),
+                    content: "写入成功".into(),
+                },
+                None,
+                None,
+            )
+            .unwrap();
+        drop(session);
+        let resumed = Session::open(&path).unwrap();
+        let messages = resumed.context_messages();
+        crate::llm::validate_tool_history(&messages).unwrap();
+        assert!(
+            matches!(messages.last(), Some(Message::Tool { tool_call_id, content, .. }) if tool_call_id == "second" && content.contains("执行结果未知"))
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(
+                    |m| matches!(m, Message::Tool { tool_call_id, .. } if tool_call_id == "first")
+                )
+                .count(),
+            1
+        );
+        assert!(
+            !dir.join("marker").exists(),
+            "recovery must not rerun a tool"
+        );
+        let count = messages.len();
+        drop(resumed);
+        let resumed = Session::open(&path).unwrap();
+        assert_eq!(resumed.context_messages().len(), count);
+        drop(resumed);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_live_session_cannot_be_opened_by_a_second_writer() {
+        let (session, dir) = temp_session_with_a_message("writer-lock");
+        assert_eq!(
+            list_in(&dir).len(),
+            1,
+            "listing remains read-only while a writer is active"
+        );
+        assert!(Session::open(session.path()).is_err());
+        let path = session.path().to_path_buf();
+        drop(session);
+        drop(Session::open(&path).unwrap());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn closing_a_session_releases_the_lock_even_with_a_duplicated_descriptor() {
+        let (session, dir) = temp_session_with_a_message("duplicated-lock");
+        let path = session.path().to_path_buf();
+        let Storage::Open(file) = &session.storage else {
+            panic!("saved session");
+        };
+        let inherited = file.try_clone().unwrap();
+        drop(session);
+        drop(Session::open(&path).unwrap());
+        drop(inherited);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn relocation_preserves_the_latest_model_level_and_immutable_header() {
+        let (mut session, dir) = temp_session_with_a_message("relocation-model");
+        let path = session.path().to_path_buf();
+        session
+            .push_turn_context(&dir, "work/changed", "high")
+            .unwrap();
+        let elsewhere = dir.join("elsewhere");
+        session.relocate(&elsewhere).unwrap();
+        assert_eq!(
+            session.current_model(),
+            Some(("work/changed".into(), "high".into()))
+        );
+        assert_eq!(session.header().model, "work/m");
+        assert_eq!(session.header().cwd, dir.to_string_lossy());
+        drop(session);
+        let mut resumed = Session::open(&path).unwrap();
+        assert_eq!(
+            resumed.current_model(),
+            Some(("work/changed".into(), "high".into()))
+        );
+        assert_eq!(resumed.current_cwd(), Some(elsewhere.clone()));
+        let count = resumed.records().len();
+        resumed.relocate(&elsewhere).unwrap();
+        assert_eq!(resumed.records().len(), count);
+        drop(resumed);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn context_pressure_includes_new_input_and_ignores_summary_usage_after_reopen() {
@@ -1079,7 +1414,9 @@ mod tests {
             .push_message(Message::user_text("你好"), None, None)
             .unwrap();
         assert!(session.is_saved());
-        let reopened = Session::open(session.path()).unwrap();
+        let path = session.path().to_path_buf();
+        drop(session);
+        let reopened = Session::open(&path).unwrap();
         assert_eq!(reopened.name().as_deref(), Some("只有名字"));
 
         let _ = std::fs::remove_dir_all(dir);
@@ -1468,8 +1805,11 @@ mod tests {
         );
         assert_eq!(list_in(&dir).len(), 1);
         // Reopening sees the same conversation, header included.
-        let reopened = Session::open(session.path()).unwrap();
-        assert_eq!(reopened.id(), session.id());
+        let path = session.path().to_path_buf();
+        let id = session.id().to_string();
+        drop(session);
+        let reopened = Session::open(&path).unwrap();
+        assert_eq!(reopened.id(), id);
         assert_eq!(reopened.context_messages().len(), 2);
 
         let _ = std::fs::remove_dir_all(dir);
@@ -1477,18 +1817,15 @@ mod tests {
 
     #[test]
     fn resuming_elsewhere_moves_the_recorded_directory() {
-        // The header records where the session *started*; the newest environment block says
-        // where it is happening now. Resuming in another directory must append a block and
-        // update the header, so a second resume does not think it moved again.
+        // The immutable header records where it started; the latest context records moves.
         let (mut session, dir) = temp_session("relocate");
         let elsewhere = std::env::temp_dir().join("pi-relocate-target");
         std::fs::create_dir_all(&elsewhere).unwrap();
 
         assert!(session.current_cwd().is_none(), "no block yet");
         session.relocate(&elsewhere).unwrap();
-        assert_eq!(session.header().cwd, elsewhere.to_string_lossy());
-        // Only the header moved; there is still no conversation, so no environment block.
-        assert!(session.current_cwd().is_none());
+        assert_eq!(session.header().cwd, dir.to_string_lossy());
+        assert_eq!(session.current_cwd().as_deref(), Some(elsewhere.as_path()));
 
         let block = crate::agent::r#loop::environment_block(&elsewhere, "sid", "/usr/bin/zsh");
         session.push_message(Message::user_text(block), None, None).unwrap();
@@ -1502,16 +1839,18 @@ mod tests {
     }
 
     #[test]
-    fn current_cwd_takes_the_newest_block() {
+    fn current_cwd_uses_turn_context_instead_of_parsing_conversation_text() {
         let (mut session, dir) = temp_session("cwd-blocks");
         for cwd in ["/tmp/one", "/tmp/two", "/tmp/three"] {
             let block = crate::agent::r#loop::environment_block(Path::new(cwd), "sid", "zsh");
             session.push_message(Message::user_text(block), None, None).unwrap();
         }
+        assert!(session.current_cwd().is_none());
+        session.push_turn_context(Path::new("/tmp/current"), "p/m", "high").unwrap();
         assert_eq!(
             session.current_cwd().as_deref(),
-            Some(Path::new("/tmp/three")),
-            "the newest block wins"
+            Some(Path::new("/tmp/current")),
+            "conversation text is not session metadata"
         );
         let _ = std::fs::remove_dir_all(dir);
     }

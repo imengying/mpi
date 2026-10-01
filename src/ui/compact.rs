@@ -18,14 +18,6 @@ use crate::ui::screen::{Block, Line, Span, Style};
 use crate::ui::theme::{Color, Theme};
 use crate::util;
 
-/// Build the transcript block for a finished tool call.
-///
-/// The header rows are pinned: collapsing hides the *output*, never the fact of what ran
-/// or which file changed.
-pub fn tool_block(name: &str, arguments: &serde_json::Value, output: &ToolOutput) -> Block {
-    tool_block_with(name, arguments, output, false)
-}
-
 /// The mark for a call: still running, failed, or finished.
 ///
 /// A running call gets `●` rather than a green tick, because the tick is a claim about the
@@ -45,12 +37,11 @@ pub fn status_mark(running: bool, failed: bool) -> (Style, &'static str) {
 /// when there is no result yet to describe it.
 fn arguments_display(name: &str, arguments: &serde_json::Value) -> Display {
     match name {
-        "bash" => Display::Command { expanded: false, footer: Vec::new() },
+        "bash" => Display::Command { footer: Vec::new() },
         "write" | "edit" | "read" | "grep" | "find" | "ls" => Display::File {
             verb: crate::tools::verb_for(name),
             path: arguments
                 .get("path")
-                .or_else(|| arguments.get("file_path"))
                 .and_then(|v| v.as_str())
                 .unwrap_or(name)
                 .to_string(),
@@ -59,17 +50,13 @@ fn arguments_display(name: &str, arguments: &serde_json::Value) -> Display {
     }
 }
 
-fn tool_block_with(
-    name: &str,
-    arguments: &serde_json::Value,
-    output: &ToolOutput,
-    running: bool,
-) -> Block {
+/// Build a finished call with its header and outcome always visible.
+pub fn tool_block(name: &str, arguments: &serde_json::Value, output: &ToolOutput) -> Block {
     let theme = Theme::default();
     let mut lines: Vec<Line> = Vec::new();
     let mut head = 1usize;
     let mut tail = 0usize;
-    let (mark_style, mark) = status_mark(running, output.is_error);
+    let (mark_style, mark) = status_mark(false, output.is_error);
     let mark_span = Span::new(mark, mark_style);
 
     match &output.display {
@@ -161,7 +148,6 @@ fn plain_text_lines(text: &str, style: Style) -> Vec<Line> {
 /// The `✓ $ command` header as styled runs. A collapsed multi-line command shows its first
 /// line plus a note, because printing the whole body would defeat collapsing.
 pub fn command_header(mark: &Span, command: &str) -> Vec<Line> {
-    let _ = Theme::default();
     let mut spans = vec![
         Span::new(mark.text.clone(), Style { bold: true, ..mark.style }),
         Span::plain(" "),
@@ -213,7 +199,7 @@ pub fn note_lines(text: &str, style: Style) -> Vec<Line> {
 /// shown: the pairing lives in the `tool_call_id`, and a result printed on its own would
 /// read as unexplained output. Stored messages carry no `duration`, so a resumed command
 /// shows its output without a time — inventing one would be worse than omitting it.
-pub fn replay_blocks(messages: &[crate::llm::Message], width: usize) -> Vec<crate::ui::screen::Block> {
+pub fn replay_blocks(messages: &[crate::llm::Message]) -> Vec<crate::ui::screen::Block> {
     use crate::llm::{Block as MsgBlock, Message};
 
     // Tool results, keyed by the call they belong to.
@@ -250,14 +236,15 @@ pub fn replay_blocks(messages: &[crate::llm::Message], width: usize) -> Vec<crat
             Message::Assistant { content, stop_reason } => {
                 let mut lines: Vec<Line> = Vec::new();
                 let had_thinking = content.iter().any(|b| matches!(b, MsgBlock::Thinking { .. }));
+                if had_thinking { push_lines(&mut out, thinking_done_lines()); }
                 let stopped = *stop_reason == Some(crate::llm::StopReason::Aborted);
                 // Said once, on the first hosted call or citation, not once per result.
                 let mut announced_search = false;
                 for block in content {
                     match block {
                         MsgBlock::Text { text } => {
-                            lines.extend(crate::ui::markdown::render(text, width));
-                            lines.push(Line::blank());
+                            push_lines(&mut out, std::mem::take(&mut lines));
+                            if !text.trim().is_empty() { out.push(Block::markdown(text)); }
                         }
                         MsgBlock::ToolCall { id, name, arguments } => {
                             if !lines.is_empty() {
@@ -287,13 +274,7 @@ pub fn replay_blocks(messages: &[crate::llm::Message], width: usize) -> Vec<crat
                         _ => {}
                     }
                 }
-                if had_thinking {
-                    let mut prefix = thinking_done_lines();
-                    prefix.extend(lines);
-                    push_lines(&mut out, prefix);
-                } else if !lines.is_empty() {
-                    push_lines(&mut out, lines);
-                }
+                push_lines(&mut out, lines);
                 // A resumed session has to say that the answer was cut short, or a stopped
                 // turn reads as a model that simply trailed off — and the user has no way to
                 // tell "I stopped this" from "it gave up".
@@ -333,12 +314,11 @@ fn push_lines(out: &mut Vec<crate::ui::screen::Block>, lines: Vec<Line>) {
 fn stored_output(name: &str, arguments: &serde_json::Value, content: &str) -> ToolOutput {
     let mut output = ToolOutput::text(content);
     output.display = match name {
-        "bash" => Display::Command { expanded: false, footer: Vec::new() },
+        "bash" => Display::Command { footer: Vec::new() },
         "write" | "edit" | "read" | "grep" | "find" | "ls" => Display::File {
             verb: crate::tools::verb_for(name),
             path: arguments
                 .get("path")
-                .or_else(|| arguments.get("file_path"))
                 .and_then(|v| v.as_str())
                 .map(util::one_line)
                 .unwrap_or_else(|| "…".into()),
@@ -374,8 +354,7 @@ pub fn running_line(name: &str, arguments: &serde_json::Value) -> Vec<Span> {
             header_line.into_iter().next().map(|line| line.spans).unwrap_or_default()
         }
         Display::File { verb, path } => {
-            let _ = Theme::default();
-            vec![
+                    vec![
                 header,
                 Span::plain(" "),
                 Span::new(*verb, Style::plain()),
@@ -492,7 +471,7 @@ mod tests {
             content: vec![MsgBlock::Text { text: "说到一半".into() }],
             stop_reason: Some(StopReason::Aborted),
         }];
-        let text: String = replay_blocks(&stopped, 80)
+        let text: String = replay_blocks(&stopped)
             .iter()
             .flat_map(|block| plain(&block.render(80)))
             .collect::<Vec<_>>()
@@ -505,7 +484,7 @@ mod tests {
             content: vec![MsgBlock::Text { text: "说完了".into() }],
             stop_reason: Some(StopReason::Stop),
         }];
-        let text: String = replay_blocks(&finished, 80)
+        let text: String = replay_blocks(&finished)
             .iter()
             .flat_map(|block| plain(&block.render(80)))
             .collect::<Vec<_>>()
@@ -544,7 +523,7 @@ mod tests {
             },
         ];
         let blocks: Vec<Vec<String>> =
-            replay_blocks(&messages, 80).iter().map(|block| plain(&block.render(80))).collect();
+            replay_blocks(&messages).iter().map(|block| plain(&block.render(80))).collect();
         let text = blocks.join(&"".to_string()).join("\n");
 
         assert!(text.contains("› 跑一下 echo"), "{text}");
@@ -579,7 +558,7 @@ mod tests {
             }],
             stop_reason: None,
         }];
-        let text: Vec<String> = replay_blocks(&messages, 80)
+        let text: Vec<String> = replay_blocks(&messages)
             .iter()
             .flat_map(|block| plain(&block.render(80)))
             .collect();
@@ -590,7 +569,7 @@ mod tests {
     fn a_command_result_collapses_to_its_tail() {
         let output = ToolOutput {
             content: (0..20).map(|i| format!("row {i}\n")).collect(),
-            display: Display::Command { expanded: false, footer: vec!["耗时 0.4s".into()] },
+            display: Display::Command { footer: vec!["耗时 0.4s".into()] },
             is_error: false,
             duration: None,
         };
@@ -635,7 +614,7 @@ mod tests {
         // compares between runs, so it has to survive collapsing.
         let mut output = ToolOutput {
             content: "done\n".into(),
-            display: Display::Command { expanded: false, footer: Vec::new() },
+            display: Display::Command { footer: Vec::new() },
             is_error: false,
             duration: None,
         };
@@ -664,7 +643,7 @@ mod tests {
     fn a_failed_command_is_marked_and_reports_the_exit_code() {
         let output = ToolOutput {
             content: "boom\n[退出码 3]\n".into(),
-            display: Display::Command { expanded: false, footer: vec!["退出码 3".into()] },
+            display: Display::Command { footer: vec!["退出码 3".into()] },
             is_error: true,
             duration: None,
         };
@@ -798,7 +777,7 @@ mod tests {
     fn every_line_contains_no_escape_sequences() {
         let output = ToolOutput {
             content: "ok\n".into(),
-            display: Display::Command { expanded: false, footer: vec!["退出码 1".into()] },
+            display: Display::Command { footer: vec!["退出码 1".into()] },
             is_error: true,
             duration: None,
         };

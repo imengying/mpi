@@ -40,13 +40,9 @@ pub fn ask(request: PanelRequest) -> Decision {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         return Decision::Deny;
     }
-    // The shared guard, not a private one: this runs *inside* a turn, and switching raw mode
-    // off on the way out would hand the prompt back a line-buffering terminal — which is
-    // what used to swallow every keystroke typed while a turn was running.
-    let guard = match crate::ui::screen::RawGuard::enter() {
-        Ok(guard) => guard,
-        Err(_) => return Decision::Deny,
-    };
+    if crate::ui::terminal::ensure_raw_mode().is_err() {
+        return Decision::Deny;
+    }
     let theme = Theme::default();
     let mut state = PanelState::new(&request.body);
     let mut out = std::io::stdout();
@@ -72,7 +68,6 @@ pub fn ask(request: PanelRequest) -> Decision {
     state.clear(&mut out);
     let _ = crossterm::execute!(out, cursor::Show);
     let _ = out.flush();
-    drop(guard);
     decision
 }
 
@@ -80,8 +75,7 @@ struct PanelState {
     body: String,
     offset: usize,
     allow_selected: bool,
-    /// How many rows the previous frame occupied, so the next one can overwrite it.
-    drawn: usize,
+    top: Option<usize>,
 }
 
 impl PanelState {
@@ -93,19 +87,26 @@ impl PanelState {
             body: util::review(body),
             offset: 0,
             allow_selected: true,
-            drawn: 0,
+            top: None,
         }
     }
 }
 
 impl PanelState {
     fn handle_key(&mut self, key: KeyEvent) -> Option<Decision> {
+        if key.kind == crossterm::event::KeyEventKind::Release {
+            return None;
+        }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Esc => return Some(Decision::Deny),
             KeyCode::Char('c') if ctrl => return Some(Decision::Deny),
             KeyCode::Enter => {
-                return Some(if self.allow_selected { Decision::Allow } else { Decision::Deny });
+                return Some(if self.allow_selected {
+                    Decision::Allow
+                } else {
+                    Decision::Deny
+                });
             }
             KeyCode::Char('a') | KeyCode::Char('1') => return Some(Decision::Allow),
             KeyCode::Char('n') | KeyCode::Char('2') => return Some(Decision::Deny),
@@ -126,9 +127,24 @@ impl PanelState {
 
     fn draw(&mut self, out: &mut impl Write, theme: &Theme) -> std::io::Result<()> {
         let (width, rows) = terminal::size().unwrap_or((80, 24));
-        let width = width as usize;
-        let height = (rows as usize).min(Defaults::AUTH_PANEL_MAX_HEIGHT as usize).max(4);
-        let inner = width.saturating_sub(2).max(1);
+        self.draw_at(
+            out,
+            theme,
+            usize::from(width.max(1)),
+            usize::from(rows.max(1)),
+        )
+    }
+
+    fn draw_at(
+        &mut self,
+        out: &mut impl Write,
+        theme: &Theme,
+        width: usize,
+        rows: usize,
+    ) -> std::io::Result<()> {
+        let height = rows.min(Defaults::AUTH_PANEL_MAX_HEIGHT as usize);
+        let inset = usize::from(width >= 3);
+        let inner = width.saturating_sub(inset * 2).max(1);
         let content = util::wrap(&self.body, inner);
         let dock = height >= 5;
         let divider = height >= 8;
@@ -147,7 +163,8 @@ impl PanelState {
         let row = |plain: &str, selected: bool, style: &dyn Fn(&str) -> String| -> String {
             let visible = util::truncate(plain, inner, "…");
             let pad = " ".repeat(inner.saturating_sub(util::width(&visible)));
-            let line = format!(" {}{pad} ", style(&visible));
+            let edge = " ".repeat(inset);
+            let line = format!("{edge}{}{pad}{edge}", style(&visible));
             if selected {
                 theme.bg_selected(&line)
             } else {
@@ -159,7 +176,9 @@ impl PanelState {
         if dock {
             lines.push(rule.clone());
         }
-        lines.push(row(TITLE, false, &|text| theme.fg(Color::Cyan, text)));
+        if height >= 3 {
+            lines.push(row(TITLE, false, &|text| theme.fg(Color::Cyan, text)));
+        }
         for line in visible {
             lines.push(row(line, false, &|text| theme.fg(Color::Text, text)));
         }
@@ -170,39 +189,53 @@ impl PanelState {
             let marker = if selected { "› " } else { "  " };
             let text = format!("{marker}{label}");
             row(&text, selected, &|visible| {
-                let styled = if selected { theme.bold(visible) } else { visible.to_string() };
+                let styled = if selected {
+                    theme.bold(visible)
+                } else {
+                    visible.to_string()
+                };
                 theme.fg(Color::Cyan, &styled)
             })
         };
-        lines.push(choice(ALLOW_LABEL, self.allow_selected));
-        lines.push(choice(DENY_LABEL, !self.allow_selected));
-
-        if self.drawn > 0 {
-            crossterm::execute!(out, cursor::MoveToPreviousLine(self.drawn as u16))?;
+        if height > 1 || self.allow_selected {
+            lines.push(choice(ALLOW_LABEL, self.allow_selected));
         }
+        if height > 1 || !self.allow_selected {
+            lines.push(choice(DENY_LABEL, !self.allow_selected));
+        }
+
         // Paint every cell so the transcript cannot bleed through between rows. The rows are
         // already exactly `width` columns of *visible* text; the escapes are not counted,
         // which is the whole reason for measuring the stripped form here.
-        let mut frame = String::new();
-        for line in &lines {
+        let top = rows.saturating_sub(lines.len());
+        let clear = self.top.map_or(top, |old| old.min(top));
+        let mut frame = format!(
+            "\u{1b}[?2026h\u{1b}[{};1H\u{1b}[J\u{1b}[{};1H",
+            clear + 1,
+            top + 1
+        );
+        for (index, line) in lines.iter().enumerate() {
+            if index > 0 {
+                frame.push_str("\r\n");
+            }
             let width_used = util::width(&util::strip_ansi(line));
             frame.push_str(line);
             frame.push_str(&" ".repeat(width.saturating_sub(width_used)));
-            frame.push_str("\u{1b}[0m\r\n");
+            frame.push_str("\u{1b}[0m");
         }
+        frame.push_str("\u{1b}[?2026l");
         out.write_all(frame.as_bytes())?;
         out.flush()?;
-        self.drawn = lines.len();
+        self.top = Some(top);
         Ok(())
     }
 
     fn clear(&mut self, out: &mut impl Write) {
-        if self.drawn == 0 {
+        let Some(top) = self.top.take() else {
             return;
-        }
-        let _ = crossterm::execute!(out, cursor::MoveToPreviousLine(self.drawn as u16));
+        };
+        let _ = crossterm::execute!(out, cursor::MoveTo(0, top as u16));
         let _ = crossterm::execute!(out, terminal::Clear(terminal::ClearType::FromCursorDown));
-        self.drawn = 0;
     }
 }
 
@@ -210,31 +243,89 @@ impl PanelState {
 mod tests {
     use super::*;
 
+    #[test]
+    fn authorization_remains_bottom_anchored_on_resize_and_in_tiny_windows() {
+        let mut panel = state_with_rows(40);
+        let mut terminal = vt100::Parser::new(24, 40, 100);
+        let theme = Theme::default();
+        for (width, height) in [(40, 24), (20, 8), (4, 3), (1, 1), (60, 30)] {
+            terminal.screen_mut().set_size(height, width);
+            let mut frame = Vec::new();
+            panel
+                .draw_at(&mut frame, &theme, width as usize, height as usize)
+                .unwrap();
+            terminal.process(&frame);
+            assert_eq!(terminal.screen().cursor_position().0, height - 1);
+            assert!(panel.top.unwrap() < height as usize);
+            if width >= 20 {
+                assert!(terminal.screen().contents().contains(ALLOW_LABEL));
+                assert!(terminal.screen().contents().contains(DENY_LABEL));
+            }
+        }
+        assert!(
+            panel
+                .handle_key(KeyEvent::new_with_kind(
+                    KeyCode::Enter,
+                    KeyModifiers::NONE,
+                    crossterm::event::KeyEventKind::Release
+                ))
+                .is_none()
+        );
+    }
+
     fn state(body: &str) -> PanelState {
         PanelState::new(body)
     }
 
     /// A panel whose body is `count` numbered rows.
     fn state_with_rows(count: usize) -> PanelState {
-        state(&(0..count).map(|i| format!("body line {i}\n")).collect::<String>())
+        state(
+            &(0..count)
+                .map(|i| format!("body line {i}\n"))
+                .collect::<String>(),
+        )
     }
 
     #[test]
     fn enter_confirms_the_selected_choice() {
         let mut panel = state("cat x");
-        assert_eq!(panel.handle_key(KeyEvent::from(KeyCode::Enter)), Some(Decision::Allow));
+        assert_eq!(
+            panel.handle_key(KeyEvent::from(KeyCode::Enter)),
+            Some(Decision::Allow)
+        );
         panel.handle_key(KeyEvent::from(KeyCode::Tab));
-        assert_eq!(panel.handle_key(KeyEvent::from(KeyCode::Enter)), Some(Decision::Deny));
+        assert_eq!(
+            panel.handle_key(KeyEvent::from(KeyCode::Enter)),
+            Some(Decision::Deny)
+        );
     }
 
     #[test]
     fn shortcuts_decide_immediately() {
-        assert_eq!(state("x").handle_key(KeyEvent::from(KeyCode::Char('a'))), Some(Decision::Allow));
-        assert_eq!(state("x").handle_key(KeyEvent::from(KeyCode::Char('1'))), Some(Decision::Allow));
-        assert_eq!(state("x").handle_key(KeyEvent::from(KeyCode::Char('n'))), Some(Decision::Deny));
-        assert_eq!(state("x").handle_key(KeyEvent::from(KeyCode::Char('2'))), Some(Decision::Deny));
-        assert_eq!(state("x").handle_key(KeyEvent::from(KeyCode::Char('q'))), Some(Decision::Deny));
-        assert_eq!(state("x").handle_key(KeyEvent::from(KeyCode::Esc)), Some(Decision::Deny));
+        assert_eq!(
+            state("x").handle_key(KeyEvent::from(KeyCode::Char('a'))),
+            Some(Decision::Allow)
+        );
+        assert_eq!(
+            state("x").handle_key(KeyEvent::from(KeyCode::Char('1'))),
+            Some(Decision::Allow)
+        );
+        assert_eq!(
+            state("x").handle_key(KeyEvent::from(KeyCode::Char('n'))),
+            Some(Decision::Deny)
+        );
+        assert_eq!(
+            state("x").handle_key(KeyEvent::from(KeyCode::Char('2'))),
+            Some(Decision::Deny)
+        );
+        assert_eq!(
+            state("x").handle_key(KeyEvent::from(KeyCode::Char('q'))),
+            Some(Decision::Deny)
+        );
+        assert_eq!(
+            state("x").handle_key(KeyEvent::from(KeyCode::Esc)),
+            Some(Decision::Deny)
+        );
         let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert_eq!(state("x").handle_key(ctrl_c), Some(Decision::Deny));
     }
@@ -274,7 +365,14 @@ mod tests {
     /// asserted without a terminal. The panel's own body is used as-is.
     fn frame(panel: &mut PanelState) -> Vec<String> {
         let mut out: Vec<u8> = Vec::new();
-        panel.draw(&mut out, &Theme { mode: crate::ui::theme::ColorMode::True }).unwrap();
+        panel
+            .draw(
+                &mut out,
+                &Theme {
+                    mode: crate::ui::theme::ColorMode::True,
+                },
+            )
+            .unwrap();
         let text = String::from_utf8_lossy(&out).to_string();
         text.split("\r\n")
             .map(|line| {
@@ -305,7 +403,14 @@ mod tests {
     /// trailing padding is exactly what has to be measured.
     fn frame_widths(panel: &mut PanelState) -> Vec<(String, usize)> {
         let mut out: Vec<u8> = Vec::new();
-        panel.draw(&mut out, &Theme { mode: crate::ui::theme::ColorMode::True }).unwrap();
+        panel
+            .draw(
+                &mut out,
+                &Theme {
+                    mode: crate::ui::theme::ColorMode::True,
+                },
+            )
+            .unwrap();
         let text = String::from_utf8_lossy(&out).to_string();
         text.split("\r\n")
             .filter(|line| !line.is_empty())
@@ -318,7 +423,9 @@ mod tests {
 
     /// The terminal width the panel will draw at, as the panel itself asks for it.
     fn terminal_width() -> usize {
-        terminal::size().map(|(cols, _)| cols as usize).unwrap_or(80)
+        terminal::size()
+            .map(|(cols, _)| cols as usize)
+            .unwrap_or(80)
     }
 
     #[test]
@@ -365,14 +472,20 @@ mod tests {
         // Docked strip: a rule, the fixed title, the body, a rule, then the two choices.
         assert!(lines[0].starts_with('─'), "{lines:?}");
         assert_eq!(lines[1], TITLE, "{lines:?}");
-        assert_eq!(TITLE, "需要授权", "the title is short and fixed: the choices say the rest");
+        assert_eq!(
+            TITLE, "需要授权",
+            "the title is short and fixed: the choices say the rest"
+        );
         // No category label and no tool name anywhere in the frame: the body already says
         // what is being asked, and `bash` is the same on every platform.
         for line in &lines {
             assert!(!line.contains("bash"), "{lines:?}");
             assert!(!line.contains("危险操作"), "{lines:?}");
         }
-        assert!(lines.contains(&"› 1. 允许本次操作".to_string()), "{lines:?}");
+        assert!(
+            lines.contains(&"› 1. 允许本次操作".to_string()),
+            "{lines:?}"
+        );
         assert!(lines.contains(&"2. 拒绝并停止".to_string()), "{lines:?}");
         // The choices are the last two rows.
         assert!(lines[lines.len() - 2].starts_with("› 1."), "{lines:?}");
@@ -385,8 +498,14 @@ mod tests {
         frame(&mut panel);
         panel.handle_key(KeyEvent::from(KeyCode::Tab));
         let lines = frame(&mut panel);
-        assert!(lines.iter().any(|line| line == "1. 允许本次操作"), "{lines:?}");
-        assert!(lines.iter().any(|line| line == "› 2. 拒绝并停止"), "{lines:?}");
+        assert!(
+            lines.iter().any(|line| line == "1. 允许本次操作"),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line == "› 2. 拒绝并停止"),
+            "{lines:?}"
+        );
     }
 
     #[test]
@@ -396,7 +515,10 @@ mod tests {
         assert!(first[2].contains("body line 0"), "{first:?}");
         panel.handle_key(KeyEvent::from(KeyCode::End));
         let last = frame(&mut panel);
-        assert!(!last[2].contains("body line 0"), "the view should have scrolled: {last:?}");
+        assert!(
+            !last[2].contains("body line 0"),
+            "the view should have scrolled: {last:?}"
+        );
         // The decision rows are always the final two, however far the body has scrolled.
         assert!(last[last.len() - 2].starts_with("› 1."), "{last:?}");
         assert!(last[last.len() - 1].starts_with("2."), "{last:?}");
@@ -410,18 +532,39 @@ mod tests {
         // screen, ring the bell, or reverse the text.
         let payload = "\u{1b}[2Jclear\u{7}bell\u{202e}reversed";
         let panel = state(payload);
-        assert!(panel.body.contains("\\u001b"), "ESC must be escaped: {:?}", panel.body);
-        assert!(panel.body.contains("\\u0007"), "BEL must be escaped: {:?}", panel.body);
-        assert!(panel.body.contains("\\u202e"), "RTL override must be escaped: {:?}", panel.body);
+        assert!(
+            panel.body.contains("\\u001b"),
+            "ESC must be escaped: {:?}",
+            panel.body
+        );
+        assert!(
+            panel.body.contains("\\u0007"),
+            "BEL must be escaped: {:?}",
+            panel.body
+        );
+        assert!(
+            panel.body.contains("\\u202e"),
+            "RTL override must be escaped: {:?}",
+            panel.body
+        );
         assert!(!panel.body.contains('\u{1b}'), "{:?}", panel.body);
         // The payload's own text survives, so the display is faithful.
         assert!(panel.body.contains("clear"), "{:?}", panel.body);
         assert!(panel.body.contains("reversed"), "{:?}", panel.body);
         let mut panel = panel;
         let lines = frame(&mut panel);
-        assert!(lines.iter().all(|line| !line.contains('\u{1b}')), "{lines:?}");
-        assert!(lines.iter().all(|line| !line.contains('\u{7}')), "{lines:?}");
-        assert!(lines.contains(&"› 1. 允许本次操作".to_string()), "{lines:?}");
+        assert!(
+            lines.iter().all(|line| !line.contains('\u{1b}')),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().all(|line| !line.contains('\u{7}')),
+            "{lines:?}"
+        );
+        assert!(
+            lines.contains(&"› 1. 允许本次操作".to_string()),
+            "{lines:?}"
+        );
     }
 
     #[test]
@@ -435,4 +578,3 @@ mod tests {
         );
     }
 }
-

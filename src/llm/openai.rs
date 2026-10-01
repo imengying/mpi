@@ -598,6 +598,29 @@ pub struct Assembler {
 }
 
 impl Assembler {
+    pub fn finish_stream(self) -> Completion {
+        let valid = matches!(
+            self.stop_reason.as_deref(),
+            Some("stop" | "tool_calls" | "function_call" | "length" | "max_tokens")
+        );
+        let missing_call = self
+            .calls
+            .iter()
+            .any(|(id, name, _)| id.is_empty() || name.is_empty());
+        let length = matches!(self.stop_reason.as_deref(), Some("length" | "max_tokens"));
+        let completion = self.finish();
+        if completion.error.is_some() {
+            return completion.checked();
+        }
+        if !valid {
+            return completion.failed("流式响应未收到有效的 finish_reason");
+        }
+        if missing_call && !length {
+            return completion.failed("流式工具调用缺少 id 或名称");
+        }
+        completion.checked()
+    }
+
     pub(crate) fn push_delta(&mut self, delta: &StreamDelta, on_delta: &mut dyn FnMut(Delta)) {
         let thinking = delta
             .reasoning_content

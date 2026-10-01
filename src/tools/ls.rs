@@ -4,7 +4,6 @@ use std::path::Path;
 
 use crate::llm::ToolSpec;
 use crate::tools::{Display, ToolOutput};
-use crate::util;
 
 pub fn spec() -> ToolSpec {
     ToolSpec {
@@ -57,14 +56,12 @@ pub async fn execute(arguments: &serde_json::Value, cwd: &Path) -> Result<ToolOu
         }
         command.arg("--").arg(&target_path);
     }
-    let output = command
-        .current_dir(cwd)
-        .output()
+    let output = super::process::capture(command.current_dir(cwd))
         .await
         .map_err(|err| format!("列目录失败：{err}"))?;
-    let stdout = util::sanitize(String::from_utf8_lossy(&output.stdout).as_ref());
+    let (stdout, _) = output.stdout.finish(true).map_err(|err| err.to_string())?;
     if !output.status.success() {
-        let stderr = util::sanitize(String::from_utf8_lossy(&output.stderr).as_ref());
+        let (stderr, _) = output.stderr.finish(true).map_err(|err| err.to_string())?;
         return Err(if stderr.trim().is_empty() {
             format!("列目录失败（退出码 {:?}）", output.status.code())
         } else {
@@ -85,6 +82,27 @@ pub async fn execute(arguments: &serde_json::Value, cwd: &Path) -> Result<ToolOu
 mod tests {
     use super::*;
     use crate::tools::block;
+
+    #[test]
+    fn a_large_listing_retains_the_full_output_without_an_unbounded_result() {
+        let dir = std::env::temp_dir().join(format!("pi-ls-large-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir(&dir).unwrap();
+        for index in 0..800 {
+            std::fs::write(dir.join(format!("{index:04}-{}.txt", "x".repeat(100))), "").unwrap();
+        }
+        let out = block(execute(&serde_json::json!({}), &dir)).unwrap();
+        assert!(!out.is_error && out.content.len() <= crate::util::MAX_OUTPUT_BYTES);
+        let path = out
+            .content
+            .split("完整输出：")
+            .nth(1)
+            .unwrap()
+            .trim()
+            .trim_end_matches(']');
+        assert!(std::fs::metadata(path).unwrap().len() > crate::util::MAX_OUTPUT_BYTES as u64);
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
 
     fn fixture() -> std::path::PathBuf {

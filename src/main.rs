@@ -104,7 +104,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 // The note for "nothing to expand" comes from the screen itself.
                 let _ = agent.screen.toggle_last_collapsible();
             }
-            Action::Interrupt => continue,
+            Action::Interrupt => break,
             // Esc stops the turn in flight, and this is the prompt: nothing is running, so
             // there is nothing to stop. The screen only raises it while the spinner is up,
             // which is why reaching here is a no-op rather than a special case.
@@ -190,4 +190,3 @@ fn futures_block<F: std::future::Future>(future: F) -> F::Output {
         .expect("a Tokio runtime")
         .block_on(future)
 }
-

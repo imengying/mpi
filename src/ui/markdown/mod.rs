@@ -119,6 +119,26 @@ fn is_blank_line(line: &Line) -> bool {
     line.spans.iter().all(|span| span.text.trim().is_empty())
 }
 
+/// Blank-terminated blocks outside a code fence can leave the live preview.
+pub(crate) fn stable_prefix(text: &str) -> usize {
+    let mut fence: Option<Fence> = None;
+    let mut offset = 0;
+    let mut stable = 0;
+    for line in text.split_inclusive('\n') {
+        if !line.ends_with('\n') { break; }
+        offset += line.len();
+        let raw = line.trim_end_matches('\n');
+        if let Some(open) = &fence {
+            if closes(open, raw) { fence = None; }
+        } else if let Some(open) = Fence::open(raw) {
+            fence = Some(open);
+        } else if raw.trim().is_empty() {
+            stable = offset;
+        }
+    }
+    stable
+}
+
 /// One line of a fenced block. The indent is part of the line, and `hang` matches it so a
 /// wrapped code line lines up under the code rather than under the frame.
 ///
@@ -597,6 +617,16 @@ use code::{push, render_table, starts_with};
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stable_stream_blocks_hold_open_fences_and_partial_tables() {
+        for text in ["段落\n\n尾", "段落\n\n```rs\nfirst\n\nsecond\n", "段落\n\n| A | B |\n| - | - |\n"] {
+            assert_eq!(&text[..stable_prefix(text)], "段落\n\n");
+        }
+        let closed = "段落\n\n~~~~\n\ncode\n~~~~\n\n尾";
+        assert_eq!(&closed[..stable_prefix(closed)], "段落\n\n~~~~\n\ncode\n~~~~\n\n");
+        assert_eq!(stable_prefix("尚未结束的段落"), 0);
+    }
 
     #[test]
     fn summaries_render_combined_emphasis_escapes_and_code_delimiters() {

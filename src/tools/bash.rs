@@ -15,7 +15,8 @@ pub fn spec() -> ToolSpec {
     ToolSpec {
         name: "bash".into(),
         description: "在 zsh 中执行一条命令并返回输出。只读的简单命令会自动执行，\
-                      其余命令会在执行前请求用户授权。命令输出默认只显示末尾若干行。"
+                      其余命令会在执行前请求用户授权。自动授权的内容搜索会跳过敏感文件。\
+                      命令输出默认只显示末尾若干行。"
             .into(),
         parameters: serde_json::json!({
             "type": "object",
@@ -38,15 +39,15 @@ pub async fn execute_with_shell(
     let capture = super::output::Capture::new().map_err(|err| format!("创建输出文件失败：{err}"))?;
     let stdout = capture.file.try_clone().map_err(|err| err.to_string())?;
     let stderr = capture.file.try_clone().map_err(|err| err.to_string())?;
-    let mut child = tokio::process::Command::new(shell)
+    let mut process = tokio::process::Command::new(shell);
+    process
         .arg("-c")
         .arg(command)
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr))
-        .kill_on_drop(true)
-        .spawn()
+        .stderr(Stdio::from(stderr));
+    let mut child = super::process::Child::spawn(&mut process)
         .map_err(|err| format!("无法启动 {shell}：{err}"))?;
 
     let status = child
@@ -80,7 +81,7 @@ pub async fn execute_with_shell(
     }
     Ok(ToolOutput {
         content,
-        display: Display::Command { expanded: false, footer },
+        display: Display::Command { footer },
         is_error: failed,
 duration: None,
 })
@@ -90,6 +91,50 @@ duration: None,
 mod tests {
     use super::*;
     use crate::tools::block;
+
+    #[tokio::test]
+    async fn cancellation_stops_background_descendants() {
+        let dir = std::env::temp_dir().join(format!("pi-cancel-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir(&dir).unwrap();
+        let task_dir = dir.clone();
+        let task = tokio::spawn(async move {
+            execute_with_shell(
+                "sh -c 'printf ready > ready; sleep 0.5; printf survived > marker' & wait",
+                &task_dir,
+                "/usr/bin/zsh",
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !dir.join("ready").exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        assert!(
+            !dir.join("marker").exists(),
+            "cancelled grandchildren must not continue writing"
+        );
+        execute_with_shell(
+            "sh -c 'sleep 0.1; printf complete > normal' &",
+            &dir,
+            "/usr/bin/zsh",
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !dir.join("normal").exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("normal completion must preserve an explicitly approved background job");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn large_stderr_cannot_block_stdout_and_keeps_the_full_log() {

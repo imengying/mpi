@@ -129,3 +129,51 @@ fn the_policy_reports_a_reason_for_every_refusal() {
     }
     let _ = Path::new(".");
 }
+
+#[tokio::test]
+async fn broad_and_explicit_glob_searches_cannot_read_secrets() {
+    use mpi::auth::guard::PermissionGate;
+    let dir = std::env::temp_dir().join(format!("pi-search-policy-{}", uuid::Uuid::now_v7()));
+    std::fs::create_dir_all(dir.join(".ssh")).unwrap();
+    std::fs::write(dir.join(".env"), "policy-secret-sentinel\n").unwrap();
+    std::fs::write(dir.join(".ENV.local"), "policy-secret-sentinel\n").unwrap();
+    std::fs::write(dir.join(".ssh/config"), "policy-secret-sentinel\n").unwrap();
+    std::fs::write(dir.join("ordinary.txt"), "ordinary-sentinel\n").unwrap();
+    let gate = PermissionGate::new(false, Dialect::Zsh);
+    for command in [
+        "rg --hidden --no-ignore policy-secret-sentinel .",
+        "rg --hidden --no-ignore --glob .env -- policy-secret-sentinel .",
+        "rg --hidden --no-ignore -g '*.local' policy-secret-sentinel .",
+        "grep -r --include=.env policy-secret-sentinel .",
+        "grep -r policy-secret-sentinel .",
+    ] {
+        let approved = gate
+            .check("bash", &serde_json::json!({"command":command}), &dir)
+            .unwrap();
+        let out = mpi::tools::execute("bash", &approved, &dir, "/usr/bin/zsh").await;
+        assert!(
+            !out.content.contains("policy-secret-sentinel"),
+            "{command}: {}",
+            out.content
+        );
+    }
+    for command in [
+        "rg --hidden --no-ignore ordinary-sentinel .",
+        "grep -r ordinary-sentinel .",
+    ] {
+        let approved = gate
+            .check("bash", &serde_json::json!({"command":command}), &dir)
+            .unwrap();
+        let out = mpi::tools::execute("bash", &approved, &dir, "/usr/bin/zsh").await;
+        assert!(
+            !out.is_error && out.content.contains("ordinary-sentinel"),
+            "{command}: {}",
+            out.content
+        );
+    }
+    let input = serde_json::json!({"pattern":"policy-secret-sentinel", "glob":".env"});
+    let approved = gate.check("grep", &input, &dir).unwrap();
+    let out = mpi::tools::execute("grep", &approved, &dir, "/usr/bin/zsh").await;
+    assert!(!out.content.contains("policy-secret-sentinel"));
+    std::fs::remove_dir_all(dir).unwrap();
+}

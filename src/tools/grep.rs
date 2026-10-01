@@ -1,15 +1,16 @@
 //! `grep`: content search. Uses system `rg` when present, otherwise `grep -rn`.
 
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use crate::llm::ToolSpec;
 use crate::tools::{Display, ToolOutput};
-use crate::util;
 
 pub fn spec() -> ToolSpec {
     ToolSpec {
         name: "grep".into(),
-        description: "在文件内容中搜索。优先使用系统 rg，回退 grep。输出为「文件:行号:内容」。"
+        description: "在文件内容中搜索。优先使用系统 rg，回退 grep。输出为「文件:行号:内容」。\
+                      递归搜索默认跳过凭据、密钥及敏感目录；搜索敏感内容请明确指定其路径并获得授权。"
             .into(),
         parameters: serde_json::json!({
             "type": "object",
@@ -41,6 +42,19 @@ fn engine() -> Option<Engine> {
 }
 
 pub async fn execute(arguments: &serde_json::Value, cwd: &Path) -> Result<ToolOutput, String> {
+    execute_with_engine(
+        arguments,
+        cwd,
+        engine().ok_or("系统中既没有 rg 也没有 grep，无法搜索")?,
+    )
+    .await
+}
+
+async fn execute_with_engine(
+    arguments: &serde_json::Value,
+    cwd: &Path,
+    engine: Engine,
+) -> Result<ToolOutput, String> {
     let pattern = crate::tools::required_str(arguments, "pattern")?;
     if pattern.is_empty() {
         return Err("pattern 不能为空".into());
@@ -50,19 +64,32 @@ pub async fn execute(arguments: &serde_json::Value, cwd: &Path) -> Result<ToolOu
     if !target_path.exists() {
         return Err(format!("路径不存在：{target}"));
     }
+    let filter_secrets = target_path.is_dir()
+        && crate::auth::policy::assess_path(crate::auth::policy::Operation::Read, target, cwd)
+            .allows();
     let glob = arguments.get("glob").and_then(|v| v.as_str());
     let ignore_case = arguments.get("ignore_case").and_then(|v| v.as_bool()).unwrap_or(false);
     let fixed = arguments.get("fixed_strings").and_then(|v| v.as_bool()).unwrap_or(false);
     let context = crate::tools::optional_u64(arguments, "context").unwrap_or(0);
-    let max_results = crate::tools::optional_u64(arguments, "max_results").unwrap_or(200) as usize;
+    let max_results = crate::tools::optional_u64(arguments, "max_results").unwrap_or(200);
+    if max_results == 0 {
+        return Err("max_results 必须大于 0".into());
+    }
 
-    let engine = engine().ok_or("系统中既没有 rg 也没有 grep，无法搜索")?;
     let mut command = tokio::process::Command::new(match &engine {
         Engine::Ripgrep(path) | Engine::GnuGrep(path) => path,
     });
     match &engine {
         Engine::Ripgrep(_) => {
-            command.arg("--line-number").arg("--no-heading").arg("--color=never");
+            command.args([
+                "--no-config",
+                "--line-number",
+                "--with-filename",
+                "--null",
+                "--no-heading",
+                "--context-separator=",
+                "--color=never",
+            ]);
             if ignore_case {
                 command.arg("--ignore-case");
             }
@@ -75,11 +102,17 @@ pub async fn execute(arguments: &serde_json::Value, cwd: &Path) -> Result<ToolOu
             if context > 0 {
                 command.arg("--context").arg(context.to_string());
             }
-            command.arg("--max-count").arg(max_results.to_string());
+            command
+                .arg("--max-count")
+                .arg(max_results.saturating_add(1).to_string());
+            if filter_secrets {
+                command.args(crate::auth::policy::search_exclusions(true));
+            }
             command.arg("--").arg(pattern).arg(&target_path);
         }
         Engine::GnuGrep(_) => {
-            command.arg("-rn").arg("--color=never");
+            command.args(["-rInH", "-Z", "--no-group-separator", "--color=never"]);
+            command.env_remove("POSIXLY_CORRECT");
             if ignore_case {
                 command.arg("-i");
             }
@@ -92,42 +125,79 @@ pub async fn execute(arguments: &serde_json::Value, cwd: &Path) -> Result<ToolOu
             if context > 0 {
                 command.arg(format!("-C{context}"));
             }
-            command.arg("-m").arg(max_results.to_string());
+            command
+                .arg("-m")
+                .arg(max_results.saturating_add(1).to_string());
+            if filter_secrets {
+                command.args(crate::auth::policy::search_exclusions(false));
+            }
             command.arg("--").arg(pattern).arg(&target_path);
         }
     }
-    let output = command
-        .current_dir(cwd)
-        .output()
+    let output = super::process::capture(command.current_dir(cwd))
         .await
         .map_err(|err| format!("搜索命令启动失败：{err}"))?;
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    let body = util::sanitize(&stdout);
-    if body.trim().is_empty() {
-        let mut content = "没有找到匹配。".to_string();
-        if !stderr.trim().is_empty() {
-            content.push('\n');
-            content.push_str(&util::sanitize(&stderr));
+    let failed = !matches!(output.status.code(), Some(0 | 1));
+    let body = tokio::task::spawn_blocking(move || select_matches(output.stdout, max_results))
+        .await
+        .map_err(|err| err.to_string())?
+        .map_err(|err| format!("读取搜索输出失败：{err}"))?;
+    let (stderr, _) = output.stderr.finish(true).map_err(|err| err.to_string())?;
+    let mut content = if body.is_empty() {
+        if failed {
+            format!("搜索失败（退出码 {:?}）", output.status.code())
+        } else {
+            "没有找到匹配。".into()
         }
-        return Ok(ToolOutput {
-            content,
-            display: Display::File { verb: "搜索", path: target.to_string() },
-            is_error: false,
-            duration: None,
-        });
-    }
-    let mut content = body.clone();
+    } else {
+        body
+    };
     if !stderr.trim().is_empty() {
         content.push('\n');
-        content.push_str(&util::sanitize(&stderr));
+        content.push_str(&stderr);
     }
     Ok(ToolOutput {
         content,
         display: Display::File { verb: "搜索", path: target.to_string() },
-        is_error: false,
+        is_error: failed,
         duration: None,
     })
+}
+
+fn select_matches(mut raw: super::output::Capture, max_results: u64) -> std::io::Result<String> {
+    raw.file.seek(SeekFrom::Start(0))?;
+    let mut reader = std::io::BufReader::new(&mut raw.file);
+    let mut selected = super::output::Capture::new()?;
+    let mut count = 0u64;
+    while let Some(path) = super::output::field(&mut reader, 0, crate::util::MAX_OUTPUT_BYTES)? {
+        // Ripgrep emits an empty separator line between distant context groups.
+        let path = path.strip_prefix(b"\n").unwrap_or(&path);
+        let mut number = Vec::new();
+        let separator = loop {
+            let mut byte = [0];
+            reader.read_exact(&mut byte)?;
+            if matches!(byte[0], b':' | b'-') {
+                break byte[0];
+            }
+            if !byte[0].is_ascii_digit() || number.len() >= 20 {
+                return Err(std::io::Error::other("无法识别搜索行号"));
+            }
+            number.push(byte[0]);
+        };
+        if separator == b':' {
+            if count == max_results {
+                writeln!(selected.file, "[已截断，仅返回前 {max_results} 条匹配]")?;
+                break;
+            }
+            count += 1;
+        }
+        selected.file.write_all(path)?;
+        selected.file.write_all(&[separator])?;
+        selected.file.write_all(&number)?;
+        selected.file.write_all(&[separator])?;
+        super::output::copy_line(&mut reader, &mut selected.file)?;
+    }
+    selected.finish(true).map(|(text, _)| text)
 }
 
 #[cfg(test)]
@@ -135,6 +205,97 @@ mod tests {
     use super::*;
     use crate::tools::block;
     use std::path::PathBuf;
+
+    #[test]
+    fn gnu_fallback_enforces_the_same_limits_and_secret_filters() {
+        let dir = fixture("gnu-fallback");
+        std::fs::write(dir.join(".env"), "beta\n").unwrap();
+        let input = serde_json::json!({"pattern":"beta", "context":1, "max_results":1});
+        let engine =
+            Engine::GnuGrep(super::super::first_present(&["/usr/bin/grep", "/bin/grep"]).unwrap());
+        let out = block(execute_with_engine(&input, &dir, engine)).unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(
+            out.content
+                .lines()
+                .filter(|line| line.ends_with(":beta"))
+                .count(),
+            1,
+            "{}",
+            out.content
+        );
+        assert!(out.content.contains("已截断"));
+        assert!(!out.content.contains(".env"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_match_limit_is_global_and_preserves_context() {
+        let dir = fixture("global-limit");
+        let out = block(execute(
+            &serde_json::json!({"pattern":"beta", "context":1, "max_results":1}),
+            &dir,
+        ))
+        .unwrap();
+        assert_eq!(
+            out.content
+                .lines()
+                .filter(|line| line.ends_with(":beta"))
+                .count(),
+            1,
+            "{}",
+            out.content
+        );
+        assert!(out.content.contains("已截断"));
+        assert!(
+            out.content.contains("-1-")
+                && (out.content.contains("alpha") || out.content.contains("gamma"))
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn recursive_search_cannot_restore_secrets_with_a_glob() {
+        let dir = fixture("secrets");
+        std::fs::write(dir.join(".env"), "search-sentinel\n").unwrap();
+        std::fs::create_dir(dir.join(".ssh")).unwrap();
+        std::fs::write(dir.join(".ssh/config"), "search-sentinel\n").unwrap();
+        let out = block(execute(
+            &serde_json::json!({"pattern":"search-sentinel", "glob":".env"}),
+            &dir,
+        ))
+        .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("没有找到匹配"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_huge_match_is_bounded_and_retained_in_full() {
+        let dir = fixture("huge-match");
+        let line = format!("match{}\n", "x".repeat(2 * 1024 * 1024));
+        std::fs::write(dir.join("huge.txt"), &line).unwrap();
+        let out = block(execute(&serde_json::json!({"pattern":"match"}), &dir)).unwrap();
+        assert!(out.content.len() <= crate::util::MAX_OUTPUT_BYTES);
+        let path = out
+            .content
+            .split("完整输出：")
+            .nth(1)
+            .unwrap()
+            .trim_end_matches(']');
+        assert!(std::fs::metadata(path).unwrap().len() > line.len() as u64);
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn invalid_patterns_report_an_error() {
+        let dir = fixture("invalid-regex");
+        let out = block(execute(&serde_json::json!({"pattern":"["}), &dir)).unwrap();
+        assert!(out.is_error);
+        assert!(!out.content.contains("没有找到匹配"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
 
     /// A directory holding `a.txt` and `b.txt`, private to one test.

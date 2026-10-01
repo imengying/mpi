@@ -4,11 +4,11 @@
 //! rows. Both are pure — no terminal, no `Screen` — so the caret can be checked as a
 //! coordinate rather than by watching a cursor blink.
 //!
-//! The caret is a **character** index, not a byte offset and not a column: bytes would split
-//! a CJK character, and columns would make a horizontal move depend on how wide the
-//! characters happen to be.
+//! The caret is a character index. Movement and deletion follow grapheme boundaries,
+//! so combining marks and emoji sequences stay intact.
 
 use crate::util;
+use unicode_segmentation::UnicodeSegmentation;
 
 /// One row of the input area: the prompt prefix, the text on that row, and the index into
 /// the buffer (in characters) of the first character the row shows.
@@ -46,21 +46,27 @@ pub(crate) fn input_layout(text: &str, width: usize, prompt_width: usize) -> Vec
     // Every row, continuation included, carries a two-column prefix so the text lines up
     // under itself; the usable width is therefore the same on all of them.
     let room = width.saturating_sub(prompt_width).max(1);
-    for (index, c) in text.chars().enumerate() {
-        if c == '\n' {
+    let mut index = 0;
+    for grapheme in text.graphemes(true) {
+        if grapheme == "\n" {
             rows.push(InputRow {
                 prefix: String::new(),
                 text: std::mem::take(&mut current),
                 start,
             });
             if used == room {
-                rows.push(InputRow { prefix: String::new(), text: String::new(), start: index });
+                rows.push(InputRow {
+                    prefix: String::new(),
+                    text: String::new(),
+                    start: index,
+                });
             }
             start = index + 1;
+            index += 1;
             used = 0;
             continue;
         }
-        let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+        let cw = util::width(grapheme);
         if used + cw > room && used > 0 {
             rows.push(InputRow {
                 prefix: String::new(),
@@ -70,22 +76,36 @@ pub(crate) fn input_layout(text: &str, width: usize, prompt_width: usize) -> Vec
             start = index;
             used = 0;
         }
-        current.push(c);
+        current.push_str(grapheme);
         used += cw;
+        index += grapheme.chars().count();
     }
-    rows.push(InputRow { prefix: String::new(), text: current, start });
+    rows.push(InputRow {
+        prefix: String::new(),
+        text: current,
+        start,
+    });
     // A row filled to the last cell needs one more for the caret to sit on. The caret marks
     // where the next character goes, and there is no cell left on this row to draw it in:
     // asking the terminal for a column past the right edge is clamped to the last cell at
     // best, and clamps are exactly what a caret must not depend on. An empty row is where
     // readline puts the cursor in the same situation.
-    if rows.last().is_some_and(|row| util::width(&row.text) == room) {
+    if rows
+        .last()
+        .is_some_and(|row| util::width(&row.text) == room)
+    {
         let start = text.chars().count();
-        rows.push(InputRow { prefix: String::new(), text: String::new(), start });
+        rows.push(InputRow {
+            prefix: String::new(),
+            text: String::new(),
+            start,
+        });
     }
     // Tag the prefixes now that the row count is known.
     for (index, row) in rows.iter_mut().enumerate() {
-        row.prefix = if index == 0 {
+        row.prefix = if prompt_width == 0 {
+            String::new()
+        } else if index == 0 {
             "› ".to_string()
         } else {
             " ".repeat(prompt_width)
@@ -142,6 +162,7 @@ pub struct Editor {
     chars: Vec<char>,
     /// Where the next character typed goes, as an index into `chars`.
     caret: usize,
+    preferred_column: Option<usize>,
 }
 
 impl Editor {
@@ -152,7 +173,11 @@ impl Editor {
     pub fn from_text(text: &str) -> Self {
         let chars: Vec<char> = text.chars().collect();
         let caret = chars.len();
-        Editor { chars, caret }
+        Editor {
+            chars,
+            caret,
+            preferred_column: None,
+        }
     }
 
     pub fn text(&self) -> String {
@@ -171,27 +196,39 @@ impl Editor {
         self.caret
     }
 
-    /// Move the caret `delta` characters left or right, stopping at both ends.
+    /// Move `delta` graphemes left or right, stopping at both ends.
     ///
     /// Clamping rather than wrapping is what makes the key safe to hold down: a caret that
     /// jumped from one end of the line to the other would make correcting a typo a guessing
     /// game about where it is going to land.
     pub fn move_caret(&mut self, delta: isize) {
-        self.caret = (self.caret as isize + delta).clamp(0, self.chars.len() as isize) as usize;
+        self.preferred_column = None;
+        let boundaries = self.boundaries();
+        let index = boundaries.partition_point(|position| *position < self.caret);
+        let next = index.saturating_add_signed(delta).min(boundaries.len() - 1);
+        self.caret = boundaries[next];
     }
 
     pub fn home(&mut self) {
+        self.preferred_column = None;
         self.caret = 0;
     }
 
     pub fn end(&mut self) {
+        self.preferred_column = None;
         self.caret = self.chars.len();
     }
 
     /// Insert at the caret, which then sits after the text just typed.
     pub fn insert(&mut self, text: &str) {
+        self.preferred_column = None;
         self.chars.splice(self.caret..self.caret, text.chars());
         self.caret += text.chars().count();
+        self.caret = self
+            .boundaries()
+            .into_iter()
+            .find(|position| *position >= self.caret)
+            .unwrap_or(self.chars.len());
     }
 
     /// Both clipboard paths insert one edit, preserving paragraphs without terminal controls.
@@ -202,22 +239,30 @@ impl Editor {
 
     /// Backspace: remove the character *before* the caret, if there is one.
     pub fn backspace(&mut self) {
+        self.preferred_column = None;
         if self.caret > 0 {
-            self.caret -= 1;
-            self.chars.remove(self.caret);
+            let previous = self
+                .boundaries()
+                .into_iter()
+                .take_while(|position| *position < self.caret)
+                .last()
+                .unwrap_or(0);
+            self.chars.drain(previous..self.caret);
+            self.caret = previous;
         }
     }
 
     /// Delete: remove the character *under* the caret, leaving the caret where it is.
     pub fn delete(&mut self) {
+        self.preferred_column = None;
         if self.caret < self.chars.len() {
-            self.chars.remove(self.caret);
+            let next = self
+                .boundaries()
+                .into_iter()
+                .find(|position| *position > self.caret)
+                .unwrap_or(self.chars.len());
+            self.chars.drain(self.caret..next);
         }
-    }
-
-    pub fn clear(&mut self) {
-        self.chars.clear();
-        self.caret = 0;
     }
 
     /// Delete back to the start of the current word, as Ctrl+W does everywhere else.
@@ -226,29 +271,193 @@ impl Editor {
     /// pressing Ctrl+W in the middle of a line removes the word to the left rather than the
     /// tail of the line.
     pub fn delete_word(&mut self) {
-        while self.caret > 0 && self.chars[self.caret - 1] == ' ' {
-            self.backspace();
+        let end = self.caret;
+        self.move_word(-1);
+        self.chars.drain(self.caret..end);
+    }
+
+    pub fn move_word(&mut self, direction: isize) {
+        self.preferred_column = None;
+        if direction < 0 {
+            while self.caret > 0 && self.chars[self.caret - 1].is_whitespace() {
+                self.caret -= 1;
+            }
+            while self.caret > 0 && !self.chars[self.caret - 1].is_whitespace() {
+                self.caret -= 1;
+            }
+        } else {
+            while self.caret < self.chars.len() && !self.chars[self.caret].is_whitespace() {
+                self.caret += 1;
+            }
+            while self.caret < self.chars.len() && self.chars[self.caret].is_whitespace() {
+                self.caret += 1;
+            }
         }
-        while self.caret > 0 && self.chars[self.caret - 1] != ' ' {
-            self.backspace();
-        }
+        let boundaries = self.boundaries();
+        self.caret = if direction < 0 {
+            boundaries
+                .into_iter()
+                .take_while(|position| *position <= self.caret)
+                .last()
+                .unwrap_or(0)
+        } else {
+            boundaries
+                .into_iter()
+                .find(|position| *position >= self.caret)
+                .unwrap_or(self.chars.len())
+        };
     }
 
     /// Delete from the caret back to the start of the line.
     pub fn delete_to_start(&mut self) {
-        self.chars.drain(..self.caret);
-        self.caret = 0;
+        self.preferred_column = None;
+        let start = self.line_start();
+        self.chars.drain(start..self.caret);
+        self.caret = start;
     }
 
     /// Delete from the caret to the end of the line.
     pub fn delete_to_end(&mut self) {
-        self.chars.truncate(self.caret);
+        self.preferred_column = None;
+        let end = self.line_end();
+        let end = if end == self.caret && end < self.chars.len() {
+            end + 1
+        } else {
+            end
+        };
+        self.chars.drain(self.caret..end);
+    }
+
+    pub fn line_home(&mut self) {
+        self.caret = self.line_start();
+        self.preferred_column = None;
+    }
+
+    pub fn line_end_caret(&mut self) {
+        self.caret = self.line_end();
+        self.preferred_column = None;
+    }
+
+    fn line_start(&self) -> usize {
+        self.chars[..self.caret]
+            .iter()
+            .rposition(|ch| *ch == '\n')
+            .map_or(0, |index| index + 1)
+    }
+
+    fn line_end(&self) -> usize {
+        self.chars[self.caret..]
+            .iter()
+            .position(|ch| *ch == '\n')
+            .map_or(self.chars.len(), |index| self.caret + index)
+    }
+
+    /// Move by visual rows, remembering the display column across short lines.
+    /// Returns false at an edge, where the caller can enter input history.
+    pub fn move_vertical(&mut self, delta: isize, width: usize, prefix: usize) -> bool {
+        let rows = input_layout(&self.text(), width, prefix);
+        let (row, column) = input_caret(&rows, self.caret);
+        let target = row as isize + delta;
+        if target < 0 || target >= rows.len() as isize {
+            return false;
+        }
+        let column = *self.preferred_column.get_or_insert(column);
+        let target = target as usize;
+        let mut offset = 0;
+        let mut cells = 0;
+        for grapheme in rows[target].text.graphemes(true) {
+            let next = cells + util::width(grapheme);
+            if next > column {
+                break;
+            }
+            cells = next;
+            offset += grapheme.chars().count();
+        }
+        self.caret = rows[target].start + offset;
+        // A full wrapped row's trailing insertion position belongs to the next row.
+        if target + 1 < rows.len() && self.caret >= rows[target + 1].start {
+            self.caret = self
+                .boundaries()
+                .into_iter()
+                .take_while(|position| *position < rows[target + 1].start)
+                .last()
+                .unwrap_or(0);
+        }
+        true
+    }
+
+    fn boundaries(&self) -> Vec<usize> {
+        let text = self.text();
+        let mut boundaries = vec![0];
+        let mut chars = 0;
+        for grapheme in text.graphemes(true) {
+            chars += grapheme.chars().count();
+            boundaries.push(chars);
+        }
+        boundaries
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grapheme_editing_keeps_accents_flags_and_joined_emoji_intact() {
+        for cluster in ["e\u{301}", "🇨🇳", "👩‍💻"] {
+            let mut editor = Editor::from_text(&format!("a{cluster}b"));
+            editor.move_caret(-2);
+            assert_eq!(editor.caret(), 1);
+            editor.delete();
+            assert_eq!(editor.text(), "ab");
+            editor = Editor::from_text(&format!("a{cluster}"));
+            editor.backspace();
+            assert_eq!(editor.text(), "a");
+            let rows = input_layout(&format!("{cluster}x{cluster}"), 5, 2);
+            assert!(rows.iter().all(|row| util::width(&row.text) <= 3));
+            assert_eq!(
+                rows.iter().map(|row| row.text.as_str()).collect::<String>(),
+                format!("{cluster}x{cluster}")
+            );
+        }
+    }
+
+    #[test]
+    fn vertical_movement_remembers_columns_and_uses_wrapped_rows() {
+        let mut editor = Editor::from_text("abcdef\n中\nuvwxyz");
+        assert!(editor.move_vertical(-1, 20, 2));
+        assert_eq!(editor.caret(), 8);
+        assert!(editor.move_vertical(-1, 20, 2));
+        assert_eq!(editor.caret(), 6);
+        assert!(!editor.move_vertical(-1, 20, 2));
+        assert!(editor.move_vertical(1, 20, 2));
+        assert!(editor.move_vertical(1, 20, 2));
+        assert_eq!(editor.caret(), editor.len());
+        let mut editor = Editor::from_text("abcdefghijklmn");
+        assert!(editor.move_vertical(-1, 8, 2));
+        assert_eq!(editor.caret(), 8);
+        assert!(editor.move_vertical(-1, 8, 2));
+        assert_eq!(editor.caret(), 2);
+    }
+
+    #[test]
+    fn line_editing_and_word_navigation_preserve_other_paragraphs() {
+        let mut editor = Editor::from_text("before\none two\nafter");
+        editor.move_caret(-8);
+        editor.line_home();
+        assert_eq!(editor.caret(), 7);
+        editor.line_end_caret();
+        assert_eq!(editor.caret(), 14);
+        editor.move_word(-1);
+        assert_eq!(editor.caret(), 11);
+        assert_eq!(editor.text(), "before\none two\nafter");
+        editor.delete_to_end();
+        assert_eq!(editor.text(), "before\none \nafter");
+        editor.delete_to_start();
+        assert_eq!(editor.text(), "before\n\nafter");
+        editor.delete_to_end();
+        assert_eq!(editor.text(), "before\nafter");
+    }
 
     #[test]
     fn pasted_paragraphs_keep_breaks_and_insert_at_the_caret() {
@@ -265,15 +474,19 @@ mod tests {
     fn paragraph_layout_tracks_blank_lines_and_caret_positions() {
         let text = "你好\n\n世界\n";
         let rows = input_layout(text, 7, 2);
-        assert_eq!(rows.iter().map(|r| r.text.as_str()).collect::<Vec<_>>(),
-                   vec!["你好", "", "世界", ""]);
+        assert_eq!(
+            rows.iter().map(|r| r.text.as_str()).collect::<Vec<_>>(),
+            vec!["你好", "", "世界", ""]
+        );
         assert_eq!(input_caret(&rows, 2), (0, 4));
         assert_eq!(input_caret(&rows, 3), (1, 0));
         assert_eq!(input_caret(&rows, 4), (2, 0));
         assert_eq!(input_caret(&rows, 7), (3, 0));
         let rows = input_layout("abcde\nf", 6, 2);
-        assert_eq!(rows.iter().map(|r| r.text.as_str()).collect::<Vec<_>>(),
-                   vec!["abcd", "e", "f"]);
+        assert_eq!(
+            rows.iter().map(|r| r.text.as_str()).collect::<Vec<_>>(),
+            vec!["abcd", "e", "f"]
+        );
         assert_eq!(input_caret(&rows, 6), (2, 0));
         let rows = input_layout("你好\n", 6, 2);
         assert_eq!(input_caret(&rows, 2), (1, 0));
@@ -362,7 +575,10 @@ mod tests {
         let rows = input_rows(&text, 12, 2);
         assert_eq!(rows[0].0, "› ");
         assert_eq!(rows[0].1, "abcdefghij");
-        assert_eq!(rows[1].0, "  ", "continuation rows align with the text, not the prompt");
+        assert_eq!(
+            rows[1].0, "  ",
+            "continuation rows align with the text, not the prompt"
+        );
         // Ten cells per row, because the two-column prefix is on every row.
         assert_eq!(rows[1].1, "klmnopqrst");
         assert_eq!(rows[2].1, "uvwxyz");

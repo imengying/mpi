@@ -16,3 +16,4 @@ pub mod screen;
 pub mod terminal;
 pub mod text;
 pub mod theme;
+mod viewport;

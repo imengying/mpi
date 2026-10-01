@@ -24,6 +24,16 @@ struct Assemblers {
     responses: responses::Assembler,
 }
 
+impl Assemblers {
+    fn finish(self, api: Api) -> super::Completion {
+        match api {
+            Api::AnthropicMessages => self.anthropic.finish_stream(),
+            Api::OpenAiCompletions => self.openai.finish_stream(),
+            Api::OpenAiResponses => self.responses.finish_stream(),
+        }
+    }
+}
+
 /// Which body/parser pair a provider uses. Read once per request so the dispatch is a
 /// single match rather than a string comparison scattered through the call.
 fn api_of(provider: &Provider) -> Result<Api, LlmError> {
@@ -116,26 +126,33 @@ impl Client {
         let mut response = response;
         // `chunk()` is inherent on `Response`, so no extra stream-trait dependency is
         // needed just to read the body incrementally.
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|err| LlmError::Transport(err.to_string()))?
-        {
+        loop {
+            let chunk = match response.chunk().await {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) => break,
+                Err(err) => {
+                    return Ok(assemblers
+                        .finish(api)
+                        .failed(format!("流式传输中断：{err}")));
+                }
+            };
             buffer.extend_from_slice(&chunk);
-            drain_sse(&mut buffer, api, &mut assemblers, on_delta)?;
+            if let Err(err) = drain_sse(&mut buffer, api, &mut assemblers, on_delta) {
+                return Ok(assemblers.finish(api).failed(err.to_string()));
+            }
             if buffer.len() > 8 * 1024 * 1024 {
-                return Err(LlmError::Decode("SSE 单帧超过 8 MiB".into()));
+                return Ok(assemblers.finish(api).failed("SSE 单帧超过 8 MiB"));
             }
         }
         if !buffer.is_empty() {
-            let frame = std::str::from_utf8(&buffer).map_err(|err| LlmError::Decode(err.to_string()))?;
-            dispatch(frame, api, &mut assemblers, on_delta)?;
+            let result = std::str::from_utf8(&buffer)
+                .map_err(|err| LlmError::Decode(err.to_string()))
+                .and_then(|frame| dispatch(frame, api, &mut assemblers, on_delta));
+            if let Err(err) = result {
+                return Ok(assemblers.finish(api).failed(err.to_string()));
+            }
         }
-        Ok(match api {
-            Api::AnthropicMessages => assemblers.anthropic.finish(),
-            Api::OpenAiCompletions => assemblers.openai.finish(),
-            Api::OpenAiResponses => assemblers.responses.finish(),
-        })
+        Ok(assemblers.finish(api))
     }
 
     /// Buffered summary completion with the normal cache/routing identity and tools disabled.
@@ -341,6 +358,164 @@ fn drain_sse(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tool_prefix(api: Api) -> Vec<serde_json::Value> {
+        let args = r#"{"path":"must-not-exist","content":"bad"}"#;
+        match api {
+            Api::OpenAiCompletions => vec![serde_json::json!({"choices":[{"delta":{
+                "content":"已生成的正文", "reasoning_content":"已有思考",
+                "tool_calls":[{"index":0,"id":"c1","function":{"name":"write","arguments":args}}]
+            }}]})],
+            Api::OpenAiResponses => vec![
+                serde_json::json!({"type":"response.output_text.delta", "output_index":0, "delta":"已生成的正文"}),
+                serde_json::json!({"type":"response.output_item.added", "output_index":1, "item":{"type":"function_call", "id":"fc1", "call_id":"c1", "name":"write", "arguments":args}}),
+            ],
+            Api::AnthropicMessages => vec![
+                serde_json::json!({"type":"content_block_start", "index":0, "content_block":{"type":"text","text":""}}),
+                serde_json::json!({"type":"content_block_delta", "index":0, "delta":{"type":"text_delta","text":"已生成的正文"}}),
+                serde_json::json!({"type":"content_block_start", "index":1, "content_block":{"type":"tool_use","id":"c1","name":"write","input":{}}}),
+                serde_json::json!({"type":"content_block_delta", "index":1, "delta":{"type":"input_json_delta","partial_json":args}}),
+                serde_json::json!({"type":"content_block_stop", "index":1}),
+            ],
+        }
+    }
+
+    #[test]
+    fn every_protocol_requires_a_terminal_event_before_releasing_tools() {
+        for api in [
+            Api::OpenAiCompletions,
+            Api::OpenAiResponses,
+            Api::AnthropicMessages,
+        ] {
+            for terminal in [false, true] {
+                let mut assemblers = Assemblers::default();
+                let mut sink = |_: Delta| {};
+                for event in tool_prefix(api) {
+                    dispatch(
+                        &format!("data: {event}\n\n"),
+                        api,
+                        &mut assemblers,
+                        &mut sink,
+                    )
+                    .unwrap();
+                }
+                if terminal {
+                    let events = match api {
+                        Api::OpenAiCompletions => vec![
+                            serde_json::json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
+                        ],
+                        Api::OpenAiResponses => vec![
+                            serde_json::json!({"type":"response.completed","response":{"status":"completed"}}),
+                        ],
+                        Api::AnthropicMessages => vec![
+                            serde_json::json!({"type":"message_delta","delta":{"stop_reason":"tool_use"}}),
+                            serde_json::json!({"type":"message_stop"}),
+                        ],
+                    };
+                    for event in events {
+                        dispatch(
+                            &format!("data: {event}\n\n"),
+                            api,
+                            &mut assemblers,
+                            &mut sink,
+                        )
+                        .unwrap();
+                    }
+                } else {
+                    dispatch("data: [DONE]\n\n", api, &mut assemblers, &mut sink).unwrap();
+                }
+                let completion = assemblers.finish(api);
+                assert_eq!(completion.text(), "已生成的正文");
+                assert_eq!(
+                    completion.stop_reason,
+                    if terminal {
+                        super::super::StopReason::ToolUse
+                    } else {
+                        super::super::StopReason::Error
+                    }
+                );
+                assert_eq!(completion.tool_calls().len(), usize::from(terminal));
+            }
+        }
+    }
+
+    #[test]
+    fn in_band_errors_discard_tools_and_preserve_partial_text() {
+        for api in [
+            Api::OpenAiCompletions,
+            Api::OpenAiResponses,
+            Api::AnthropicMessages,
+        ] {
+            let mut assemblers = Assemblers::default();
+            let mut sink = |_: Delta| {};
+            for event in tool_prefix(api) {
+                dispatch(
+                    &format!("data: {event}\n\n"),
+                    api,
+                    &mut assemblers,
+                    &mut sink,
+                )
+                .unwrap();
+            }
+            let error = match api {
+                Api::OpenAiCompletions => {
+                    serde_json::json!({"error":{"message":"upstream failed"}})
+                }
+                Api::OpenAiResponses => {
+                    serde_json::json!({"type":"error","message":"upstream failed"})
+                }
+                Api::AnthropicMessages => {
+                    serde_json::json!({"type":"error","error":{"type":"overloaded_error","message":"upstream failed"}})
+                }
+            };
+            dispatch(
+                &format!("data: {error}\n\n"),
+                api,
+                &mut assemblers,
+                &mut sink,
+            )
+            .unwrap();
+            let completion = assemblers.finish(api);
+            assert_eq!(completion.text(), "已生成的正文");
+            assert!(completion.tool_calls().is_empty());
+            assert!(
+                completion
+                    .error
+                    .as_deref()
+                    .unwrap()
+                    .contains("upstream failed")
+            );
+        }
+    }
+
+    #[test]
+    fn incomplete_responses_without_a_reason_are_errors() {
+        let mut assemblers = Assemblers::default();
+        let api = Api::OpenAiResponses;
+        let mut sink = |_: Delta| {};
+        for event in tool_prefix(api) {
+            dispatch(
+                &format!("data: {event}\n\n"),
+                api,
+                &mut assemblers,
+                &mut sink,
+            )
+            .unwrap();
+        }
+        dispatch(
+            r#"data: {"type":"response.incomplete","response":{"status":"incomplete"}}
+
+"#,
+            api,
+            &mut assemblers,
+            &mut sink,
+        )
+        .unwrap();
+        let completion = assemblers.finish(api);
+        assert_eq!(completion.stop_reason, super::super::StopReason::Error);
+        assert!(completion.tool_calls().is_empty());
+        assert!(completion.error.is_some());
+    }
 
     #[test]
     fn utf8_and_crlf_frames_survive_every_transport_boundary() {

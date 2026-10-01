@@ -184,28 +184,9 @@ impl Agent {
             if target == self.session.path() {
                 return Ok(());
             }
-            // Flush anything pending before pointing the loop at another file.
-            let model_spec = self.model_spec.clone();
             match Session::open(&target) {
                 Ok(session) => {
-                    self.session = session;
-                            self.screen.clear_transcript();
-                    // The switched-to session may have started under a different `AGENTS.md`,
-                    // so the prompt is re-read here too.
-                    self.system_prompt = system_prompt_from(&self.cwd);
-                    // No note: the user picked this session from a list that already showed its
-                    // name, and the replay below plus the footer carry it from here.
-                    if self.config.find(&model_spec).is_some() {
-                        self.model_spec = model_spec;
-                    }
-                    // Same replay as a start-up resume: the switched-to session has to look
-                    // like the session it is, answers included.
-                    for block in ui_compact::replay_blocks(&self.session.context_messages(), self.screen.width()) {
-                        self.screen.push(block);
-                    }
-                    // …and the same history: the arrows belong to the session that is now
-                    // open, not to the one that was left behind.
-                    self.screen.seed_history(self.session.user_history());
+                    self.restore_session(session)?;
                 }
                 Err(err) => {
                     self.screen.push_lines(ui_compact::note_lines(
@@ -286,6 +267,7 @@ impl Agent {
                     crate::ui::screen::Style::new(Color::Dim),
                 ));
             }
+            self.session.push_turn_context(&self.cwd, &self.model_spec, &self.level)?;
             Ok(())
         }
 

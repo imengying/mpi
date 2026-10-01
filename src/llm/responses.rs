@@ -738,6 +738,14 @@ impl Assembler {
             }
             "response.completed" | "response.incomplete" => {
                 self.saw_terminal = true;
+                self.stop_reason = Some(
+                    if event.kind == "response.completed" {
+                        "completed"
+                    } else {
+                        "incomplete"
+                    }
+                    .into(),
+                );
                 if let Some(body) = event.response {
                     self.finish_body(body);
                 }
@@ -798,7 +806,11 @@ impl Assembler {
                 slot.encrypted_content = item.encrypted_content.clone();
             }
         }
-        self.stop_reason = Some(body.status.unwrap_or_else(|| "completed".into()));
+        self.stop_reason = Some(body.status.unwrap_or_else(|| {
+            self.stop_reason
+                .clone()
+                .unwrap_or_else(|| "completed".into())
+        }));
         if let Some(details) = body.incomplete_details
             && let Some(reason) = details.reason
         {
@@ -888,6 +900,13 @@ impl Assembler {
             None => match self.incomplete.as_deref() {
                 Some("max_output_tokens") => StopReason::Length,
                 Some(_) => StopReason::Error,
+                None if self
+                    .stop_reason
+                    .as_deref()
+                    .is_some_and(|status| status != "completed") =>
+                {
+                    StopReason::Error
+                }
                 None => {
                     if content.iter().any(|block| matches!(block, Block::ToolCall { .. })) {
                         StopReason::ToolUse
@@ -904,6 +923,37 @@ impl Assembler {
             stop_reason,
             error: None,
         }
+    }
+
+    pub fn finish_stream(self) -> Completion {
+        let confirmed = self.saw_terminal;
+        let missing_call = self.items.iter().any(|slot| {
+            slot.kind.as_deref() == Some("function_call")
+                && (slot.call_id.as_deref().is_none_or(str::is_empty)
+                    || slot.name.as_deref().is_none_or(str::is_empty))
+        });
+        let incomplete = self.incomplete.clone().or_else(|| {
+            self.stop_reason
+                .clone()
+                .filter(|status| status != "completed")
+        });
+        let completion = self.finish();
+        if completion.error.is_some() {
+            return completion.checked();
+        }
+        if !confirmed {
+            return completion.failed("流式响应未收到 response.completed 或其他终止事件");
+        }
+        if completion.stop_reason == StopReason::Error {
+            return completion.failed(format!(
+                "响应未完成：{}",
+                incomplete.as_deref().unwrap_or("上游未给出原因")
+            ));
+        }
+        if missing_call && completion.stop_reason != StopReason::Length {
+            return completion.failed("流式工具调用缺少 call_id 或名称");
+        }
+        completion.checked()
     }
 }
 

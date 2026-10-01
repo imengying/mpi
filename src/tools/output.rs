@@ -1,6 +1,6 @@
 //! Disk-backed output capture: children never block on unread pipes and memory is bounded.
 
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{BufRead, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
 use crate::util::{self, MAX_OUTPUT_BYTES, MAX_OUTPUT_LINES};
@@ -34,8 +34,7 @@ impl Capture {
         let start = size.saturating_sub(MAX_OUTPUT_BYTES as u64);
         self.file.seek(SeekFrom::Start(start))?;
         let mut bytes = Vec::with_capacity(MAX_OUTPUT_BYTES);
-        self.file
-            .by_ref()
+        Read::by_ref(&mut self.file)
             .take(MAX_OUTPUT_BYTES as u64)
             .read_to_end(&mut bytes)?;
         // The seek may land inside a UTF-8 character. Skip only continuation bytes.
@@ -87,6 +86,52 @@ impl Drop for Capture {
     fn drop(&mut self) {
         if !self.retained {
             let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Read a small delimiter-separated field without allocating an unbounded record.
+pub(super) fn field(
+    reader: &mut impl BufRead,
+    delimiter: u8,
+    limit: usize,
+) -> std::io::Result<Option<Vec<u8>>> {
+    let mut bytes = Vec::new();
+    loop {
+        let buffer = reader.fill_buf()?;
+        if buffer.is_empty() {
+            return if bytes.is_empty() {
+                Ok(None)
+            } else {
+                Err(std::io::Error::other("输出记录不完整"))
+            };
+        }
+        let end = buffer.iter().position(|b| *b == delimiter);
+        let count = end.unwrap_or(buffer.len());
+        if bytes.len().saturating_add(count) > limit {
+            return Err(std::io::Error::other("输出字段过长"));
+        }
+        bytes.extend_from_slice(&buffer[..count]);
+        reader.consume(count + usize::from(end.is_some()));
+        if end.is_some() {
+            return Ok(Some(bytes));
+        }
+    }
+}
+
+/// Copy one possibly huge line in fixed-size chunks, including its newline.
+pub(super) fn copy_line(reader: &mut impl BufRead, writer: &mut impl Write) -> std::io::Result<()> {
+    loop {
+        let buffer = reader.fill_buf()?;
+        if buffer.is_empty() {
+            return Ok(());
+        }
+        let end = buffer.iter().position(|b| *b == b'\n');
+        let count = end.map_or(buffer.len(), |index| index + 1);
+        writer.write_all(&buffer[..count])?;
+        reader.consume(count);
+        if end.is_some() {
+            return Ok(());
         }
     }
 }

@@ -11,6 +11,7 @@ pub mod ls;
 pub mod read;
 pub mod write;
 mod output;
+mod process;
 
 use std::path::Path;
 
@@ -64,7 +65,6 @@ impl ToolOutput {
     pub fn error_for(name: &str, arguments: &serde_json::Value, content: impl Into<String>) -> Self {
         let display = match name {
             "bash" => Display::Command {
-                expanded: false,
                 footer: Vec::new(),
             },
             "write" | "edit" | "read" | "grep" | "find" | "ls" => Display::File {
@@ -90,8 +90,7 @@ impl ToolOutput {
     pub fn budget(self) -> Self {
         let truncated = util::truncate_output(&self.content);
         let display = match (self.display, truncated.full_path.clone()) {
-            (Display::Command { expanded, footer }, path) => Display::Command {
-                expanded,
+            (Display::Command { footer }, path) => Display::Command {
                 footer: {
                     let mut parts = footer;
                     if let Some(path) = path {
@@ -118,7 +117,6 @@ pub enum Display {
     None,
     /// A bash result: exit status plus the note lines shown under the output.
     Command {
-        expanded: bool,
         footer: Vec<String>,
     },
     /// A diff for `edit` / `write`, as the rows to show and the change counts.

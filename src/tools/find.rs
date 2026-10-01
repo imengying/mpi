@@ -1,5 +1,6 @@
 //! `find`: locate files by name. Uses system `fd` when present, otherwise `find`.
 
+use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 
 use crate::llm::ToolSpec;
@@ -37,6 +38,19 @@ fn engine() -> Option<Engine> {
 }
 
 pub async fn execute(arguments: &serde_json::Value, cwd: &Path) -> Result<ToolOutput, String> {
+    execute_with_engine(
+        arguments,
+        cwd,
+        engine().ok_or("系统中既没有 fd 也没有 find，无法查找")?,
+    )
+    .await
+}
+
+async fn execute_with_engine(
+    arguments: &serde_json::Value,
+    cwd: &Path,
+    engine: Engine,
+) -> Result<ToolOutput, String> {
     let pattern = crate::tools::required_str(arguments, "pattern")?;
     if pattern.is_empty() {
         return Err("pattern 不能为空".into());
@@ -49,14 +63,16 @@ pub async fn execute(arguments: &serde_json::Value, cwd: &Path) -> Result<ToolOu
     let kind = arguments.get("type").and_then(|v| v.as_str()).unwrap_or("");
     let max_depth = crate::tools::optional_u64(arguments, "max_depth");
     let max_results = crate::tools::optional_u64(arguments, "max_results").unwrap_or(500);
+    if max_results == 0 {
+        return Err("max_results 必须大于 0".into());
+    }
 
-    let engine = engine().ok_or("系统中既没有 fd 也没有 find，无法查找")?;
     let mut command = tokio::process::Command::new(match &engine {
         Engine::Fd(path) | Engine::GnuFind(path) => path,
     });
     match &engine {
         Engine::Fd(_) => {
-            command.arg("--color=never").arg("--hidden");
+            command.arg("--color=never").arg("--hidden").arg("--print0");
             match kind {
                 "file" => {
                     command.arg("--type").arg("f");
@@ -69,7 +85,9 @@ pub async fn execute(arguments: &serde_json::Value, cwd: &Path) -> Result<ToolOu
             if let Some(depth) = max_depth {
                 command.arg("--max-depth").arg(depth.to_string());
             }
-            command.arg("--max-results").arg(max_results.to_string());
+            command
+                .arg("--max-results")
+                .arg(max_results.saturating_add(1).to_string());
             // fd matches on a substring by default; globs have to opt in.
             if pattern.contains('*') || pattern.contains('?') {
                 command.arg("--glob");
@@ -91,59 +109,77 @@ pub async fn execute(arguments: &serde_json::Value, cwd: &Path) -> Result<ToolOu
                 }
                 _ => {}
             }
-            command.arg("-name").arg(pattern);
+            command.arg("-name").arg(pattern).arg("-print0");
         }
     }
-    let output = command
-        .current_dir(cwd)
-        .output()
+    let output = super::process::capture(command.current_dir(cwd))
         .await
         .map_err(|err| format!("查找命令启动失败：{err}"))?;
-    let stdout = util::sanitize(String::from_utf8_lossy(&output.stdout).as_ref());
-    let stderr = util::sanitize(String::from_utf8_lossy(&output.stderr).as_ref());
-    let mut lines: Vec<String> = stdout
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| {
-            // Present paths relative to the search root so the transcript stays short.
-            let path = Path::new(line);
-            match path.strip_prefix(&target_path) {
-                Ok(rest) if !rest.as_os_str().is_empty() => rest.display().to_string(),
-                _ => line.to_string(),
-            }
-        })
-        .collect();
-    let truncated = lines.len() as u64 > max_results && matches!(engine, Engine::GnuFind(_));
-    if truncated {
-        lines.truncate(max_results as usize);
-    }
-    if lines.is_empty() {
-        let mut content = "没有找到匹配的文件。".to_string();
-        if !stderr.trim().is_empty() {
-            content.push('\n');
-            content.push_str(&stderr);
+    let body =
+        tokio::task::spawn_blocking(move || select_paths(output.stdout, &target_path, max_results))
+            .await
+            .map_err(|err| err.to_string())??;
+    let (stderr, _) = output.stderr.finish(true).map_err(|err| err.to_string())?;
+    let failed = !output.status.success();
+    let mut content = if body.is_empty() {
+        if failed {
+            format!("查找失败（退出码 {:?}）", output.status.code())
+        } else {
+            "没有找到匹配的文件。".into()
         }
-        return Ok(ToolOutput {
-            content,
-            display: Display::File { verb: "查找", path: target.to_string() },
-            is_error: false,
-duration: None,
-});
-    }
-    let mut content = lines.join("\n");
-    content.push('\n');
-    if truncated {
-        // The one thing the rows cannot say for themselves: this is a capped list, not the
-        // whole answer. A note repeating the count was removed — anyone reading can count
-        // the lines — but silently returning a prefix would read as "there is nothing else".
-        content.push_str(&format!("[已截断，仅列出前 {} 个]\n", lines.len()));
+    } else {
+        body
+    };
+    if !stderr.trim().is_empty() {
+        content.push('\n');
+        content.push_str(&stderr);
     }
     Ok(ToolOutput {
         content,
         display: Display::File { verb: "查找", path: target.to_string() },
-        is_error: false,
+        is_error: failed,
         duration: None,
     })
+}
+
+fn select_paths(
+    mut raw: super::output::Capture,
+    target_path: &Path,
+    max_results: u64,
+) -> Result<String, String> {
+    raw.file
+        .seek(SeekFrom::Start(0))
+        .map_err(|err| err.to_string())?;
+    let mut reader = std::io::BufReader::new(&mut raw.file);
+    let mut selected = super::output::Capture::new().map_err(|err| err.to_string())?;
+    let mut count = 0u64;
+    while let Some(bytes) = super::output::field(&mut reader, 0, crate::util::MAX_OUTPUT_BYTES)
+        .map_err(|err| err.to_string())?
+    {
+        if count == max_results {
+            writeln!(selected.file, "[已截断，仅列出前 {max_results} 个]")
+                .map_err(|err| err.to_string())?;
+            break;
+        }
+        let line = String::from_utf8_lossy(&bytes);
+        let path = Path::new(line.as_ref());
+        let relative = path
+            .strip_prefix(target_path)
+            .ok()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(path);
+        writeln!(
+            selected.file,
+            "{}",
+            util::one_line(&relative.to_string_lossy())
+        )
+        .map_err(|err| err.to_string())?;
+        count += 1;
+    }
+    selected
+        .finish(true)
+        .map(|(body, _)| body)
+        .map_err(|err| err.to_string())
 }
 
 #[cfg(test)]
@@ -151,6 +187,63 @@ mod tests {
     use super::*;
     use crate::tools::block;
     use std::path::PathBuf;
+
+    #[test]
+    fn gnu_fallback_caps_results_without_splitting_filenames_at_newlines() {
+        let dir = std::env::temp_dir().join(format!("pi-find-gnu-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir(&dir).unwrap();
+        for name in ["line\nbreak.txt", "second.txt", "third.txt"] {
+            std::fs::write(dir.join(name), "").unwrap();
+        }
+        let binary = super::super::first_present(&["/usr/bin/find", "/bin/find"]).unwrap();
+        let full = block(execute_with_engine(
+            &serde_json::json!({"pattern":"*.txt"}),
+            &dir,
+            Engine::GnuFind(binary.clone()),
+        ))
+        .unwrap();
+        assert_eq!(full.content.lines().count(), 3, "{}", full.content);
+        let out = block(execute_with_engine(
+            &serde_json::json!({"pattern":"*.txt", "max_results":2}),
+            &dir,
+            Engine::GnuFind(binary),
+        ))
+        .unwrap();
+        assert_eq!(
+            out.content
+                .lines()
+                .filter(|line| !line.starts_with('['))
+                .count(),
+            2
+        );
+        assert!(out.content.contains("已截断"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_large_file_list_keeps_a_bounded_excerpt_and_full_log() {
+        let dir = std::env::temp_dir().join(format!("pi-find-large-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir(&dir).unwrap();
+        for index in 0..800 {
+            std::fs::write(dir.join(format!("{index:04}-{}.txt", "x".repeat(100))), "").unwrap();
+        }
+        let out = block(execute(
+            &serde_json::json!({"pattern":"*.txt", "max_results":1000}),
+            &dir,
+        ))
+        .unwrap();
+        assert!(!out.is_error && out.content.len() <= crate::util::MAX_OUTPUT_BYTES);
+        let path = out
+            .content
+            .split("完整输出：")
+            .nth(1)
+            .unwrap()
+            .trim_end_matches(']');
+        let full = std::fs::read_to_string(path).unwrap();
+        assert_eq!(full.lines().count(), 800);
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
 
     fn fixture() -> PathBuf {
