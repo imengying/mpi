@@ -2,6 +2,28 @@
 //!
 //! Message serialisation is done with structs (never hand-built `Value`s) so field
 //! order is stable and prompt-cache prefixes stay byte-identical between turns.
+//!
+//! # The three protocols do not share an assembler, on purpose
+//!
+//! `anthropic`, `openai` and `responses` each own a request builder, a stream-event parser
+//! and an `Assembler` that turns a stream of decoded frames into one [`Completion`]. The
+//! three assemblers look alike at the edges — they all record usage, a stop reason and an
+//! error, and two of them record where a hosted search was issued — and that resemblance is
+//! not an invitation to merge them. What they accumulate is shaped by the wire format, which
+//! is different in each case:
+//!
+//! * `anthropic`: content blocks indexed by position, each a text/thinking/tool-use variant
+//!   that may be opened, delta'd into and closed across separate events.
+//! * `openai`: flat deltas (`content`, `reasoning_content`, `tool_calls` by index) with
+//!   arguments arriving as a string that only parses once the call is complete.
+//! * `responses`: whole items keyed by `output_index`, with reasoning carried as an
+//!   encrypted signature that has to be attributed to the provider and model that issued it.
+//!
+//! A shared abstraction would have to model all three of those, which is a superset of any
+//! one of them, and every protocol detail would then be expressed as a configuration of that
+//! superset. The similarity that remains — three fields' worth of bookkeeping — is cheaper to
+//! repeat than to abstract. `client.rs` is the one place that knows all three: it owns the
+//! SSE framing and the dispatch, and its [`client::Assemblers`] holds one of each.
 
 pub mod anthropic;
 pub mod client;
