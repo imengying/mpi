@@ -368,11 +368,23 @@ impl Agent {
             Err(_) => (None, self.level.clone()),
         };
         let cache_hit = self.session.totals.hit_rate();
-        let context_tokens = self.session.measured_context_tokens().or_else(|| {
-            let messages = self.session.context_messages();
-            let tools = tools::specs();
-            Some(llm::estimate_request_context(&messages, self.system_prompt.as_deref().unwrap_or_default(), &tools))
-        });
+        let context_usage = footer::context_usage(
+            self.compaction.running,
+            self.session.measured_context_tokens(),
+            self.session.context_holds_only_environment(),
+            || {
+                // Only reached once there is a conversation: the session's own reading is
+                // the number to show whenever it exists, and an unspoken session shows
+                // nothing rather than the fixed prefix every request carries.
+                let messages = self.session.context_messages();
+                let tools = tools::specs();
+                llm::estimate_request_context(
+                    &messages,
+                    self.system_prompt.as_deref().unwrap_or_default(),
+                    &tools,
+                )
+            },
+        );
         let context_window = model.and_then(|model| model.context_window);
         let state = FooterState {
             cwd: self.cwd.clone(),
@@ -380,11 +392,10 @@ impl Agent {
             session_name: self.session.name(),
             totals: self.session.totals,
             cache_hit_rate: cache_hit,
-            context_tokens,
+            context_usage,
             context_window,
             model: model.cloned(),
             level,
-            compacting: self.compaction.running,
             busy: busy.map(str::to_owned),
         };
         self.screen.set_footer_state(state);

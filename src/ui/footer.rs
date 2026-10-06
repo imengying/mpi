@@ -9,6 +9,10 @@
 //! name. Line 2 is the four usage fields on the left and the model name right-aligned.
 //! The three usage fields are separated by exactly three spaces, and the model keeps at
 //! least two columns of clearance from them.
+//!
+//! The context field carries its own state rather than a bare number: see [`ContextUsage`]
+//! for why a session that has said nothing shows `—` instead of counting what the request
+//! would carry.
 
 use std::path::Path;
 
@@ -16,6 +20,48 @@ use crate::config::{Defaults, ModelConfig, Usage};
 use crate::ui::screen::{Line, Span, Style};
 use crate::ui::theme::{CACHE_ICON, Color, Theme};
 use crate::util;
+
+/// What the context field knows, which is exactly what it can print.
+///
+/// Three states rather than a `Option<u64>` plus a flag, because the field prints three
+/// different things and each one means something different: `—` before the session has
+/// said anything, `?` while a compaction is replacing the context the last count
+/// described, and a number when there is a number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextUsage {
+    /// Nothing to measure yet. A session that has not been spoken to carries only the
+    /// environment block, and counting that plus the tool schemas would report the fixed
+    /// prefix every request carries as context the user had spent before typing anything.
+    Unmeasured,
+    /// A count exists and must not be shown: a compaction is running, so the number
+    /// describes the context being replaced, not the one the next request will carry.
+    Stale,
+    /// The tokens the next request would carry.
+    Tokens(u64),
+}
+
+/// The context state for a session, decided where the states are defined.
+///
+/// The order is the point: a running compaction hides the count it is replacing, a count
+/// the upstream reported beats any estimate, and a session that has said nothing is not
+/// estimated at all. `estimate` runs only when its number would be shown, so a fresh
+/// session never pays to measure a context that is not there.
+pub fn context_usage(
+    compacting: bool,
+    measured: Option<u64>,
+    holds_only_environment: bool,
+    estimate: impl FnOnce() -> u64,
+) -> ContextUsage {
+    if compacting {
+        ContextUsage::Stale
+    } else if let Some(measured) = measured {
+        ContextUsage::Tokens(measured)
+    } else if holds_only_environment {
+        ContextUsage::Unmeasured
+    } else {
+        ContextUsage::Tokens(estimate())
+    }
+}
 
 /// Everything the footer needs, gathered once per render.
 #[derive(Clone)]
@@ -25,12 +71,10 @@ pub struct FooterState {
     pub session_name: Option<String>,
     pub totals: Usage,
     pub cache_hit_rate: Option<f64>,
-    pub context_tokens: Option<u64>,
+    pub context_usage: ContextUsage,
     pub context_window: Option<u64>,
     pub model: Option<ModelConfig>,
     pub level: String,
-    /// A compaction is running: the count is not trustworthy yet.
-    pub compacting: bool,
     /// Shown while a turn is in flight.
     pub busy: Option<String>,
 }
@@ -97,12 +141,13 @@ fn stats_line(state: &FooterState, theme: &Theme, width: usize) -> Line {
         Some(rate) => format!("{rate:.1}%"),
         None => "—".to_string(),
     };
-    let context = match state.context_tokens {
-        // After a compaction the old count is meaningless, so it reads as unknown rather
-        // than as a stale number.
-        _ if state.compacting => "?".to_string(),
-        Some(tokens) => util::fmt_tokens(tokens, true),
-        None => "?".to_string(),
+    let context = match state.context_usage {
+        // A count that describes the context being replaced is not printed: it would name
+        // what compaction is throwing away, not what the next request will carry.
+        ContextUsage::Stale => "?".to_string(),
+        // Nothing has been said yet, so there is nothing spent to report.
+        ContextUsage::Unmeasured => "—".to_string(),
+        ContextUsage::Tokens(tokens) => util::fmt_tokens(tokens, true),
     };
     let window = state
         .context_window
@@ -110,8 +155,10 @@ fn stats_line(state: &FooterState, theme: &Theme, width: usize) -> Line {
         .unwrap_or_else(|| "?".to_string());
     let context_text = format!("{context}/{window}");
 
-    let percent = match (state.context_tokens, state.context_window) {
-        (Some(tokens), Some(window)) if window > 0 => tokens as f64 / window as f64 * 100.0,
+    let percent = match (state.context_usage, state.context_window) {
+        (ContextUsage::Tokens(tokens), Some(window)) if window > 0 => {
+            tokens as f64 / window as f64 * 100.0
+        }
         _ => 0.0,
     };
     let context_color = theme.context(percent);
@@ -272,11 +319,10 @@ mod tests {
                 cache_write: 0,
             },
             cache_hit_rate: Some(99.5),
-            context_tokens: Some(17_300),
+            context_usage: ContextUsage::Tokens(17_300),
             context_window: Some(1_000_000),
             model: None,
             level: "high".into(),
-            compacting: false,
             busy: None,
         }
     }
@@ -367,8 +413,23 @@ mod tests {
         };
         let mut state = state("/tmp");
         state.context_window = None;
-        state.context_tokens = None;
-        assert!(plain(&render(&state, &theme, 120))[1].contains("?/?"));
+        assert!(plain(&render(&state, &theme, 120))[1].contains("17.3k/?"));
+    }
+
+    #[test]
+    fn a_session_that_has_said_nothing_shows_no_context_usage() {
+        // What a fresh session would otherwise print is the fixed prefix every request
+        // carries — the tool schemas and the environment block, some 1.1k with these seven
+        // tools — which is not context the user has spent. `—` says that, and says it the
+        // same way the cache field says a session has no cache data yet.
+        let theme = Theme {
+            mode: ColorMode::Ansi256,
+        };
+        let mut state = state("/tmp");
+        state.context_usage = ContextUsage::Unmeasured;
+        let text = plain(&render(&state, &theme, 120))[1].clone();
+        assert!(text.contains("—/1M"), "{text:?}");
+        assert!(!text.contains("0/1M"), "{text:?}");
     }
 
     #[test]
@@ -377,10 +438,43 @@ mod tests {
             mode: ColorMode::Ansi256,
         };
         let mut state = state("/tmp");
-        state.compacting = true;
+        state.context_usage = ContextUsage::Stale;
         let text = plain(&render(&state, &theme, 120))[1].clone();
         assert!(text.contains("?/1M"), "{text:?}");
         assert!(!text.contains("17.3k"), "{text:?}");
+    }
+
+    #[test]
+    fn the_estimate_is_asked_for_only_when_its_number_would_be_shown() {
+        use std::cell::Cell;
+        let asked = Cell::new(0);
+        let estimate = || {
+            asked.set(asked.get() + 1);
+            1_138
+        };
+        // A fresh session is never estimated: counting the fixed prefix is what put a
+        // number on screen before the user had said anything.
+        assert_eq!(
+            context_usage(false, None, true, estimate),
+            ContextUsage::Unmeasured
+        );
+        assert_eq!(asked.get(), 0);
+        // A reported count beats an estimate, and a running compaction hides both.
+        assert_eq!(
+            context_usage(false, Some(42), false, estimate),
+            ContextUsage::Tokens(42)
+        );
+        assert_eq!(
+            context_usage(true, Some(42), false, estimate),
+            ContextUsage::Stale
+        );
+        assert_eq!(asked.get(), 0);
+        // A conversation with no reading yet is the one case that pays for the estimate.
+        assert_eq!(
+            context_usage(false, None, false, estimate),
+            ContextUsage::Tokens(1_138)
+        );
+        assert_eq!(asked.get(), 1);
     }
 
     #[test]
@@ -399,11 +493,11 @@ mod tests {
                 .clone();
             (span.text, span.style.fg)
         };
-        state.context_tokens = Some(750_000);
+        state.context_usage = ContextUsage::Tokens(750_000);
         assert_eq!(gauge(&state), ("750k/1M".to_string(), Color::Yellow));
-        state.context_tokens = Some(950_000);
+        state.context_usage = ContextUsage::Tokens(950_000);
         assert_eq!(gauge(&state), ("950k/1M".to_string(), Color::Red));
-        state.context_tokens = Some(17_300);
+        state.context_usage = ContextUsage::Tokens(17_300);
         assert_eq!(gauge(&state), ("17.3k/1M".to_string(), Color::Green));
     }
 

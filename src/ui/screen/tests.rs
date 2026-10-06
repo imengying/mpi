@@ -494,11 +494,10 @@ fn the_status_reflows_without_new_model_output_after_a_resize() {
         session_name: None,
         totals: crate::config::Usage::default(),
         cache_hit_rate: None,
-        context_tokens: Some(500),
+        context_usage: crate::ui::footer::ContextUsage::Tokens(500),
         context_window: Some(100_000),
         model: Some(model),
         level: String::new(),
-        compacting: false,
         busy: None,
     });
     screen.width = 80;
@@ -1627,11 +1626,10 @@ fn no_live_row_is_wider_than_the_terminal() {
             cache_write: 0,
         },
         cache_hit_rate: Some(99.5),
-        context_tokens: Some(17_300),
+        context_usage: crate::ui::footer::ContextUsage::Tokens(17_300),
         context_window: Some(1_000_000),
         model: None,
         level: "high".into(),
-        compacting: false,
         busy: None,
     };
     screen.set_footer(crate::ui::footer::render(

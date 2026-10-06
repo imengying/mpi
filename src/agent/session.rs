@@ -612,6 +612,18 @@ impl Session {
         )
     }
 
+    /// Whether the model would see nothing but the environment block.
+    ///
+    /// True for a session that has not been spoken to: the block is the head every session
+    /// starts with, and until something else is in the context there is no conversation to
+    /// measure — only the fixed prefix every request carries, tool schemas included. The
+    /// footer reads this to say "nothing spent yet" instead of printing that prefix as if
+    /// the user had spent it.
+    pub fn context_holds_only_environment(&self) -> bool {
+        self.context_entries()
+            .all(|(message, _)| crate::agent::r#loop::is_environment_block(message))
+    }
+
     pub fn last_checkpoint_index(&self) -> Option<usize> {
         self.records
             .iter()
@@ -1644,6 +1656,24 @@ mod tests {
         drop(session);
         let reopened = Session::open(&path).unwrap();
         assert_eq!(reopened.measured_context_tokens(), None);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn only_the_environment_block_counts_as_having_said_nothing() {
+        // What the footer's context field is allowed to call "no conversation yet". A
+        // session starts with the block and nothing else, and the first real message — the
+        // user's or a resumed history's — is what makes the field worth printing.
+        let (mut session, dir) = temp_session("only-environment");
+        let block = crate::agent::r#loop::environment_block(&dir, "sid", "/usr/bin/zsh");
+        assert!(
+            session.context_holds_only_environment(),
+            "a session with no records at all has nothing to measure"
+        );
+        session.push_message(Message::user_text(block), None, None).unwrap();
+        assert!(session.context_holds_only_environment());
+        session.push_message(Message::user_text("第一句话"), None, None).unwrap();
+        assert!(!session.context_holds_only_environment());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
