@@ -92,7 +92,7 @@ impl Agent {
                     None,
                 )?;
                 self.screen
-                    .push(ui_compact::tool_block(name, arguments, &output));
+                    .push(ui_compact::tool_block(name, arguments, &output, status));
             }
             next += count;
             if stopped {
@@ -163,7 +163,7 @@ impl Agent {
             }
             tokio::select! {
                 result = workers.join_next() => {
-                    settle_tool_task(result.expect("a running worker"), &task_indices, &mut results);
+                    settle_tool_task(result.expect("a running worker"), &task_indices, calls, &mut results);
                 }
                 _ = ticker.tick() => self.screen.tick_working(),
             }
@@ -171,11 +171,11 @@ impl Agent {
         if stopped {
             // Keep completed results even when Esc arrives before they were observed.
             while let Some(result) = workers.try_join_next() {
-                settle_tool_task(result, &task_indices, &mut results);
+                settle_tool_task(result, &task_indices, calls, &mut results);
             }
             workers.abort_all();
             while let Some(result) = workers.join_next().await {
-                settle_tool_task(result, &task_indices, &mut results);
+                settle_tool_task(result, &task_indices, calls, &mut results);
             }
         }
         (
@@ -226,9 +226,16 @@ impl Agent {
     }
 }
 
+/// Record the terminal outcome of one tool worker.
+///
+/// The call's own arguments are passed in so a call that never produced a result can still
+/// say what was attempted. Without them the block would fall back to the bare tool name
+/// here and to the command on the next resume, and the same interrupted call would read
+/// differently in the two views.
 fn settle_tool_task(
     result: Result<(usize, ToolOutput), tokio::task::JoinError>,
     task_indices: &std::collections::HashMap<tokio::task::Id, usize>,
+    calls: &[(String, String, serde_json::Value)],
     results: &mut [Option<(ToolOutput, ToolStatus)>],
 ) {
     let (index, output, status) = match result {
@@ -242,19 +249,22 @@ fn settle_tool_task(
         }
         Err(error) => {
             let index = task_indices[&error.id()];
-            if error.is_cancelled() {
+            let (name, arguments) = (&calls[index].1, &calls[index].2);
+            // Both messages are written for the model, and both end up in its context: it
+            // has to know the call did not complete and must check before retrying. The
+            // transcript does not repeat them — see `ui::compact::result_text`.
+            let (content, status) = if error.is_cancelled() {
                 (
-                    index,
-                    ToolOutput::error("用户中止了工具执行，可能已有部分效果；请先检查实际状态。"),
+                    "用户中止了工具执行，可能已有部分效果；请先检查实际状态。".to_string(),
                     ToolStatus::Cancelled,
                 )
             } else {
                 (
-                    index,
-                    ToolOutput::error(format!("工具执行任务异常，结果未知：{error}")),
+                    format!("工具执行任务异常，结果未知：{error}"),
                     ToolStatus::Unknown,
                 )
-            }
+            };
+            (index, ToolOutput::error_for(name, arguments, content), status)
         }
     };
     results[index] = Some((output, status));
@@ -304,9 +314,16 @@ mod tests {
         let mut workers = tokio::task::JoinSet::new();
         let mut indices = std::collections::HashMap::new();
         let mut results = vec![None; 3];
+        // The calls whose workers are being settled: a worker that never returned a result
+        // still has to be describable in the transcript.
+        let calls: Vec<(String, String, serde_json::Value)> = vec![
+            ("a".into(), "bash".into(), serde_json::json!({"command": "ls -l"})),
+            ("b".into(), "bash".into(), serde_json::json!({"command": "sleep 30"})),
+            ("c".into(), "read".into(), serde_json::json!({"path": "x.rs"})),
+        ];
         let completed = workers.spawn(async { (0, ToolOutput::text("completed result")) });
         indices.insert(completed.id(), 0);
-        settle_tool_task(workers.join_next().await.unwrap(), &indices, &mut results);
+        settle_tool_task(workers.join_next().await.unwrap(), &indices, &calls, &mut results);
 
         let (started, running) = tokio::sync::oneshot::channel();
         let cancelled = workers.spawn(async {
@@ -317,16 +334,26 @@ mod tests {
         running.await.unwrap();
         let crashed = workers.spawn(async { panic!("tool worker failed") });
         indices.insert(crashed.id(), 2);
-        settle_tool_task(workers.join_next().await.unwrap(), &indices, &mut results);
+        settle_tool_task(workers.join_next().await.unwrap(), &indices, &calls, &mut results);
         workers.abort_all();
         while let Some(result) = workers.join_next().await {
-            settle_tool_task(result, &indices, &mut results);
+            settle_tool_task(result, &indices, &calls, &mut results);
         }
         let results: Vec<_> = results.into_iter().map(Option::unwrap).collect();
         assert_eq!(results[0].0.content, "completed result");
         assert_eq!(results[0].1, ToolStatus::Success);
         assert_eq!(results[1].1, ToolStatus::Cancelled);
         assert!(results[1].0.content.contains("可能已有部分效果"));
+        // The interrupted call still knows what it was running: without this echo the
+        // block would say `⊘ bash` here and `⊘ $ sleep 30` on the next resume.
+        assert!(matches!(
+            results[1].0.display,
+            crate::tools::Display::Command { .. }
+        ));
+        assert!(matches!(
+            results[2].0.display,
+            crate::tools::Display::File { .. }
+        ));
         assert_eq!(results[2].1, ToolStatus::Unknown);
         assert!(results[2].0.content.contains("结果未知"));
     }

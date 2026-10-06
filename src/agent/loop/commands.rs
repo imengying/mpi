@@ -386,8 +386,8 @@ impl Agent {
             .push_compaction_end(&compaction_id, None)
             .map_err(|err| CompactError::Session(err.to_string()))?;
         // The token counts are not restated: the footer carries the context gauge, and that is
-        // the number the user is already reading. What the footer cannot say is that the
-        // compaction did not help, because nothing shrank.
+        // the number the user is already reading. A compaction that shrank nothing is not a
+        // quietly-worded success either — it fails as `NotSmaller` and never reaches here.
         let note = "已压缩";
         self.screen.push_lines(ui_compact::note_lines(
             note,

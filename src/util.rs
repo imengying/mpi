@@ -299,7 +299,7 @@ pub fn truncate_output(raw: &str) -> Truncated {
         // Losing the temp copy is better than losing the answer: report it inline.
         let kept = tail(raw, &lines);
         return Truncated {
-            text: format!("{kept}\n\n[完整输出写入临时文件失败：{err}]"),
+            text: format!("{}\n\n[完整输出写入临时文件失败：{err}]", kept.trim_end()),
             truncated: true,
             dropped_lines: over_lines,
             full_path: None,
@@ -313,7 +313,9 @@ pub fn truncate_output(raw: &str) -> Truncated {
         full_path.display()
     );
     Truncated {
-        text: format!("{kept}{note}"),
+        // The kept tail ends with the newline the last line had, and the note opens with a
+        // blank row of its own: without this the note sits two rows under the output.
+        text: format!("{}{note}", kept.trim_end()),
         truncated: true,
         dropped_lines: over_lines,
         full_path: Some(full_path),

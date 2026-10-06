@@ -387,15 +387,17 @@ impl Session {
             file.sync_data()?;
             session
                 .recovery_notes
-                .push("已恢复会话；末尾未写完整的记录已移除。".into());
+                .push("末尾未写完整的记录已移除。".into());
         } else if needs_newline {
             file.write_all(b"\n")?;
             file.sync_data()?;
         }
         session.storage = Storage::Open(file);
         if !pending.is_empty() {
+            // The facts and nothing else: the file stopped mid-call, so what the call did is
+            // unknown, and that is the one thing the user has to settle before working on.
             session.recovery_notes.push(
-                "上次会话中有工具调用未记录结果，已标记为执行结果未知；请先检查实际状态。".into(),
+                "上次会话中途退出，有工具调用未记录结果；请先检查实际状态。".into(),
             );
         }
         for (tool_call_id, name) in pending {
