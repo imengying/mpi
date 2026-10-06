@@ -159,7 +159,7 @@ impl Client {
 
     /// Stream one assistant turn, invoking `on_delta` for every token.
     ///
-    /// A failure that produced **nothing** is retried (see [`RETRY_LIMIT`]); one that
+    /// A failure that produced **nothing** is retried (see `RETRY_LIMIT`); one that
     /// already delivered text is not. Tokens cannot be un-shown, so a second request would
     /// print the answer twice and the caller would have to choose which copy to keep.
     pub async fn stream(

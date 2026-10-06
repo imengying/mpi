@@ -23,7 +23,7 @@
 //! one of them, and every protocol detail would then be expressed as a configuration of that
 //! superset. The similarity that remains — three fields' worth of bookkeeping — is cheaper to
 //! repeat than to abstract. `client.rs` is the one place that knows all three: it owns the
-//! SSE framing and the dispatch, and its [`client::Assemblers`] holds one of each.
+//! SSE framing and the dispatch, and its `client::Assemblers` holds one of each.
 
 pub mod anthropic;
 pub mod client;

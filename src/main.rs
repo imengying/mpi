@@ -1,6 +1,6 @@
 //! pi: a minimal terminal coding agent.
 //!
-//! The binary is a thin shell around [`agent::loop::Agent`]: read config, open (or resume) a
+//! The binary is a thin shell around `mpi::agent::loop::Agent`: read config, open (or resume) a
 //! session, then alternate between reading a line and running a turn. Slash commands are
 //! handled here so the loop itself stays about talking to the model.
 

@@ -33,7 +33,7 @@ pub struct Segment {
     /// Redirections that only move or discard a file descriptor, kept in the form they
     /// were written so the command that runs is the command that was checked.
     ///
-    /// Only descriptor forms land here — [`descriptor_redirect`] returns nothing for a
+    /// Only descriptor forms land here — `descriptor_redirect` returns nothing for a
     /// redirection that names a file, and the parser refuses those.
     pub redirects: Vec<String>,
 }

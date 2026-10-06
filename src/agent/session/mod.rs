@@ -17,10 +17,10 @@
 //! method that appends a record. The work around it is split by what it touches, because
 //! the pieces are read for different reasons and change for different causes:
 //!
-//! * [`record`] — one line of the file, typed. The data, and its validation.
-//! * [`file`] — the descriptor: locking, appending, recovering a torn tail, deleting.
-//! * [`context`] — what the model would be sent, projected over the records.
-//! * [`store`] — the directory of sessions: listing, previews, id-prefix lookup.
+//! * `record` — one line of the file, typed. The data, and its validation.
+//! * `file` — the descriptor: locking, appending, recovering a torn tail, deleting.
+//! * `context` — what the model would be sent, projected over the records.
+//! * `store` — the directory of sessions: listing, previews, id-prefix lookup.
 //!
 //! The split is not cosmetic: `context` does no IO and needs no lock, `store` must never
 //! lock or repair a file somebody is writing, and mixing the two with the append path in one

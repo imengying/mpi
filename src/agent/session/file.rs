@@ -272,7 +272,7 @@ impl Session {
     /// Delete the session file.
     ///
     /// The handle is closed first: an open handle keeps the file alive and, on Windows,
-    /// blocks the unlink outright. After this the session is inert — [`Session::append`]
+    /// blocks the unlink outright. After this the session is inert — `Session::append`
     /// refuses, so a late write cannot recreate the file the user just deleted.
     /// Returns whether there was a file to remove: a session that never became a
     /// conversation has nothing on disk, and claiming otherwise would be a lie.

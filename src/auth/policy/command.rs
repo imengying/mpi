@@ -1,505 +1,26 @@
-//! The authorization policy.
+//! Command-line judgements: which commands may run without asking.
 //!
-//! Two modes of thinking live in this file:
+//! The line is parsed first ([`parse_literal_commands`], from `auth::parse`) into segments
+//! and words, and then every word of every segment is resolved: to a trusted absolute
+//! executable, to a concrete path, or to a refusal. That order matters, because the
+//! alternative — pattern-matching the command text — cannot see through `--file=/etc/shadow`
+//! or a `cd` earlier in the same line.
 //!
-//! 1. **Parsing.** [`parse_literal_commands`] recognises a small literal-shell subset.
-//!    Anything it does not understand — expansions, redirects, background jobs, globs,
-//!    control characters — is refused, not guessed at. A command pi cannot read is a
-//!    command it asks about.
-//! 2. **Vetting.** Every word of every segment is resolved: to a trusted absolute
-//!    executable, to a concrete path, or to a refusal. Path arguments are checked
-//!    including the values hiding inside options (`--file=X`, `-fX`, `-nfX`).
-//!
-//! The shell dialect matters: zsh expands `=cmd` and `~+` where bash leaves them
-//! literal, so a word whose meaning differs from its text is sent to the user rather
-//! than rewritten.
+//! Most of this file is the per-command option tables. A command is auto-approved only if
+//! every option it was given is one this file knows to be harmless *for that command*:
+//! `rg --files` reads, `rg --pre` executes. Unknown options are sent to the user, which is
+//! why the tables err toward listing what is understood rather than what is forbidden.
 
 use std::collections::HashSet;
-use std::path::{Component, Path, PathBuf};
-
-use crate::config::DEFAULT_SHELL;
+use std::path::{Path, PathBuf};
 
 use crate::auth::parse::is_line_range_print;
-pub use crate::auth::parse::{Segment, Word, parse_literal_commands};
+use crate::auth::parse::{Word, parse_literal_commands};
 
-/// Ask the user before running. `ask` carries the reason handed to the model on refusal.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Assessment {
-    Allow { safe_command: Option<String> },
-    Ask { reason: String },
-}
-
-impl Assessment {
-    pub fn ask(reason: impl Into<String>) -> Self {
-        Assessment::Ask {
-            reason: reason.into(),
-        }
-    }
-
-    pub fn allow() -> Self {
-        Assessment::Allow { safe_command: None }
-    }
-
-    pub fn allows(&self) -> bool {
-        matches!(self, Assessment::Allow { .. })
-    }
-
-    pub fn reason(&self) -> Option<&str> {
-        match self {
-            Assessment::Ask { reason } => Some(reason),
-            _ => None,
-        }
-    }
-}
-
-/// The refusal text the model receives. Without the reason the model can only guess
-/// why it was blocked and re-issues the same call.
-pub fn refusal(reason: Option<&str>) -> String {
-    match reason {
-        Some(reason) => format!("未获得用户授权，操作未执行（{reason}）"),
-        None => "未获得用户授权，操作未执行".to_string(),
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Dialect {
-    Bash,
-    Zsh,
-}
-
-impl Dialect {
-    /// Select the expansion rules of the configured shell.
-    pub fn for_shell_path(path: &str) -> Dialect {
-        let name = path.rsplit('/').next().unwrap_or(path);
-        let name = name.strip_suffix(".exe").unwrap_or(name);
-        if name.eq_ignore_ascii_case("zsh") {
-            Dialect::Zsh
-        } else {
-            Dialect::Bash
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Dialect::Zsh => "zsh",
-            Dialect::Bash => "bash",
-        }
-    }
-}
-
-/// The dialect pi will actually use, derived from the configured shell.
-pub fn configured_dialect(shell_path: &str) -> Dialect {
-    Dialect::for_shell_path(if shell_path.is_empty() {
-        DEFAULT_SHELL
-    } else {
-        shell_path
-    })
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Operation {
-    Read,
-    Write,
-}
-
-// ---------------------------------------------------------------------------
-// Path handling
-// ---------------------------------------------------------------------------
-
-/// Resolve a literal tool path, supporting only the home-directory shorthand `~`.
-pub fn resolve_tool_path(input: &str, cwd: &Path) -> PathBuf {
-    let path = input;
-    let expanded = if path == "~" {
-        home().to_string_lossy().to_string()
-    } else if let Some(rest) = path.strip_prefix("~/") {
-        home().join(rest).to_string_lossy().to_string()
-    } else {
-        path.to_string()
-    };
-    let candidate = PathBuf::from(expanded);
-    if candidate.is_absolute() {
-        candidate
-    } else {
-        cwd.join(candidate)
-    }
-}
-
-/// Lexical normalisation: drop `.`, resolve `..`, keep the path absolute and without
-/// a trailing separator. Symlinks are *not* followed here; [`canonical_path`] does that.
-pub fn normalize(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !out.pop() {
-                    out.push("..");
-                }
-            }
-            other => out.push(other.as_os_str()),
-        }
-    }
-    if out.as_os_str().is_empty() {
-        PathBuf::from("/")
-    } else {
-        out
-    }
-}
-
-/// Resolve a path through symlinks even when the leaf does not exist yet, so a write
-/// through a symlinked directory is judged by where it really lands.
-pub fn canonical_path(path: &Path, depth: usize) -> std::io::Result<PathBuf> {
-    if depth > 80 {
-        return Err(std::io::Error::other("路径或符号链接层级过深"));
-    }
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()?.join(path)
-    };
-    match std::fs::canonicalize(&absolute) {
-        Ok(resolved) => Ok(resolved),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            // Resolve links before processing `..`, including when a write's leaf is new.
-            let mut resolved = PathBuf::new();
-            for component in absolute.components() {
-                match component {
-                    Component::CurDir => {}
-                    Component::ParentDir => {
-                        resolved.pop();
-                    }
-                    Component::Normal(part) => {
-                        let next = resolved.join(part);
-                        match std::fs::symlink_metadata(&next) {
-                            Ok(meta) if meta.file_type().is_symlink() => {
-                                let target = std::fs::read_link(&next)?;
-                                let target = if target.is_absolute() {
-                                    target
-                                } else {
-                                    resolved.join(target)
-                                };
-                                resolved = canonical_path(&target, depth + 1)?;
-                            }
-                            Ok(_) => resolved = next,
-                            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                                resolved = next
-                            }
-                            Err(err) => return Err(err),
-                        }
-                    }
-                    other => resolved.push(other.as_os_str()),
-                }
-            }
-            Ok(resolved)
-        }
-        Err(err) => Err(err),
-    }
-}
-
-/// The canonical home directory, resolved once: it is hit on nearly every check.
-pub fn home() -> PathBuf {
-    static HOME: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    HOME.get_or_init(|| {
-        let raw = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
-        canonical_path(&raw, 0).unwrap_or(raw)
-    })
-    .clone()
-}
-
-fn inside(path: &Path, root: &Path) -> bool {
-    path == root || path.starts_with(root)
-}
-
-fn basename(path: &Path) -> String {
-    path.file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_default()
-}
-
-/// Directories that are sensitive wherever they appear. A project may legitimately contain
-/// a `.docker` or `.azure` directory, but reading one is still worth a question: the names
-/// only mean credentials, and a false prompt is cheaper than a leaked key.
-const SENSITIVE_DIRS: &[&str] = &[
-    ".ssh", ".gnupg", ".aws", ".kube", ".docker", ".azure", ".gcloud",
-];
-/// Multi-segment credential locations, relative to the home directory. The agent harnesses
-/// are listed too: pi keeps provider keys in `~/.pi/config.json` and its sessions next to
-/// them, and codex/Claude/Gemini keep the same kind of live secret. `~/.pi` is this tool's
-/// own store — the config holds the provider key in clear text, so a command that reads it
-/// is worth a question.
-const HOME_PATHS: &[&str] = &[
-    ".config/gh",
-    ".config/gcloud",
-    ".config/glab-cli",
-    ".config/hub",
-    ".config/doctl",
-    ".pi",
-    ".codex",
-    ".claude",
-    ".gemini",
-    ".continue",
-    ".aider",
-    ".local/share/keyrings",
-];
-/// Credential-like names, matched on the basename anywhere: a directory-only rule misses
-/// `grep -r . .ssh`, which reads private keys without naming one.
-const SENSITIVE_NAMES: &[&str] = &[
-    ".env",
-    ".netrc",
-    ".git-credentials",
-    ".npmrc",
-    ".pypirc",
-    ".dockercfg",
-    ".gitconfig",
-    ".bash_history",
-    ".zsh_history",
-    ".python_history",
-    ".mysql_history",
-    ".psql_history",
-    ".wgetrc",
-    ".curlrc",
-    ".pgpass",
-    ".authinfo",
-    ".s3cfg",
-    ".terraformrc",
-    ".my.cnf",
-    ".mylogin.cnf",
-    ".kubeconfig",
-    ".credentials.json",
-    ".envrc",
-    ".htpasswd",
-    "application_default_credentials.json",
-    "hosts.yml",
-];
-/// Private-key containers: the extension alone is enough to ask before touching.
-const SENSITIVE_SUFFIXES: &[&str] = &[
-    "pem", "key", "pfx", "p12", "jks", "keystore", "ppk", "kdbx", "ovpn",
-];
-
-fn basename_is_sensitive(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    if SENSITIVE_NAMES.iter().any(|n| *n == lower) {
-        return true;
-    }
-    // `.env` itself and the `.env.local` family.
-    if lower.starts_with(".env.") {
-        return true;
-    }
-    // SSH keys, whatever the algorithm: `id_rsa`, `id_ed25519`, …
-    if lower.starts_with("id_") && lower.len() > 3 {
-        return true;
-    }
-    // service-account.json, service_account_x.json, serviceaccount.json
-    if lower.starts_with("service") && lower.contains("account") && lower.ends_with(".json") {
-        return true;
-    }
-    false
-}
-
-/// Secret-bearing basenames that are only meaningful outside a project checkout: a
-/// repository may legitimately contain a fixture called `auth.json`.
-fn home_only_name(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    matches!(
-        lower.as_str(),
-        ".claude.json"
-            | ".aider.conf.yml"
-            | "auth.json"
-            | "oauth_creds.json"
-            | "oauth-creds.json"
-            | "credentials"
-            | "credentials.json"
-            | "credentialsdb"
-            | "token.json"
-            | "login.keyring"
-    ) || lower
-        .strip_prefix("keyring.")
-        .is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_alphanumeric()))
-}
-
-fn extension_is_sensitive(path: &Path) -> bool {
-    match path.extension().and_then(|e| e.to_str()) {
-        Some(ext) => SENSITIVE_SUFFIXES
-            .iter()
-            .any(|s| s.eq_ignore_ascii_case(ext)),
-        None => false,
-    }
-}
-
-fn sensitive(path: &Path) -> bool {
-    let segments: Vec<String> = path
-        .components()
-        .filter_map(|c| match c {
-            Component::Normal(part) => Some(part.to_string_lossy().to_string()),
-            _ => None,
-        })
-        .collect();
-    if segments
-        .iter()
-        .any(|part| SENSITIVE_DIRS.iter().any(|d| d.eq_ignore_ascii_case(part)))
-    {
-        return true;
-    }
-    let name = basename(path);
-    if basename_is_sensitive(&name) {
-        return true;
-    }
-    if extension_is_sensitive(path) {
-        return true;
-    }
-    let text = path.to_string_lossy();
-    if text.ends_with("/shadow") || text.ends_with("/gshadow") {
-        return true;
-    }
-    if path.starts_with("/proc") && matches!(name.as_str(), "environ" | "mem") {
-        return true;
-    }
-    // The remaining rules only apply inside the user's own home directory.
-    let home = home();
-    if !inside(path, &home) {
-        return false;
-    }
-    if home_only_name(&name) {
-        return true;
-    }
-    let relative = path.strip_prefix(&home).unwrap_or(path);
-    let parts: Vec<String> = relative
-        .components()
-        .filter_map(|c| match c {
-            Component::Normal(part) => Some(part.to_string_lossy().to_string()),
-            _ => None,
-        })
-        .collect();
-    for end in 1..=parts.len() {
-        let prefix = parts[..end].join("/");
-        if HOME_PATHS.iter().any(|p| *p == prefix) {
-            return true;
-        }
-    }
-    false
-}
-
-/// Exclusions for recursive content searches, shared by the native and shell tools.
-/// These are appended after user globs so a broad include cannot restore secret files.
-pub(crate) fn search_exclusions(ripgrep: bool) -> Vec<String> {
-    let mut patterns: Vec<String> = SENSITIVE_NAMES.iter().map(|s| s.to_string()).collect();
-    patterns.extend(
-        [
-            ".env.*",
-            "id_*",
-            "service*account*.json",
-            "shadow",
-            "gshadow",
-            "environ",
-            "mem",
-        ]
-        .map(str::to_string),
-    );
-    patterns.extend(SENSITIVE_SUFFIXES.iter().map(|s| format!("*.{s}")));
-    patterns.extend(
-        [
-            ".claude.json",
-            ".aider.conf.yml",
-            "auth.json",
-            "oauth_creds.json",
-            "oauth-creds.json",
-            "credentials",
-            "credentials.json",
-            "credentialsdb",
-            "token.json",
-            "login.keyring",
-            "keyring.*",
-        ]
-        .map(str::to_string),
-    );
-    let mut dirs: Vec<String> = SENSITIVE_DIRS.iter().map(|s| s.to_string()).collect();
-    dirs.extend(
-        HOME_PATHS
-            .iter()
-            .map(|s| s.rsplit('/').next().unwrap().to_string()),
-    );
-    if ripgrep {
-        patterns.extend(dirs);
-        patterns
-            .into_iter()
-            .flat_map(|pattern| ["--iglob".into(), format!("!{pattern}")])
-            .collect()
-    } else {
-        // GNU grep has no case-insensitive glob flag. Character classes give the same rule.
-        let insensitive = |s: String| {
-            s.chars()
-                .map(|c| {
-                    if c.is_ascii_alphabetic() {
-                        format!("[{}{}]", c.to_ascii_lowercase(), c.to_ascii_uppercase())
-                    } else {
-                        c.to_string()
-                    }
-                })
-                .collect::<String>()
-        };
-        patterns
-            .into_iter()
-            .map(|p| format!("--exclude={}", insensitive(p)))
-            .chain(
-                dirs.into_iter()
-                    .map(|p| format!("--exclude-dir={}", insensitive(p))),
-            )
-            .collect()
-    }
-}
-
-/// Path check for `read`, `write` and `edit`.
-pub fn assess_path(operation: Operation, input: &str, cwd: &Path) -> Assessment {
-    if input.is_empty() || input.contains('\0') {
-        return Assessment::ask("无法确认目标路径");
-    }
-    let original = resolve_tool_path(input, cwd);
-    let target = match canonical_path(&original, 0) {
-        Ok(target) => target,
-        Err(_) => return Assessment::ask("目标路径无法可靠解析，需要人工确认"),
-    };
-    if sensitive(&original) || sensitive(&target) {
-        return Assessment::ask("目标涉及凭据或敏感配置");
-    }
-    if operation == Operation::Read {
-        return Assessment::allow();
-    }
-    let root = match canonical_path(cwd, 0) {
-        Ok(root) => root,
-        Err(_) => return Assessment::ask("无法确认当前工作目录"),
-    };
-    if !inside(&target, &root) {
-        return Assessment::ask("目标位于当前工作目录之外（已解析符号链接）");
-    }
-    let touches_metadata = |path: &Path| {
-        path.components().any(|c| match c {
-            Component::Normal(part) => {
-                let part = part.to_string_lossy();
-                matches!(part.as_ref(), ".git" | ".pi" | ".codex" | ".agents")
-            }
-            _ => false,
-        }) || basename(path) == "AGENTS.md"
-    };
-    if touches_metadata(&original) || touches_metadata(&target) {
-        return Assessment::ask("目标涉及 Git 元数据、代理配置或权限规则");
-    }
-    if let Ok(meta) = std::fs::symlink_metadata(&target) {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            if meta.nlink() > 1 {
-                return Assessment::ask("目标存在硬链接，写入可能影响其他路径");
-            }
-        }
-        #[cfg(not(unix))]
-        let _ = meta;
-    }
-    Assessment::allow()
-}
-
-// ---------------------------------------------------------------------------
-// What runs without asking
-// ---------------------------------------------------------------------------
+use super::path::{
+    assess_path, canonical_path, home, normalize, resolve_tool_path, search_exclusions,
+};
+use super::{Assessment, Dialect, Operation};
 
 /// Commands whose arguments are data rather than paths.
 ///
@@ -533,7 +54,7 @@ const READ_COMMANDS: &[&str] = &[
 /// auto-approved, which is what stops PATH hijacking.
 const TRUSTED_DIRS: &[&str] = &["/usr/bin", "/bin"];
 
-fn trusted_executable_target(name: &str, resolved: &Path) -> bool {
+pub(super) fn trusted_executable_target(name: &str, resolved: &Path) -> bool {
     let target_name = resolved.file_name().and_then(|n| n.to_str());
     // Debian/Ubuntu's alternatives system resolves `which` to which.debianutils.
     // Keep aliases explicit: accepting any renamed target could turn a reader into rm.
@@ -585,7 +106,7 @@ pub fn trusted_executable(command: &str) -> Option<PathBuf> {
     None
 }
 
-fn command_reason(name: &str) -> String {
+pub(super) fn command_reason(name: &str) -> String {
     if ["rm", "rmdir", "unlink", "shred", "wipe"].contains(&name) {
         return "命令会删除文件，需要确认目标".into();
     }
@@ -626,7 +147,7 @@ fn command_reason(name: &str) -> String {
 /// `knownOptions`: every long option must be in the allow-list, and every short-option
 /// cluster must satisfy `short`. Abbreviations are rejected, because `--out` can mean
 /// `--output` to GNU getopt.
-fn known_long_options(args: &[String], allowed: &[&str]) -> bool {
+pub(super) fn known_long_options(args: &[String], allowed: &[&str]) -> bool {
     for arg in args {
         if arg == "--" {
             break;
@@ -645,7 +166,7 @@ fn known_long_options(args: &[String], allowed: &[&str]) -> bool {
 
 /// Validate a short-option cluster: every character is a plain flag, or one takes a
 /// value (which then absorbs the rest of the argument, or the next one).
-fn known_short_options(args: &[String], simple: &str, value_taking: &str) -> bool {
+pub(super) fn known_short_options(args: &[String], simple: &str, value_taking: &str) -> bool {
     for arg in args {
         if arg == "--" {
             break;
@@ -672,7 +193,7 @@ fn known_short_options(args: &[String], simple: &str, value_taking: &str) -> boo
 /// Short options that absorb the rest of their own argument as a path (or take one from
 /// the next argument). `-nfFILE` is `-n -f FILE`, because letters are consumed left to
 /// right as flags until one takes a value.
-fn short_path_options(command: &str) -> &'static [(char, Operation)] {
+pub(super) fn short_path_options(command: &str) -> &'static [(char, Operation)] {
     match command {
         "grep" => &[('f', Operation::Read)],
         "rg" => &[('f', Operation::Read)],
@@ -684,7 +205,7 @@ fn short_path_options(command: &str) -> &'static [(char, Operation)] {
 }
 
 /// The literal value a glued short option would take, e.g. `FILE` from `-nfFILE`.
-fn glued_short_value(command: &str, arg: &str) -> Option<(String, Operation)> {
+pub(super) fn glued_short_value(command: &str, arg: &str) -> Option<(String, Operation)> {
     let options = short_path_options(command);
     if options.is_empty() || !arg.starts_with('-') || arg.starts_with("--") {
         return None;
@@ -699,7 +220,7 @@ fn glued_short_value(command: &str, arg: &str) -> Option<(String, Operation)> {
 }
 
 /// A leading `~` survives the quoting rewrite only if it is expanded first.
-fn expand_home(value: &str, dialect: Dialect) -> Option<String> {
+pub(super) fn expand_home(value: &str, dialect: Dialect) -> Option<String> {
     if value == "~" {
         return Some(home().to_string_lossy().to_string());
     }
@@ -725,11 +246,11 @@ fn expand_home(value: &str, dialect: Dialect) -> Option<String> {
 /// `^foo` is deliberately allowed: it is a glob or a plain literal, and `grep '^import'`
 /// is far too common to refuse. A leading `=` inside a longer word (`a=b.txt`) is not an
 /// expansion in zsh and is left untouched.
-fn zsh_rewrite_risk(value: &str) -> bool {
+pub(super) fn zsh_rewrite_risk(value: &str) -> bool {
     value.len() > 1 && value.starts_with('=')
 }
 
-fn shell_quote(value: &str) -> String {
+pub(super) fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
@@ -743,7 +264,7 @@ fn shell_quote(value: &str) -> String {
 ///
 /// `args` has already had `~` expanded and dialect rewrites resolved. `Some(reason)` asks
 /// the user; `None` means the command's options were all recognised.
-fn option_problem(name: &str, args: &[String]) -> Option<String> {
+pub(super) fn option_problem(name: &str, args: &[String]) -> Option<String> {
     if matches!(name, "rg" | "grep")
         && args.iter().any(|arg| {
             matches!(arg.as_str(), "--follow" | "--dereference-recursive")
@@ -1153,7 +674,7 @@ fn option_problem(name: &str, args: &[String]) -> Option<String> {
     None
 }
 
-fn vet_segment(words: &[Word], cwd: &Path, dialect: Dialect) -> Assessment {
+pub(super) fn vet_segment(words: &[Word], cwd: &Path, dialect: Dialect) -> Assessment {
     let Some((command, raw_args)) = words.split_first() else {
         return Assessment::ask("未找到可执行命令");
     };
@@ -1300,7 +821,7 @@ fn vet_segment(words: &[Word], cwd: &Path, dialect: Dialect) -> Assessment {
 /// ([`DATA_ARG_COMMANDS`]) carry data rather than paths and are exempt.
 ///
 /// `Some(decision)` means an argument was refused; `None` means they all checked out.
-fn path_problem(name: &str, args: &[String], cwd: &Path) -> Option<Assessment> {
+pub(super) fn path_problem(name: &str, args: &[String], cwd: &Path) -> Option<Assessment> {
     if matches!(name, "rg" | "grep") {
         return search_path_problem(name, args, cwd);
     }
@@ -1480,7 +1001,7 @@ fn path_problem(name: &str, args: &[String], cwd: &Path) -> Option<Assessment> {
 }
 
 /// `sed -n '1,10p' file`, `sed -n '5p' file`, `sed '1,$p' file`. Nothing else.
-fn vet_git(executable: &Path, args: &[String], cwd: &Path) -> Assessment {
+pub(super) fn vet_git(executable: &Path, args: &[String], cwd: &Path) -> Assessment {
     let args = args
         .strip_prefix(&["--no-pager".to_string()])
         .unwrap_or(args);
@@ -1650,7 +1171,7 @@ fn vet_git(executable: &Path, args: &[String], cwd: &Path) -> Assessment {
 
 /// `-[0-9]+`, `-n[0-9]*`, `-[pswbrzR]+`, `-U[0-9]*`, `-M[0-9]*`, `-C[0-9]*`, `-S...`,
 /// `-G...` — the short flags git shortens but never uses for writes.
-fn git_short_options_ok(options: &[String]) -> bool {
+pub(super) fn git_short_options_ok(options: &[String]) -> bool {
     for arg in options {
         if arg == "--" {
             break;
@@ -1689,7 +1210,11 @@ fn git_short_options_ok(options: &[String]) -> bool {
 /// segment is vetted against where it will really run.
 ///
 /// `None` means this is not a `cd`. `Some(Err)` asks the user.
-fn cd_target(words: &[Word], cwd: &Path, dialect: Dialect) -> Option<Result<PathBuf, String>> {
+pub(super) fn cd_target(
+    words: &[Word],
+    cwd: &Path,
+    dialect: Dialect,
+) -> Option<Result<PathBuf, String>> {
     let (command, args) = words.split_first()?;
     if command.value != "cd" || command.quoted {
         return None;
@@ -1801,498 +1326,5 @@ pub fn assess_command(command: &str, cwd: &Path, dialect: Dialect) -> Assessment
     }
     Assessment::Allow {
         safe_command: Some(normalized.join(" ")),
-    }
-}
-
-/// Tools that only ever read.
-pub fn assess_tool(
-    name: &str,
-    input: &serde_json::Value,
-    cwd: &Path,
-    dialect: Dialect,
-) -> Assessment {
-    let string = |key: &str| input.get(key).and_then(|v| v.as_str()).unwrap_or("");
-    match name {
-        "bash" => assess_command(string("command"), cwd, dialect),
-        "write" | "edit" => {
-            let path = string("path");
-            assess_path(Operation::Write, path, cwd)
-        }
-        "read" | "grep" | "find" | "ls" => {
-            let path = {
-                let explicit = string("path");
-                if explicit.is_empty() {
-                    cwd.to_string_lossy().to_string()
-                } else {
-                    explicit.to_string()
-                }
-            };
-            assess_path(Operation::Read, &path, cwd)
-        }
-        _ => Assessment::ask("自定义工具尚未归类，需要确认其操作"),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn process_environments_need_approval() {
-        for command in [
-            "ps eww -p 1",
-            "ps auxe",
-            "ps --environment",
-            "ps -eo environ",
-            "ps --format=pid,env",
-            "cat /proc/1/environ",
-            "grep --fi .env needle .",
-        ] {
-            assert!(!allows(command), "{command}");
-        }
-        for command in ["ps aux", "ps -eo pid,cmd", "ps -p 1 -o pid,comm"] {
-            assert!(allows(command), "{command}: {}", reason(command));
-        }
-        assert!(!allows("rg --follow needle ."));
-        assert!(!allows("grep -R needle ."));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn parent_components_are_resolved_after_symlinks() {
-        let dir = std::env::temp_dir().join(format!("pi-path-{}", uuid::Uuid::now_v7()));
-        std::fs::create_dir_all(dir.join(".ssh/child")).unwrap();
-        std::fs::write(dir.join(".ssh/fixture.txt"), "secret").unwrap();
-        std::os::unix::fs::symlink(dir.join(".ssh/child"), dir.join("alias")).unwrap();
-        assert_eq!(
-            canonical_path(&resolve_tool_path("alias/../fixture.txt", &dir), 0).unwrap(),
-            dir.join(".ssh/fixture.txt")
-        );
-        for operation in [Operation::Read, Operation::Write] {
-            assert!(!assess_path(operation, "alias/../fixture.txt", &dir).allows());
-            assert!(!assess_path(operation, "alias/../new.txt", &dir).allows());
-        }
-        assert!(!assess_command("cat alias/../fixture.txt", &dir, Dialect::Zsh).allows());
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn executable_targets_accept_only_known_system_aliases() {
-        for target in [
-            "/usr/bin/which",
-            "/bin/which",
-            "/usr/bin/which.debianutils",
-            "/bin/which.debianutils",
-        ] {
-            assert!(
-                trusted_executable_target("which", Path::new(target)),
-                "{target}"
-            );
-        }
-        for (name, target) in [
-            ("which", "/tmp/which.debianutils"),
-            ("which", "/usr/local/bin/which.debianutils"),
-            ("which", "/usr/bin/rm"),
-            ("which", "/usr/bin/which.unknown"),
-            ("cat", "/usr/bin/which.debianutils"),
-            ("cat", "/usr/bin/rm"),
-        ] {
-            assert!(
-                !trusted_executable_target(name, Path::new(target)),
-                "{name}: {target}"
-            );
-        }
-    }
-
-    #[test]
-    fn search_patterns_are_data_but_pattern_files_are_checked() {
-        for command in [
-            "rg '.env' src",
-            "rg -ne '.ssh/id_rsa' src",
-            "grep -e /etc/shadow src/main.rs",
-            "git --no-pager diff --stat",
-            "pwd;",
-        ] {
-            assert!(allows(command), "{command}: {}", reason(command));
-        }
-        for command in [
-            "rg -nf.env src",
-            "rg -n -f .env src",
-            "grep --exclude-from=.env hello .",
-            "rg --files -- .env",
-            "date --se=20260101",
-            "date 010100002026",
-        ] {
-            assert!(!allows(command), "{command}");
-        }
-    }
-
-    #[test]
-    fn directory_changes_cannot_escape_pipeline_or_failure_scopes() {
-        for command in [
-            "cd /tmp | cat .env",
-            "cd /tmp || cat .env",
-            "echo ok | cd /tmp; cat .env",
-        ] {
-            assert!(
-                !assess_command(command, Path::new("/"), Dialect::Zsh).allows(),
-                "{command}"
-            );
-        }
-        assert!(assess_command("cd /tmp && pwd", Path::new("/"), Dialect::Zsh).allows());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn an_executable_alias_cannot_turn_a_reader_into_a_writer() {
-        let dir = std::env::temp_dir().join(format!("pi-executable-{}", uuid::Uuid::now_v7()));
-        std::fs::create_dir(&dir).unwrap();
-        let alias = dir.join("cat");
-        std::os::unix::fs::symlink("/usr/bin/rm", &alias).unwrap();
-        assert!(trusted_executable(alias.to_str().unwrap()).is_none());
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    fn cwd() -> PathBuf {
-        std::env::temp_dir().join("pi-policy-cwd")
-    }
-
-    fn allows(command: &str) -> bool {
-        assess_command(command, &cwd(), Dialect::Zsh).allows()
-    }
-
-    fn reason(command: &str) -> String {
-        assess_command(command, &cwd(), Dialect::Zsh)
-            .reason()
-            .unwrap_or_default()
-            .to_string()
-    }
-
-    #[test]
-    fn simple_read_commands_are_rewritten_to_absolute_paths() {
-        let decision = assess_command("cat notes.txt", &cwd(), Dialect::Zsh);
-        match decision {
-            Assessment::Allow {
-                safe_command: Some(command),
-            } => {
-                assert_eq!(command, "'/usr/bin/cat' 'notes.txt'");
-            }
-            other => panic!("expected allow with rewrite, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn a_hijacked_command_name_is_not_auto_approved() {
-        assert!(!allows("./cat x"));
-        assert!(!allows("/tmp/cat x"));
-    }
-
-    #[test]
-    fn secret_paths_ask() {
-        assert!(reason("cat ~/.ssh/id_rsa").contains("凭据"));
-        assert!(reason("cat /etc/shadow").contains("凭据"));
-        assert!(reason("cat .env").contains("凭据"));
-        assert!(reason("cat server.key").contains("凭据"));
-        // `~/.pi` is this tool's own store, and its config holds the provider key.
-        assert!(!allows("cat ~/.pi/config.json"));
-        assert!(!allows("cat ~/.codex/config.toml"));
-        assert!(!allows("grep -r . .ssh"));
-    }
-
-    #[test]
-    fn a_project_fixture_called_auth_json_is_still_checked_but_allowed_outside_home() {
-        // Outside the home directory the generic names do not apply.
-        let decision = assess_path(Operation::Read, "/srv/app/tests/auth.json", &cwd());
-        assert!(decision.allows());
-    }
-
-    #[test]
-    fn redirection_and_substitution_ask() {
-        assert!(reason("echo hi > file").contains("重定向"));
-        assert!(reason("cat $(ls)").contains("变量"));
-        assert!(reason("cat `ls`").contains("变量"));
-        assert!(reason("ls *.rs").contains("通配符"));
-        assert!(reason("ls; rm -rf /").contains("删除"));
-        assert!(reason("sleep 1 &").contains("后台"));
-        // A heredoc redirects stdin, so it is a real redirection and asks.
-        assert!(reason("python3 - <<EOF").contains("重定向"));
-    }
-
-    #[test]
-    fn descriptor_redirects_do_not_ask() {
-        // `2>&1` and `2>/dev/null` move or discard a descriptor. They are in a large share
-        // of the commands a model writes out of habit, and refusing them is what pushed a
-        // vetted `cargo test 2>&1` into a `python3 - <<EOF`.
-        assert!(allows("ls 2>&1"));
-        assert!(allows("cat notes.txt 2>/dev/null"));
-        assert!(allows("cat notes.txt > /dev/null"));
-        assert!(allows("cat notes.txt >&2"));
-        assert!(allows("cat notes.txt 2>&-"));
-        assert!(allows("ls 2>/dev/null; ls"));
-        // A redirect that names a file is still a write, and still asks.
-        assert!(reason("cat a > b").contains("重定向"));
-        assert!(reason("cat a >> b").contains("重定向"));
-        assert!(reason("cat a 2> b").contains("重定向"));
-        assert!(reason("cat a >& b").contains("重定向"));
-        assert!(reason("cat < a").contains("重定向"));
-        assert!(reason("echo a>f").contains("重定向"));
-    }
-
-    #[test]
-    fn the_allowed_rewrite_keeps_the_descriptor_redirect() {
-        // The command that runs has to be the command that was checked, or the transcript
-        // shows one thing and the shell does another.
-        match assess_command("cat notes.txt 2>&1", &cwd(), Dialect::Zsh) {
-            Assessment::Allow {
-                safe_command: Some(command),
-            } => {
-                assert!(command.ends_with("2>&1"), "{command}");
-            }
-            other => panic!("expected allow with rewrite, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn inspection_commands_do_not_ask_but_keep_their_dangerous_options() {
-        // These cannot change anything, and asking about them every time was a question
-        // with one answer.
-        for command in [
-            "which cargo",
-            "date",
-            "date +%Y-%m-%d",
-            "nproc",
-            "uptime",
-            "free -h",
-            "ps aux",
-            "id",
-            "whoami",
-            "basename /a/b",
-            "dirname /a/b",
-            "column -t notes.txt",
-            "lscpu",
-            "seq 1 5",
-        ] {
-            assert!(
-                allows(command),
-                "`{command}` should not ask: {}",
-                reason(command)
-            );
-        }
-        // `basename` prints its argument rather than opening it, so a sensitive-looking
-        // name is not a leak here.
-        assert!(allows("basename /etc/shadow"));
-        // The options that do more than read still ask.
-        assert!(reason("date -s 2020-01-01").contains("系统时间"));
-        assert!(reason("date --set=now").contains("系统时间"));
-        assert!(reason("date -f /etc/passwd").contains("系统时间"));
-        // And a path argument is still checked, so these are not a way to read a secret.
-        assert!(reason("column -t /etc/shadow").contains("凭据"));
-        assert!(reason("lscpu /etc/shadow").contains("凭据"));
-        // `env` prints every variable, the provider key included, so it never joins this
-        // group however convenient it would be.
-        assert!(!allows("env"));
-    }
-
-    #[test]
-    fn cd_moves_what_later_segments_are_checked_against() {
-        let cwd = cwd();
-        std::fs::create_dir_all(cwd.join("sub")).unwrap();
-        // Inside the tree it is an ordinary helper, and the path it is given is resolved
-        // against the directory the shell will really be in.
-        assert!(allows("cd sub && ls"));
-        assert!(allows("cd . && ls"));
-        // Anything that could mean a different directory to the shell than to this check
-        // asks: `-` depends on earlier commands, two arguments is not a cd, a symlinked
-        // target changes how `..` resolves, and a missing directory cannot be checked.
-        assert!(reason("cd -").contains("更早的命令"));
-        assert!(reason("cd a b").contains("单个目录"));
-        assert!(reason("cd /nonexistent-pi-xyz").contains("不是目录"));
-    }
-
-    #[test]
-    fn cd_cannot_launder_a_sensitive_path() {
-        // The hole this guards: `cd ~` then a name that is only sensitive inside the home
-        // directory. Judged against the project it looks like any other relative name, so
-        // a check that forgot to move with the `cd` would call this safe while the shell
-        // read the file next to the API keys.
-        let home = home();
-        let sensitive = home.join(".pi/config.json");
-        assert!(
-            reason(&format!(
-                "cd {} && cat .pi/config.json",
-                shell_quote(&home.to_string_lossy())
-            ))
-            .contains("凭据"),
-            "a cd was used to launder a path into a sensitive directory"
-        );
-        assert!(!allows("cd ~ && cat .ssh/id_rsa"));
-        // And the same name outside home is still an ordinary file.
-        assert!(allows("cat .pi/config.json"));
-        let _ = sensitive;
-    }
-
-    #[test]
-    fn data_argument_commands_are_not_path_checked() {
-        assert!(allows("echo hello"));
-        assert!(allows("printf %s x"));
-        assert!(allows("uname -a"));
-        // …but they still cannot smuggle options that write.
-        assert!(allows("echo --file=/etc/passwd"));
-    }
-
-    #[test]
-    fn glued_option_values_are_checked() {
-        assert!(reason("grep -f~/.ssh/id_rsa x").contains("凭据"));
-        assert!(reason("grep --file=~/.ssh/id_rsa x").contains("凭据"));
-        assert!(reason("grep -f ~/.ssh/id_rsa x").contains("凭据"));
-        // -nfFILE must be read as -n -f FILE, not as the flag `fFILE`.
-        assert!(reason("grep -nf~/.ssh/id_rsa x").contains("凭据"));
-        assert!(reason("file -f~/.ssh/id_rsa x").contains("凭据"));
-        assert!(reason("du -X~/.ssh/id_rsa").contains("凭据"));
-        assert!(reason("sort -o/tmp/out x").contains("写入文件"));
-    }
-
-    #[test]
-    fn zsh_only_expansions_ask_but_quoted_forms_do_not() {
-        assert!(reason("cat =ls").contains("=命令"));
-        assert!(reason("cat ~+/x").contains("展开"));
-        assert!(reason("cat ~root/x").contains("展开"));
-        // A quoted or escaped leading = is a literal in zsh.
-        assert!(allows("grep '=x' file"));
-        assert!(allows("grep \"=x\" file"));
-        assert!(allows("grep \\=x file"));
-        // An empty quote does not protect the expansion.
-        assert!(reason("cat ''=ls").contains("=命令"));
-        // And in bash the same word is just a literal.
-        assert!(assess_command("cat =ls", &cwd(), Dialect::Bash).allows());
-    }
-
-    #[test]
-    fn git_is_limited_to_read_only_subcommands() {
-        assert!(allows("git status"));
-        assert!(allows("git log --oneline -5"));
-        assert!(allows("git diff --stat"));
-        assert!(allows("git rev-parse HEAD"));
-        assert!(allows("git ls-files"));
-        assert!(reason("git commit -m x").contains("Git 写操作"));
-        assert!(reason("git push").contains("Git 写操作"));
-        assert!(reason("git -c core.pager=evil log").contains("外部程序"));
-        assert!(reason("git diff --ext-diff").contains("外部程序"));
-        assert!(reason("git show HEAD:%G").contains("外部程序"));
-    }
-
-    #[test]
-    fn git_rewrites_disable_pager_hooks_and_external_diff() {
-        match assess_command("git log --oneline", &cwd(), Dialect::Zsh) {
-            Assessment::Allow {
-                safe_command: Some(command),
-            } => {
-                assert!(command.contains("--no-pager"));
-                assert!(command.contains("core.fsmonitor=false"));
-                assert!(command.contains("core.hooksPath=/dev/null"));
-                assert!(command.contains("--no-ext-diff"));
-                assert!(command.contains("--no-textconv"));
-            }
-            other => panic!("expected rewrite, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn git_rev_path_forms_are_path_checked() {
-        assert!(reason("git show HEAD:~/.ssh/id_rsa").contains("凭据"));
-        assert!(reason("git show HEAD:.env").contains("凭据"));
-    }
-
-    #[test]
-    fn sed_only_allows_line_range_printing() {
-        assert!(allows("sed -n '1,10p' file.txt"));
-        assert!(allows("sed -n '5p' file.txt"));
-        assert!(allows(r"sed '1,$p' file.txt"));
-        assert!(reason("sed -i 's/a/b/' file.txt").contains("sed"));
-        assert!(reason("sed -n '1,10p' -e 'w /tmp/x' file.txt").contains("sed"));
-        assert!(reason("sed -n '1,10w /tmp/x' file.txt").contains("sed"));
-    }
-
-    #[test]
-    fn unknown_options_ask() {
-        assert!(reason("rg --pre 'evil' pattern").contains("外部程序"));
-        assert!(reason("rg --unknown-flag x").contains("未被确认"));
-        assert!(reason("find . -delete").contains("find"));
-        assert!(reason("find . -frobnicate").contains("未被确认"));
-        assert!(reason("sort --output=/tmp/x f").contains("写入文件"));
-        assert!(reason("file --uncompress x").contains("外部程序"));
-        assert!(allows("rg --hidden pattern"));
-        assert!(allows("find . -name '*.rs' -type f"));
-        assert!(allows("sort -u file"));
-        assert!(allows("file -b x"));
-    }
-
-    #[test]
-    fn writes_outside_the_project_ask() {
-        let cwd = cwd();
-        assert!(
-            assess_path(Operation::Write, "/tmp/elsewhere.txt", &cwd)
-                .reason()
-                .is_some()
-        );
-        assert!(assess_path(Operation::Write, "notes.txt", &cwd).allows());
-        assert!(
-            assess_path(Operation::Write, ".git/config", &cwd)
-                .reason()
-                .is_some()
-        );
-        assert!(
-            assess_path(Operation::Write, "AGENTS.md", &cwd)
-                .reason()
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn compound_commands_are_vetted_segment_by_segment() {
-        assert!(allows("cat a.txt | head -3"));
-        assert!(reason("cat a.txt && rm a.txt").contains("删除"));
-        assert!(reason("ls || sudo rm -rf /").contains("提升权限"));
-    }
-
-    #[test]
-    fn script_and_network_commands_ask() {
-        assert!(reason("python3 -c 'print(1)'").contains("脚本"));
-        assert!(reason("curl http://x").contains("网络"));
-        assert!(reason("sudo ls").contains("提升权限"));
-        assert!(reason("msg=hi env").contains("环境变量"));
-    }
-
-    #[test]
-    fn empty_or_broken_input_asks() {
-        assert!(!allows(""));
-        assert!(!allows("   "));
-        assert!(reason("cat 'unterminated").contains("引号未闭合"));
-        assert!(reason("cat a.txt |").contains("不完整"));
-    }
-
-    #[test]
-    fn headless_denial_text_names_the_rule() {
-        let text = refusal(Some("命令会删除文件，需要确认目标"));
-        assert_eq!(
-            text,
-            "未获得用户授权，操作未执行（命令会删除文件，需要确认目标）"
-        );
-        assert_eq!(refusal(None), "未获得用户授权，操作未执行");
-    }
-
-    #[test]
-    fn tools_route_to_the_right_check() {
-        let cwd = cwd();
-        let read = serde_json::json!({"path": "src/main.rs"});
-        assert!(assess_tool("read", &read, &cwd, Dialect::Zsh).allows());
-        let write = serde_json::json!({"path": "src/main.rs", "content": "x"});
-        assert!(assess_tool("write", &write, &cwd, Dialect::Zsh).allows());
-        let outside = serde_json::json!({"path": "/etc/hosts", "content": "x"});
-        assert!(!assess_tool("write", &outside, &cwd, Dialect::Zsh).allows());
-        let grep = serde_json::json!({"pattern": "x", "path": "~/.ssh"});
-        assert!(!assess_tool("grep", &grep, &cwd, Dialect::Zsh).allows());
-        let bash = serde_json::json!({"command": "ls"});
-        assert!(assess_tool("bash", &bash, &cwd, Dialect::Zsh).allows());
     }
 }
