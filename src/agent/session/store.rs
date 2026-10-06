@@ -10,7 +10,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::config::sessions_dir;
+use super::dirs::sessions_dir;
 use crate::llm::{Block, Message};
 
 use super::{Record, Session};

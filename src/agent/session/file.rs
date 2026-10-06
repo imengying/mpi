@@ -181,8 +181,8 @@ impl Session {
             // A resumed session is a live one: if it is continued in another directory its
             // file follows, the same as a session that was never interrupted.
             register_under: path
-                .starts_with(crate::config::sessions_root())
-                .then(crate::config::sessions_root),
+                .starts_with(super::dirs::sessions_root())
+                .then(super::dirs::sessions_root),
             storage: Storage::Buffered,
             last_id,
             records,
@@ -240,7 +240,7 @@ impl Session {
         // it rather than reused. Both name the same directory; only the name changes, and it
         // changes before the file exists, so nothing has to be moved.
         if let Some(root) = self.register_under.clone() {
-            let registered = crate::config::register_dir_in(&root, &self.cwd);
+            let registered = super::dirs::register_dir_in(&root, &self.cwd);
             let name = self
                 .path
                 .file_name()

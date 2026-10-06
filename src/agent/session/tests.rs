@@ -657,7 +657,7 @@ fn deleting_the_last_session_takes_its_store_directory_with_it() {
     std::fs::create_dir_all(&project).unwrap();
 
     let mut session = Session::create_in(
-        &crate::config::sessions_dir_in(&store, &project),
+        &super::dirs::sessions_dir_in(&store, &project),
         &project,
         "work/m",
     )
@@ -670,7 +670,7 @@ fn deleting_the_last_session_takes_its_store_directory_with_it() {
     assert!(dir.is_dir());
 
     session.delete().unwrap();
-    assert!(crate::config::forget_dir_if_empty_in(&store, &project));
+    assert!(super::dirs::forget_dir_if_empty_in(&store, &project));
     assert!(!dir.exists());
     assert!(list_in(&store).is_empty());
 
@@ -943,8 +943,8 @@ fn sessions_are_stored_under_the_directory_they_belong_to() {
     std::fs::create_dir_all(&a).unwrap();
     std::fs::create_dir_all(&b).unwrap();
 
-    let dir_a = crate::config::sessions_dir_in(&store, &a);
-    let dir_b = crate::config::sessions_dir_in(&store, &b);
+    let dir_a = super::dirs::sessions_dir_in(&store, &a);
+    let dir_b = super::dirs::sessions_dir_in(&store, &b);
     let mut in_a = Session::create_in(&dir_a, &a, "work/m").unwrap();
     in_a.push_message(Message::user_text("在 a 里"), None, None)
         .unwrap();
@@ -969,20 +969,20 @@ fn the_same_directory_always_gets_the_same_id() {
     let project = root.join("proj");
     std::fs::create_dir_all(&project).unwrap();
 
-    let first = crate::config::register_dir_in(&store, &project);
-    assert_eq!(crate::config::register_dir_in(&store, &project), first);
+    let first = super::dirs::register_dir_in(&store, &project);
+    assert_eq!(super::dirs::register_dir_in(&store, &project), first);
     assert_eq!(
-        crate::config::dir_id_in(&store, &project).as_deref(),
+        super::dirs::dir_id_in(&store, &project).as_deref(),
         Some(first.as_str())
     );
     assert_eq!(
-        crate::config::sessions_dir_in(&store, &project)
+        super::dirs::sessions_dir_in(&store, &project)
             .file_name()
             .unwrap(),
         first.as_str()
     );
     // A table written here is readable by the next process, which is the whole point.
-    let index = crate::config::read_dirs_index_for_test(&store);
+    let index = super::dirs::read_dirs_index_for_test(&store);
     assert_eq!(
         index.get(&first).map(String::as_str),
         Some(project.to_string_lossy().as_ref())
@@ -1002,17 +1002,17 @@ fn merely_looking_at_a_directory_does_not_register_it() {
     let project = root.join("proj");
     std::fs::create_dir_all(&project).unwrap();
 
-    assert!(crate::config::dir_id_in(&store, &project).is_none());
+    assert!(super::dirs::dir_id_in(&store, &project).is_none());
     // Asking twice gives two ids, which is fine: neither names a real directory.
-    let _ = crate::config::sessions_dir_in(&store, &project);
-    let _ = crate::config::sessions_dir_in(&store, &project);
-    assert!(crate::config::read_dirs_index_for_test(&store).is_empty());
-    assert!(crate::config::dir_id_in(&store, &project).is_none());
+    let _ = super::dirs::sessions_dir_in(&store, &project);
+    let _ = super::dirs::sessions_dir_in(&store, &project);
+    assert!(super::dirs::read_dirs_index_for_test(&store).is_empty());
+    assert!(super::dirs::dir_id_in(&store, &project).is_none());
 
     // Creating a session is what registers it, and then the id is stable.
-    let id = crate::config::register_dir_in(&store, &project);
+    let id = super::dirs::register_dir_in(&store, &project);
     assert_eq!(
-        crate::config::dir_id_in(&store, &project).as_deref(),
+        super::dirs::dir_id_in(&store, &project).as_deref(),
         Some(id.as_str())
     );
 

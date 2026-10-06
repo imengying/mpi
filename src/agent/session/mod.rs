@@ -28,10 +28,13 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::config::{Usage, sessions_dir};
+use crate::config::Usage;
+
+use self::dirs::sessions_dir;
 use crate::llm::{Message, StopReason};
 
 mod context;
+pub mod dirs;
 mod file;
 mod record;
 mod store;
@@ -83,7 +86,7 @@ impl Session {
         // directory pi is started in into the table, and the table is meant to say where
         // sessions *are* (see [`Session::persist`]).
         let mut session = Self::create_in(&sessions_dir(cwd), cwd, model)?;
-        session.register_under = Some(crate::config::sessions_root());
+        session.register_under = Some(dirs::sessions_root());
         Ok(session)
     }
 
@@ -232,8 +235,8 @@ impl Session {
         if self.register_under.is_none() {
             return Ok(());
         }
-        let root = crate::config::sessions_root();
-        let id = crate::config::register_dir_in(&root, &self.cwd);
+        let root = dirs::sessions_root();
+        let id = dirs::register_dir_in(&root, &self.cwd);
         let name = match self.path.file_name() {
             Some(name) => name.to_owned(),
             None => return Ok(()),

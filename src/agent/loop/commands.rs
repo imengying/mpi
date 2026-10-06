@@ -105,7 +105,7 @@ impl Agent {
         // The store's entry goes with the last session in it. Otherwise a directory stays
         // listed for every project that was ever used, and the store stops being a list of
         // where history *is* — which is the whole reason for grouping by directory.
-        crate::config::forget_dir_if_empty(&self.cwd);
+        crate::agent::session::dirs::forget_dir_if_empty(&self.cwd);
         self.screen.push_lines(ui_compact::note_lines(
             &format!("已删除会话文件：{path}"),
             crate::ui::screen::Style::new(Color::Dim),
