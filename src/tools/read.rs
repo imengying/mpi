@@ -27,9 +27,9 @@ pub fn spec() -> ToolSpec {
 pub async fn execute(arguments: &serde_json::Value, cwd: &Path) -> Result<ToolOutput, String> {
     let path = crate::tools::required_str(arguments, "path")?;
     let resolved = crate::auth::policy::resolve_tool_path(path, cwd);
-    let meta = std::fs::metadata(&resolved).map_err(|err| format!("无法读取 {path}：{err}"))?;
+    let meta = std::fs::metadata(&resolved).map_err(|err| format!("无法读取：{err}"))?;
     if meta.is_dir() {
-        return Err(format!("{path} 是目录；请用 ls 或 find"));
+        return Err("这是一个目录；改用 ls 或 find 读取。".to_string());
     }
     let offset = crate::tools::optional_u64(arguments, "offset")
         .unwrap_or(1)
@@ -102,7 +102,7 @@ fn read_window(path: &Path, offset: u64, limit: u64) -> Result<String, String> {
         }
         output.finish(false).map(|(text, _)| text)
     };
-    read().map_err(|err| format!("无法读取 {}：{err}", path.display()))
+    read().map_err(|err| format!("无法读取：{err}"))
 }
 
 #[cfg(test)]
@@ -193,7 +193,9 @@ mod tests {
             &dir,
         ))
         .unwrap_err();
-        assert!(error.contains("是目录"));
+        assert!(error.contains("这是一个目录"));
+        // The path is in the call and in the block header; the result does not restate it.
+        assert!(!error.contains("src"));
     }
 
     #[test]

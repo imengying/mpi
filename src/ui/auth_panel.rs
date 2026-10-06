@@ -6,6 +6,10 @@
 //! live there and was removed because the body already says what is being asked, and the
 //! tool name (`bash`) carries no information on any platform.
 //!
+//! The body is the thing being asked about and nothing else: the command, or the arguments
+//! for a file tool. A policy reason used to sit above it, which was the same mistake the
+//! title's category label was — a sentence explaining what the reader is already looking at.
+//!
 //! There is no timeout: waiting forever is the point.
 
 use std::io::{IsTerminal, Write};
@@ -17,8 +21,9 @@ use crate::config::Defaults;
 use crate::ui::theme::{Color, Theme};
 use crate::util;
 
-/// What the panel shows. The body is plain text; every control character in it has
-/// already been escaped so a crafted payload cannot move the cursor or recolour the UI.
+/// What the panel shows: the call itself, with no commentary around it. The body is plain
+/// text; every control character in it has already been escaped so a crafted payload cannot
+/// move the cursor or recolour the UI.
 pub struct PanelRequest {
     pub body: String,
 }

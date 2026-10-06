@@ -33,7 +33,7 @@ pub async fn execute(arguments: &serde_json::Value, cwd: &Path) -> Result<ToolOu
     }
     tokio::fs::write(&resolved, content)
         .await
-        .map_err(|err| format!("无法写入 {path}：{err}"))?;
+        .map_err(|err| format!("无法写入：{err}"))?;
     let existed = before.is_some();
     let display = match &before {
         Some(before) => diff::for_write(before, content),
@@ -41,7 +41,7 @@ pub async fn execute(arguments: &serde_json::Value, cwd: &Path) -> Result<ToolOu
     };
     let action = if existed { "已覆盖" } else { "已创建" };
     Ok(ToolOutput {
-        content: format!("{action} {path}（{} 字节）", content.len()),
+        content: format!("{action}（{} 字节）", content.len()),
         display,
         is_error: false,
         duration: None,

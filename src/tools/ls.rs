@@ -37,7 +37,7 @@ pub async fn execute(arguments: &serde_json::Value, cwd: &Path) -> Result<ToolOu
         .unwrap_or(".");
     let target_path = crate::auth::policy::resolve_tool_path(target, cwd);
     if !target_path.is_dir() {
-        return Err(format!("路径不是目录：{target}"));
+        return Err("这不是目录。".to_string());
     }
     let all = arguments
         .get("all")

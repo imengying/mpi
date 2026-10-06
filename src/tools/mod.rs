@@ -67,18 +67,9 @@ impl ToolOutput {
         arguments: &serde_json::Value,
         content: impl Into<String>,
     ) -> Self {
-        let display = match name {
-            "bash" => Display::Command { footer: Vec::new() },
-            "write" | "edit" | "read" | "grep" | "find" | "ls" => Display::File {
-                verb: verb_for(name),
-                path: arguments
-                    .get("path")
-                    .and_then(|value| value.as_str())
-                    .map(crate::util::one_line)
-                    .unwrap_or_else(|| "…".into()),
-            },
-            _ => Display::None,
-        };
+        // One description of a call, shared with the running line and the resumed view:
+        // see `ui::compact::arguments_display`.
+        let display = crate::ui::compact::arguments_display(name, arguments);
         ToolOutput {
             content: content.into(),
             display,
@@ -216,7 +207,11 @@ pub async fn execute(
     };
     let elapsed = started.elapsed();
     result
-        .unwrap_or_else(|err| ToolOutput::error(err.to_string()))
+        // `error_for`, not `error`: a failure has to say what was attempted. The plain
+        // constructor leaves the display empty, so the block fell back to the bare tool name
+        // — the live view said `× read` where the resumed one said `× 读取 nope.rs`, for the
+        // same call.
+        .unwrap_or_else(|err| ToolOutput::error_for(name, arguments, err.to_string()))
         .budget()
         .timed(elapsed)
 }

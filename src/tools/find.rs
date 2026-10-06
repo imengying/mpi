@@ -61,7 +61,7 @@ async fn execute_with_engine(
         .unwrap_or(".");
     let target_path = crate::auth::policy::resolve_tool_path(target, cwd);
     if !target_path.is_dir() {
-        return Err(format!("路径不是目录：{target}"));
+        return Err("这不是目录。".to_string());
     }
     let kind = arguments.get("type").and_then(|v| v.as_str()).unwrap_or("");
     let max_depth = crate::tools::optional_u64(arguments, "max_depth");

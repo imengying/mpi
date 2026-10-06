@@ -65,7 +65,7 @@ async fn execute_with_engine(
         .unwrap_or(".");
     let target_path = crate::auth::policy::resolve_tool_path(target, cwd);
     if !target_path.exists() {
-        return Err(format!("路径不存在：{target}"));
+        return Err("路径不存在。".to_string());
     }
     let filter_secrets = target_path.is_dir()
         && crate::auth::policy::assess_path(crate::auth::policy::Operation::Read, target, cwd)

@@ -46,17 +46,15 @@ pub async fn execute(arguments: &serde_json::Value, cwd: &Path) -> Result<ToolOu
     let resolved = crate::auth::policy::resolve_tool_path(path, cwd);
     let before = tokio::fs::read_to_string(&resolved)
         .await
-        .map_err(|err| format!("无法读取 {path}：{err}"))?;
+        .map_err(|err| format!("无法读取：{err}"))?;
     let occurrences = before.matches(old_text).count();
     if occurrences == 0 {
-        return Err(format!(
-            "在 {path} 中找不到 old_text。请先 read 该文件确认当前内容（注意缩进与换行必须逐字一致）。"
-        ));
+        return Err("找不到 old_text：它必须与文件内容逐字一致（含缩进与换行）。".to_string());
     }
     if occurrences > 1 && !replace_all {
         return Err(format!(
-            "{path} 中 old_text 出现了 {occurrences} 次，无法确定要改哪一处；\
-             请给出更长的上下文，或设置 replace_all=true。"
+            "old_text 出现了 {occurrences} 次，无法确定要改哪一处（可给更长的上下文，\
+             或设 replace_all=true）。"
         ));
     }
     let after = if replace_all {
@@ -66,11 +64,11 @@ pub async fn execute(arguments: &serde_json::Value, cwd: &Path) -> Result<ToolOu
     };
     tokio::fs::write(&resolved, &after)
         .await
-        .map_err(|err| format!("无法写入 {path}：{err}"))?;
+        .map_err(|err| format!("无法写入：{err}"))?;
     let replaced = if replace_all { occurrences } else { 1 };
     let display = diff::for_edit(&before, &after);
     Ok(ToolOutput {
-        content: format!("已修改 {path}（替换 {replaced} 处）"),
+        content: format!("已修改（替换 {replaced} 处）"),
         display,
         is_error: false,
         duration: None,
@@ -136,7 +134,10 @@ mod tests {
         ))
         .unwrap_err();
         assert!(error.contains("找不到 old_text"));
-        assert!(error.contains("请先 read"));
+        // The cause, not an instruction: the model reads this as a tool result, and it does
+        // not need to be told to read the file it just failed to edit.
+        assert!(error.contains("逐字一致"));
+        assert!(!error.contains("请先 read"));
     }
 
     #[test]

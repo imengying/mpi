@@ -55,18 +55,34 @@ fn result_text(status: crate::llm::ToolStatus, content: &str) -> &str {
     }
 }
 
-/// The display a call would have, derived from its arguments alone. Used while running,
-/// when there is no result yet to describe it.
-fn arguments_display(name: &str, arguments: &serde_json::Value) -> Display {
+/// The display a call would have, derived from its arguments alone.
+///
+/// This is the one place that decides how a call is described when all there is to go on is
+/// what the model asked for: the running line uses it before there is a result, and a
+/// resumed session uses it after one — the display itself is presentation and is not stored.
+/// Keeping it in one place is what makes those two views agree; three copies of the same
+/// match is how a live `● 搜索 .` came back from a resume as `✓ 搜索 …`.
+///
+/// The default for a missing `path` is the tool's own: the search tools work on the working
+/// directory when none is given, while the file tools require one and a call without it is
+/// better shown as an unnamed target than as the tool's name.
+pub(crate) fn arguments_display(name: &str, arguments: &serde_json::Value) -> Display {
+    let path = |fallback: &str| {
+        arguments
+            .get("path")
+            .and_then(|value| value.as_str())
+            .map(util::one_line)
+            .unwrap_or_else(|| fallback.to_string())
+    };
     match name {
         "bash" => Display::Command { footer: Vec::new() },
-        "write" | "edit" | "read" | "grep" | "find" | "ls" => Display::File {
+        "grep" | "find" | "ls" => Display::File {
             verb: crate::tools::verb_for(name),
-            path: arguments
-                .get("path")
-                .and_then(|v| v.as_str())
-                .unwrap_or(name)
-                .to_string(),
+            path: path("."),
+        },
+        "read" | "write" | "edit" => Display::File {
+            verb: crate::tools::verb_for(name),
+            path: path("…"),
         },
         _ => Display::None,
     }
@@ -122,10 +138,13 @@ pub fn tool_block(
             }
         }
         Display::Diff { .. } => {
+            // The verb comes from the call, not from the block shape: `write` and `edit` both
+            // render a diff, and a hardcoded 修改 made a live write read differently from the
+            // same write on the next resume.
             lines.push(Line::spans(vec![
                 mark_span.clone(),
                 Span::plain(" "),
-                Span::plain("修改"),
+                Span::plain(crate::tools::verb_for(name)),
                 Span::plain(" "),
                 Span::new(theme_path(arguments), Style::new(Color::Cyan)),
             ]));
@@ -414,18 +433,7 @@ fn push_lines(out: &mut Vec<crate::ui::screen::Block>, lines: Vec<Line>) {
 /// refused call, which is exactly the shape of "a call with a known result and no extras".
 fn stored_output(name: &str, arguments: &serde_json::Value, content: &str) -> ToolOutput {
     let mut output = ToolOutput::text(content);
-    output.display = match name {
-        "bash" => Display::Command { footer: Vec::new() },
-        "write" | "edit" | "read" | "grep" | "find" | "ls" => Display::File {
-            verb: crate::tools::verb_for(name),
-            path: arguments
-                .get("path")
-                .and_then(|v| v.as_str())
-                .map(util::one_line)
-                .unwrap_or_else(|| "…".into()),
-        },
-        _ => Display::None,
-    };
+    output.display = arguments_display(name, arguments);
     output
 }
 
@@ -781,6 +789,112 @@ mod tests {
             .flat_map(|block| plain(&block.render(80)))
             .collect();
         assert!(!text.iter().any(|line| line.contains("耗时")), "{text:?}");
+    }
+
+    /// 一次调用的头在实时与恢复会话两条路上必须一致。
+    ///
+    /// 显示层不进会话文件，所以恢复会话时它由参数重新推出——这正是两处会悄悄分叉的
+    /// 地方：曾经实时是 `× read`（丢了调用描述）、恢复是 `× 读取 nope.rs`；`write` 的
+    /// diff 头写死「修改」，恢复却按调用说「写入」；搜索不传 path 时实时是 `.`、恢复是 `…`。
+    #[test]
+    fn a_call_reads_the_same_live_and_after_a_resume() {
+        use crate::llm::{Block as MB, Message, StopReason};
+        use crate::tools::ToolOutput;
+
+        let cases: Vec<(&str, serde_json::Value)> = vec![
+            ("bash", serde_json::json!({"command": "ls -l"})),
+            ("read", serde_json::json!({"path": "src/a.rs"})),
+            ("read", serde_json::json!({"path": "nope.rs"})),
+            ("write", serde_json::json!({"path": "a.rs", "content": "x"})),
+            ("edit", serde_json::json!({"path": "a.rs"})),
+            ("grep", serde_json::json!({"pattern": "fn"})),
+            ("grep", serde_json::json!({"pattern": "fn", "path": "src"})),
+            ("find", serde_json::json!({"pattern": "*.rs"})),
+            ("ls", serde_json::json!({})),
+            ("ls", serde_json::json!({"path": "src"})),
+        ];
+        for (name, arguments) in cases {
+            let mut output = ToolOutput::text("body\n");
+            output.display = arguments_display(name, &arguments);
+            for status in [
+                ToolStatus::Success,
+                ToolStatus::Error,
+                ToolStatus::Cancelled,
+                ToolStatus::Skipped,
+            ] {
+                if status != ToolStatus::Success {
+                    output.is_error = true;
+                }
+                let live = plain(&tool_block(name, &arguments, &output, status).render(80));
+                let resumed: Vec<String> = replay_blocks(&[
+                    Message::Assistant {
+                        content: vec![MB::ToolCall {
+                            id: "c1".into(),
+                            name: name.into(),
+                            arguments: arguments.clone(),
+                        }],
+                        stop_reason: Some(StopReason::ToolUse),
+                    },
+                    Message::Tool {
+                        status,
+                        tool_call_id: "c1".into(),
+                        name: name.into(),
+                        content: output.content.clone(),
+                    },
+                ])
+                .iter()
+                .flat_map(|block| plain(&block.render(80)))
+                .filter(|line| !line.is_empty())
+                .collect();
+                assert_eq!(
+                    live.first(),
+                    resumed.first(),
+                    "{name} {arguments} {status:?} 的头在两条路上不一致"
+                );
+            }
+        }
+    }
+
+    /// 工具结果的正文不复述 header 已经写着的路径。
+    #[tokio::test]
+    async fn a_tool_result_never_repeats_the_path_in_its_header() {
+        let dir = std::env::temp_dir().join(format!("pi-dup-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("a.rs"), "fn a() {}\n").unwrap();
+        let context = crate::tools::ToolContext {
+            cwd: dir.clone(),
+            shell: "/usr/bin/zsh".into(),
+        };
+        let cases: Vec<(&str, serde_json::Value)> = vec![
+            ("read", serde_json::json!({"path": "nope.rs"})),
+            ("read", serde_json::json!({"path": "."})),
+            (
+                "write",
+                serde_json::json!({"path": "new.rs", "content": "x"}),
+            ),
+            (
+                "edit",
+                serde_json::json!({"path": "a.rs", "old_text": "zzz", "new_text": "y"}),
+            ),
+            ("ls", serde_json::json!({})),
+            ("grep", serde_json::json!({"pattern": "zzz"})),
+            ("find", serde_json::json!({"pattern": "*.zzz"})),
+        ];
+        for (name, arguments) in cases {
+            let output = crate::tools::execute(name, &arguments, &context).await;
+            let status = if output.is_error {
+                ToolStatus::Error
+            } else {
+                ToolStatus::Success
+            };
+            // 路径在参数里、在 header 里，不该再出现在正文里。
+            if let Some(path) = arguments.get("path").and_then(|value| value.as_str()) {
+                let lines = plain(&tool_block(name, &arguments, &output, status).render(80));
+                let mentions = lines.iter().filter(|line| line.contains(path)).count();
+                assert_eq!(mentions, 1, "{name} {arguments} 把路径写了两遍：{lines:?}");
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

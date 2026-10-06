@@ -62,7 +62,7 @@ impl PermissionGate {
             Assessment::Ask { reason } => {
                 if self.interactive
                     && auth_panel::ask(PanelRequest {
-                        body: format!("{reason}\n\n{}", panel_body(tool, input)),
+                        body: panel_body(tool, input),
                     }) == auth_panel::Decision::Allow
                 {
                     Ok(input.clone())
@@ -75,7 +75,13 @@ impl PermissionGate {
 }
 
 /// What the panel shows: the command itself for `bash`, the resolved arguments for the
-/// file tools. The caller prepends the policy reason so the user can assess the request.
+/// file tools.
+///
+/// Nothing else. The policy's reason used to be prepended, and it was a sentence explaining
+/// the command the user is looking at — "重定向可能写入文件或执行脚本" above a command whose
+/// redirection is in plain sight. The panel asks one question ("run this?"), so it shows one
+/// thing: what would run. A reason still reaches the model in the refusal, which is where it
+/// can act on it.
 fn panel_body(tool: &str, input: &serde_json::Value) -> String {
     if tool == "bash"
         && let Some(command) = input.get("command").and_then(|v| v.as_str())
@@ -88,6 +94,39 @@ fn panel_body(tool: &str, input: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_panel_shows_the_call_and_no_commentary_about_it() {
+        // The panel asks one question and shows one thing: what would run. The policy's
+        // reason is not part of it — "重定向可能写入文件或执行脚本" above a command whose
+        // redirection is right there is the same mistake as a category label in the title.
+        let command = "cat data.txt > out.txt";
+        let body = panel_body("bash", &serde_json::json!({ "command": command }));
+        assert_eq!(body, command);
+
+        // The file tools show their arguments, which is all the panel has to say for them.
+        let write = panel_body(
+            "write",
+            &serde_json::json!({ "path": "a.txt", "content": "hi" }),
+        );
+        assert!(write.contains("\"path\": \"a.txt\""), "{write}");
+
+        // The reason is not lost, it moved: a refusal still carries it, because the model is
+        // the one that has to act on it. A headless gate refuses everything, which is the
+        // same refusal an interactive "2" produces.
+        let refused = PermissionGate::new(false, Dialect::Zsh)
+            .check(
+                "bash",
+                &serde_json::json!({ "command": command }),
+                &std::env::temp_dir(),
+            )
+            .unwrap_err();
+        assert!(
+            refused.message().contains("未获得用户授权"),
+            "{}",
+            refused.message()
+        );
+    }
 
     #[test]
     fn execution_receives_the_vetted_absolute_command() {
