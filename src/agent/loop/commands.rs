@@ -343,7 +343,11 @@ impl Agent {
             (model.context_window.unwrap_or(128_000) / 12).min(1024) as usize * 4,
         );
         let compaction_id = uuid::Uuid::now_v7().to_string();
-        let token_before = llm::estimate_request_context(&messages, self.system_prompt.as_deref().unwrap_or_default(), &tools);
+        let token_before = llm::estimate_request_context(
+            &messages,
+            self.system_prompt.as_deref().unwrap_or_default(),
+            &tools,
+        );
         self.session
             .push_compaction_start(
                 &compaction_id,

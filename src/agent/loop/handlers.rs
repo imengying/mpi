@@ -7,7 +7,11 @@ impl Agent {
         if let Some(used) = self.session.measured_context_tokens() {
             return used;
         }
-        llm::estimate_request_context(messages, self.system_prompt.as_deref().unwrap_or_default(), tools)
+        llm::estimate_request_context(
+            messages,
+            self.system_prompt.as_deref().unwrap_or_default(),
+            tools,
+        )
     }
 
     pub(super) fn prune_context(&mut self) -> anyhow::Result<bool> {
@@ -40,7 +44,9 @@ impl Agent {
                 calls[next..]
                     .iter()
                     .take(4)
-                    .take_while(|(_, name, _)| tools::execution_mode(name) == tools::ExecutionMode::Parallel)
+                    .take_while(|(_, name, _)| {
+                        tools::execution_mode(name) == tools::ExecutionMode::Parallel
+                    })
                     .count()
             } else {
                 1
@@ -71,13 +77,22 @@ impl Agent {
             self.screen.set_running(running);
             for ((id, name, _), approval) in batch.iter().zip(approved.iter()) {
                 if let Ok(arguments) = approval {
-                    self.session.push_tool_start(id, name, arguments.clone(), tools::replay_safe(name))?;
+                    self.session.push_tool_start(
+                        id,
+                        name,
+                        arguments.clone(),
+                        tools::replay_safe(name),
+                    )?;
                 }
             }
             let (results, stopped) = self.run_tool_batch(batch, approved).await;
             self.screen.clear_running();
-            for (((id, name, arguments), (output, status)), started) in batch.iter().zip(results).zip(started) {
-                let duration_ms = output.duration.map(|duration| duration.as_millis().min(u64::MAX as u128) as u64);
+            for (((id, name, arguments), (output, status)), started) in
+                batch.iter().zip(results).zip(started)
+            {
+                let duration_ms = output
+                    .duration
+                    .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64);
                 if started {
                     self.session.push_tool_end(id, name, status, duration_ms)?;
                 }
@@ -136,7 +151,10 @@ impl Agent {
         let mut workers = tokio::task::JoinSet::new();
         let mut task_indices = std::collections::HashMap::new();
         let mut results = vec![None; calls.len()];
-        let context = tools::ToolContext { cwd: self.cwd.clone(), shell: self.config.shell.path.clone() };
+        let context = tools::ToolContext {
+            cwd: self.cwd.clone(),
+            shell: self.config.shell.path.clone(),
+        };
         for (index, approval) in approved.into_iter().enumerate() {
             match approval {
                 Err(output) => results[index] = Some((output, ToolStatus::Error)),
@@ -264,7 +282,11 @@ fn settle_tool_task(
                     ToolStatus::Unknown,
                 )
             };
-            (index, ToolOutput::error_for(name, arguments, content), status)
+            (
+                index,
+                ToolOutput::error_for(name, arguments, content),
+                status,
+            )
         }
     };
     results[index] = Some((output, status));
@@ -317,13 +339,30 @@ mod tests {
         // The calls whose workers are being settled: a worker that never returned a result
         // still has to be describable in the transcript.
         let calls: Vec<(String, String, serde_json::Value)> = vec![
-            ("a".into(), "bash".into(), serde_json::json!({"command": "ls -l"})),
-            ("b".into(), "bash".into(), serde_json::json!({"command": "sleep 30"})),
-            ("c".into(), "read".into(), serde_json::json!({"path": "x.rs"})),
+            (
+                "a".into(),
+                "bash".into(),
+                serde_json::json!({"command": "ls -l"}),
+            ),
+            (
+                "b".into(),
+                "bash".into(),
+                serde_json::json!({"command": "sleep 30"}),
+            ),
+            (
+                "c".into(),
+                "read".into(),
+                serde_json::json!({"path": "x.rs"}),
+            ),
         ];
         let completed = workers.spawn(async { (0, ToolOutput::text("completed result")) });
         indices.insert(completed.id(), 0);
-        settle_tool_task(workers.join_next().await.unwrap(), &indices, &calls, &mut results);
+        settle_tool_task(
+            workers.join_next().await.unwrap(),
+            &indices,
+            &calls,
+            &mut results,
+        );
 
         let (started, running) = tokio::sync::oneshot::channel();
         let cancelled = workers.spawn(async {
@@ -334,7 +373,12 @@ mod tests {
         running.await.unwrap();
         let crashed = workers.spawn(async { panic!("tool worker failed") });
         indices.insert(crashed.id(), 2);
-        settle_tool_task(workers.join_next().await.unwrap(), &indices, &calls, &mut results);
+        settle_tool_task(
+            workers.join_next().await.unwrap(),
+            &indices,
+            &calls,
+            &mut results,
+        );
         workers.abort_all();
         while let Some(result) = workers.join_next().await {
             settle_tool_task(result, &indices, &calls, &mut results);

@@ -8,10 +8,10 @@ pub mod edit;
 pub mod find;
 pub mod grep;
 pub mod ls;
-pub mod read;
-pub mod write;
 mod output;
 mod process;
+pub mod read;
+pub mod write;
 
 use std::path::{Path, PathBuf};
 
@@ -62,11 +62,13 @@ impl ToolOutput {
 
     /// An error that still echoes what was attempted, so a refusal in the transcript shows
     /// the command or path the user is being asked about.
-    pub fn error_for(name: &str, arguments: &serde_json::Value, content: impl Into<String>) -> Self {
+    pub fn error_for(
+        name: &str,
+        arguments: &serde_json::Value,
+        content: impl Into<String>,
+    ) -> Self {
         let display = match name {
-            "bash" => Display::Command {
-                footer: Vec::new(),
-            },
+            "bash" => Display::Command { footer: Vec::new() },
             "write" | "edit" | "read" | "grep" | "find" | "ls" => Display::File {
                 verb: verb_for(name),
                 path: arguments
@@ -116,9 +118,7 @@ pub enum Display {
     #[default]
     None,
     /// A bash result: exit status plus the note lines shown under the output.
-    Command {
-        footer: Vec<String>,
-    },
+    Command { footer: Vec<String> },
     /// A diff for `edit` / `write`, as the rows to show and the change counts.
     Diff {
         diff: String,
@@ -126,10 +126,7 @@ pub enum Display {
         removed: usize,
     },
     /// A plain file header line.
-    File {
-        verb: &'static str,
-        path: String,
-    },
+    File { verb: &'static str, path: String },
 }
 
 pub(crate) fn verb_for(name: &str) -> &'static str {
@@ -145,8 +142,7 @@ pub(crate) fn verb_for(name: &str) -> &'static str {
 }
 
 /// Tool names in the order they are advertised. **Do not reorder.**
-pub const TOOL_ORDER: [&str; 7] =
-    ["read", "write", "edit", "bash", "grep", "find", "ls"];
+pub const TOOL_ORDER: [&str; 7] = ["read", "write", "edit", "bash", "grep", "find", "ls"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionMode {
@@ -173,7 +169,9 @@ pub fn metadata(name: &str) -> Option<ToolMetadata> {
 }
 
 pub fn execution_mode(name: &str) -> ExecutionMode {
-    metadata(name).map(|meta| meta.execution).unwrap_or(ExecutionMode::Exclusive)
+    metadata(name)
+        .map(|meta| meta.execution)
+        .unwrap_or(ExecutionMode::Exclusive)
 }
 
 pub fn replay_safe(name: &str) -> bool {
@@ -283,9 +281,21 @@ mod tests {
     #[test]
     fn every_spec_has_a_description_and_an_object_schema() {
         for spec in specs() {
-            assert!(!spec.description.is_empty(), "{} has no description", spec.name);
-            assert_eq!(spec.parameters["type"], "object", "{} schema is not an object", spec.name);
-            assert!(spec.parameters.get("properties").is_some(), "{} has no properties", spec.name);
+            assert!(
+                !spec.description.is_empty(),
+                "{} has no description",
+                spec.name
+            );
+            assert_eq!(
+                spec.parameters["type"], "object",
+                "{} schema is not an object",
+                spec.name
+            );
+            assert!(
+                spec.parameters.get("properties").is_some(),
+                "{} has no properties",
+                spec.name
+            );
         }
     }
 

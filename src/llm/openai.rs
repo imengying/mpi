@@ -1067,11 +1067,14 @@ mod tests {
             "id":"m", "sampling_params_by_thinking_level": {
                 "high": {"temperature":0.7, "top_p":0.9}
             }
-        })).unwrap();
+        }))
+        .unwrap();
         let provider: Provider = serde_json::from_value(serde_json::json!({
             "name":"work", "api":"completions", "base_url":"https://gateway.example/v1"
-        })).unwrap();
-        let body = serde_json::to_value(build_request(&request(&model, &provider, &[]), true)).unwrap();
+        }))
+        .unwrap();
+        let body =
+            serde_json::to_value(build_request(&request(&model, &provider, &[]), true)).unwrap();
         assert_eq!(body["temperature"], 0.7);
         assert_eq!(body["top_p"], 0.9);
     }

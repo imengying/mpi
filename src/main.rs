@@ -9,7 +9,7 @@ use clap::Parser;
 use mpi::agent::r#loop::Agent;
 use mpi::cli::{Cli, Command};
 use mpi::config::Config;
-use mpi::ui::screen::{teardown, Action};
+use mpi::ui::screen::{Action, teardown};
 use mpi::ui::{compact as ui_compact, theme::Color};
 
 fn main() {
@@ -171,7 +171,9 @@ fn run_turn_and_drain(
 }
 
 fn most_recent_session(cwd: &std::path::Path) -> Option<std::path::PathBuf> {
-    mpi::agent::session::list(cwd).first().map(|summary| summary.path.clone())
+    mpi::agent::session::list(cwd)
+        .first()
+        .map(|summary| summary.path.clone())
 }
 
 /// Drive an async agent call from the synchronous turn loop.

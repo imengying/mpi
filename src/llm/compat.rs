@@ -32,7 +32,9 @@ impl SearchFormat {
         match self {
             SearchFormat::Off => false,
             SearchFormat::Anthropic => api == crate::llm::Api::AnthropicMessages,
-            SearchFormat::WebSearch | SearchFormat::WebAndX => api == crate::llm::Api::OpenAiResponses,
+            SearchFormat::WebSearch | SearchFormat::WebAndX => {
+                api == crate::llm::Api::OpenAiResponses
+            }
             SearchFormat::Xai | SearchFormat::Qwen | SearchFormat::Zhipu => {
                 api == crate::llm::Api::OpenAiCompletions
             }
@@ -286,7 +288,8 @@ mod tests {
     fn hosted_search_follows_the_host_and_the_protocol() {
         use crate::llm::Api;
         assert_eq!(
-            Compat::from_base_url("https://api.anthropic.com", Api::AnthropicMessages).search_format,
+            Compat::from_base_url("https://api.anthropic.com", Api::AnthropicMessages)
+                .search_format,
             Some(SearchFormat::Anthropic)
         );
         assert_eq!(
@@ -302,16 +305,24 @@ mod tests {
             Some(SearchFormat::Xai)
         );
         assert_eq!(
-            Compat::from_base_url("https://dashscope.aliyuncs.com/compatible-mode/v1", Api::OpenAiCompletions)
-                .search_format,
+            Compat::from_base_url(
+                "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                Api::OpenAiCompletions
+            )
+            .search_format,
             Some(SearchFormat::Qwen)
         );
         assert_eq!(
-            Compat::from_base_url("https://open.bigmodel.cn/api/paas/v4", Api::OpenAiCompletions).search_format,
+            Compat::from_base_url(
+                "https://open.bigmodel.cn/api/paas/v4",
+                Api::OpenAiCompletions
+            )
+            .search_format,
             Some(SearchFormat::Zhipu)
         );
         assert_eq!(
-            Compat::from_base_url("https://api.z.ai/api/paas/v4", Api::OpenAiCompletions).search_format,
+            Compat::from_base_url("https://api.z.ai/api/paas/v4", Api::OpenAiCompletions)
+                .search_format,
             Some(SearchFormat::Zhipu)
         );
         // DeepSeek documents `web_search` as ignored on Responses, and chat completions has
@@ -321,7 +332,8 @@ mod tests {
             None
         );
         assert_eq!(
-            Compat::from_base_url("https://api.deepseek.com/v1", Api::OpenAiCompletions).search_format,
+            Compat::from_base_url("https://api.deepseek.com/v1", Api::OpenAiCompletions)
+                .search_format,
             None
         );
         // An unknown completions gateway has no search field pi is willing to invent.
@@ -333,7 +345,8 @@ mod tests {
 
     #[test]
     fn search_format_off_clears_a_detected_format() {
-        let mut compat = Compat::from_base_url("https://api.x.ai/v1", crate::llm::Api::OpenAiResponses);
+        let mut compat =
+            Compat::from_base_url("https://api.x.ai/v1", crate::llm::Api::OpenAiResponses);
         let patch: CompatPatch = serde_json::from_str(r#"{"search_format":"off"}"#).unwrap();
         compat.apply(&patch);
         assert_eq!(compat.search_format, None);

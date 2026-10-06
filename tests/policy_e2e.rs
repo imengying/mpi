@@ -1,7 +1,7 @@
 //! End-to-end checks on the authorization policy, with no model in the loop.
 //! These are the invariants the whole gate depends on, so they are asserted directly.
 
-use mpi::auth::policy::{assess_command, assess_tool, Dialect};
+use mpi::auth::policy::{Dialect, assess_command, assess_tool};
 use std::path::Path;
 
 fn cwd() -> std::path::PathBuf {
@@ -51,12 +51,29 @@ fn destructive_commands_always_ask() {
 #[test]
 fn only_the_vetted_read_commands_are_auto_approved() {
     for command in [
-        "pwd", "ls", "ls -la", "cat Cargo.toml", "head -5 src/main.rs",
-        "wc -l src/main.rs", "stat Cargo.toml", "du -sh src", "file Cargo.toml",
-        "rg pattern src", "grep -n pattern src/main.rs", "find . -name '*.rs'",
-        "sort src/main.rs", "uname -a", "df -h", "echo hi", "printf x",
-        "sed -n '1,5p' src/main.rs", "git status", "git log --oneline -5",
-        "git diff --stat", "git rev-parse HEAD", "git ls-files",
+        "pwd",
+        "ls",
+        "ls -la",
+        "cat Cargo.toml",
+        "head -5 src/main.rs",
+        "wc -l src/main.rs",
+        "stat Cargo.toml",
+        "du -sh src",
+        "file Cargo.toml",
+        "rg pattern src",
+        "grep -n pattern src/main.rs",
+        "find . -name '*.rs'",
+        "sort src/main.rs",
+        "uname -a",
+        "df -h",
+        "echo hi",
+        "printf x",
+        "sed -n '1,5p' src/main.rs",
+        "git status",
+        "git log --oneline -5",
+        "git diff --stat",
+        "git rev-parse HEAD",
+        "git ls-files",
     ] {
         let decision = assess_command(command, &cwd(), Dialect::Zsh);
         assert!(
@@ -89,7 +106,10 @@ fn reading_secrets_asks_but_reading_source_does_not() {
     let dir = cwd();
     for path in ["Cargo.toml", "src/main.rs", "."] {
         let input = serde_json::json!({"path": path});
-        assert!(assess_tool("read", &input, &dir, Dialect::Zsh).allows(), "{path}");
+        assert!(
+            assess_tool("read", &input, &dir, Dialect::Zsh).allows(),
+            "{path}"
+        );
     }
     for path in [
         "~/.ssh/id_rsa",
@@ -100,7 +120,10 @@ fn reading_secrets_asks_but_reading_source_does_not() {
         "/etc/shadow",
     ] {
         let input = serde_json::json!({"path": path});
-        assert!(!assess_tool("read", &input, &dir, Dialect::Zsh).allows(), "{path}");
+        assert!(
+            !assess_tool("read", &input, &dir, Dialect::Zsh).allows(),
+            "{path}"
+        );
     }
 }
 
@@ -119,11 +142,16 @@ fn headless_refuses_rather_than_approving() {
     );
 }
 
-
 #[test]
 fn the_policy_reports_a_reason_for_every_refusal() {
     // A refusal without a reason is what makes a model retry the same command forever.
-    for command in ["rm -rf /", "sudo ls", "curl x", "cat ~/.ssh/id_rsa", "ls *.rs"] {
+    for command in [
+        "rm -rf /",
+        "sudo ls",
+        "curl x",
+        "cat ~/.ssh/id_rsa",
+        "ls *.rs",
+    ] {
         let reason = must_ask(command);
         assert!(!reason.trim().is_empty(), "{command}");
     }
@@ -140,7 +168,10 @@ async fn broad_and_explicit_glob_searches_cannot_read_secrets() {
     std::fs::write(dir.join(".ssh/config"), "policy-secret-sentinel\n").unwrap();
     std::fs::write(dir.join("ordinary.txt"), "ordinary-sentinel\n").unwrap();
     let gate = PermissionGate::new(false, Dialect::Zsh);
-    let context = mpi::tools::ToolContext { cwd: dir.clone(), shell: "/usr/bin/zsh".into() };
+    let context = mpi::tools::ToolContext {
+        cwd: dir.clone(),
+        shell: "/usr/bin/zsh".into(),
+    };
     for command in [
         "rg --hidden --no-ignore policy-secret-sentinel .",
         "rg --hidden --no-ignore --glob .env -- policy-secret-sentinel .",

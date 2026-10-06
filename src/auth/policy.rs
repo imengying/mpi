@@ -19,8 +19,8 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::config::DEFAULT_SHELL;
 
-pub use crate::auth::parse::{Segment, Word, parse_literal_commands};
 use crate::auth::parse::is_line_range_print;
+pub use crate::auth::parse::{Segment, Word, parse_literal_commands};
 
 /// Ask the user before running. `ask` carries the reason handed to the model on refusal.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,7 +31,9 @@ pub enum Assessment {
 
 impl Assessment {
     pub fn ask(reason: impl Into<String>) -> Self {
-        Assessment::Ask { reason: reason.into() }
+        Assessment::Ask {
+            reason: reason.into(),
+        }
     }
 
     pub fn allow() -> Self {
@@ -87,7 +89,11 @@ impl Dialect {
 
 /// The dialect pi will actually use, derived from the configured shell.
 pub fn configured_dialect(shell_path: &str) -> Dialect {
-    Dialect::for_shell_path(if shell_path.is_empty() { DEFAULT_SHELL } else { shell_path })
+    Dialect::for_shell_path(if shell_path.is_empty() {
+        DEFAULT_SHELL
+    } else {
+        shell_path
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -205,33 +211,70 @@ fn inside(path: &Path, root: &Path) -> bool {
 }
 
 fn basename(path: &Path) -> String {
-    path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()
+    path.file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default()
 }
 
 /// Directories that are sensitive wherever they appear. A project may legitimately contain
 /// a `.docker` or `.azure` directory, but reading one is still worth a question: the names
 /// only mean credentials, and a false prompt is cheaper than a leaked key.
-const SENSITIVE_DIRS: &[&str] = &[".ssh", ".gnupg", ".aws", ".kube", ".docker", ".azure", ".gcloud"];
+const SENSITIVE_DIRS: &[&str] = &[
+    ".ssh", ".gnupg", ".aws", ".kube", ".docker", ".azure", ".gcloud",
+];
 /// Multi-segment credential locations, relative to the home directory. The agent harnesses
 /// are listed too: pi keeps provider keys in `~/.pi/config.json` and its sessions next to
 /// them, and codex/Claude/Gemini keep the same kind of live secret. `~/.pi` is this tool's
 /// own store — the config holds the provider key in clear text, so a command that reads it
 /// is worth a question.
 const HOME_PATHS: &[&str] = &[
-    ".config/gh", ".config/gcloud", ".config/glab-cli", ".config/hub", ".config/doctl",
-    ".pi", ".codex", ".claude", ".gemini", ".continue", ".aider", ".local/share/keyrings",
+    ".config/gh",
+    ".config/gcloud",
+    ".config/glab-cli",
+    ".config/hub",
+    ".config/doctl",
+    ".pi",
+    ".codex",
+    ".claude",
+    ".gemini",
+    ".continue",
+    ".aider",
+    ".local/share/keyrings",
 ];
 /// Credential-like names, matched on the basename anywhere: a directory-only rule misses
 /// `grep -r . .ssh`, which reads private keys without naming one.
 const SENSITIVE_NAMES: &[&str] = &[
-    ".env", ".netrc", ".git-credentials", ".npmrc", ".pypirc", ".dockercfg", ".gitconfig",
-    ".bash_history", ".zsh_history", ".python_history", ".mysql_history", ".psql_history",
-    ".wgetrc", ".curlrc", ".pgpass", ".authinfo", ".s3cfg", ".terraformrc", ".my.cnf",
-    ".mylogin.cnf", ".kubeconfig", ".credentials.json", ".envrc", ".htpasswd",
-    "application_default_credentials.json", "hosts.yml",
+    ".env",
+    ".netrc",
+    ".git-credentials",
+    ".npmrc",
+    ".pypirc",
+    ".dockercfg",
+    ".gitconfig",
+    ".bash_history",
+    ".zsh_history",
+    ".python_history",
+    ".mysql_history",
+    ".psql_history",
+    ".wgetrc",
+    ".curlrc",
+    ".pgpass",
+    ".authinfo",
+    ".s3cfg",
+    ".terraformrc",
+    ".my.cnf",
+    ".mylogin.cnf",
+    ".kubeconfig",
+    ".credentials.json",
+    ".envrc",
+    ".htpasswd",
+    "application_default_credentials.json",
+    "hosts.yml",
 ];
 /// Private-key containers: the extension alone is enough to ask before touching.
-const SENSITIVE_SUFFIXES: &[&str] = &["pem", "key", "pfx", "p12", "jks", "keystore", "ppk", "kdbx", "ovpn"];
+const SENSITIVE_SUFFIXES: &[&str] = &[
+    "pem", "key", "pfx", "p12", "jks", "keystore", "ppk", "kdbx", "ovpn",
+];
 
 fn basename_is_sensitive(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
@@ -247,10 +290,7 @@ fn basename_is_sensitive(name: &str) -> bool {
         return true;
     }
     // service-account.json, service_account_x.json, serviceaccount.json
-    if lower.starts_with("service")
-        && lower.contains("account")
-        && lower.ends_with(".json")
-    {
+    if lower.starts_with("service") && lower.contains("account") && lower.ends_with(".json") {
         return true;
     }
     false
@@ -279,7 +319,9 @@ fn home_only_name(name: &str) -> bool {
 
 fn extension_is_sensitive(path: &Path) -> bool {
     match path.extension().and_then(|e| e.to_str()) {
-        Some(ext) => SENSITIVE_SUFFIXES.iter().any(|s| s.eq_ignore_ascii_case(ext)),
+        Some(ext) => SENSITIVE_SUFFIXES
+            .iter()
+            .any(|s| s.eq_ignore_ascii_case(ext)),
         None => false,
     }
 }
@@ -292,7 +334,10 @@ fn sensitive(path: &Path) -> bool {
             _ => None,
         })
         .collect();
-    if segments.iter().any(|part| SENSITIVE_DIRS.iter().any(|d| d.eq_ignore_ascii_case(part))) {
+    if segments
+        .iter()
+        .any(|part| SENSITIVE_DIRS.iter().any(|d| d.eq_ignore_ascii_case(part)))
+    {
         return true;
     }
     let name = basename(path);
@@ -477,9 +522,8 @@ const DATA_ARG_COMMANDS: &[&str] = &[
 /// alongside the rest. `env` is deliberately absent: bare `env` prints every environment
 /// variable, provider keys included, and `env cmd` runs an arbitrary command.
 const READ_COMMANDS: &[&str] = &[
-    "pwd", "ls", "cat", "head", "tail", "wc", "stat", "readlink", "realpath", "printf",
-    "echo", "true", "false", "cut", "tr", "du", "df", "uname", "rg", "grep", "find",
-    "sort", "file", "sed",
+    "pwd", "ls", "cat", "head", "tail", "wc", "stat", "readlink", "realpath", "printf", "echo",
+    "true", "false", "cut", "tr", "du", "df", "uname", "rg", "grep", "find", "sort", "file", "sed",
     // Inspection only: no argument writes, and nothing here reads a path as data.
     "which", "date", "nproc", "uptime", "free", "ps", "id", "whoami", "basename", "dirname",
     "column", "lscpu", "seq",
@@ -493,12 +537,12 @@ fn trusted_executable_target(name: &str, resolved: &Path) -> bool {
     let target_name = resolved.file_name().and_then(|n| n.to_str());
     // Debian/Ubuntu's alternatives system resolves `which` to which.debianutils.
     // Keep aliases explicit: accepting any renamed target could turn a reader into rm.
-    let same_command = target_name == Some(name)
-        || (name == "which" && target_name == Some("which.debianutils"));
+    let same_command =
+        target_name == Some(name) || (name == "which" && target_name == Some("which.debianutils"));
     same_command
-        && resolved.parent().is_some_and(|parent| {
-            TRUSTED_DIRS.iter().any(|dir| parent == Path::new(dir))
-        })
+        && resolved
+            .parent()
+            .is_some_and(|parent| TRUSTED_DIRS.iter().any(|dir| parent == Path::new(dir)))
 }
 
 /// Trusted absolute path for a whitelisted command, or `None` when it is unavailable.
@@ -511,20 +555,27 @@ pub fn trusted_executable(command: &str) -> Option<PathBuf> {
     let candidates: Vec<PathBuf> = if command.contains('/') {
         vec![PathBuf::from(command)]
     } else {
-        TRUSTED_DIRS.iter().map(|dir| Path::new(dir).join(name)).collect()
+        TRUSTED_DIRS
+            .iter()
+            .map(|dir| Path::new(dir).join(name))
+            .collect()
     };
     for candidate in candidates {
         if !candidate.is_absolute() {
             continue;
         }
-        let Ok(resolved) = std::fs::canonicalize(&candidate) else { continue };
+        let Ok(resolved) = std::fs::canonicalize(&candidate) else {
+            continue;
+        };
         if !trusted_executable_target(name, &resolved) {
             continue;
         }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let Ok(meta) = std::fs::metadata(&resolved) else { continue };
+            let Ok(meta) = std::fs::metadata(&resolved) else {
+                continue;
+            };
             if meta.permissions().mode() & 0o111 == 0 {
                 continue;
             }
@@ -544,18 +595,26 @@ fn command_reason(name: &str) -> String {
     if name.starts_with("mkfs") || name.starts_with("fsck") {
         return "命令可能修改磁盘、挂载或系统状态".into();
     }
-    if ["dd", "fdisk", "parted", "mount", "umount", "reboot", "shutdown"].contains(&name) {
+    if [
+        "dd", "fdisk", "parted", "mount", "umount", "reboot", "shutdown",
+    ]
+    .contains(&name)
+    {
         return "命令可能修改磁盘、挂载或系统状态".into();
     }
     if name == "git" || name == "gh" {
         return "Git 写操作、发布或自定义配置需要确认".into();
     }
-    if ["curl", "wget", "ssh", "scp", "rsync", "nc", "ncat", "telnet"].contains(&name) {
+    if [
+        "curl", "wget", "ssh", "scp", "rsync", "nc", "ncat", "telnet",
+    ]
+    .contains(&name)
+    {
         return "网络传输或远程命令需要确认".into();
     }
     if [
-        "bash", "sh", "zsh", "fish", "python", "python3", "node", "bun", "deno", "perl",
-        "ruby", "awk", "eval", "source", "exec", "env", "xargs", "make", "cargo",
+        "bash", "sh", "zsh", "fish", "python", "python3", "node", "bun", "deno", "perl", "ruby",
+        "awk", "eval", "source", "exec", "env", "xargs", "make", "cargo",
     ]
     .contains(&name)
     {
@@ -1098,14 +1157,22 @@ fn vet_segment(words: &[Word], cwd: &Path, dialect: Dialect) -> Assessment {
     let Some((command, raw_args)) = words.split_first() else {
         return Assessment::ask("未找到可执行命令");
     };
-    let name = command.value.rsplit('/').next().unwrap_or(&command.value).to_string();
+    let name = command
+        .value
+        .rsplit('/')
+        .next()
+        .unwrap_or(&command.value)
+        .to_string();
     if name.is_empty() {
         return Assessment::ask("命令为空或格式不正确");
     }
     // `FOO=bar cmd` changes how the command runs, so it is never auto-approved.
     if let Some((head, _)) = command.value.split_once('=')
         && !head.is_empty()
-        && head.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && head
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
         && head.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
     {
         return Assessment::ask("环境变量赋值可能改变命令的执行方式");
@@ -1214,7 +1281,13 @@ fn vet_segment(words: &[Word], cwd: &Path, dialect: Dialect) -> Assessment {
     let mut rewritten = vec![executable.to_string_lossy().to_string()];
     rewritten.extend(args);
     Assessment::Allow {
-        safe_command: Some(rewritten.iter().map(|w| shell_quote(w)).collect::<Vec<_>>().join(" ")),
+        safe_command: Some(
+            rewritten
+                .iter()
+                .map(|w| shell_quote(w))
+                .collect::<Vec<_>>()
+                .join(" "),
+        ),
     }
 }
 
@@ -1231,18 +1304,19 @@ fn path_problem(name: &str, args: &[String], cwd: &Path) -> Option<Assessment> {
     if matches!(name, "rg" | "grep") {
         return search_path_problem(name, args, cwd);
     }
-// Check every argument a literal path could hide in, including option values such as
-// `--file=...`. `cat id_rsa` matters as much as `cat .ssh/id_rsa`, and printing
-// commands carry data rather than paths, so they are exempt.
-if !DATA_ARG_COMMANDS.contains(&name) {
-    let mut pending: Option<Operation> = None;
-    for arg in args {
-        if arg == "--" {
-            pending = None;
-            continue;
-        }
-        if let Some(operation) = pending
-            && !arg.starts_with('-') {
+    // Check every argument a literal path could hide in, including option values such as
+    // `--file=...`. `cat id_rsa` matters as much as `cat .ssh/id_rsa`, and printing
+    // commands carry data rather than paths, so they are exempt.
+    if !DATA_ARG_COMMANDS.contains(&name) {
+        let mut pending: Option<Operation> = None;
+        for arg in args {
+            if arg == "--" {
+                pending = None;
+                continue;
+            }
+            if let Some(operation) = pending
+                && !arg.starts_with('-')
+            {
                 let decision = assess_path(operation, arg, cwd);
                 pending = None;
                 if !decision.allows() {
@@ -1250,9 +1324,11 @@ if !DATA_ARG_COMMANDS.contains(&name) {
                 }
                 continue;
             }
-        pending = None;
-        if arg.starts_with('-') && !arg.starts_with("--")
-            && let Some((value, operation)) = glued_short_value(name, arg) {
+            pending = None;
+            if arg.starts_with('-')
+                && !arg.starts_with("--")
+                && let Some((value, operation)) = glued_short_value(name, arg)
+            {
                 if value.is_empty() {
                     pending = Some(operation);
                     continue;
@@ -1263,98 +1339,164 @@ if !DATA_ARG_COMMANDS.contains(&name) {
                 }
                 continue;
             }
-        let values: Vec<&str> = if arg.starts_with('-') && !arg.starts_with("-/") && !arg.starts_with("-~") {
-            match arg.split_once('=') {
-                Some((_, value)) => vec![value],
-                None => Vec::new(),
+            let values: Vec<&str> =
+                if arg.starts_with('-') && !arg.starts_with("-/") && !arg.starts_with("-~") {
+                    match arg.split_once('=') {
+                        Some((_, value)) => vec![value],
+                        None => Vec::new(),
+                    }
+                } else {
+                    vec![arg.as_str()]
+                };
+            for value in values {
+                if value.is_empty() {
+                    continue;
+                }
+                let decision = assess_path(Operation::Read, value, cwd);
+                if !decision.allows() {
+                    return Some(decision);
+                }
             }
-        } else {
-            vec![arg.as_str()]
-        };
-        for value in values {
-            if value.is_empty() {
+        }
+    }
+
+    /// Search patterns and formatting options are data; pattern files and operands are paths.
+    fn search_path_problem(name: &str, args: &[String], cwd: &Path) -> Option<Assessment> {
+        let default_root = assess_path(Operation::Read, &cwd.to_string_lossy(), cwd);
+        if !default_root.allows() {
+            return Some(default_root);
+        }
+        let mut pattern = false;
+        let mut files_only = false;
+        let mut positional = false;
+        let mut pending: Option<bool> = None; // true: path, false: literal data
+        for arg in args {
+            if let Some(path) = pending.take() {
+                if path {
+                    let decision = assess_path(Operation::Read, arg, cwd);
+                    if !decision.allows() {
+                        return Some(decision);
+                    }
+                }
                 continue;
             }
-            let decision = assess_path(Operation::Read, value, cwd);
+            if !positional && arg == "--" {
+                positional = true;
+                continue;
+            }
+            if !positional && arg.starts_with("--") {
+                let (flag, value) = arg
+                    .split_once('=')
+                    .map_or((arg.as_str(), None), |(k, v)| (k, Some(v)));
+                if flag == "--files" {
+                    files_only = true;
+                }
+                if matches!(flag, "--regexp" | "--file") {
+                    pattern = true;
+                }
+                let path = matches!(flag, "--file" | "--exclude-from");
+                let data = matches!(
+                    flag,
+                    "--regexp"
+                        | "--glob"
+                        | "--iglob"
+                        | "--type"
+                        | "--type-not"
+                        | "--replace"
+                        | "--max-count"
+                        | "--max-columns"
+                        | "--max-depth"
+                        | "--max-filesize"
+                        | "--encoding"
+                        | "--color"
+                        | "--colour"
+                        | "--colors"
+                        | "--sort"
+                        | "--sortr"
+                        | "--binary-files"
+                        | "--directories"
+                        | "--devices"
+                        | "--group-separator"
+                        | "--before-context"
+                        | "--after-context"
+                        | "--context"
+                        | "--include"
+                        | "--exclude"
+                        | "--exclude-dir"
+                        | "--label"
+                );
+                if let Some(value) = value {
+                    if !data {
+                        let decision = assess_path(Operation::Read, value, cwd);
+                        if !decision.allows() {
+                            return Some(decision);
+                        }
+                    }
+                } else if (path || data)
+                    && (name != "grep" || !matches!(flag, "--color" | "--colour"))
+                {
+                    pending = Some(path);
+                }
+                continue;
+            }
+            if !positional && arg.starts_with('-') && arg != "-" {
+                let value_flags = if name == "rg" {
+                    "efgtrTABCm"
+                } else {
+                    "efABCmdD"
+                };
+                for (index, flag) in arg[1..].char_indices() {
+                    if !value_flags.contains(flag) {
+                        continue;
+                    }
+                    if matches!(flag, 'e' | 'f') {
+                        pattern = true;
+                    }
+                    let value = &arg[1 + index + flag.len_utf8()..];
+                    if value.is_empty() {
+                        pending = Some(flag == 'f');
+                    } else if flag == 'f' {
+                        let decision = assess_path(Operation::Read, value, cwd);
+                        if !decision.allows() {
+                            return Some(decision);
+                        }
+                    }
+                    break;
+                }
+                continue;
+            }
+            if !pattern && !files_only {
+                pattern = true;
+                continue;
+            }
+            let decision = assess_path(Operation::Read, arg, cwd);
             if !decision.allows() {
                 return Some(decision);
             }
         }
+        pending.map(|_| Assessment::ask("搜索选项缺少参数"))
     }
-}
-
-/// Search patterns and formatting options are data; pattern files and operands are paths.
-fn search_path_problem(name: &str, args: &[String], cwd: &Path) -> Option<Assessment> {
-    let default_root = assess_path(Operation::Read, &cwd.to_string_lossy(), cwd);
-    if !default_root.allows() { return Some(default_root); }
-    let mut pattern = false;
-    let mut files_only = false;
-    let mut positional = false;
-    let mut pending: Option<bool> = None; // true: path, false: literal data
-    for arg in args {
-        if let Some(path) = pending.take() {
-            if path {
-                let decision = assess_path(Operation::Read, arg, cwd);
-                if !decision.allows() { return Some(decision); }
-            }
-            continue;
-        }
-        if !positional && arg == "--" { positional = true; continue; }
-        if !positional && arg.starts_with("--") {
-            let (flag, value) = arg.split_once('=').map_or((arg.as_str(), None), |(k, v)| (k, Some(v)));
-            if flag == "--files" { files_only = true; }
-            if matches!(flag, "--regexp" | "--file") { pattern = true; }
-            let path = matches!(flag, "--file" | "--exclude-from");
-            let data = matches!(flag, "--regexp" | "--glob" | "--iglob" | "--type" | "--type-not"
-                | "--replace" | "--max-count" | "--max-columns" | "--max-depth" | "--max-filesize" | "--encoding"
-                | "--color" | "--colour" | "--colors" | "--sort" | "--sortr"
-                | "--binary-files" | "--directories" | "--devices" | "--group-separator"
-                | "--before-context" | "--after-context" | "--context" | "--include" | "--exclude"
-                | "--exclude-dir" | "--label");
-            if let Some(value) = value {
-                if !data {
-                    let decision = assess_path(Operation::Read, value, cwd);
-                    if !decision.allows() { return Some(decision); }
-                }
-            } else if (path || data) && (name != "grep" || !matches!(flag, "--color" | "--colour")) {
-                pending = Some(path);
-            }
-            continue;
-        }
-        if !positional && arg.starts_with('-') && arg != "-" {
-            let value_flags = if name == "rg" { "efgtrTABCm" } else { "efABCmdD" };
-            for (index, flag) in arg[1..].char_indices() {
-                if !value_flags.contains(flag) { continue; }
-                if matches!(flag, 'e' | 'f') { pattern = true; }
-                let value = &arg[1 + index + flag.len_utf8()..];
-                if value.is_empty() { pending = Some(flag == 'f'); }
-                else if flag == 'f' {
-                    let decision = assess_path(Operation::Read, value, cwd);
-                    if !decision.allows() { return Some(decision); }
-                }
-                break;
-            }
-            continue;
-        }
-        if !pattern && !files_only { pattern = true; continue; }
-        let decision = assess_path(Operation::Read, arg, cwd);
-        if !decision.allows() { return Some(decision); }
-    }
-    pending.map(|_| Assessment::ask("搜索选项缺少参数"))
-}
     None
 }
 
 /// `sed -n '1,10p' file`, `sed -n '5p' file`, `sed '1,$p' file`. Nothing else.
 fn vet_git(executable: &Path, args: &[String], cwd: &Path) -> Assessment {
-    let args = args.strip_prefix(&["--no-pager".to_string()]).unwrap_or(args);
+    let args = args
+        .strip_prefix(&["--no-pager".to_string()])
+        .unwrap_or(args);
     // Scan for the options that make git execute something else *before* choosing a
     // subcommand, because `git -c core.pager=evil log` would otherwise be reported as an
     // unknown subcommand and the real hazard would go unnamed.
     let dangerous = args.iter().any(|arg| {
-        let long_bad = ["--ext-diff", "--textconv", "--output", "--config-env", "--exec-path"]
-            .iter()
-            .any(|bad| arg == bad || arg.starts_with(&format!("{bad}=")));
+        let long_bad = [
+            "--ext-diff",
+            "--textconv",
+            "--output",
+            "--config-env",
+            "--exec-path",
+        ]
+        .iter()
+        .any(|bad| arg == bad || arg.starts_with(&format!("{bad}=")));
         let sets_config = arg == "-c" || (arg.starts_with("-c") && !arg.starts_with("--"));
         let order_file = arg.starts_with("-O") && !arg.starts_with("--");
         long_bad || sets_config || order_file || arg.contains("%G")
@@ -1380,29 +1522,97 @@ fn vet_git(executable: &Path, args: &[String], cwd: &Path) -> Assessment {
             }
         }
     }
-    if !["status", "diff", "log", "show", "rev-parse", "ls-files", "ls-tree"]
-        .contains(&subcommand.as_str())
+    if ![
+        "status",
+        "diff",
+        "log",
+        "show",
+        "rev-parse",
+        "ls-files",
+        "ls-tree",
+    ]
+    .contains(&subcommand.as_str())
     {
         return Assessment::ask(command_reason("git"));
     }
     if !known_long_options(
         options,
         &[
-            "--stat", "--shortstat", "--numstat", "--name-only", "--name-status", "--check",
-            "--summary", "--cached", "--staged", "--no-index", "--patch", "--no-patch",
-            "--color", "--no-color", "--word-diff", "--word-diff-regex",
-            "--ignore-space-at-eol", "--ignore-space-change", "--ignore-all-space",
-            "--ignore-blank-lines", "--exit-code", "--quiet", "--no-ext-diff",
-            "--no-textconv", "--unified", "--oneline", "--decorate", "--graph", "--all",
-            "--branches", "--tags", "--remotes", "--max-count", "--pretty", "--format",
-            "--since", "--until", "--author", "--committer", "--grep", "--date",
-            "--abbrev-commit", "--reverse", "--first-parent", "--follow", "--no-merges",
-            "--merges", "--short", "--porcelain", "--branch", "--untracked-files", "--ignored",
-            "--ignore-submodules", "--show-toplevel", "--git-dir", "--absolute-git-dir",
-            "--show-prefix", "--is-inside-work-tree", "--verify", "--abbrev-ref",
-            "--symbolic-full-name", "--sq", "--end-of-options", "--git-path", "--stage",
-            "--deleted", "--modified", "--others", "--exclude-standard", "--error-unmatch",
-            "--full-name", "--eol", "--long", "--full-tree", "--object-only",
+            "--stat",
+            "--shortstat",
+            "--numstat",
+            "--name-only",
+            "--name-status",
+            "--check",
+            "--summary",
+            "--cached",
+            "--staged",
+            "--no-index",
+            "--patch",
+            "--no-patch",
+            "--color",
+            "--no-color",
+            "--word-diff",
+            "--word-diff-regex",
+            "--ignore-space-at-eol",
+            "--ignore-space-change",
+            "--ignore-all-space",
+            "--ignore-blank-lines",
+            "--exit-code",
+            "--quiet",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--unified",
+            "--oneline",
+            "--decorate",
+            "--graph",
+            "--all",
+            "--branches",
+            "--tags",
+            "--remotes",
+            "--max-count",
+            "--pretty",
+            "--format",
+            "--since",
+            "--until",
+            "--author",
+            "--committer",
+            "--grep",
+            "--date",
+            "--abbrev-commit",
+            "--reverse",
+            "--first-parent",
+            "--follow",
+            "--no-merges",
+            "--merges",
+            "--short",
+            "--porcelain",
+            "--branch",
+            "--untracked-files",
+            "--ignored",
+            "--ignore-submodules",
+            "--show-toplevel",
+            "--git-dir",
+            "--absolute-git-dir",
+            "--show-prefix",
+            "--is-inside-work-tree",
+            "--verify",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            "--sq",
+            "--end-of-options",
+            "--git-path",
+            "--stage",
+            "--deleted",
+            "--modified",
+            "--others",
+            "--exclude-standard",
+            "--error-unmatch",
+            "--full-name",
+            "--eol",
+            "--long",
+            "--full-tree",
+            "--object-only",
         ],
     ) || !git_short_options_ok(options)
     {
@@ -1428,7 +1638,13 @@ fn vet_git(executable: &Path, args: &[String], cwd: &Path) -> Assessment {
     }
     rewritten.extend(options.iter().cloned());
     Assessment::Allow {
-        safe_command: Some(rewritten.iter().map(|w| shell_quote(w)).collect::<Vec<_>>().join(" ")),
+        safe_command: Some(
+            rewritten
+                .iter()
+                .map(|w| shell_quote(w))
+                .collect::<Vec<_>>()
+                .join(" "),
+        ),
     }
 }
 
@@ -1532,7 +1748,8 @@ pub fn assess_command(command: &str, cwd: &Path, dialect: Dialect) -> Assessment
     for (index, segment) in segments.iter().enumerate() {
         if let Some(target) = cd_target(&segment.words, &here, dialect) {
             // Pipelines and failure branches do not share one predictable working directory.
-            if index != 0 || segment.operator.as_deref().is_some_and(|op| op != "&&")
+            if index != 0
+                || segment.operator.as_deref().is_some_and(|op| op != "&&")
                 || segments.iter().any(|s| s.operator.as_deref() == Some("||"))
             {
                 return Assessment::ask("只能自动确认命令开头通过 && 连接的目录切换");
@@ -1582,11 +1799,18 @@ pub fn assess_command(command: &str, cwd: &Path, dialect: Dialect) -> Assessment
             }
         }
     }
-    Assessment::Allow { safe_command: Some(normalized.join(" ")) }
+    Assessment::Allow {
+        safe_command: Some(normalized.join(" ")),
+    }
 }
 
 /// Tools that only ever read.
-pub fn assess_tool(name: &str, input: &serde_json::Value, cwd: &Path, dialect: Dialect) -> Assessment {
+pub fn assess_tool(
+    name: &str,
+    input: &serde_json::Value,
+    cwd: &Path,
+    dialect: Dialect,
+) -> Assessment {
     let string = |key: &str| input.get(key).and_then(|v| v.as_str()).unwrap_or("");
     match name {
         "bash" => assess_command(string("command"), cwd, dialect),
@@ -1654,8 +1878,16 @@ mod tests {
 
     #[test]
     fn executable_targets_accept_only_known_system_aliases() {
-        for target in ["/usr/bin/which", "/bin/which", "/usr/bin/which.debianutils", "/bin/which.debianutils"] {
-            assert!(trusted_executable_target("which", Path::new(target)), "{target}");
+        for target in [
+            "/usr/bin/which",
+            "/bin/which",
+            "/usr/bin/which.debianutils",
+            "/bin/which.debianutils",
+        ] {
+            assert!(
+                trusted_executable_target("which", Path::new(target)),
+                "{target}"
+            );
         }
         for (name, target) in [
             ("which", "/tmp/which.debianutils"),
@@ -1665,24 +1897,47 @@ mod tests {
             ("cat", "/usr/bin/which.debianutils"),
             ("cat", "/usr/bin/rm"),
         ] {
-            assert!(!trusted_executable_target(name, Path::new(target)), "{name}: {target}");
+            assert!(
+                !trusted_executable_target(name, Path::new(target)),
+                "{name}: {target}"
+            );
         }
     }
 
     #[test]
     fn search_patterns_are_data_but_pattern_files_are_checked() {
-        for command in ["rg '.env' src", "rg -ne '.ssh/id_rsa' src", "grep -e /etc/shadow src/main.rs", "git --no-pager diff --stat", "pwd;"] {
+        for command in [
+            "rg '.env' src",
+            "rg -ne '.ssh/id_rsa' src",
+            "grep -e /etc/shadow src/main.rs",
+            "git --no-pager diff --stat",
+            "pwd;",
+        ] {
             assert!(allows(command), "{command}: {}", reason(command));
         }
-        for command in ["rg -nf.env src", "rg -n -f .env src", "grep --exclude-from=.env hello .", "rg --files -- .env", "date --se=20260101", "date 010100002026"] {
+        for command in [
+            "rg -nf.env src",
+            "rg -n -f .env src",
+            "grep --exclude-from=.env hello .",
+            "rg --files -- .env",
+            "date --se=20260101",
+            "date 010100002026",
+        ] {
             assert!(!allows(command), "{command}");
         }
     }
 
     #[test]
     fn directory_changes_cannot_escape_pipeline_or_failure_scopes() {
-        for command in ["cd /tmp | cat .env", "cd /tmp || cat .env", "echo ok | cd /tmp; cat .env"] {
-            assert!(!assess_command(command, Path::new("/"), Dialect::Zsh).allows(), "{command}");
+        for command in [
+            "cd /tmp | cat .env",
+            "cd /tmp || cat .env",
+            "echo ok | cd /tmp; cat .env",
+        ] {
+            assert!(
+                !assess_command(command, Path::new("/"), Dialect::Zsh).allows(),
+                "{command}"
+            );
         }
         assert!(assess_command("cd /tmp && pwd", Path::new("/"), Dialect::Zsh).allows());
     }
@@ -1707,14 +1962,19 @@ mod tests {
     }
 
     fn reason(command: &str) -> String {
-        assess_command(command, &cwd(), Dialect::Zsh).reason().unwrap_or_default().to_string()
+        assess_command(command, &cwd(), Dialect::Zsh)
+            .reason()
+            .unwrap_or_default()
+            .to_string()
     }
 
     #[test]
     fn simple_read_commands_are_rewritten_to_absolute_paths() {
         let decision = assess_command("cat notes.txt", &cwd(), Dialect::Zsh);
         match decision {
-            Assessment::Allow { safe_command: Some(command) } => {
+            Assessment::Allow {
+                safe_command: Some(command),
+            } => {
                 assert_eq!(command, "'/usr/bin/cat' 'notes.txt'");
             }
             other => panic!("expected allow with rewrite, got {other:?}"),
@@ -1783,7 +2043,9 @@ mod tests {
         // The command that runs has to be the command that was checked, or the transcript
         // shows one thing and the shell does another.
         match assess_command("cat notes.txt 2>&1", &cwd(), Dialect::Zsh) {
-            Assessment::Allow { safe_command: Some(command) } => {
+            Assessment::Allow {
+                safe_command: Some(command),
+            } => {
                 assert!(command.ends_with("2>&1"), "{command}");
             }
             other => panic!("expected allow with rewrite, got {other:?}"),
@@ -1795,11 +2057,26 @@ mod tests {
         // These cannot change anything, and asking about them every time was a question
         // with one answer.
         for command in [
-            "which cargo", "date", "date +%Y-%m-%d", "nproc", "uptime", "free -h", "ps aux",
-            "id", "whoami", "basename /a/b", "dirname /a/b", "column -t notes.txt", "lscpu",
+            "which cargo",
+            "date",
+            "date +%Y-%m-%d",
+            "nproc",
+            "uptime",
+            "free -h",
+            "ps aux",
+            "id",
+            "whoami",
+            "basename /a/b",
+            "dirname /a/b",
+            "column -t notes.txt",
+            "lscpu",
             "seq 1 5",
         ] {
-            assert!(allows(command), "`{command}` should not ask: {}", reason(command));
+            assert!(
+                allows(command),
+                "`{command}` should not ask: {}",
+                reason(command)
+            );
         }
         // `basename` prints its argument rather than opening it, so a sensitive-looking
         // name is not a leak here.
@@ -1841,8 +2118,11 @@ mod tests {
         let home = home();
         let sensitive = home.join(".pi/config.json");
         assert!(
-            reason(&format!("cd {} && cat .pi/config.json", shell_quote(&home.to_string_lossy())))
-                .contains("凭据"),
+            reason(&format!(
+                "cd {} && cat .pi/config.json",
+                shell_quote(&home.to_string_lossy())
+            ))
+            .contains("凭据"),
             "a cd was used to launder a path into a sensitive directory"
         );
         assert!(!allows("cd ~ && cat .ssh/id_rsa"));
@@ -1904,7 +2184,9 @@ mod tests {
     #[test]
     fn git_rewrites_disable_pager_hooks_and_external_diff() {
         match assess_command("git log --oneline", &cwd(), Dialect::Zsh) {
-            Assessment::Allow { safe_command: Some(command) } => {
+            Assessment::Allow {
+                safe_command: Some(command),
+            } => {
                 assert!(command.contains("--no-pager"));
                 assert!(command.contains("core.fsmonitor=false"));
                 assert!(command.contains("core.hooksPath=/dev/null"));
@@ -1948,10 +2230,22 @@ mod tests {
     #[test]
     fn writes_outside_the_project_ask() {
         let cwd = cwd();
-        assert!(assess_path(Operation::Write, "/tmp/elsewhere.txt", &cwd).reason().is_some());
+        assert!(
+            assess_path(Operation::Write, "/tmp/elsewhere.txt", &cwd)
+                .reason()
+                .is_some()
+        );
         assert!(assess_path(Operation::Write, "notes.txt", &cwd).allows());
-        assert!(assess_path(Operation::Write, ".git/config", &cwd).reason().is_some());
-        assert!(assess_path(Operation::Write, "AGENTS.md", &cwd).reason().is_some());
+        assert!(
+            assess_path(Operation::Write, ".git/config", &cwd)
+                .reason()
+                .is_some()
+        );
+        assert!(
+            assess_path(Operation::Write, "AGENTS.md", &cwd)
+                .reason()
+                .is_some()
+        );
     }
 
     #[test]
@@ -1980,7 +2274,10 @@ mod tests {
     #[test]
     fn headless_denial_text_names_the_rule() {
         let text = refusal(Some("命令会删除文件，需要确认目标"));
-        assert_eq!(text, "未获得用户授权，操作未执行（命令会删除文件，需要确认目标）");
+        assert_eq!(
+            text,
+            "未获得用户授权，操作未执行（命令会删除文件，需要确认目标）"
+        );
         assert_eq!(refusal(None), "未获得用户授权，操作未执行");
     }
 

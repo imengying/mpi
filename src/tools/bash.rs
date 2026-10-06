@@ -35,8 +35,13 @@ pub async fn execute_with_shell(
     cwd: &Path,
     shell: &str,
 ) -> Result<ToolOutput, String> {
-    let shell = if shell.is_empty() { crate::config::DEFAULT_SHELL } else { shell };
-    let capture = super::output::Capture::new().map_err(|err| format!("创建输出文件失败：{err}"))?;
+    let shell = if shell.is_empty() {
+        crate::config::DEFAULT_SHELL
+    } else {
+        shell
+    };
+    let capture =
+        super::output::Capture::new().map_err(|err| format!("创建输出文件失败：{err}"))?;
     let stdout = capture.file.try_clone().map_err(|err| err.to_string())?;
     let stderr = capture.file.try_clone().map_err(|err| err.to_string())?;
     let mut process = tokio::process::Command::new(shell);
@@ -56,7 +61,9 @@ pub async fn execute_with_shell(
         .map_err(|err| format!("等待命令结束失败：{err}"))?;
     let code = status.code();
 
-    let (body, full_path) = capture.finish(true).map_err(|err| format!("读取命令输出失败：{err}"))?;
+    let (body, full_path) = capture
+        .finish(true)
+        .map_err(|err| format!("读取命令输出失败：{err}"))?;
 
     let failed = code != Some(0);
     let mut content = String::new();
@@ -83,8 +90,8 @@ pub async fn execute_with_shell(
         content,
         display: Display::Command { footer },
         is_error: failed,
-duration: None,
-})
+        duration: None,
+    })
 }
 
 #[cfg(test)]
@@ -139,25 +146,41 @@ mod tests {
     #[test]
     fn large_stderr_cannot_block_stdout_and_keeps_the_full_log() {
         let out = block(async {
-            tokio::time::timeout(std::time::Duration::from_secs(5), execute_with_shell(
-                "printf '%*s' 262144 '' >&2; printf '\\nlast-output\\n'",
-                &std::env::temp_dir(), "/usr/bin/zsh",
-            )).await.expect("stderr must not deadlock the command").unwrap()
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                execute_with_shell(
+                    "printf '%*s' 262144 '' >&2; printf '\\nlast-output\\n'",
+                    &std::env::temp_dir(),
+                    "/usr/bin/zsh",
+                ),
+            )
+            .await
+            .expect("stderr must not deadlock the command")
+            .unwrap()
         });
         assert!(out.content.contains("last-output"));
         assert!(out.content.len() <= crate::util::MAX_OUTPUT_BYTES);
-        let Display::Command { footer, .. } = out.display else { panic!("command display") };
-        let path = footer.iter().find_map(|line| line.strip_prefix("完整输出：")).unwrap();
+        let Display::Command { footer, .. } = out.display else {
+            panic!("command display")
+        };
+        let path = footer
+            .iter()
+            .find_map(|line| line.strip_prefix("完整输出："))
+            .unwrap();
         assert!(std::fs::metadata(path).unwrap().len() > 262144);
         std::fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn non_utf8_output_does_not_discard_the_rest_of_the_stream() {
-        let out = block(execute_with_shell("printf '\\377ok\\n'", &std::env::temp_dir(), "/usr/bin/zsh")).unwrap();
+        let out = block(execute_with_shell(
+            "printf '\\377ok\\n'",
+            &std::env::temp_dir(),
+            "/usr/bin/zsh",
+        ))
+        .unwrap();
         assert!(out.content.contains("ok"));
     }
-    
 
     #[test]
     fn runs_through_zsh_and_reports_the_exit_code() {
@@ -166,7 +189,12 @@ mod tests {
         assert!(out.content.contains("hi"));
         assert!(!out.is_error);
 
-        let failed = block(execute_with_shell("echo oops; exit 3", &cwd, "/usr/bin/zsh")).unwrap();
+        let failed = block(execute_with_shell(
+            "echo oops; exit 3",
+            &cwd,
+            "/usr/bin/zsh",
+        ))
+        .unwrap();
         assert!(failed.is_error);
         assert!(failed.content.contains("[退出码 3]"));
     }

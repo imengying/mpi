@@ -25,9 +25,8 @@ pub fn run() -> Result<()> {
 }
 
 async fn update() -> Result<()> {
-    let triple = target_triple().context(
-        "当前平台没有对应的 Release 产物（只有 Linux / macOS 的 x86_64 / aarch64）",
-    )?;
+    let triple = target_triple()
+        .context("当前平台没有对应的 Release 产物（只有 Linux / macOS 的 x86_64 / aarch64）")?;
     let current = cli::version();
 
     let http = reqwest::Client::builder()
@@ -38,7 +37,9 @@ async fn update() -> Result<()> {
         .read_timeout(Duration::from_secs(300))
         .build()?;
     let release: serde_json::Value = http
-        .get(format!("https://api.github.com/repos/{REPO}/releases/latest"))
+        .get(format!(
+            "https://api.github.com/repos/{REPO}/releases/latest"
+        ))
         .header("Accept", "application/vnd.github+json")
         .send()
         .await

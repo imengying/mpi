@@ -45,12 +45,20 @@ pub struct PastedImage {
 impl PastedImage {
     /// The block that goes into the conversation.
     pub fn block(&self) -> Block {
-        Block::Image { media_type: "image/png".to_string(), data: self.data.clone() }
+        Block::Image {
+            media_type: "image/png".to_string(),
+            data: self.data.clone(),
+        }
     }
 
     /// One line for the transcript, e.g. `[图片 1280×720, 84 KB]`.
     pub fn label(&self) -> String {
-        format!("[图片 {}×{}, {}]", self.width, self.height, human_size(self.bytes))
+        format!(
+            "[图片 {}×{}, {}]",
+            self.width,
+            self.height,
+            human_size(self.bytes)
+        )
     }
 }
 
@@ -97,7 +105,9 @@ pub fn encode_rgba(width: usize, height: usize, rgba: &[u8]) -> Result<PastedIma
         writer
             .write_image_data(&rgba[..expected])
             .map_err(|err| ImageError::Encode(err.to_string()))?;
-        writer.finish().map_err(|err| ImageError::Encode(err.to_string()))?;
+        writer
+            .finish()
+            .map_err(|err| ImageError::Encode(err.to_string()))?;
     }
     let bytes = encoded.len();
     Ok(PastedImage {
@@ -110,7 +120,8 @@ pub fn encode_rgba(width: usize, height: usize, rgba: &[u8]) -> Result<PastedIma
 
 /// Read the clipboard's image, if it has one.
 pub fn read_clipboard_image() -> Result<PastedImage, ImageError> {
-    let mut clipboard = arboard::Clipboard::new().map_err(|err| ImageError::Clipboard(err.to_string()))?;
+    let mut clipboard =
+        arboard::Clipboard::new().map_err(|err| ImageError::Clipboard(err.to_string()))?;
     match clipboard.get_image() {
         Ok(image) => encode_rgba(image.width, image.height, &image.bytes),
         Err(_) => Err(ImageError::NoImage),
@@ -119,7 +130,8 @@ pub fn read_clipboard_image() -> Result<PastedImage, ImageError> {
 
 /// Read the clipboard's text, for the paste-a-path case.
 pub fn read_clipboard_text() -> Result<String, ImageError> {
-    let mut clipboard = arboard::Clipboard::new().map_err(|err| ImageError::Clipboard(err.to_string()))?;
+    let mut clipboard =
+        arboard::Clipboard::new().map_err(|err| ImageError::Clipboard(err.to_string()))?;
     match clipboard.get_text() {
         Ok(text) if !text.is_empty() => Ok(text),
         _ => Err(ImageError::NoText),
@@ -140,7 +152,9 @@ mod tests {
         assert!(matches!(image.block(), Block::Image { .. }));
 
         // The payload is real PNG: magic bytes decoded from the base64.
-        let raw = base64::engine::general_purpose::STANDARD.decode(&image.data).unwrap();
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(&image.data)
+            .unwrap();
         assert_eq!(&raw[..8], b"\x89PNG\r\n\x1a\n");
         assert_eq!(image.bytes, raw.len());
     }

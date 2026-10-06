@@ -229,13 +229,24 @@ impl Record {
 
     fn validate(&self) -> Result<(), &'static str> {
         match self {
-            Record::Compacted { replacement_history, replacement_ids, .. }
-            | Record::Pruned { replacement_history, replacement_ids, .. } => {
+            Record::Compacted {
+                replacement_history,
+                replacement_ids,
+                ..
+            }
+            | Record::Pruned {
+                replacement_history,
+                replacement_ids,
+                ..
+            } => {
                 if replacement_history.len() != replacement_ids.len() {
                     return Err("检查点消息与记录 ID 数量不一致");
                 }
                 let mut seen = std::collections::HashSet::new();
-                if replacement_ids.iter().any(|id| id.is_empty() || !seen.insert(id)) {
+                if replacement_ids
+                    .iter()
+                    .any(|id| id.is_empty() || !seen.insert(id))
+                {
                     return Err("检查点记录 ID 不能为空或重复");
                 }
             }
@@ -396,9 +407,9 @@ impl Session {
         if !pending.is_empty() {
             // The facts and nothing else: the file stopped mid-call, so what the call did is
             // unknown, and that is the one thing the user has to settle before working on.
-            session.recovery_notes.push(
-                "上次会话中途退出，有工具调用未记录结果；请先检查实际状态。".into(),
-            );
+            session
+                .recovery_notes
+                .push("上次会话中途退出，有工具调用未记录结果；请先检查实际状态。".into());
         }
         for (tool_call_id, name) in pending {
             session.push_message(Message::Tool {
@@ -438,9 +449,9 @@ impl Session {
             }
             match serde_json::from_slice::<Record>(&line) {
                 Ok(record) => {
-                    record.validate().map_err(|err| SessionError::Parse(format!(
-                        "{} 第 {number} 行：{err}", path.display()
-                    )))?;
+                    record.validate().map_err(|err| {
+                        SessionError::Parse(format!("{} 第 {number} 行：{err}", path.display()))
+                    })?;
                     records.push(record);
                     valid_len += line.len() as u64;
                     needs_newline = !terminated;
@@ -560,31 +571,45 @@ impl Session {
     /// checkpoint, using the checkpoint's replacement history in its place.
     fn context_entries(&self) -> impl Iterator<Item = (&Message, &str)> {
         let checkpoint = self.last_checkpoint_index();
-        let replacement = checkpoint.map(|index| {
-            match &self.records[index] {
-                Record::Compacted { replacement_history, replacement_ids, .. }
-                | Record::Pruned { replacement_history, replacement_ids, .. } => {
-                    (replacement_history, replacement_ids)
+        let replacement = checkpoint
+            .map(|index| match &self.records[index] {
+                Record::Compacted {
+                    replacement_history,
+                    replacement_ids,
+                    ..
                 }
+                | Record::Pruned {
+                    replacement_history,
+                    replacement_ids,
+                    ..
+                } => (replacement_history, replacement_ids),
                 _ => unreachable!(),
-            }
-        }).into_iter().flat_map(|(messages, ids)| {
-            messages.iter().zip(ids.iter().map(String::as_str))
-        });
+            })
+            .into_iter()
+            .flat_map(|(messages, ids)| messages.iter().zip(ids.iter().map(String::as_str)));
         let start = checkpoint.map_or(0, |index| index + 1);
-        replacement.chain(self.records[start..].iter().filter_map(|record| {
-            record.message().map(|message| (message, record.id()))
-        }))
+        replacement.chain(
+            self.records[start..]
+                .iter()
+                .filter_map(|record| record.message().map(|message| (message, record.id()))),
+        )
     }
 
     pub fn context_snapshot(&self) -> ContextSnapshot {
-        let (messages, entry_ids) = self.context_entries()
-            .map(|(message, id)| (message.clone(), id.to_string())).unzip();
-        ContextSnapshot { messages, entry_ids }
+        let (messages, entry_ids) = self
+            .context_entries()
+            .map(|(message, id)| (message.clone(), id.to_string()))
+            .unzip();
+        ContextSnapshot {
+            messages,
+            entry_ids,
+        }
     }
 
     pub fn context_messages(&self) -> Vec<Message> {
-        self.context_entries().map(|(message, _)| message.clone()).collect()
+        self.context_entries()
+            .map(|(message, _)| message.clone())
+            .collect()
     }
 
     /// Latest observed prompt+answer plus messages appended since that observation.
@@ -817,7 +842,7 @@ impl Session {
             _ => None,
         });
         let tools_hash = crate::util::stable_digest(
-            &serde_json::to_string(request.tools).expect("tool schema is serializable")
+            &serde_json::to_string(request.tools).expect("tool schema is serializable"),
         );
         let record = Record::RequestContext {
             parent_id: self.last_id.clone(),
@@ -827,7 +852,11 @@ impl Session {
             model: request.model.id.clone(),
             level: request.level.to_string(),
             context_window: request.model.context_window,
-            token_estimate: crate::llm::estimate_request_context(request.messages, "", request.tools),
+            token_estimate: crate::llm::estimate_request_context(
+                request.messages,
+                "",
+                request.tools,
+            ),
             system_prompt_hash,
             tools_hash,
             cache_hints: request.cache_hints,
@@ -1004,7 +1033,9 @@ impl Session {
     }
 
     fn append(&mut self, record: Record, id: String) -> Result<(), SessionError> {
-        record.validate().map_err(|err| SessionError::Parse(err.into()))?;
+        record
+            .validate()
+            .map_err(|err| SessionError::Parse(err.into()))?;
         // The file is created by the record that turns an empty launch into a conversation;
         // until then everything is buffered, including the header and the environment block,
         // and is written out in one go. Keeping those out of the file is not only about
@@ -1672,9 +1703,13 @@ mod tests {
             session.context_holds_only_environment(),
             "a session with no records at all has nothing to measure"
         );
-        session.push_message(Message::user_text(block), None, None).unwrap();
+        session
+            .push_message(Message::user_text(block), None, None)
+            .unwrap();
         assert!(session.context_holds_only_environment());
-        session.push_message(Message::user_text("第一句话"), None, None).unwrap();
+        session
+            .push_message(Message::user_text("第一句话"), None, None)
+            .unwrap();
         assert!(!session.context_holds_only_environment());
         std::fs::remove_dir_all(dir).unwrap();
     }

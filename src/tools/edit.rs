@@ -73,8 +73,8 @@ pub async fn execute(arguments: &serde_json::Value, cwd: &Path) -> Result<ToolOu
         content: format!("已修改 {path}（替换 {replaced} 处）"),
         display,
         is_error: false,
-duration: None,
-})
+        duration: None,
+    })
 }
 
 #[cfg(test)]
@@ -82,7 +82,6 @@ mod tests {
     use super::*;
     use crate::tools::block;
     use std::path::PathBuf;
-
 
     fn temp_dir() -> PathBuf {
         let dir = std::env::temp_dir().join(format!("pi-edit-{}", std::process::id()));

@@ -192,9 +192,7 @@ pub fn find_cut_point(messages: &[Message], keep_recent_tokens: u64) -> Option<C
         let turn_start = if is_user(&messages[cut]) {
             None
         } else {
-            (0..cut)
-                .rev()
-                .find(|index| is_user(&messages[*index]))
+            (0..cut).rev().find(|index| is_user(&messages[*index]))
         };
         // A cut inside the first turn would summarise nothing.
         if turn_start == Some(0) && cut == 1 {

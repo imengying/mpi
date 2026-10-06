@@ -84,7 +84,11 @@ fn build(before: &str, after: &str) -> Display {
     let rows = diff_rows(&before_lines, &after_lines, 0, 0);
     let added = rows.iter().filter(|row| row.kind == Kind::Added).count();
     let removed = rows.iter().filter(|row| row.kind == Kind::Removed).count();
-    Display::Diff { diff: body_of(&rows), added, removed }
+    Display::Diff {
+        diff: body_of(&rows),
+        added,
+        removed,
+    }
 }
 
 /// A file's lines *with* their newline terminators.
@@ -190,7 +194,11 @@ fn build_window(before: &str, after: &str) -> Display {
     }
     let added = rows.iter().filter(|row| row.kind == Kind::Added).count();
     let removed = rows.iter().filter(|row| row.kind == Kind::Removed).count();
-    Display::Diff { diff: body_of(&rows), added, removed }
+    Display::Diff {
+        diff: body_of(&rows),
+        added,
+        removed,
+    }
 }
 
 /// How many lines at each end of the two files are identical, counted from that end.
@@ -224,10 +232,14 @@ fn windows<'s, 'a>(
         .map(|index| {
             // A side with nothing left to split off contributes an empty slice at its end,
             // so its lines are not shown twice.
-            let (old_from, old_to) =
-                old_ranges.get(index).copied().unwrap_or((old.len(), old.len()));
-            let (new_from, new_to) =
-                new_ranges.get(index).copied().unwrap_or((new.len(), new.len()));
+            let (old_from, old_to) = old_ranges
+                .get(index)
+                .copied()
+                .unwrap_or((old.len(), old.len()));
+            let (new_from, new_to) = new_ranges
+                .get(index)
+                .copied()
+                .unwrap_or((new.len(), new.len()));
             (
                 offset + old_from,
                 offset + new_from,
@@ -303,7 +315,13 @@ fn num(value: Option<usize>) -> String {
 ///
 /// Keep complete source lines; the screen handles width and native selection.
 pub fn render(display: &Display) -> Vec<Line> {
-    let Display::Diff { diff, added, removed, .. } = display else {
+    let Display::Diff {
+        diff,
+        added,
+        removed,
+        ..
+    } = display
+    else {
         return Vec::new();
     };
     let mut out = Vec::new();
@@ -379,7 +397,10 @@ mod tests {
                 .parse()
                 .unwrap_or_else(|_| panic!("not a number: {row:?}"));
             assert!(value >= 1, "line numbers start at 1: {row:?}");
-            assert!(tail.starts_with(' '), "the text is past the column: {row:?}");
+            assert!(
+                tail.starts_with(' '),
+                "the text is past the column: {row:?}"
+            );
         }
         assert!(rendered.len() >= 4, "{rendered:?}");
     }
@@ -406,9 +427,18 @@ mod tests {
         }
         // The removals still name the real lines they were, and the replacement names the
         // line it took over.
-        assert!(rendered.contains(&"-    5 │ line 5".to_string()), "{rendered:?}");
-        assert!(rendered.contains(&"-    8 │ line 8".to_string()), "{rendered:?}");
-        assert!(rendered.contains(&"+    5 │ REPLACEMENT".to_string()), "{rendered:?}");
+        assert!(
+            rendered.contains(&"-    5 │ line 5".to_string()),
+            "{rendered:?}"
+        );
+        assert!(
+            rendered.contains(&"-    8 │ line 8".to_string()),
+            "{rendered:?}"
+        );
+        assert!(
+            rendered.contains(&"+    5 │ REPLACEMENT".to_string()),
+            "{rendered:?}"
+        );
     }
 
     #[test]
@@ -440,7 +470,10 @@ mod tests {
         // Three rows of context on each side of the one-line change, so ten rows in all: the
         // change is nowhere near a screenful, whatever the file's size.
         assert_eq!(rendered.len(), CONTEXT_LINES * 2 + 2, "{rendered:?}");
-        assert!(!rendered.iter().any(|row| row.ends_with("line 1")), "{rendered:?}");
+        assert!(
+            !rendered.iter().any(|row| row.ends_with("line 1")),
+            "{rendered:?}"
+        );
     }
 
     #[test]
@@ -456,12 +489,30 @@ mod tests {
         after[150] = "NEW B\n".into();
         let rendered = rows(&for_edit(&before.concat(), &after.concat()));
 
-        assert!(rendered.iter().any(|row| row.contains("OLD A")), "{rendered:?}");
-        assert!(rendered.iter().any(|row| row.contains("OLD B")), "{rendered:?}");
-        assert!(rendered.iter().any(|row| row.ends_with("line 10")), "context above A");
-        assert!(rendered.iter().any(|row| row.ends_with("line 12")), "context below A");
-        assert!(rendered.iter().any(|row| row.ends_with("line 149")), "context above B");
-        assert!(rendered.iter().any(|row| row.ends_with("line 153")), "context below B");
+        assert!(
+            rendered.iter().any(|row| row.contains("OLD A")),
+            "{rendered:?}"
+        );
+        assert!(
+            rendered.iter().any(|row| row.contains("OLD B")),
+            "{rendered:?}"
+        );
+        assert!(
+            rendered.iter().any(|row| row.ends_with("line 10")),
+            "context above A"
+        );
+        assert!(
+            rendered.iter().any(|row| row.ends_with("line 12")),
+            "context below A"
+        );
+        assert!(
+            rendered.iter().any(|row| row.ends_with("line 149")),
+            "context above B"
+        );
+        assert!(
+            rendered.iter().any(|row| row.ends_with("line 153")),
+            "context below B"
+        );
     }
 
     #[test]
@@ -474,8 +525,14 @@ mod tests {
         after[40] = "NEW\n".into();
         let rendered = rows(&for_edit(&before.concat(), &after.concat()));
 
-        assert!(rendered.iter().any(|row| row.contains("OLD")), "{rendered:?}");
-        assert!(rendered.iter().any(|row| row.ends_with("line 38")), "the lead-in survives");
+        assert!(
+            rendered.iter().any(|row| row.contains("OLD")),
+            "{rendered:?}"
+        );
+        assert!(
+            rendered.iter().any(|row| row.ends_with("line 38")),
+            "the lead-in survives"
+        );
         assert!(
             !rendered.iter().any(|row| row.contains("line 1\n")),
             "the top of the file is not context for anything: {rendered:?}"
@@ -492,16 +549,32 @@ mod tests {
         let after: String = (0..MAX_DIFF_LINES).map(|i| format!("new {i}\n")).collect();
         let display = for_edit(&before, &after);
         let rendered = rows(&display);
-        assert!(rendered.iter().any(|row| row.contains("old 0")), "{}", rendered.len());
-        assert!(rendered.iter().any(|row| row.contains("new 1999")), "{}", rendered.len());
+        assert!(
+            rendered.iter().any(|row| row.contains("old 0")),
+            "{}",
+            rendered.len()
+        );
+        assert!(
+            rendered.iter().any(|row| row.contains("new 1999")),
+            "{}",
+            rendered.len()
+        );
         // The window bounds the work: at most both windows, and each changed line on both
         // sides of it.
-        assert!(rendered.len() <= WINDOW_LINES * 4, "the window bounds the work: {}", rendered.len());
+        assert!(
+            rendered.len() <= WINDOW_LINES * 4,
+            "the window bounds the work: {}",
+            rendered.len()
+        );
         // The counts describe the rows that are actually there, since the whole file was not
         // walked to produce an exact total for an excerpt.
         assert_eq!(counts(&display), (WINDOW_LINES, WINDOW_LINES));
         // Nothing says the preview was skipped.
-        assert!(!rendered.iter().any(|row| row.contains("省略")), "{}", rendered.len());
+        assert!(
+            !rendered.iter().any(|row| row.contains("省略")),
+            "{}",
+            rendered.len()
+        );
     }
 
     #[test]
@@ -509,7 +582,9 @@ mod tests {
         // The case the two-end window got wrong: an edit in the middle of a big file showed
         // two slices of *unchanged* text, reported `+0 −0`, and said nothing about the edit
         // at all. Trimming the shared ends first makes the excerpt be the change itself.
-        let mut before: Vec<String> = (0..MAX_DIFF_LINES + 1000).map(|i| format!("line {i}")).collect();
+        let mut before: Vec<String> = (0..MAX_DIFF_LINES + 1000)
+            .map(|i| format!("line {i}"))
+            .collect();
         let mut after = before.clone();
         let middle = before.len() / 2;
         before[middle] = "OLD MIDDLE".to_string();
@@ -518,12 +593,20 @@ mod tests {
 
         assert_eq!(counts(&display), (1, 1), "one line changed on each side");
         let rendered = rows(&display);
-        assert!(rendered.iter().any(|row| row.contains("OLD MIDDLE")), "{rendered:?}");
-        assert!(rendered.iter().any(|row| row.contains("NEW MIDDLE")), "{rendered:?}");
+        assert!(
+            rendered.iter().any(|row| row.contains("OLD MIDDLE")),
+            "{rendered:?}"
+        );
+        assert!(
+            rendered.iter().any(|row| row.contains("NEW MIDDLE")),
+            "{rendered:?}"
+        );
         // The line numbers still point where the rows came from in the real file.
         let expected = middle + 1;
         assert!(
-            rendered.iter().any(|row| row.contains(&format!("{expected}"))),
+            rendered
+                .iter()
+                .any(|row| row.contains(&format!("{expected}"))),
             "line {expected} is the one that changed: {rendered:?}"
         );
     }
@@ -532,11 +615,17 @@ mod tests {
     fn an_appended_line_at_the_very_end_is_shown() {
         // An append is the common shape of a large write, and the changed region is the last
         // line — which a window counted from the start would miss entirely.
-        let before: String = (0..MAX_DIFF_LINES + 1000).map(|i| format!("line {i}\n")).collect();
+        let before: String = (0..MAX_DIFF_LINES + 1000)
+            .map(|i| format!("line {i}\n"))
+            .collect();
         let after = format!("{before}APPENDED\n");
         let display = for_edit(&before, &after);
         assert_eq!(counts(&display), (1, 0));
-        assert!(rows(&display).iter().any(|row| row.contains("APPENDED")), "{:?}", rows(&display));
+        assert!(
+            rows(&display).iter().any(|row| row.contains("APPENDED")),
+            "{:?}",
+            rows(&display)
+        );
     }
 
     #[test]
@@ -547,7 +636,12 @@ mod tests {
         // came out as both removed and added — the same text on two tinted rows. Keeping each
         // line's terminator with it is what makes these two texts compare as they read.
         let joined = for_edit("a\nb", "a\nb\n");
-        assert_eq!(counts(&joined), (1, 1), "the final line changed: {:?}", rows(&joined));
+        assert_eq!(
+            counts(&joined),
+            (1, 1),
+            "the final line changed: {:?}",
+            rows(&joined)
+        );
 
         let same = for_edit("a\nb\n", "a\nb\n");
         assert_eq!(counts(&same), (0, 0), "identical files differ in nothing");
@@ -556,13 +650,18 @@ mod tests {
     #[test]
     fn a_file_that_gained_a_prefix_shows_the_first_line() {
         // The mirror image: the change is at the very top, and everything below it moved.
-        let body: Vec<String> = (0..MAX_DIFF_LINES + 1000).map(|i| format!("line {i}")).collect();
+        let body: Vec<String> = (0..MAX_DIFF_LINES + 1000)
+            .map(|i| format!("line {i}"))
+            .collect();
         let mut after = vec!["HEADER".to_string()];
         after.extend(body.clone());
         let display = for_edit(&body.join("\n"), &after.join("\n"));
         assert_eq!(counts(&display), (1, 0));
         let rendered = rows(&display);
-        assert!(rendered.iter().any(|row| row.contains("HEADER")), "{rendered:?}");
+        assert!(
+            rendered.iter().any(|row| row.contains("HEADER")),
+            "{rendered:?}"
+        );
     }
 
     #[test]
@@ -573,15 +672,23 @@ mod tests {
         let before: String = (0..MAX_DIFF_LINES).map(|i| format!("old {i}\n")).collect();
         let after: String = (0..MAX_DIFF_LINES).map(|i| format!("new {i}\n")).collect();
         let rendered = rows(&for_edit(&before, &after));
-        assert!(rendered.iter().any(|row| row.contains("old 0")), "the first removal: {rendered:?}");
+        assert!(
+            rendered.iter().any(|row| row.contains("old 0")),
+            "the first removal: {rendered:?}"
+        );
         assert!(
             rendered.iter().any(|row| row.contains("new 1999")),
             "the last addition: {rendered:?}"
         );
         // And the line numbers are the real ones, not the excerpt's own offsets.
-        assert!(rendered.iter().any(|row| row.starts_with("-    1")), "{rendered:?}");
         assert!(
-            rendered.iter().any(|row| row.contains(&format!("{:>5} │ new 1999", MAX_DIFF_LINES))),
+            rendered.iter().any(|row| row.starts_with("-    1")),
+            "{rendered:?}"
+        );
+        assert!(
+            rendered
+                .iter()
+                .any(|row| row.contains(&format!("{:>5} │ new 1999", MAX_DIFF_LINES))),
             "the last addition keeps its line number: {rendered:?}"
         );
     }
@@ -591,7 +698,8 @@ mod tests {
         let display = for_edit("short\n", "a much longer replacement line that overflows\n");
         let lines = render(&display);
         assert!(lines.iter().any(|line| {
-            line.text().ends_with("a much longer replacement line that overflows")
+            line.text()
+                .ends_with("a much longer replacement line that overflows")
         }));
         for line in crate::ui::text::Block::lines(lines).render(20) {
             assert!(line.width() <= 20, "too wide: {line:?}");
@@ -601,12 +709,17 @@ mod tests {
     #[test]
     fn rendering_neutralizes_terminal_controls_without_losing_code_indentation() {
         let display = Display::Diff {
-            diff: "+    1 │     let x = 1;\u{1b}]52;c;ZmFrZQ==\u{7}\n+    2 │ \tcall();\u{1b}[2J".into(),
+            diff: "+    1 │     let x = 1;\u{1b}]52;c;ZmFrZQ==\u{7}\n+    2 │ \tcall();\u{1b}[2J"
+                .into(),
             added: 2,
             removed: 0,
         };
         let lines = render(&display);
-        assert!(lines.iter().all(|line| !line.text().contains(['\u{1b}', '\u{7}'])));
+        assert!(
+            lines
+                .iter()
+                .all(|line| !line.text().contains(['\u{1b}', '\u{7}']))
+        );
         assert!(lines[1].text().ends_with("    let x = 1;"));
         assert!(lines[2].text().ends_with("    call();"));
     }

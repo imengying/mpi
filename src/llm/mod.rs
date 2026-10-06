@@ -25,8 +25,11 @@ pub enum Api {
 
 impl Api {
     /// Every protocol, in the order the config's docs list them.
-    pub const ALL: [Api; 3] =
-        [Api::AnthropicMessages, Api::OpenAiCompletions, Api::OpenAiResponses];
+    pub const ALL: [Api; 3] = [
+        Api::AnthropicMessages,
+        Api::OpenAiCompletions,
+        Api::OpenAiResponses,
+    ];
 
     /// The name the config writes, which is also what the error message quotes.
     ///
@@ -145,21 +148,30 @@ pub enum Message {
 
 impl Message {
     pub fn user_text(text: impl Into<String>) -> Self {
-        Message::User { content: vec![Block::Text { text: text.into() }] }
+        Message::User {
+            content: vec![Block::Text { text: text.into() }],
+        }
     }
 
     pub fn assistant_text(text: impl Into<String>) -> Self {
-        Message::Assistant { content: vec![Block::Text { text: text.into() }], stop_reason: None }
+        Message::Assistant {
+            content: vec![Block::Text { text: text.into() }],
+            stop_reason: None,
+        }
     }
 
     pub fn text(&self) -> String {
         let blocks = match self {
             Message::System { content } => return content.clone(),
             Message::User { content } | Message::Assistant { content, .. } => content,
-            Message::Tool { content, status, .. } => return match status {
-                ToolStatus::Success => content.clone(),
-                _ => format!("[工具状态：{}]\n{content}", status.label()),
-            },
+            Message::Tool {
+                content, status, ..
+            } => {
+                return match status {
+                    ToolStatus::Success => content.clone(),
+                    _ => format!("[工具状态：{}]\n{content}", status.label()),
+                };
+            }
         };
         blocks
             .iter()
@@ -172,7 +184,9 @@ impl Message {
     }
 
     pub fn thinking(&self) -> String {
-        let Message::Assistant { content, .. } = self else { return String::new() };
+        let Message::Assistant { content, .. } = self else {
+            return String::new();
+        };
         content
             .iter()
             .filter_map(|block| match block {
@@ -184,11 +198,17 @@ impl Message {
     }
 
     pub fn tool_calls(&self) -> Vec<(&str, &str, &serde_json::Value)> {
-        let Message::Assistant { content, .. } = self else { return Vec::new() };
+        let Message::Assistant { content, .. } = self else {
+            return Vec::new();
+        };
         content
             .iter()
             .filter_map(|block| match block {
-                Block::ToolCall { id, name, arguments } => Some((id.as_str(), name.as_str(), arguments)),
+                Block::ToolCall {
+                    id,
+                    name,
+                    arguments,
+                } => Some((id.as_str(), name.as_str(), arguments)),
                 _ => None,
             })
             .collect()
@@ -211,12 +231,21 @@ impl Message {
                 for block in content {
                     match block {
                         Block::Text { text } => tokens += util::estimate_tokens(text),
-                        Block::Thinking { thinking, .. } => tokens += util::estimate_tokens(thinking),
-                        Block::ToolCall { name, arguments, .. } => {
-                            tokens += util::estimate_tokens(name) + util::estimate_tokens(&arguments.to_string())
+                        Block::Thinking { thinking, .. } => {
+                            tokens += util::estimate_tokens(thinking)
                         }
-                        Block::Hosted { payload, .. } => tokens += util::estimate_tokens(&payload.to_string()),
-                        Block::Citation { url, title } => tokens += util::estimate_tokens(url) + util::estimate_tokens(title),
+                        Block::ToolCall {
+                            name, arguments, ..
+                        } => {
+                            tokens += util::estimate_tokens(name)
+                                + util::estimate_tokens(&arguments.to_string())
+                        }
+                        Block::Hosted { payload, .. } => {
+                            tokens += util::estimate_tokens(&payload.to_string())
+                        }
+                        Block::Citation { url, title } => {
+                            tokens += util::estimate_tokens(url) + util::estimate_tokens(title)
+                        }
                         Block::Image { .. } => images += 1,
                     }
                 }
@@ -410,7 +439,9 @@ pub(crate) fn pending_tool_calls(messages: &[Message]) -> Result<Vec<(String, St
             continue;
         }
         if !pending.is_empty() {
-            return Err(LlmError::Decode("工具调用缺少结果，不能继续发送对话".into()));
+            return Err(LlmError::Decode(
+                "工具调用缺少结果，不能继续发送对话".into(),
+            ));
         }
         for (id, name, _) in message.tool_calls() {
             if id.is_empty() || name.is_empty() {
@@ -438,12 +469,18 @@ pub fn hosted_search(model: &ModelConfig, provider: &Provider) -> Option<compat:
 
 /// One citation, the way it is shown under an answer.
 pub fn citation_line(title: &str, url: &str) -> String {
-    if title.is_empty() { url.to_string() } else { format!("{title}  {url}") }
+    if title.is_empty() {
+        url.to_string()
+    } else {
+        format!("{title}  {url}")
+    }
 }
 
 /// Citation lines on an assistant message, in order, without the "searched" header.
 pub fn citation_lines(message: &Message) -> Vec<String> {
-    let Message::Assistant { content, .. } = message else { return Vec::new() };
+    let Message::Assistant { content, .. } = message else {
+        return Vec::new();
+    };
     content
         .iter()
         .filter_map(|block| match block {
@@ -482,7 +519,10 @@ pub fn thinking_budget(level: &str, max_tokens: u64) -> u64 {
 
 pub fn plan_thinking(model: &ModelConfig, level: &str, max_tokens: u64) -> ThinkingPlan {
     if !model.reasoning || level.is_empty() || level == "off" {
-        return ThinkingPlan { effort: None, budget_tokens: None };
+        return ThinkingPlan {
+            effort: None,
+            budget_tokens: None,
+        };
     }
     ThinkingPlan {
         effort: Some(level.to_string()),
@@ -507,7 +547,8 @@ pub fn clamp_level(model: &ModelConfig, level: &str) -> (String, bool) {
 pub fn estimate_request_context(messages: &[Message], system: &str, tools: &[ToolSpec]) -> u64 {
     let system = util::estimate_tokens(system);
     let messages = messages.iter().map(Message::estimate_tokens).sum::<u64>();
-    let tools = tools.iter()
+    let tools = tools
+        .iter()
         .map(|tool| util::estimate_tokens(&serde_json::to_string(tool).expect("tool schema")))
         .sum::<u64>();
     system + messages + tools
@@ -519,10 +560,27 @@ mod tests {
 
     #[test]
     fn tool_history_requires_one_immediate_result_per_call_without_mutating_messages() {
-        let call = |id: &str| Block::ToolCall { id:id.into(), name:"read".into(), arguments:serde_json::json!({"path":"a.rs"}) };
-        let assistant = |content| Message::Assistant { content, stop_reason:Some(StopReason::ToolUse) };
-        let result = |id: &str| Message::Tool { status: crate::llm::ToolStatus::Success, tool_call_id:id.into(), name:"read".into(), content:String::new() };
-        let history = vec![Message::user_text("read"), assistant(vec![call("a"), call("b")]), result("b"), result("a")];
+        let call = |id: &str| Block::ToolCall {
+            id: id.into(),
+            name: "read".into(),
+            arguments: serde_json::json!({"path":"a.rs"}),
+        };
+        let assistant = |content| Message::Assistant {
+            content,
+            stop_reason: Some(StopReason::ToolUse),
+        };
+        let result = |id: &str| Message::Tool {
+            status: crate::llm::ToolStatus::Success,
+            tool_call_id: id.into(),
+            name: "read".into(),
+            content: String::new(),
+        };
+        let history = vec![
+            Message::user_text("read"),
+            assistant(vec![call("a"), call("b")]),
+            result("b"),
+            result("a"),
+        ];
         let original = history.clone();
         assert!(validate_tool_history(&history).is_ok());
         assert_eq!(history, original);
@@ -532,7 +590,15 @@ mod tests {
             vec![assistant(vec![call("a")]), Message::user_text("next")],
             vec![assistant(vec![call("a"), call("a")]), result("a")],
             vec![assistant(vec![call("a")]), result("a"), result("a")],
-            vec![assistant(vec![call("a")]), Message::Tool { status: crate::llm::ToolStatus::Success, tool_call_id:"a".into(), name:"write".into(), content:String::new() }],
+            vec![
+                assistant(vec![call("a")]),
+                Message::Tool {
+                    status: crate::llm::ToolStatus::Success,
+                    tool_call_id: "a".into(),
+                    name: "write".into(),
+                    content: String::new(),
+                },
+            ],
         ] {
             assert!(validate_tool_history(&invalid).is_err(), "{invalid:?}");
         }
@@ -575,7 +641,12 @@ mod tests {
 
     #[test]
     fn usage_cache_hit_rate_uses_prompt_tokens() {
-        let usage = crate::config::Usage { input: 100, output: 50, cache_read: 900, cache_write: 0 };
+        let usage = crate::config::Usage {
+            input: 100,
+            output: 50,
+            cache_read: 900,
+            cache_write: 0,
+        };
         assert_eq!(usage.hit_rate(), Some(90.0));
         assert_eq!(crate::config::Usage::default().hit_rate(), None);
     }

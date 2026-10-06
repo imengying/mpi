@@ -70,11 +70,15 @@ fn the_system_message_and_tools_are_identical_between_turns() {
     let (model, provider) = fixtures();
     let tools = tools();
     let first = vec![
-        Message::System { content: SYSTEM.into() },
+        Message::System {
+            content: SYSTEM.into(),
+        },
         Message::user_text("first question"),
     ];
     let second = vec![
-        Message::System { content: SYSTEM.into() },
+        Message::System {
+            content: SYSTEM.into(),
+        },
         Message::user_text("first question"),
         Message::assistant_text("first answer"),
         Message::user_text("second question"),
@@ -112,19 +116,24 @@ fn message_serialisation_order_is_fixed() {
     // The same message must serialise to the same bytes every time, whatever order the
     // caller assembled the fields in.
     let messages = vec![
-        Message::System { content: SYSTEM.into() },
+        Message::System {
+            content: SYSTEM.into(),
+        },
         Message::user_text("hi"),
         Message::Assistant {
-            content: vec![
-                Block::ToolCall {
-                    id: "c1".into(),
-                    name: "read".into(),
-                    arguments: serde_json::json!({"path": "a.rs", "limit": 10}),
-                },
-            ],
+            content: vec![Block::ToolCall {
+                id: "c1".into(),
+                name: "read".into(),
+                arguments: serde_json::json!({"path": "a.rs", "limit": 10}),
+            }],
             stop_reason: Some(mpi::llm::StopReason::ToolUse),
         },
-        Message::Tool { status: ToolStatus::Success, tool_call_id: "c1".into(), name: "read".into(), content: "data".into() },
+        Message::Tool {
+            status: ToolStatus::Success,
+            tool_call_id: "c1".into(),
+            name: "read".into(),
+            content: "data".into(),
+        },
     ];
     let first = serde_json::to_string(&body_of(&messages, &model, &provider)).unwrap();
     for _ in 0..5 {
@@ -139,21 +148,55 @@ fn message_serialisation_order_is_fixed() {
 #[test]
 fn tool_outcomes_reach_all_protocols_without_rewriting_success_content() {
     let (model, provider) = fixtures();
-    for status in [ToolStatus::Success, ToolStatus::Error, ToolStatus::Cancelled, ToolStatus::Skipped, ToolStatus::Unknown] {
+    for status in [
+        ToolStatus::Success,
+        ToolStatus::Error,
+        ToolStatus::Cancelled,
+        ToolStatus::Skipped,
+        ToolStatus::Unknown,
+    ] {
         let original = "原始内容\n    code\n";
         let messages = vec![
-            Message::Assistant { content:vec![Block::ToolCall { id:"c".into(), name:"read".into(), arguments:serde_json::json!({"path":"a.rs"}) }], stop_reason:Some(mpi::llm::StopReason::ToolUse) },
-            Message::Tool { tool_call_id:"c".into(), name:"read".into(), content:original.into(), status },
+            Message::Assistant {
+                content: vec![Block::ToolCall {
+                    id: "c".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({"path":"a.rs"}),
+                }],
+                stop_reason: Some(mpi::llm::StopReason::ToolUse),
+            },
+            Message::Tool {
+                tool_call_id: "c".into(),
+                name: "read".into(),
+                content: original.into(),
+                status,
+            },
         ];
-        let request = Request { model:&model, provider:&provider, messages:&messages, tools:&[], level:"high", session_id:"s", cache_hints:false };
+        let request = Request {
+            model: &model,
+            provider: &provider,
+            messages: &messages,
+            tools: &[],
+            level: "high",
+            session_id: "s",
+            cache_hints: false,
+        };
         let chat = serde_json::to_value(openai::build_request(&request, true)).unwrap();
-        let responses = serde_json::to_value(mpi::llm::responses::build_request(&request, true)).unwrap();
+        let responses =
+            serde_json::to_value(mpi::llm::responses::build_request(&request, true)).unwrap();
         let anthropic = serde_json::to_value(anthropic::build_request(&request)).unwrap();
-        let expected = if status == ToolStatus::Success { original.to_string() } else { format!("[工具状态：{}]\n{original}", status.label()) };
+        let expected = if status == ToolStatus::Success {
+            original.to_string()
+        } else {
+            format!("[工具状态：{}]\n{original}", status.label())
+        };
         assert_eq!(chat["messages"][1]["content"], expected);
         assert_eq!(responses["input"][1]["output"], expected);
         assert_eq!(anthropic["messages"][1]["content"][0]["content"], expected);
-        assert_eq!(anthropic["messages"][1]["content"][0]["is_error"], status != ToolStatus::Success);
+        assert_eq!(
+            anthropic["messages"][1]["content"][0]["is_error"],
+            status != ToolStatus::Success
+        );
         assert_eq!(messages[1].text(), expected);
     }
     assert!(serde_json::from_value::<Message>(serde_json::json!({"role":"tool","tool_call_id":"c","name":"read","content":"old result"})).is_err(), "execution status is required in the current session format");
@@ -163,7 +206,10 @@ fn tool_outcomes_reach_all_protocols_without_rewriting_success_content() {
 fn the_tool_block_is_stable_and_ordered() {
     // Tool order is a cache boundary, so it must not depend on a hash map's iteration order.
     let names: Vec<String> = tools().iter().map(|tool| tool.name.clone()).collect();
-    assert_eq!(names, vec!["read", "write", "edit", "bash", "grep", "find", "ls"]);
+    assert_eq!(
+        names,
+        vec!["read", "write", "edit", "bash", "grep", "find", "ls"]
+    );
     for _ in 0..5 {
         let again: Vec<String> = tools().iter().map(|tool| tool.name.clone()).collect();
         assert_eq!(names, again);
@@ -187,7 +233,10 @@ fn pi_adds_nothing_of_its_own_to_the_system_prompt() {
     // where it came from, which is stable for as long as the file does not move.
     assert!(text.contains(body.trim_end()), "{text:?}");
     for volatile in ["2026-", "main", "deepseek"] {
-        assert!(!text.contains(volatile), "pi injected {volatile:?}: {text:?}");
+        assert!(
+            !text.contains(volatile),
+            "pi injected {volatile:?}: {text:?}"
+        );
     }
     // Reading twice gives the same bytes, which is what makes it a usable prefix.
     let (_, again) = mpi::agent::r#loop::load_agents_md(&dir).unwrap();
@@ -202,7 +251,9 @@ fn the_environment_block_is_a_message_not_the_system_prompt() {
     let cwd = std::path::Path::new("/tmp/some-project");
     let block = mpi::agent::r#loop::environment_block(cwd, "session-1", "/usr/bin/zsh");
     let messages = vec![
-        Message::System { content: SYSTEM.into() },
+        Message::System {
+            content: SYSTEM.into(),
+        },
         Message::user_text(block.clone()),
     ];
     let (model, provider) = fixtures();
@@ -211,7 +262,10 @@ fn the_environment_block_is_a_message_not_the_system_prompt() {
     assert_eq!(array[0]["role"], "system");
     assert!(array[0]["content"].as_str().unwrap() == SYSTEM);
     assert!(
-        array[1]["content"].as_str().unwrap().contains("/tmp/some-project"),
+        array[1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("/tmp/some-project"),
         "the cwd must travel in the conversation, not the system prompt"
     );
     // And the environment block is present exactly once, as the first user turn.
@@ -225,14 +279,18 @@ fn history_is_never_rewritten_by_a_later_turn() {
     // exactly the same bytes as they did at the start — no "已执行" annotations, no
     // reordering, no reformatting.
     let mut messages = vec![
-        Message::System { content: SYSTEM.into() },
+        Message::System {
+            content: SYSTEM.into(),
+        },
         Message::user_text("read a.rs"),
     ];
-    let baseline = serde_json::to_string(&body_of(&messages, &model, &provider)["messages"]).unwrap();
+    let baseline =
+        serde_json::to_string(&body_of(&messages, &model, &provider)["messages"]).unwrap();
     for turn in 0..4 {
         messages.push(mpi::llm::Message::assistant_text(format!("answer {turn}")));
         messages.push(mpi::llm::Message::user_text(format!("question {turn}")));
-        let now = serde_json::to_string(&body_of(&messages, &model, &provider)["messages"]).unwrap();
+        let now =
+            serde_json::to_string(&body_of(&messages, &model, &provider)["messages"]).unwrap();
         assert!(
             now.starts_with(baseline.trim_end_matches(']')),
             "turn {turn} rewrote the earlier history"
@@ -243,7 +301,12 @@ fn history_is_never_rewritten_by_a_later_turn() {
 #[test]
 fn openai_requests_carry_the_prompt_cache_key() {
     let (model, provider) = fixtures();
-    let messages = vec![Message::System { content: SYSTEM.into() }, Message::user_text("hi")];
+    let messages = vec![
+        Message::System {
+            content: SYSTEM.into(),
+        },
+        Message::user_text("hi"),
+    ];
     let body = body_of(&messages, &model, &provider);
     assert_eq!(body["prompt_cache_key"], "session-id");
     // The session id is also what pins a gateway's load balancer to one backend.
@@ -253,54 +316,119 @@ fn openai_requests_carry_the_prompt_cache_key() {
 #[test]
 fn summary_requests_keep_the_prefix_without_reusing_the_main_cache_key() {
     use mpi::agent::compact::{SummaryRequest, prepare_summary};
-    use mpi::llm::{StopReason, responses, client::summary_request_body};
+    use mpi::llm::{StopReason, client::summary_request_body, responses};
     let (model, provider) = fixtures();
     let tools = tools();
     let prefix = vec![
         Message::user_text("第一项任务"),
-        Message::Assistant { content:vec![
-            Block::Thinking { thinking:"保留这段原始推理".into(), signature:None },
-            Block::ToolCall { id:"c1".into(), name:"read".into(), arguments:serde_json::json!({"path":"a.rs"}) },
-        ], stop_reason:Some(StopReason::ToolUse) },
-        Message::Tool { status: ToolStatus::Success, tool_call_id:"c1".into(), name:"read".into(), content:"原始文件内容".into() },
+        Message::Assistant {
+            content: vec![
+                Block::Thinking {
+                    thinking: "保留这段原始推理".into(),
+                    signature: None,
+                },
+                Block::ToolCall {
+                    id: "c1".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({"path":"a.rs"}),
+                },
+            ],
+            stop_reason: Some(StopReason::ToolUse),
+        },
+        Message::Tool {
+            status: ToolStatus::Success,
+            tool_call_id: "c1".into(),
+            name: "read".into(),
+            content: "原始文件内容".into(),
+        },
     ];
     let original = prefix.clone();
-    let mut full_history = vec![Message::System { content:SYSTEM.into() }];
+    let mut full_history = vec![Message::System {
+        content: SYSTEM.into(),
+    }];
     full_history.extend(prefix.clone());
     full_history.push(Message::assistant_text("已完成"));
     full_history.push(Message::user_text("最近任务"));
     for api in ["completions", "messages", "responses"] {
-        let provider = Provider { api:api.into(), ..provider.clone() };
+        let provider = Provider {
+            api: api.into(),
+            ..provider.clone()
+        };
         let settings = SummaryRequest {
-            provider:&provider, model:&model, tools:&tools, level:"max", session_id:"session-id",
-            system_prompt:Some(SYSTEM), custom_instructions:Some("保留待办"),
+            provider: &provider,
+            model: &model,
+            tools: &tools,
+            level: "max",
+            session_id: "session-id",
+            system_prompt: Some(SYSTEM),
+            custom_instructions: Some("保留待办"),
         };
         let prepared = prepare_summary(&settings, &prefix, true).unwrap();
         assert!(prepared.reuses_history_prefix);
         assert_eq!(&prepared.messages[1..1 + prefix.len()], prefix.as_slice());
-        assert!(prepared.messages.last().unwrap().text().contains("保留待办"));
+        assert!(
+            prepared
+                .messages
+                .last()
+                .unwrap()
+                .text()
+                .contains("保留待办")
+        );
         let request = prepared.request(&settings);
         let summary = serde_json::to_value(summary_request_body(&request).unwrap()).unwrap();
-        let normal = Request { model:&model, messages:&full_history, ..request };
+        let normal = Request {
+            model: &model,
+            messages: &full_history,
+            ..request
+        };
         let (normal, messages_key, system_key) = match api {
-            "completions" => (serde_json::to_value(openai::build_request(&normal, true)).unwrap(), "messages", "unused"),
-            "messages" => (serde_json::to_value(anthropic::build_request(&normal)).unwrap(), "messages", "system"),
-            _ => (serde_json::to_value(responses::build_request(&normal, true)).unwrap(), "input", "instructions"),
+            "completions" => (
+                serde_json::to_value(openai::build_request(&normal, true)).unwrap(),
+                "messages",
+                "unused",
+            ),
+            "messages" => (
+                serde_json::to_value(anthropic::build_request(&normal)).unwrap(),
+                "messages",
+                "system",
+            ),
+            _ => (
+                serde_json::to_value(responses::build_request(&normal, true)).unwrap(),
+                "input",
+                "instructions",
+            ),
         };
         assert_eq!(normal["tools"], summary["tools"], "{api}: tools changed");
-        assert_eq!(normal[system_key], summary[system_key], "{api}: system changed");
+        assert_eq!(
+            normal[system_key], summary[system_key],
+            "{api}: system changed"
+        );
         let summary_messages = summary[messages_key].as_array().unwrap();
         let main_messages = normal[messages_key].as_array().unwrap();
-        assert_eq!(&summary_messages[..summary_messages.len() - 1], &main_messages[..summary_messages.len() - 1], "{api}: history prefix changed");
+        assert_eq!(
+            &summary_messages[..summary_messages.len() - 1],
+            &main_messages[..summary_messages.len() - 1],
+            "{api}: history prefix changed"
+        );
         assert!(summary.get("prompt_cache_key").is_none());
-        assert_eq!(summary["tool_choice"], if api == "messages" { serde_json::json!({"type":"none"}) } else { serde_json::json!("none") });
+        assert_eq!(
+            summary["tool_choice"],
+            if api == "messages" {
+                serde_json::json!({"type":"none"})
+            } else {
+                serde_json::json!("none")
+            }
+        );
         if api == "completions" {
             assert_eq!(normal["thinking"], summary["thinking"]);
             assert_eq!(normal["reasoning_effort"], summary["reasoning_effort"]);
         }
         assert_eq!(summary["stream"], false);
     }
-    assert_eq!(prefix, original, "summary planning rewrote the source history");
+    assert_eq!(
+        prefix, original,
+        "summary planning rewrote the source history"
+    );
 }
 
 #[test]
@@ -313,7 +441,9 @@ fn anthropic_puts_breakpoints_on_system_tools_and_the_last_block() {
     let (provider, model) = config.find("a/claude").unwrap();
     let tools = tools();
     let messages = vec![
-        Message::System { content: SYSTEM.into() },
+        Message::System {
+            content: SYSTEM.into(),
+        },
         Message::user_text("hi"),
     ];
     let request = Request {
@@ -358,10 +488,16 @@ fn the_tool_block_is_identical_across_anthropic_turns() {
             session_id: "s",
             cache_hints: true,
         };
-        serde_json::to_string(&serde_json::to_value(anthropic::build_request(&request)).unwrap()["tools"])
-            .unwrap()
+        serde_json::to_string(
+            &serde_json::to_value(anthropic::build_request(&request)).unwrap()["tools"],
+        )
+        .unwrap()
     };
     let short = vec![Message::user_text("one")];
-    let longer = vec![Message::user_text("one"), Message::assistant_text("two"), Message::user_text("three")];
+    let longer = vec![
+        Message::user_text("one"),
+        Message::assistant_text("two"),
+        Message::user_text("three"),
+    ];
     assert_eq!(render(&short), render(&longer));
 }

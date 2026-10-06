@@ -16,7 +16,9 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::agent::compact::{self, CompactError, CompactionState, Reason, RetryBudget, SummaryRequest};
+use crate::agent::compact::{
+    self, CompactError, CompactionState, Reason, RetryBudget, SummaryRequest,
+};
 use crate::agent::session::Session;
 use crate::auth::guard::PermissionGate;
 use crate::auth::policy;
@@ -184,7 +186,10 @@ impl Agent {
         // is, is not — the file is one `read` away if that matters.
         if let Some((path, _)) = &agents {
             screen.push_lines(ui_compact::note_lines(
-                &format!("系统提示词：{}", util::shorten_home(path, dirs::home_dir().as_deref())),
+                &format!(
+                    "系统提示词：{}",
+                    util::shorten_home(path, dirs::home_dir().as_deref())
+                ),
                 crate::ui::screen::Style::new(Color::Dim),
             ));
         }
@@ -211,7 +216,12 @@ impl Agent {
     }
 
     /// Resume an existing session file.
-    pub fn resume(config: Config, cwd: PathBuf, path: &Path, interactive: bool) -> anyhow::Result<Self> {
+    pub fn resume(
+        config: Config,
+        cwd: PathBuf,
+        path: &Path,
+        interactive: bool,
+    ) -> anyhow::Result<Self> {
         let mut session = Session::open(path)?;
         let (model_spec, level) = restored_selection(&config, &session)?;
         let dialect = policy::configured_dialect(&config.shell.path);
@@ -250,7 +260,9 @@ impl Agent {
         // it, so running the tools somewhere else would make the transcript lie about where
         // it is. The header records where the session *started*, which is not the same thing
         // once it has been resumed elsewhere.
-        let recorded = session.current_cwd().unwrap_or_else(|| PathBuf::from(&session.header().cwd));
+        let recorded = session
+            .current_cwd()
+            .unwrap_or_else(|| PathBuf::from(&session.header().cwd));
         if recorded == cwd {
             // Same directory as before: nothing to say and nothing to write.
         } else {
@@ -314,9 +326,7 @@ impl Agent {
         self.deleted = false;
         self.system_prompt = system_prompt_from(&self.cwd);
         self.screen.clear_transcript();
-        for block in
-            ui_compact::replay_blocks(&self.session.context_messages())
-        {
+        for block in ui_compact::replay_blocks(&self.session.context_messages()) {
             self.screen.push(block);
         }
         self.screen.seed_history(self.session.user_history());
@@ -401,7 +411,8 @@ impl Agent {
         self.screen.set_footer_state(state);
         // The session name and directory both live in the footer, so the window title is
         // refreshed wherever the footer is — including a session switch.
-        self.screen.set_title(self.session.name().as_deref(), &self.cwd);
+        self.screen
+            .set_title(self.session.name().as_deref(), &self.cwd);
         self.screen.render();
     }
 
@@ -420,7 +431,7 @@ impl Agent {
 ///
 /// Submitted messages wait for a balanced tool/result boundary; commands wait for idle.
 ///
-    /// Returns `true` when the caller must stop the turn: Esc is the one action that changes what
+/// Returns `true` when the caller must stop the turn: Esc is the one action that changes what
 /// the running turn is doing, and it has to be acted on by whoever owns the request.
 fn on_turn_action(screen: &mut Screen, action: crate::ui::screen::Action) -> bool {
     use crate::ui::screen::Action;
@@ -640,7 +651,10 @@ mod tests {
         let (path, text) = load_agents_md(&nested).expect("the root file is found");
         assert_eq!(path, root.join("AGENTS.md"));
         assert!(text.contains("根目录规则"));
-        assert!(!text.contains("内层规则"), "a nested file must not be read: {text:?}");
+        assert!(
+            !text.contains("内层规则"),
+            "a nested file must not be read: {text:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -656,7 +670,10 @@ mod tests {
         std::fs::create_dir_all(&project).unwrap();
         std::fs::write(outer.join("AGENTS.md"), "外部注入").unwrap();
         // No `.git` under the project: the root is the working directory itself.
-        assert!(load_agents_md(&project).is_none(), "the outer file must be ignored");
+        assert!(
+            load_agents_md(&project).is_none(),
+            "the outer file must be ignored"
+        );
 
         // With a `.git`, the root is the project, and the outer file is still ignored.
         std::fs::create_dir(project.join(".git")).unwrap();
@@ -721,9 +738,14 @@ mod tests {
     fn the_dialect_comes_from_the_configured_shell() {
         let mut config = Config::default();
         config.shell.path = "/usr/bin/zsh".into();
-        assert_eq!(policy::configured_dialect(&config.shell.path), policy::Dialect::Zsh);
+        assert_eq!(
+            policy::configured_dialect(&config.shell.path),
+            policy::Dialect::Zsh
+        );
         config.shell.path = "/bin/bash".into();
-        assert_eq!(policy::configured_dialect(&config.shell.path), policy::Dialect::Bash);
+        assert_eq!(
+            policy::configured_dialect(&config.shell.path),
+            policy::Dialect::Bash
+        );
     }
-
 }

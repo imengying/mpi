@@ -109,7 +109,10 @@ pub fn parse_literal_commands(command: &str) -> Result<Vec<Segment>, String> {
     macro_rules! flush_word {
         () => {{
             if started {
-                words.push(Word { value: std::mem::take(&mut word), quoted: quoted_start });
+                words.push(Word {
+                    value: std::mem::take(&mut word),
+                    quoted: quoted_start,
+                });
             }
             word.clear();
             started = false;
@@ -290,7 +293,9 @@ pub fn parse_literal_commands(command: &str) -> Result<Vec<Segment>, String> {
 /// `sed 's/a/b/'` and friends rewrite their input rather than showing it, which is a different
 /// kind of operation from reading a file, so only the print form is recognised here.
 pub(crate) fn is_line_range_print(script: &str) -> bool {
-    let Some(body) = script.strip_suffix('p') else { return false };
+    let Some(body) = script.strip_suffix('p') else {
+        return false;
+    };
     if body.is_empty() {
         return true; // bare `p`
     }

@@ -38,7 +38,10 @@ pub struct PermissionGate {
 
 impl PermissionGate {
     pub fn new(interactive: bool, dialect: Dialect) -> Self {
-        PermissionGate { interactive, dialect }
+        PermissionGate {
+            interactive,
+            dialect,
+        }
     }
 
     /// Return the exact arguments that may execute. No cached approval can be replayed.
@@ -57,9 +60,11 @@ impl PermissionGate {
                 Ok(approved)
             }
             Assessment::Ask { reason } => {
-                if self.interactive && auth_panel::ask(PanelRequest {
-                    body: format!("{reason}\n\n{}", panel_body(tool, input)),
-                }) == auth_panel::Decision::Allow {
+                if self.interactive
+                    && auth_panel::ask(PanelRequest {
+                        body: format!("{reason}\n\n{}", panel_body(tool, input)),
+                    }) == auth_panel::Decision::Allow
+                {
                     Ok(input.clone())
                 } else {
                     Err(Refusal { reason })
@@ -67,7 +72,6 @@ impl PermissionGate {
             }
         }
     }
-
 }
 
 /// What the panel shows: the command itself for `bash`, the resolved arguments for the
@@ -129,5 +133,4 @@ mod tests {
         let body = panel_body("write", &write);
         assert!(body.contains("\"path\": \"a.txt\""));
     }
-
 }

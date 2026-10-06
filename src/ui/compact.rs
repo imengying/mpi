@@ -88,7 +88,10 @@ pub fn tool_block(
 
     match &output.display {
         Display::Command { footer, .. } => {
-            let command = arguments.get("command").and_then(|v| v.as_str()).unwrap_or(name);
+            let command = arguments
+                .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or(name);
             lines.extend(command_header(&mark_span, command));
             // A header with no result under it is a complete statement — "this command, no
             // output" — so the blank separator only appears when something follows.
@@ -151,7 +154,10 @@ pub fn tool_block(
             lines.extend(plain_text_lines(body, Style::new(Color::Output)));
         }
         Display::None => {
-            lines.push(Line::spans(vec![mark_span.clone(), Span::plain(format!(" {name}"))]));
+            lines.push(Line::spans(vec![
+                mark_span.clone(),
+                Span::plain(format!(" {name}")),
+            ]));
             lines.extend(plain_text_lines(body, Style::plain()));
         }
     }
@@ -208,7 +214,13 @@ fn plain_text_lines(text: &str, style: Style) -> Vec<Line> {
 /// line plus a note, because printing the whole body would defeat collapsing.
 pub fn command_header(mark: &Span, command: &str) -> Vec<Line> {
     let mut spans = vec![
-        Span::new(mark.text.clone(), Style { bold: true, ..mark.style }),
+        Span::new(
+            mark.text.clone(),
+            Style {
+                bold: true,
+                ..mark.style
+            },
+        ),
         Span::plain(" "),
         Span::new("$ ", Style::new(Color::Magenta)),
     ];
@@ -272,7 +284,9 @@ pub fn replay_blocks(messages: &[crate::llm::Message]) -> Vec<crate::ui::screen:
         match message {
             Message::User { content } => {
                 let text = message.text();
-                if text.trim().is_empty() && content.iter().all(|b| !matches!(b, MsgBlock::Text { .. })) {
+                if text.trim().is_empty()
+                    && content.iter().all(|b| !matches!(b, MsgBlock::Text { .. }))
+                {
                     continue;
                 }
                 if !text.trim().is_empty() {
@@ -284,17 +298,31 @@ pub fn replay_blocks(messages: &[crate::llm::Message]) -> Vec<crate::ui::screen:
                     }
                 }
             }
-            Message::Assistant { content, stop_reason } => {
+            Message::Assistant {
+                content,
+                stop_reason,
+            } => {
                 // Call ids may be reused in later responses. Pair only this response's results.
-                let results: std::collections::HashMap<_, _> = messages[index + 1..].iter()
+                let results: std::collections::HashMap<_, _> = messages[index + 1..]
+                    .iter()
                     .take_while(|message| matches!(message, Message::Tool { .. }))
                     .filter_map(|message| match message {
-                        Message::Tool { tool_call_id, content, status, .. } => Some((tool_call_id.as_str(), (content.as_str(), *status))),
+                        Message::Tool {
+                            tool_call_id,
+                            content,
+                            status,
+                            ..
+                        } => Some((tool_call_id.as_str(), (content.as_str(), *status))),
                         _ => None,
-                    }).collect();
+                    })
+                    .collect();
                 let mut lines: Vec<Line> = Vec::new();
-                let had_thinking = content.iter().any(|b| matches!(b, MsgBlock::Thinking { .. }));
-                if had_thinking { push_lines(&mut out, thinking_done_lines()); }
+                let had_thinking = content
+                    .iter()
+                    .any(|b| matches!(b, MsgBlock::Thinking { .. }));
+                if had_thinking {
+                    push_lines(&mut out, thinking_done_lines());
+                }
                 let stopped = *stop_reason == Some(crate::llm::StopReason::Aborted);
                 // Said once, on the first hosted call or citation, not once per result.
                 let mut announced_search = false;
@@ -302,13 +330,22 @@ pub fn replay_blocks(messages: &[crate::llm::Message]) -> Vec<crate::ui::screen:
                     match block {
                         MsgBlock::Text { text } => {
                             push_lines(&mut out, std::mem::take(&mut lines));
-                            if !text.trim().is_empty() { out.push(Block::markdown(text)); }
+                            if !text.trim().is_empty() {
+                                out.push(Block::markdown(text));
+                            }
                         }
-                        MsgBlock::ToolCall { id, name, arguments } => {
+                        MsgBlock::ToolCall {
+                            id,
+                            name,
+                            arguments,
+                        } => {
                             if !lines.is_empty() {
                                 push_lines(&mut out, std::mem::take(&mut lines));
                             }
-                            let (content, status) = results.get(id.as_str()).copied().unwrap_or(("", crate::llm::ToolStatus::Unknown));
+                            let (content, status) = results
+                                .get(id.as_str())
+                                .copied()
+                                .unwrap_or(("", crate::llm::ToolStatus::Unknown));
                             // A tool call keeps its own block, so the output is collapsed
                             // on resume exactly as it was when it ran. The status comes from
                             // the record, which is what keeps a call the user stopped from
@@ -319,13 +356,19 @@ pub fn replay_blocks(messages: &[crate::llm::Message]) -> Vec<crate::ui::screen:
                         MsgBlock::Hosted { .. } => {
                             if !announced_search {
                                 announced_search = true;
-                                lines.push(Line::new("搜索了网页".to_string(), Style::new(Color::Dim)));
+                                lines.push(Line::new(
+                                    "搜索了网页".to_string(),
+                                    Style::new(Color::Dim),
+                                ));
                             }
                         }
                         MsgBlock::Citation { url, title } => {
                             if !announced_search {
                                 announced_search = true;
-                                lines.push(Line::new("搜索了网页".to_string(), Style::new(Color::Dim)));
+                                lines.push(Line::new(
+                                    "搜索了网页".to_string(),
+                                    Style::new(Color::Dim),
+                                ));
                             }
                             lines.push(Line::new(
                                 crate::llm::citation_line(title, url),
@@ -405,14 +448,21 @@ pub fn running_line(name: &str, arguments: &serde_json::Value) -> Vec<Span> {
     let header = Span::new(mark, style);
     match &display {
         Display::Command { .. } => {
-            let command = arguments.get("command").and_then(|v| v.as_str()).unwrap_or(name);
+            let command = arguments
+                .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or(name);
             // A multi-line command collapses to its first line here too, so the running row
             // and the finished header are the same shape.
             let header_line = command_header(&header, command);
-            header_line.into_iter().next().map(|line| line.spans).unwrap_or_default()
+            header_line
+                .into_iter()
+                .next()
+                .map(|line| line.spans)
+                .unwrap_or_default()
         }
         Display::File { verb, path } => {
-                    vec![
+            vec![
                 header,
                 Span::plain(" "),
                 Span::new(*verb, Style::plain()),
@@ -431,11 +481,11 @@ pub fn running_line(name: &str, arguments: &serde_json::Value) -> Vec<Span> {
 /// function never drops or rewrites a byte of the command.
 pub fn highlight_spans(line: &str) -> Vec<Span> {
     const KEYWORDS: [&str; 47] = [
-        "if", "then", "else", "elif", "fi", "for", "while", "do", "done", "case", "esac",
-        "in", "function", "return", "echo", "cd", "export", "source", "set", "unset",
-        "local", "readonly", "shift", "trap", "exit", "test", "git", "cargo", "rg", "fd",
-        "grep", "find", "sed", "awk", "cat", "ls", "rm", "mv", "cp", "mkdir", "touch",
-        "npm", "bun", "node", "python3", "curl", "wget",
+        "if", "then", "else", "elif", "fi", "for", "while", "do", "done", "case", "esac", "in",
+        "function", "return", "echo", "cd", "export", "source", "set", "unset", "local",
+        "readonly", "shift", "trap", "exit", "test", "git", "cargo", "rg", "fd", "grep", "find",
+        "sed", "awk", "cat", "ls", "rm", "mv", "cp", "mkdir", "touch", "npm", "bun", "node",
+        "python3", "curl", "wget",
     ];
     let mut spans: Vec<Span> = Vec::new();
     let mut word = String::new();
@@ -524,18 +574,34 @@ mod tests {
         use crate::llm::{Block as MsgBlock, Message, StopReason, ToolStatus};
         let call = || Message::Assistant {
             content: vec![MsgBlock::ToolCall {
-                id: "same".into(), name: "read".into(), arguments: serde_json::json!({"path":"a.rs"}),
-            }], stop_reason: Some(StopReason::ToolUse),
+                id: "same".into(),
+                name: "read".into(),
+                arguments: serde_json::json!({"path":"a.rs"}),
+            }],
+            stop_reason: Some(StopReason::ToolUse),
         };
         let messages = vec![
             call(),
-            Message::Tool { tool_call_id:"same".into(), name:"read".into(), content:"original data".into(), status:ToolStatus::Success },
+            Message::Tool {
+                tool_call_id: "same".into(),
+                name: "read".into(),
+                content: "original data".into(),
+                status: ToolStatus::Success,
+            },
             Message::user_text("再读一次"),
             call(),
-            Message::Tool { tool_call_id:"same".into(), name:"read".into(), content:"read failed".into(), status:ToolStatus::Error },
+            Message::Tool {
+                tool_call_id: "same".into(),
+                name: "read".into(),
+                content: "read failed".into(),
+                status: ToolStatus::Error,
+            },
         ];
         crate::llm::validate_tool_history(&messages).unwrap();
-        let rendered: Vec<_> = replay_blocks(&messages).iter().map(|block| plain(&block.render(80)).join("\n")).collect();
+        let rendered: Vec<_> = replay_blocks(&messages)
+            .iter()
+            .map(|block| plain(&block.render(80)).join("\n"))
+            .collect();
         assert!(rendered[0].contains("✓ 读取 a.rs"), "{}", rendered[0]);
         assert!(rendered[0].contains("original data"));
         assert!(!rendered[0].contains("read failed"));
@@ -543,9 +609,8 @@ mod tests {
         assert!(last.contains("× 读取 a.rs"), "{last}");
         assert!(last.contains("read failed"));
     }
-    use crate::ui::screen::Bg;
     use crate::ui::plain;
-
+    use crate::ui::screen::Bg;
 
     #[test]
     fn a_stopped_answer_says_so_when_it_is_replayed() {
@@ -553,7 +618,9 @@ mod tests {
         // Without the marker a resumed session shows a truncated reply with nothing to
         // explain it: the user cannot tell "I pressed Esc" from "the model trailed off".
         let stopped = vec![Message::Assistant {
-            content: vec![MsgBlock::Text { text: "说到一半".into() }],
+            content: vec![MsgBlock::Text {
+                text: "说到一半".into(),
+            }],
             stop_reason: Some(StopReason::Aborted),
         }];
         let text: String = replay_blocks(&stopped)
@@ -566,7 +633,9 @@ mod tests {
 
         // A normal answer carries no such note.
         let finished = vec![Message::Assistant {
-            content: vec![MsgBlock::Text { text: "说完了".into() }],
+            content: vec![MsgBlock::Text {
+                text: "说完了".into(),
+            }],
             stop_reason: Some(StopReason::Stop),
         }];
         let text: String = replay_blocks(&finished)
@@ -588,7 +657,10 @@ mod tests {
             Message::user_text("跑一下 echo"),
             Message::Assistant {
                 content: vec![
-                    MsgBlock::Thinking { thinking: "先跑命令".into(), signature: None },
+                    MsgBlock::Thinking {
+                        thinking: "先跑命令".into(),
+                        signature: None,
+                    },
                     MsgBlock::ToolCall {
                         id: "c1".into(),
                         name: "bash".into(),
@@ -604,19 +676,35 @@ mod tests {
                 content: "hi\n".into(),
             },
             Message::Assistant {
-                content: vec![MsgBlock::Text { text: "输出是 hi".into() }],
+                content: vec![MsgBlock::Text {
+                    text: "输出是 hi".into(),
+                }],
                 stop_reason: Some(StopReason::Stop),
             },
         ];
-        let blocks: Vec<Vec<String>> =
-            replay_blocks(&messages).iter().map(|block| plain(&block.render(80))).collect();
+        let blocks: Vec<Vec<String>> = replay_blocks(&messages)
+            .iter()
+            .map(|block| plain(&block.render(80)))
+            .collect();
         let text = blocks.join(&"".to_string()).join("\n");
 
         assert!(text.contains("› 跑一下 echo"), "{text}");
-        assert!(text.contains("✓ $ echo hi"), "the command must come back: {text}");
-        assert!(text.contains("hi"), "the command's output must come back: {text}");
-        assert!(text.contains("输出是 hi"), "the answer must come back: {text}");
-        assert!(text.contains("思考完成"), "thinking stays collapsed: {text}");
+        assert!(
+            text.contains("✓ $ echo hi"),
+            "the command must come back: {text}"
+        );
+        assert!(
+            text.contains("hi"),
+            "the command's output must come back: {text}"
+        );
+        assert!(
+            text.contains("输出是 hi"),
+            "the answer must come back: {text}"
+        );
+        assert!(
+            text.contains("思考完成"),
+            "thinking stays collapsed: {text}"
+        );
         // The environment block is bookkeeping, not something the user said.
         assert!(!text.contains("<environment>"), "{text}");
     }
@@ -645,12 +733,16 @@ mod tests {
                 content: model_facing.into(),
             },
             Message::Assistant {
-                content: vec![MsgBlock::Text { text: "说到一半".into() }],
+                content: vec![MsgBlock::Text {
+                    text: "说到一半".into(),
+                }],
                 stop_reason: Some(StopReason::Aborted),
             },
         ];
-        let blocks: Vec<Vec<String>> =
-            replay_blocks(&messages).iter().map(|block| plain(&block.render(80))).collect();
+        let blocks: Vec<Vec<String>> = replay_blocks(&messages)
+            .iter()
+            .map(|block| plain(&block.render(80)))
+            .collect();
         let text = blocks.join(&"".to_string()).join("\n");
         assert!(text.contains("⊘ $ sleep 30"), "{text}");
         assert!(!text.contains("可能已有部分效果"), "{text}");
@@ -665,7 +757,10 @@ mod tests {
         // turn that involved thinking, which is most of them.
         let lines = thinking_done_lines();
         assert_eq!(lines.len(), 1, "the marker is one row: {lines:?}");
-        assert!(!lines.last().unwrap().is_empty(), "and that row has text in it");
+        assert!(
+            !lines.last().unwrap().is_empty(),
+            "and that row has text in it"
+        );
     }
 
     #[test]
@@ -688,17 +783,22 @@ mod tests {
         assert!(!text.iter().any(|line| line.contains("耗时")), "{text:?}");
     }
 
-
-
     #[test]
     fn a_command_result_collapses_to_its_tail() {
         let output = ToolOutput {
             content: (0..20).map(|i| format!("row {i}\n")).collect(),
-            display: Display::Command { footer: vec!["耗时 0.4s".into()] },
+            display: Display::Command {
+                footer: vec!["耗时 0.4s".into()],
+            },
             is_error: false,
             duration: None,
         };
-        let block = tool_block("bash", &serde_json::json!({"command": "ls -l"}), &output, ToolStatus::Success);
+        let block = tool_block(
+            "bash",
+            &serde_json::json!({"command": "ls -l"}),
+            &output,
+            ToolStatus::Success,
+        );
         assert!(block.is_collapsible());
         let text = plain(&block.render(80));
         assert!(text[0].starts_with("✓ "), "{text:?}");
@@ -723,9 +823,20 @@ mod tests {
             &serde_json::json!({"command": "sleep 30"}),
             model_facing,
         );
-        let text = plain(&tool_block("bash", &serde_json::json!({"command": "sleep 30"}), &output, ToolStatus::Cancelled).render(80));
+        let text = plain(
+            &tool_block(
+                "bash",
+                &serde_json::json!({"command": "sleep 30"}),
+                &output,
+                ToolStatus::Cancelled,
+            )
+            .render(80),
+        );
         assert_eq!(text, vec!["⊘ $ sleep 30"], "{text:?}");
-        assert!(!text.iter().any(|line| line.contains("检查实际状态")), "{text:?}");
+        assert!(
+            !text.iter().any(|line| line.contains("检查实际状态")),
+            "{text:?}"
+        );
 
         // A refused or failed call is the opposite case: the text *is* the result, and it is
         // the only record of why the call did nothing.
@@ -734,9 +845,20 @@ mod tests {
             &serde_json::json!({"command": "rm -rf /"}),
             "未获得用户授权，操作未执行（命令会删除文件，需要确认目标）",
         );
-        let text = plain(&tool_block("bash", &serde_json::json!({"command": "rm -rf /"}), &refused, ToolStatus::Error).render(80));
+        let text = plain(
+            &tool_block(
+                "bash",
+                &serde_json::json!({"command": "rm -rf /"}),
+                &refused,
+                ToolStatus::Error,
+            )
+            .render(80),
+        );
         assert!(text[0].starts_with("× $ rm -rf /"), "{text:?}");
-        assert!(text.iter().any(|line| line.contains("需要确认目标")), "{text:?}");
+        assert!(
+            text.iter().any(|line| line.contains("需要确认目标")),
+            "{text:?}"
+        );
 
         // A call that was never started stores a note for the model too, and the mark says
         // the one thing the user needs: it produced no result.
@@ -745,7 +867,15 @@ mod tests {
             &serde_json::json!({"path": "src/main.rs"}),
             "用户停止了本轮，这个调用没有执行。",
         );
-        let text = plain(&tool_block("read", &serde_json::json!({"path": "src/main.rs"}), &skipped, ToolStatus::Skipped).render(80));
+        let text = plain(
+            &tool_block(
+                "read",
+                &serde_json::json!({"path": "src/main.rs"}),
+                &skipped,
+                ToolStatus::Skipped,
+            )
+            .render(80),
+        );
         assert_eq!(text, vec!["⊘ 读取 src/main.rs"], "{text:?}");
     }
 
@@ -756,12 +886,26 @@ mod tests {
         // copies belong where they are; the transcript is where they meet, so it shows one.
         let output = ToolOutput {
             content: "boom\n[退出码 3]\n".into(),
-            display: Display::Command { footer: vec!["退出码 3".into()] },
+            display: Display::Command {
+                footer: vec!["退出码 3".into()],
+            },
             is_error: true,
             duration: None,
         };
-        let text = plain(&tool_block("bash", &serde_json::json!({"command": "false"}), &output, ToolStatus::Error).render(80));
-        assert_eq!(text.iter().filter(|line| line.contains("退出码")).count(), 1, "{text:?}");
+        let text = plain(
+            &tool_block(
+                "bash",
+                &serde_json::json!({"command": "false"}),
+                &output,
+                ToolStatus::Error,
+            )
+            .render(80),
+        );
+        assert_eq!(
+            text.iter().filter(|line| line.contains("退出码")).count(),
+            1,
+            "{text:?}"
+        );
         assert!(text[0].starts_with("× $ false"), "{text:?}");
         assert_eq!(text.last().unwrap(), "[退出码 3]", "{text:?}");
 
@@ -775,17 +919,39 @@ mod tests {
             duration: None,
         }
         .budget();
-        let text = plain(&tool_block("bash", &serde_json::json!({"command": "seq"}), &output, ToolStatus::Success).render(80));
-        assert_eq!(text.iter().filter(|line| line.contains("完整输出")).count(), 1, "{text:?}");
+        let text = plain(
+            &tool_block(
+                "bash",
+                &serde_json::json!({"command": "seq"}),
+                &output,
+                ToolStatus::Success,
+            )
+            .render(80),
+        );
+        assert_eq!(
+            text.iter().filter(|line| line.contains("完整输出")).count(),
+            1,
+            "{text:?}"
+        );
 
         // A note the output never mentions is the only copy there is, so it stays.
         let output = ToolOutput {
             content: "done\n".into(),
-            display: Display::Command { footer: vec!["退出码 3".into()] },
+            display: Display::Command {
+                footer: vec!["退出码 3".into()],
+            },
             is_error: true,
             duration: None,
         };
-        let text = plain(&tool_block("bash", &serde_json::json!({"command": "false"}), &output, ToolStatus::Error).render(80));
+        let text = plain(
+            &tool_block(
+                "bash",
+                &serde_json::json!({"command": "false"}),
+                &output,
+                ToolStatus::Error,
+            )
+            .render(80),
+        );
         assert!(text.iter().any(|line| line == "退出码 3"), "{text:?}");
     }
 
@@ -795,7 +961,10 @@ mod tests {
         // outcome. Showing one while the command runs would say it succeeded before it did.
         let (style, mark) = running_mark();
         assert_eq!(mark, "●");
-        assert!(!style.bold, "a running mark is not a verdict, so it is not bold");
+        assert!(
+            !style.bold,
+            "a running mark is not a verdict, so it is not bold"
+        );
 
         // Settled calls keep the verdict marks.
         assert_eq!(status_mark(ToolStatus::Success).1, "✓");
@@ -814,7 +983,10 @@ mod tests {
         let line = running_line("bash", &serde_json::json!({"command": "ls -l\necho done"}));
         let text: String = line.iter().map(|span| span.text.as_str()).collect();
         assert!(text.starts_with("● $ ls -l"), "{text:?}");
-        assert!(!text.contains("echo done"), "only the first line is shown: {text:?}");
+        assert!(
+            !text.contains("echo done"),
+            "only the first line is shown: {text:?}"
+        );
     }
 
     #[test]
@@ -827,12 +999,25 @@ mod tests {
             is_error: false,
             duration: None,
         };
-        let block = tool_block("bash", &serde_json::json!({"command": "sleep 1"}), &output, ToolStatus::Success);
+        let block = tool_block(
+            "bash",
+            &serde_json::json!({"command": "sleep 1"}),
+            &output,
+            ToolStatus::Success,
+        );
         let text = plain(&block.render(80));
-        assert!(!text.iter().any(|line| line.contains("耗时")), "no time, no claim");
+        assert!(
+            !text.iter().any(|line| line.contains("耗时")),
+            "no time, no claim"
+        );
 
         output.duration = Some(std::time::Duration::from_millis(3400));
-        let block = tool_block("bash", &serde_json::json!({"command": "sleep 1"}), &output, ToolStatus::Success);
+        let block = tool_block(
+            "bash",
+            &serde_json::json!({"command": "sleep 1"}),
+            &output,
+            ToolStatus::Success,
+        );
         let text = plain(&block.render(80));
         assert!(text.iter().any(|line| line == "耗时 3.4s"), "{text:?}");
     }
@@ -852,13 +1037,26 @@ mod tests {
     fn a_failed_command_is_marked_and_reports_the_exit_code() {
         let output = ToolOutput {
             content: "boom\n[退出码 3]\n".into(),
-            display: Display::Command { footer: vec!["退出码 3".into()] },
+            display: Display::Command {
+                footer: vec!["退出码 3".into()],
+            },
             is_error: true,
             duration: None,
         };
-        let text = plain(&tool_block("bash", &serde_json::json!({"command": "false"}), &output, ToolStatus::Error).render(80));
+        let text = plain(
+            &tool_block(
+                "bash",
+                &serde_json::json!({"command": "false"}),
+                &output,
+                ToolStatus::Error,
+            )
+            .render(80),
+        );
         assert!(text[0].starts_with("× "), "{text:?}");
-        assert!(text.iter().any(|line| line.contains("退出码 3")), "{text:?}");
+        assert!(
+            text.iter().any(|line| line.contains("退出码 3")),
+            "{text:?}"
+        );
     }
 
     #[test]
@@ -882,7 +1080,10 @@ mod tests {
             "no-keywords-here --flag=value",
             "trailing-text",
         ] {
-            let joined: String = highlight_spans(command).iter().map(|s| s.text.as_str()).collect();
+            let joined: String = highlight_spans(command)
+                .iter()
+                .map(|s| s.text.as_str())
+                .collect();
             assert_eq!(joined, command, "highlighting changed {command:?}");
         }
     }
@@ -892,7 +1093,11 @@ mod tests {
         let spans = highlight_spans("git log # why");
         assert_eq!(spans[0].text, "git");
         assert_eq!(spans[0].style.fg, Color::Output);
-        assert!(spans.iter().any(|s| s.text == "# why" && s.style.fg == Color::Dim));
+        assert!(
+            spans
+                .iter()
+                .any(|s| s.text == "# why" && s.style.fg == Color::Dim)
+        );
     }
 
     #[test]
@@ -903,13 +1108,24 @@ mod tests {
             is_error: false,
             duration: None,
         };
-        let block = tool_block("edit", &serde_json::json!({"path": "a.rs"}), &output, ToolStatus::Success);
+        let block = tool_block(
+            "edit",
+            &serde_json::json!({"path": "a.rs"}),
+            &output,
+            ToolStatus::Success,
+        );
         // The header and the +/- summary stay visible when collapsed.
         let collapsed = plain(&block.render(80));
         assert!(collapsed[0].contains("修改 a.rs"), "{collapsed:?}");
-        assert!(collapsed[1].contains("+1") && collapsed[1].contains("−1"), "{collapsed:?}");
+        assert!(
+            collapsed[1].contains("+1") && collapsed[1].contains("−1"),
+            "{collapsed:?}"
+        );
         // A diff this small fits the preview, so nothing is hidden and there is no note.
-        assert!(!collapsed.iter().any(|line| line.contains("已收起")), "{collapsed:?}");
+        assert!(
+            !collapsed.iter().any(|line| line.contains("已收起")),
+            "{collapsed:?}"
+        );
         // Rows carry the codex tints. The row text is `-    2 │ two`, so match on the payload.
         let painted = block.render(80);
         let removed = painted
@@ -936,13 +1152,30 @@ mod tests {
             is_error: false,
             duration: None,
         };
-        let text = plain(&tool_block("edit", &serde_json::json!({"path": "big.rs"}), &output, ToolStatus::Success).render(80));
+        let text = plain(
+            &tool_block(
+                "edit",
+                &serde_json::json!({"path": "big.rs"}),
+                &output,
+                ToolStatus::Success,
+            )
+            .render(80),
+        );
         // The header and the counts are the first two rows, and real changed rows follow —
         // not a sentence standing in for them.
         assert!(text[0].contains("修改 big.rs"), "{text:?}");
-        assert!(text[1].contains("+40") && text[1].contains("−40"), "{text:?}");
-        assert!(text[2..].iter().any(|line| line.contains("old 0")), "{text:?}");
-        assert!(text[2..].iter().any(|line| line.contains("new 39")), "{text:?}");
+        assert!(
+            text[1].contains("+40") && text[1].contains("−40"),
+            "{text:?}"
+        );
+        assert!(
+            text[2..].iter().any(|line| line.contains("old 0")),
+            "{text:?}"
+        );
+        assert!(
+            text[2..].iter().any(|line| line.contains("new 39")),
+            "{text:?}"
+        );
         assert!(!text.iter().any(|line| line.contains("收起")), "{text:?}");
     }
 
@@ -950,14 +1183,25 @@ mod tests {
     fn a_file_result_shows_a_header_and_a_short_preview() {
         let output = ToolOutput {
             content: (0..20).map(|i| format!("entry {i}\n")).collect(),
-            display: Display::File { verb: "列出", path: "src".into() },
+            display: Display::File {
+                verb: "列出",
+                path: "src".into(),
+            },
             is_error: false,
             duration: None,
         };
-        let text = plain(&tool_block("ls", &serde_json::json!({}), &output, ToolStatus::Success).render(120));
-        assert!(text.iter().any(|line| line.contains("列出 src")), "{text:?}");
+        let text = plain(
+            &tool_block("ls", &serde_json::json!({}), &output, ToolStatus::Success).render(120),
+        );
+        assert!(
+            text.iter().any(|line| line.contains("列出 src")),
+            "{text:?}"
+        );
         // The tail of the listing is what survives, with nothing announcing the cut.
-        assert!(text.iter().any(|line| line.contains("entry 19")), "{text:?}");
+        assert!(
+            text.iter().any(|line| line.contains("entry 19")),
+            "{text:?}"
+        );
         assert!(!text.iter().any(|line| line.contains("收起")), "{text:?}");
     }
 
@@ -978,19 +1222,33 @@ mod tests {
             is_error: false,
             duration: None,
         };
-        let text = plain(&tool_block("read", &serde_json::json!({}), &output, ToolStatus::Success).render(80));
-        assert!(text.iter().all(|line| !line.contains('\u{1b}') && !line.contains('\u{7}')));
+        let text = plain(
+            &tool_block("read", &serde_json::json!({}), &output, ToolStatus::Success).render(80),
+        );
+        assert!(
+            text.iter()
+                .all(|line| !line.contains('\u{1b}') && !line.contains('\u{7}'))
+        );
     }
 
     #[test]
     fn every_line_contains_no_escape_sequences() {
         let output = ToolOutput {
             content: "ok\n".into(),
-            display: Display::Command { footer: vec!["退出码 1".into()] },
+            display: Display::Command {
+                footer: vec!["退出码 1".into()],
+            },
             is_error: true,
             duration: None,
         };
-        for line in tool_block("bash", &serde_json::json!({"command": "false"}), &output, ToolStatus::Error).render(60) {
+        for line in tool_block(
+            "bash",
+            &serde_json::json!({"command": "false"}),
+            &output,
+            ToolStatus::Error,
+        )
+        .render(60)
+        {
             assert!(!line.text().contains('\u{1b}'), "{line:?}");
         }
     }

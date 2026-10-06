@@ -59,7 +59,10 @@ async fn execute_with_engine(
     if pattern.is_empty() {
         return Err("pattern 不能为空".into());
     }
-    let target = arguments.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+    let target = arguments
+        .get("path")
+        .and_then(|v| v.as_str())
+        .unwrap_or(".");
     let target_path = crate::auth::policy::resolve_tool_path(target, cwd);
     if !target_path.exists() {
         return Err(format!("路径不存在：{target}"));
@@ -68,8 +71,14 @@ async fn execute_with_engine(
         && crate::auth::policy::assess_path(crate::auth::policy::Operation::Read, target, cwd)
             .allows();
     let glob = arguments.get("glob").and_then(|v| v.as_str());
-    let ignore_case = arguments.get("ignore_case").and_then(|v| v.as_bool()).unwrap_or(false);
-    let fixed = arguments.get("fixed_strings").and_then(|v| v.as_bool()).unwrap_or(false);
+    let ignore_case = arguments
+        .get("ignore_case")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let fixed = arguments
+        .get("fixed_strings")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let context = crate::tools::optional_u64(arguments, "context").unwrap_or(0);
     let max_results = crate::tools::optional_u64(arguments, "max_results").unwrap_or(200);
     if max_results == 0 {
@@ -158,7 +167,10 @@ async fn execute_with_engine(
     }
     Ok(ToolOutput {
         content,
-        display: Display::File { verb: "搜索", path: target.to_string() },
+        display: Display::File {
+            verb: "搜索",
+            path: target.to_string(),
+        },
         is_error: failed,
         duration: None,
     })
@@ -297,7 +309,6 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-
     /// A directory holding `a.txt` and `b.txt`, private to one test.
     ///
     /// Named per test rather than per process: the tests run in parallel, and a shared
@@ -305,8 +316,7 @@ mod tests {
     /// is reading it — the search then reports no match and the failure looks like a bug
     /// in the tool rather than a collision in the fixture.
     fn fixture(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir()
-            .join(format!("pi-grep-{}-{name}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("pi-grep-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("a.txt"), "alpha\nbeta\n").unwrap();
@@ -329,7 +339,11 @@ mod tests {
     #[test]
     fn reports_no_matches_without_failing() {
         let dir = fixture("no-matches");
-        let out = block(execute(&serde_json::json!({"pattern": "nosuchthing"}), &dir)).unwrap();
+        let out = block(execute(
+            &serde_json::json!({"pattern": "nosuchthing"}),
+            &dir,
+        ))
+        .unwrap();
         assert!(out.content.contains("没有找到匹配"));
         assert!(!out.is_error);
     }

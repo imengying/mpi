@@ -44,8 +44,8 @@ pub async fn execute(arguments: &serde_json::Value, cwd: &Path) -> Result<ToolOu
         content: format!("{action} {path}（{} 字节）", content.len()),
         display,
         is_error: false,
-duration: None,
-})
+        duration: None,
+    })
 }
 
 #[cfg(test)]
@@ -53,7 +53,6 @@ mod tests {
     use super::*;
     use crate::tools::block;
     use std::path::PathBuf;
-
 
     fn temp_dir() -> PathBuf {
         let dir = std::env::temp_dir().join(format!("pi-write-{}", std::process::id()));

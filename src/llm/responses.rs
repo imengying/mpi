@@ -43,7 +43,10 @@ enum ContentPart {
 
 impl ContentPart {
     fn text(text: impl Into<String>) -> Self {
-        ContentPart::Text { kind: "input_text", text: text.into() }
+        ContentPart::Text {
+            kind: "input_text",
+            text: text.into(),
+        }
     }
 
     fn image(media_type: &str, data: &str) -> Self {
@@ -184,7 +187,9 @@ pub struct ResponsesRequest {
 
 impl ResponsesRequest {
     pub(crate) fn prohibit_tools(&mut self) {
-        if !self.tools.is_empty() { self.tool_choice = Some("none"); }
+        if !self.tools.is_empty() {
+            self.tool_choice = Some("none");
+        }
     }
 }
 
@@ -216,18 +221,20 @@ pub fn build_request(req: &Request<'_>, stream: bool) -> ResponsesRequest {
                     input.push(InputEntry::Item(InputItem::message("user", parts)));
                 }
             }
-            Message::Assistant { content: blocks, .. } => {
+            Message::Assistant {
+                content: blocks, ..
+            } => {
                 // Text, thinking and tool calls are three different item kinds, and their
                 // order within the message is the order they were produced in.
                 for block in blocks {
                     match block {
-                        Block::Thinking { thinking, signature } => {
-                            if let Some(item) = reasoning_item(
-                                thinking,
-                                signature.as_deref(),
-                                provider,
-                                model,
-                            ) {
+                        Block::Thinking {
+                            thinking,
+                            signature,
+                        } => {
+                            if let Some(item) =
+                                reasoning_item(thinking, signature.as_deref(), provider, model)
+                            {
                                 input.push(InputEntry::Item(item));
                             }
                         }
@@ -242,7 +249,11 @@ pub fn build_request(req: &Request<'_>, stream: bool) -> ResponsesRequest {
                                 }],
                             )));
                         }
-                        Block::ToolCall { id, name, arguments } => {
+                        Block::ToolCall {
+                            id,
+                            name,
+                            arguments,
+                        } => {
                             input.push(InputEntry::Item(InputItem {
                                 kind: Some("function_call"),
                                 call_id: Some(id.clone()),
@@ -253,7 +264,11 @@ pub fn build_request(req: &Request<'_>, stream: bool) -> ResponsesRequest {
                         }
                         // Same rule as an encrypted reasoning item: only the provider and
                         // model that issued the search item can be sent it back.
-                        Block::Hosted { provider: origin, model: origin_model, payload } => {
+                        Block::Hosted {
+                            provider: origin,
+                            model: origin_model,
+                            payload,
+                        } => {
                             if origin == &provider.base_url
                                 && origin_model == &model.id
                                 && let Some(object) = payload.as_object()
@@ -281,14 +296,12 @@ pub fn build_request(req: &Request<'_>, stream: bool) -> ResponsesRequest {
     let mut tools: Vec<ToolDef> = req
         .tools
         .iter()
-        .map(|tool| {
-            ToolDef::Function {
-                kind: "function",
-                name: tool.name.clone(),
-                description: tool.description.clone(),
-                parameters: tool.parameters.clone(),
-                strict: compat.supports_strict_mode.then_some(true),
-            }
+        .map(|tool| ToolDef::Function {
+            kind: "function",
+            name: tool.name.clone(),
+            description: tool.description.clone(),
+            parameters: tool.parameters.clone(),
+            strict: compat.supports_strict_mode.then_some(true),
         })
         .collect();
     // After the function tools, so their bytes stay the cache prefix.
@@ -313,7 +326,8 @@ pub fn build_request(req: &Request<'_>, stream: bool) -> ResponsesRequest {
         instructions,
         input,
         tools,
-        tool_choice: (!req.tools.is_empty() || hosted_search(model, provider).is_some()).then_some("auto"),
+        tool_choice: (!req.tools.is_empty() || hosted_search(model, provider).is_some())
+            .then_some("auto"),
         max_output_tokens: Some(max_tokens.max(MIN_OUTPUT_TOKENS)),
         reasoning: reasoning.clone(),
         store: false,
@@ -381,7 +395,9 @@ pub const SIGNATURE_PREFIX: &str = "pi-responses:";
 
 /// The signature written into a thinking block.
 fn encode_signature(stored: &StoredReasoning) -> Option<String> {
-    serde_json::to_string(stored).ok().map(|json| format!("{SIGNATURE_PREFIX}{json}"))
+    serde_json::to_string(stored)
+        .ok()
+        .map(|json| format!("{SIGNATURE_PREFIX}{json}"))
 }
 
 /// Read a stored signature back, and only if it is one of ours.
@@ -590,7 +606,10 @@ impl Assembler {
     fn slot(&mut self, index: usize) -> &mut Slot {
         while self.items.len() <= index {
             let next = self.items.len();
-            self.items.push(Slot { index: next, ..Slot::default() });
+            self.items.push(Slot {
+                index: next,
+                ..Slot::default()
+            });
         }
         &mut self.items[index]
     }
@@ -842,7 +861,10 @@ impl Assembler {
             let kind = slot.kind.as_deref().unwrap_or_default();
             match kind {
                 kind if is_search_call(kind) => {
-                    let payload = slot.raw.clone().unwrap_or_else(|| search_payload(&slot, kind));
+                    let payload = slot
+                        .raw
+                        .clone()
+                        .unwrap_or_else(|| search_payload(&slot, kind));
                     content.push(Block::Hosted {
                         provider: self.provider.clone(),
                         model: self.model.clone(),
@@ -867,7 +889,9 @@ impl Assembler {
                     });
                 }
                 "function_call" => {
-                    let Some(name) = slot.name.filter(|name| !name.is_empty()) else { continue };
+                    let Some(name) = slot.name.filter(|name| !name.is_empty()) else {
+                        continue;
+                    };
                     let arguments = parse_arguments(&slot.arguments);
                     content.push(Block::ToolCall {
                         id: slot
@@ -891,7 +915,10 @@ impl Assembler {
         let stop_reason = match self.error {
             Some(message) => {
                 return Completion {
-                    message: Message::Assistant { content, stop_reason: Some(StopReason::Error) },
+                    message: Message::Assistant {
+                        content,
+                        stop_reason: Some(StopReason::Error),
+                    },
                     usage: self.usage,
                     stop_reason: StopReason::Error,
                     error: Some(message),
@@ -908,7 +935,10 @@ impl Assembler {
                     StopReason::Error
                 }
                 None => {
-                    if content.iter().any(|block| matches!(block, Block::ToolCall { .. })) {
+                    if content
+                        .iter()
+                        .any(|block| matches!(block, Block::ToolCall { .. }))
+                    {
                         StopReason::ToolUse
                     } else {
                         StopReason::Stop
@@ -918,7 +948,10 @@ impl Assembler {
         };
         let _ = (self.stop_reason, self.output_tokens, self.saw_terminal);
         Completion {
-            message: Message::Assistant { content, stop_reason: Some(stop_reason) },
+            message: Message::Assistant {
+                content,
+                stop_reason: Some(stop_reason),
+            },
             usage: self.usage,
             stop_reason,
             error: None,
@@ -1121,7 +1154,12 @@ mod tests {
 
     #[test]
     fn the_system_prompt_becomes_instructions_not_a_message() {
-        let messages = vec![Message::System { content: "S".into() }, Message::user_text("hi")];
+        let messages = vec![
+            Message::System {
+                content: "S".into(),
+            },
+            Message::user_text("hi"),
+        ];
         let body = body(&messages, "high");
         assert_eq!(body["instructions"], "S");
         assert_eq!(body["input"].as_array().unwrap().len(), 1);
@@ -1198,7 +1236,10 @@ mod tests {
             }],
             stop_reason: None,
         }];
-        assert_eq!(body(&messages, "high")["input"].as_array().unwrap().len(), 0);
+        assert_eq!(
+            body(&messages, "high")["input"].as_array().unwrap().len(),
+            0
+        );
 
         // Same host, different model: dropped too.
         let messages = vec![Message::Assistant {
@@ -1216,7 +1257,10 @@ mod tests {
             }],
             stop_reason: None,
         }];
-        assert_eq!(body(&messages, "high")["input"].as_array().unwrap().len(), 0);
+        assert_eq!(
+            body(&messages, "high")["input"].as_array().unwrap().len(),
+            0
+        );
     }
 
     #[test]
@@ -1233,7 +1277,10 @@ mod tests {
     #[test]
     fn thinking_without_a_signature_is_dropped_rather_than_faked() {
         let messages = vec![Message::Assistant {
-            content: vec![Block::Thinking { thinking: "hmm".into(), signature: None }],
+            content: vec![Block::Thinking {
+                thinking: "hmm".into(),
+                signature: None,
+            }],
             stop_reason: None,
         }];
         let body = body(&messages, "high");
@@ -1312,8 +1359,14 @@ mod tests {
 
     #[test]
     fn the_endpoint_is_appended_once() {
-        assert_eq!(endpoint("https://api.openai.com/v1"), "https://api.openai.com/v1/responses");
-        assert_eq!(endpoint("https://api.openai.com/v1/"), "https://api.openai.com/v1/responses");
+        assert_eq!(
+            endpoint("https://api.openai.com/v1"),
+            "https://api.openai.com/v1/responses"
+        );
+        assert_eq!(
+            endpoint("https://api.openai.com/v1/"),
+            "https://api.openai.com/v1/responses"
+        );
         assert_eq!(
             endpoint("https://gateway/responses"),
             "https://gateway/responses"
@@ -1342,7 +1395,11 @@ mod tests {
             }
         }
         let completion = assembler.finish();
-        assert_eq!(completion.text(), text, "streamed text does not match the message");
+        assert_eq!(
+            completion.text(),
+            text,
+            "streamed text does not match the message"
+        );
         assert_eq!(
             completion.message.thinking(),
             thinking.trim_end(),
@@ -1364,7 +1421,9 @@ mod tests {
         assert_eq!(completion.stop_reason, StopReason::Stop);
         assert_eq!(completion.usage.cache_read, 4);
         assert_eq!(completion.usage.input, 6);
-        let Message::Assistant { content, .. } = &completion.message else { panic!() };
+        let Message::Assistant { content, .. } = &completion.message else {
+            panic!()
+        };
         assert!(matches!(&content[0], Block::Thinking { thinking, .. } if thinking == "think"));
         assert!(matches!(&content[1], Block::Text { text } if text == "hello"));
     }
@@ -1392,7 +1451,10 @@ mod tests {
             r#"{"type":"response.failed","response":{"status":"failed","error":{"code":"server_error","message":"upstream exploded"}}}"#,
         ]);
         assert_eq!(completion.stop_reason, StopReason::Error);
-        assert_eq!(completion.error.as_deref(), Some("server_error: upstream exploded"));
+        assert_eq!(
+            completion.error.as_deref(),
+            Some("server_error: upstream exploded")
+        );
     }
 
     #[test]
@@ -1418,16 +1480,21 @@ mod tests {
             {"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "read", "arguments": "{\"path\":\"a.rs\"}"}
           ]
         }"#;
-        let completion =
-            serde_json::from_str::<FullResponse>(json).unwrap().assemble(Assembler::default());
+        let completion = serde_json::from_str::<FullResponse>(json)
+            .unwrap()
+            .assemble(Assembler::default());
         assert_eq!(completion.text(), "hi there");
         assert_eq!(completion.usage.cache_read, 4);
         let calls = completion.tool_calls();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].2, serde_json::json!({"path": "a.rs"}));
-        let Message::Assistant { content, .. } = &completion.message else { panic!() };
-        assert!(matches!(&content[0], Block::Thinking { thinking, signature }
-            if thinking == "think" && signature.as_deref().is_some_and(|s| s.contains("blob"))));
+        let Message::Assistant { content, .. } = &completion.message else {
+            panic!()
+        };
+        assert!(
+            matches!(&content[0], Block::Thinking { thinking, signature }
+            if thinking == "think" && signature.as_deref().is_some_and(|s| s.contains("blob")))
+        );
     }
 
     #[test]
@@ -1444,11 +1511,18 @@ mod tests {
             r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"think"}]}}"#,
             r#"{"type":"response.completed","response":{"status":"completed","output":[{"type":"reasoning","id":"rs_1","encrypted_content":"late"}]}}"#,
         ] {
-            parse_frame(json).unwrap().unwrap().feed(&mut assembler, &mut sink);
+            parse_frame(json)
+                .unwrap()
+                .unwrap()
+                .feed(&mut assembler, &mut sink);
         }
         let completion = assembler.finish();
-        let Message::Assistant { content, .. } = &completion.message else { panic!() };
-        let Block::Thinking { signature, .. } = &content[0] else { panic!() };
+        let Message::Assistant { content, .. } = &completion.message else {
+            panic!()
+        };
+        let Block::Thinking { signature, .. } = &content[0] else {
+            panic!()
+        };
         let stored = decode_signature(signature.as_deref().unwrap()).unwrap();
         assert_eq!(stored.encrypted_content.as_deref(), Some("late"));
     }
@@ -1462,8 +1536,12 @@ mod tests {
             r#"{"type":"response.reasoning_summary_text.delta","output_index":0,"delta":"two"}"#,
             r#"{"type":"response.completed","response":{"status":"completed"}}"#,
         ]);
-        let Message::Assistant { content, .. } = &completion.message else { panic!() };
-        assert!(matches!(&content[0], Block::Thinking { thinking, .. } if thinking == "one\n\ntwo"));
+        let Message::Assistant { content, .. } = &completion.message else {
+            panic!()
+        };
+        assert!(
+            matches!(&content[0], Block::Thinking { thinking, .. } if thinking == "one\n\ntwo")
+        );
     }
 
     #[test]
@@ -1489,8 +1567,13 @@ mod tests {
                         model: model.id.clone(),
                         payload: serde_json::json!({"type": "web_search_call", "id": "nope"}),
                     },
-                    Block::Citation { title: "docs".into(), url: "https://example.com".into() },
-                    Block::Text { text: "answer".into() },
+                    Block::Citation {
+                        title: "docs".into(),
+                        url: "https://example.com".into(),
+                    },
+                    Block::Text {
+                        text: "answer".into(),
+                    },
                 ],
                 stop_reason: Some(StopReason::Stop),
             },
@@ -1523,9 +1606,15 @@ mod tests {
         ]);
         assert!(completion.tool_calls().is_empty());
         assert_eq!(completion.stop_reason, StopReason::Stop);
-        let Message::Assistant { content, .. } = &completion.message else { panic!() };
-        assert!(matches!(&content[0], Block::Hosted { payload, .. } if payload["id"] == "ws_1" && payload["status"] == "completed"));
+        let Message::Assistant { content, .. } = &completion.message else {
+            panic!()
+        };
+        assert!(
+            matches!(&content[0], Block::Hosted { payload, .. } if payload["id"] == "ws_1" && payload["status"] == "completed")
+        );
         assert!(matches!(&content[1], Block::Text { text } if text == "yes"));
-        assert!(matches!(&content[2], Block::Citation { url, title } if url == "https://example.com" && title == "docs"));
+        assert!(
+            matches!(&content[2], Block::Citation { url, title } if url == "https://example.com" && title == "docs")
+        );
     }
 }

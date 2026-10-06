@@ -31,12 +31,18 @@ fn executable() -> std::path::PathBuf {
 }
 
 pub async fn execute(arguments: &serde_json::Value, cwd: &Path) -> Result<ToolOutput, String> {
-    let target = arguments.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+    let target = arguments
+        .get("path")
+        .and_then(|v| v.as_str())
+        .unwrap_or(".");
     let target_path = crate::auth::policy::resolve_tool_path(target, cwd);
     if !target_path.is_dir() {
         return Err(format!("路径不是目录：{target}"));
     }
-    let all = arguments.get("all").and_then(|v| v.as_bool()).unwrap_or(false);
+    let all = arguments
+        .get("all")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let binary = executable();
     let is_eza = binary.to_string_lossy().ends_with("eza");
     let mut command = tokio::process::Command::new(&binary);
@@ -72,7 +78,10 @@ pub async fn execute(arguments: &serde_json::Value, cwd: &Path) -> Result<ToolOu
     let content = format!("{body}\n");
     Ok(ToolOutput {
         content,
-        display: Display::File { verb: "列出", path: target.to_string() },
+        display: Display::File {
+            verb: "列出",
+            path: target.to_string(),
+        },
         is_error: false,
         duration: None,
     })
@@ -104,7 +113,6 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-
     fn fixture() -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("pi-ls-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -135,10 +143,15 @@ mod tests {
     #[test]
     fn hidden_files_are_only_listed_when_asked_for() {
         let dir = fixture();
-        let plain = block(execute(&serde_json::json!({"path": dir.to_string_lossy()}), &dir)).unwrap();
-        let all = block(
-            execute(&serde_json::json!({"path": dir.to_string_lossy(), "all": true}), &dir),
-        )
+        let plain = block(execute(
+            &serde_json::json!({"path": dir.to_string_lossy()}),
+            &dir,
+        ))
+        .unwrap();
+        let all = block(execute(
+            &serde_json::json!({"path": dir.to_string_lossy(), "all": true}),
+            &dir,
+        ))
         .unwrap();
         assert!(all.content.contains(".hidden"));
         if !executable().to_string_lossy().ends_with("eza") {
@@ -150,6 +163,12 @@ mod tests {
     fn a_file_target_is_rejected() {
         let dir = fixture();
         let file = dir.join("visible.txt");
-        assert!(block(execute(&serde_json::json!({"path": file.to_string_lossy()}), &dir)).is_err());
+        assert!(
+            block(execute(
+                &serde_json::json!({"path": file.to_string_lossy()}),
+                &dir
+            ))
+            .is_err()
+        );
     }
 }

@@ -7,7 +7,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::{Block, Completion, Delta, LlmError, Message, Request, StopReason, hosted_search, plan_thinking};
+use super::{
+    Block, Completion, Delta, LlmError, Message, Request, StopReason, hosted_search, plan_thinking,
+};
 use crate::config::Usage;
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -22,7 +24,10 @@ struct CacheControl {
 
 impl CacheControl {
     fn ephemeral(long: bool) -> Self {
-        CacheControl { kind: "ephemeral", ttl: long.then_some("1h") }
+        CacheControl {
+            kind: "ephemeral",
+            ttl: long.then_some("1h"),
+        }
     }
 }
 
@@ -55,9 +60,7 @@ enum OutBlock {
     },
     /// An image block. Anthropic takes base64 in a nested `source` object, unlike OpenAI's
     /// single data-URI string.
-    Image {
-        source: ImageSource,
-    },
+    Image { source: ImageSource },
     Thinking {
         thinking: String,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -156,7 +159,9 @@ struct ToolChoice {
 
 impl MessagesRequest {
     pub(crate) fn prohibit_tools(&mut self) {
-        if !self.tools.is_empty() { self.tool_choice = Some(ToolChoice { kind: "none" }); }
+        if !self.tools.is_empty() {
+            self.tool_choice = Some(ToolChoice { kind: "none" });
+        }
     }
 }
 
@@ -167,7 +172,9 @@ pub fn build_request(req: &Request<'_>) -> MessagesRequest {
     let max_tokens = model.max_tokens();
     let plan = plan_thinking(model, req.level, max_tokens);
     // The API max_tokens includes both thinking and the visible answer.
-    let thinking_budget = plan.budget_tokens.map(|b| b.min(max_tokens.saturating_sub(1024)));
+    let thinking_budget = plan
+        .budget_tokens
+        .map(|b| b.min(max_tokens.saturating_sub(1024)));
 
     let mut system = None;
     let mut messages: Vec<OutMessage> = Vec::new();
@@ -192,9 +199,10 @@ pub fn build_request(req: &Request<'_>) -> MessagesRequest {
                     content: blocks
                         .iter()
                         .filter_map(|block| match block {
-                            Block::Text { text } => {
-                                Some(OutBlock::Text { text: text.clone(), cache_control: None })
-                            }
+                            Block::Text { text } => Some(OutBlock::Text {
+                                text: text.clone(),
+                                cache_control: None,
+                            }),
                             Block::Image { media_type, data } => Some(OutBlock::Image {
                                 source: ImageSource::base64(media_type, data),
                             }),
@@ -203,33 +211,48 @@ pub fn build_request(req: &Request<'_>) -> MessagesRequest {
                         .collect(),
                 });
             }
-            Message::Assistant { content: blocks, .. } => {
+            Message::Assistant {
+                content: blocks, ..
+            } => {
                 flush_results(&mut messages, &mut pending_results);
                 let mut out = Vec::new();
                 for block in blocks {
                     match block {
-                        Block::Text { text } => {
-                            out.push(OutBlock::Text { text: text.clone(), cache_control: None })
-                        }
-                        Block::Thinking { thinking, signature } => out.push(OutBlock::Thinking {
+                        Block::Text { text } => out.push(OutBlock::Text {
+                            text: text.clone(),
+                            cache_control: None,
+                        }),
+                        Block::Thinking {
+                            thinking,
+                            signature,
+                        } => out.push(OutBlock::Thinking {
                             thinking: thinking.clone(),
                             // A signature belongs to the provider that issued it. A session
                             // that switched models leaves the other protocol's signature on
                             // the block, and Anthropic rejects one it did not sign.
-                            signature: signature
-                                .clone()
-                                .filter(|sig| !sig.starts_with(crate::llm::responses::SIGNATURE_PREFIX)),
+                            signature: signature.clone().filter(|sig| {
+                                !sig.starts_with(crate::llm::responses::SIGNATURE_PREFIX)
+                            }),
                         }),
-                        Block::ToolCall { id, name, arguments } => out.push(OutBlock::ToolUse {
+                        Block::ToolCall {
+                            id,
+                            name,
+                            arguments,
+                        } => out.push(OutBlock::ToolUse {
                             id: id.clone(),
                             name: name.clone(),
                             input: arguments.clone(),
                         }),
-                        Block::Hosted { provider: origin, model: origin_model, payload } => {
+                        Block::Hosted {
+                            provider: origin,
+                            model: origin_model,
+                            payload,
+                        } => {
                             // Only the provider and model that ran the search can be sent
                             // the block back. A different model would be handed a tool id
                             // it never issued.
-                            if origin == &provider.base_url && origin_model == &model.id
+                            if origin == &provider.base_url
+                                && origin_model == &model.id
                                 && let Some(block) = hosted_out(payload)
                             {
                                 out.push(block);
@@ -240,10 +263,17 @@ pub fn build_request(req: &Request<'_>) -> MessagesRequest {
                     }
                 }
                 if !out.is_empty() {
-                    messages.push(OutMessage { role: "assistant", content: out });
+                    messages.push(OutMessage {
+                        role: "assistant",
+                        content: out,
+                    });
                 }
             }
-            Message::Tool { tool_call_id, status, .. } => {
+            Message::Tool {
+                tool_call_id,
+                status,
+                ..
+            } => {
                 // Tool results are user-role blocks in the Anthropic shape, and all of
                 // them for one turn have to arrive together.
                 pending_results.push(OutBlock::ToolResult {
@@ -302,7 +332,10 @@ pub fn build_request(req: &Request<'_>) -> MessagesRequest {
         messages,
         tools,
         tool_choice: None,
-        thinking: thinking_budget.map(|budget_tokens| ThinkingConfig { kind: "enabled", budget_tokens }),
+        thinking: thinking_budget.map(|budget_tokens| ThinkingConfig {
+            kind: "enabled",
+            budget_tokens,
+        }),
         stream: true,
     }
 }
@@ -311,20 +344,30 @@ fn flush_results(messages: &mut Vec<OutMessage>, pending: &mut Vec<OutBlock>) {
     if pending.is_empty() {
         return;
     }
-    messages.push(OutMessage { role: "user", content: std::mem::take(pending) });
+    messages.push(OutMessage {
+        role: "user",
+        content: std::mem::take(pending),
+    });
 }
 
 /// A stored search block, turned back into the shape Anthropic will accept.
 fn hosted_out(payload: &serde_json::Value) -> Option<OutBlock> {
     match payload.get("type").and_then(|value| value.as_str()) {
         Some("server_tool_use") => Some(OutBlock::ServerToolUse {
-            id: payload.get("id").and_then(|value| value.as_str()).unwrap_or("").to_string(),
+            id: payload
+                .get("id")
+                .and_then(|value| value.as_str())
+                .unwrap_or("")
+                .to_string(),
             name: payload
                 .get("name")
                 .and_then(|value| value.as_str())
                 .unwrap_or("web_search")
                 .to_string(),
-            input: payload.get("input").cloned().unwrap_or_else(|| serde_json::json!({})),
+            input: payload
+                .get("input")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({})),
         }),
         Some("web_search_tool_result") => Some(OutBlock::WebSearchToolResult {
             tool_use_id: payload
@@ -332,7 +375,10 @@ fn hosted_out(payload: &serde_json::Value) -> Option<OutBlock> {
                 .and_then(|value| value.as_str())
                 .unwrap_or("")
                 .to_string(),
-            content: payload.get("content").cloned().unwrap_or_else(|| serde_json::json!([])),
+            content: payload
+                .get("content")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!([])),
         }),
         _ => None,
     }
@@ -451,8 +497,15 @@ pub struct WireDelta {
 #[derive(Debug, Clone)]
 enum Partial {
     Text(String),
-    Thinking { text: String, signature: Option<String> },
-    ToolUse { id: String, name: String, json: String },
+    Thinking {
+        text: String,
+        signature: Option<String>,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        json: String,
+    },
     /// A search block, kept whole so the next turn can send it back.
     Hosted {
         kind: String,
@@ -469,7 +522,10 @@ impl Partial {
         match self {
             Partial::Text(text) => (!text.is_empty()).then_some(Block::Text { text }),
             Partial::Thinking { text, signature } => {
-                (!text.is_empty()).then_some(Block::Thinking { thinking: text, signature })
+                (!text.is_empty()).then_some(Block::Thinking {
+                    thinking: text,
+                    signature,
+                })
             }
             Partial::ToolUse { id, name, json } => {
                 let arguments = if json.trim().is_empty() {
@@ -477,9 +533,20 @@ impl Partial {
                 } else {
                     serde_json::from_str(&json).unwrap_or(serde_json::Value::String(json))
                 };
-                Some(Block::ToolCall { id, name, arguments })
+                Some(Block::ToolCall {
+                    id,
+                    name,
+                    arguments,
+                })
             }
-            Partial::Hosted { kind, id, name, json, tool_use_id, content } => {
+            Partial::Hosted {
+                kind,
+                id,
+                name,
+                json,
+                tool_use_id,
+                content,
+            } => {
                 let payload = if kind == "web_search_tool_result" {
                     serde_json::json!({
                         "type": kind,
@@ -490,7 +557,8 @@ impl Partial {
                     let input = if json.trim().is_empty() {
                         serde_json::json!({})
                     } else {
-                        serde_json::from_str::<serde_json::Value>(&json).unwrap_or_else(|_| serde_json::json!({}))
+                        serde_json::from_str::<serde_json::Value>(&json)
+                            .unwrap_or_else(|_| serde_json::json!({}))
                     };
                     serde_json::json!({ "type": kind, "id": id, "name": name, "input": input })
                 };
@@ -530,11 +598,14 @@ impl Assembler {
 
     fn record_citations(&mut self, citations: &[WireCitation]) {
         for citation in citations {
-            let Some(url) = citation.url.clone().filter(|url| !url.is_empty()) else { continue };
+            let Some(url) = citation.url.clone().filter(|url| !url.is_empty()) else {
+                continue;
+            };
             if self.citations.iter().any(|(have, _)| have == &url) {
                 continue;
             }
-            self.citations.push((url, citation.title.clone().unwrap_or_default()));
+            self.citations
+                .push((url, citation.title.clone().unwrap_or_default()));
         }
     }
 
@@ -566,12 +637,15 @@ impl Assembler {
                 tool_use_id: block.tool_use_id.clone().unwrap_or_default(),
                 content: block.content.clone(),
             },
-            _ if block.thinking.is_some() || block.signature.is_some() => {
-                Partial::Thinking { text: String::new(), signature: None }
-            }
-            _ if block.id.is_some() && block.name.is_some() => {
-                Partial::ToolUse { id: String::new(), name: String::new(), json: String::new() }
-            }
+            _ if block.thinking.is_some() || block.signature.is_some() => Partial::Thinking {
+                text: String::new(),
+                signature: None,
+            },
+            _ if block.id.is_some() && block.name.is_some() => Partial::ToolUse {
+                id: String::new(),
+                name: String::new(),
+                json: String::new(),
+            },
             _ => Partial::Text(String::new()),
         };
     }
@@ -580,7 +654,10 @@ impl Assembler {
         match event.kind.as_str() {
             "error" => {
                 self.error = Some(
-                    event.error.map(|e| e.message).unwrap_or_else(|| "上游返回未知错误".into()),
+                    event
+                        .error
+                        .map(|e| e.message)
+                        .unwrap_or_else(|| "上游返回未知错误".into()),
                 );
             }
             "message_start" => {
@@ -617,7 +694,9 @@ impl Assembler {
                 }
             }
             "content_block_delta" => {
-                let (Some(index), Some(delta)) = (event.index, event.delta) else { return };
+                let (Some(index), Some(delta)) = (event.index, event.delta) else {
+                    return;
+                };
                 if delta.kind.as_deref() == Some("citations_delta")
                     && let Some(citation) = delta.citation.clone()
                 {
@@ -642,12 +721,16 @@ impl Assembler {
                     }
                     on_delta(Delta::Text(text));
                 } else if let Some(signature) = delta.signature {
-                    if let Partial::Thinking { signature: slot, .. } = slot {
+                    if let Partial::Thinking {
+                        signature: slot, ..
+                    } = slot
+                    {
                         *slot = Some(signature);
                     }
                 } else if let Some(json) = delta.partial_json {
                     match slot {
-                        Partial::ToolUse { json: slot, .. } | Partial::Hosted { json: slot, .. } => {
+                        Partial::ToolUse { json: slot, .. }
+                        | Partial::Hosted { json: slot, .. } => {
                             slot.push_str(&json);
                         }
                         _ => {}
@@ -672,7 +755,9 @@ impl Assembler {
     fn set_usage(&mut self, usage: &WireUsage) {
         // Anthropic reports cumulative numbers, so later events overwrite earlier
         // ones rather than summing.
-        if usage.input_tokens > 0 || usage.cache_read_input_tokens > 0 || usage.cache_creation_input_tokens > 0
+        if usage.input_tokens > 0
+            || usage.cache_read_input_tokens > 0
+            || usage.cache_creation_input_tokens > 0
         {
             self.usage.input = usage.input_tokens;
             self.usage.cache_read = usage.cache_read_input_tokens;
@@ -696,7 +781,10 @@ impl Assembler {
         }
         if let Some(message) = self.error {
             return Completion {
-                message: Message::Assistant { content, stop_reason: Some(StopReason::Error) },
+                message: Message::Assistant {
+                    content,
+                    stop_reason: Some(StopReason::Error),
+                },
                 usage: self.usage,
                 stop_reason: StopReason::Error,
                 error: Some(message),
@@ -717,7 +805,10 @@ impl Assembler {
             }
         };
         Completion {
-            message: Message::Assistant { content, stop_reason: Some(stop_reason) },
+            message: Message::Assistant {
+                content,
+                stop_reason: Some(stop_reason),
+            },
             usage: self.usage,
             stop_reason,
             error: None,
@@ -749,20 +840,29 @@ impl Assembler {
 }
 
 /// Parse `event:`/`data:` pairs. Returns the event name and decoded payload.
-pub fn parse_event(event_name: Option<&str>, payload: &str) -> Result<Option<StreamEvent>, LlmError> {
+pub fn parse_event(
+    event_name: Option<&str>,
+    payload: &str,
+) -> Result<Option<StreamEvent>, LlmError> {
     let trimmed = payload.trim();
     if trimmed.is_empty() {
         return Ok(None);
     }
-    let mut value: serde_json::Value = serde_json::from_str(trimmed)
-        .map_err(|err| LlmError::Decode(format!("{err}: {}", crate::util::truncate(trimmed, 300, "…"))))?;
+    let mut value: serde_json::Value = serde_json::from_str(trimmed).map_err(|err| {
+        LlmError::Decode(format!(
+            "{err}: {}",
+            crate::util::truncate(trimmed, 300, "…")
+        ))
+    })?;
     if let Some(name) = event_name
         && value.get("type").is_none()
         && let Some(object) = value.as_object_mut()
     {
         object.insert("type".into(), serde_json::Value::String(name.to_string()));
     }
-    serde_json::from_value(value).map(Some).map_err(|err| LlmError::Decode(err.to_string()))
+    serde_json::from_value(value)
+        .map(Some)
+        .map_err(|err| LlmError::Decode(err.to_string()))
 }
 
 /// Headers shared by streaming and non-streaming requests.
@@ -773,7 +873,10 @@ pub fn headers(api_key: &str, long_cache: bool) -> Vec<(&'static str, String)> {
         ("content-type", "application/json".to_string()),
     ];
     if long_cache {
-        headers.push(("anthropic-beta", "extended-cache-ttl-2025-04-11".to_string()));
+        headers.push((
+            "anthropic-beta",
+            "extended-cache-ttl-2025-04-11".to_string(),
+        ));
     }
     headers
 }
@@ -806,7 +909,10 @@ impl FullResponse {
             .unwrap_or_default();
         if let Some(error) = self.error {
             return Completion {
-                message: Message::Assistant { content: Vec::new(), stop_reason: Some(StopReason::Error) },
+                message: Message::Assistant {
+                    content: Vec::new(),
+                    stop_reason: Some(StopReason::Error),
+                },
                 usage,
                 stop_reason: StopReason::Error,
                 error: Some(error.message),
@@ -814,7 +920,10 @@ impl FullResponse {
         }
         let mut content = Vec::new();
         for block in self.content {
-            if matches!(block.block_type.as_deref(), Some("server_tool_use") | Some("web_search_tool_result")) {
+            if matches!(
+                block.block_type.as_deref(),
+                Some("server_tool_use") | Some("web_search_tool_result")
+            ) {
                 let payload = match block.block_type.as_deref() {
                     Some("web_search_tool_result") => serde_json::json!({
                         "type": "web_search_tool_result",
@@ -836,7 +945,10 @@ impl FullResponse {
                 continue;
             }
             if let Some(thinking) = block.thinking {
-                content.push(Block::Thinking { thinking, signature: block.signature });
+                content.push(Block::Thinking {
+                    thinking,
+                    signature: block.signature,
+                });
             } else if let Some(text) = block.text {
                 content.push(Block::Text { text });
                 for citation in block.citations {
@@ -848,8 +960,14 @@ impl FullResponse {
                     }
                 }
             } else if let (Some(id), Some(name)) = (block.id, block.name) {
-                let arguments = block.input.unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
-                content.push(Block::ToolCall { id, name, arguments });
+                let arguments = block
+                    .input
+                    .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+                content.push(Block::ToolCall {
+                    id,
+                    name,
+                    arguments,
+                });
             }
         }
         let stop_reason = match self.stop_reason.as_deref() {
@@ -859,7 +977,10 @@ impl FullResponse {
             _ => StopReason::Stop,
         };
         Completion {
-            message: Message::Assistant { content, stop_reason: Some(stop_reason) },
+            message: Message::Assistant {
+                content,
+                stop_reason: Some(stop_reason),
+            },
             usage,
             stop_reason,
             error: None,
@@ -877,8 +998,7 @@ mod tests {
             r#"{"id":"claude-x","reasoning":true,"max_tokens":16000,"thinking_levels":["low","high"]}"#,
         )
         .unwrap();
-        let provider: Provider =
-            serde_json::from_str(r#"{"name":"a","api":"messages"}"#).unwrap();
+        let provider: Provider = serde_json::from_str(r#"{"name":"a","api":"messages"}"#).unwrap();
         (model, provider)
     }
 
@@ -886,26 +1006,55 @@ mod tests {
     fn cache_breakpoints_land_on_system_tools_and_the_last_block() {
         let (model, provider) = fixtures();
         let tools = vec![
-            crate::llm::ToolSpec { name: "read".into(), description: "r".into(), parameters: serde_json::json!({}) },
-            crate::llm::ToolSpec { name: "write".into(), description: "w".into(), parameters: serde_json::json!({}) },
+            crate::llm::ToolSpec {
+                name: "read".into(),
+                description: "r".into(),
+                parameters: serde_json::json!({}),
+            },
+            crate::llm::ToolSpec {
+                name: "write".into(),
+                description: "w".into(),
+                parameters: serde_json::json!({}),
+            },
         ];
         let messages = vec![
-            Message::System { content: "system".into() },
+            Message::System {
+                content: "system".into(),
+            },
             Message::user_text("hello"),
         ];
-        let req = Request { model: &model, provider: &provider, messages: &messages, tools: &tools, level: "high", session_id: "s", cache_hints: true };
+        let req = Request {
+            model: &model,
+            provider: &provider,
+            messages: &messages,
+            tools: &tools,
+            level: "high",
+            session_id: "s",
+            cache_hints: true,
+        };
         let body = serde_json::to_value(build_request(&req)).unwrap();
         assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
         assert!(body["tools"][0]["cache_control"].is_null());
         assert_eq!(body["tools"][1]["cache_control"]["type"], "ephemeral");
-        assert_eq!(body["messages"][0]["content"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(
+            body["messages"][0]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
     }
 
     #[test]
     fn thinking_budget_is_part_of_the_total_output_budget() {
         let (model, provider) = fixtures();
         let messages = vec![Message::user_text("hi")];
-        let req = Request { model: &model, provider: &provider, messages: &messages, tools: &[], level: "high", session_id: "s", cache_hints: false };
+        let req = Request {
+            model: &model,
+            provider: &provider,
+            messages: &messages,
+            tools: &[],
+            level: "high",
+            session_id: "s",
+            cache_hints: false,
+        };
         let body = serde_json::to_value(build_request(&req)).unwrap();
         let budget = body["thinking"]["budget_tokens"].as_u64().unwrap();
         assert_eq!(budget, 8000);
@@ -917,7 +1066,15 @@ mod tests {
         let (mut model, provider) = fixtures();
         model.reasoning = false;
         let messages = vec![Message::user_text("hi")];
-        let req = Request { model: &model, provider: &provider, messages: &messages, tools: &[], level: "high", session_id: "s", cache_hints: false };
+        let req = Request {
+            model: &model,
+            provider: &provider,
+            messages: &messages,
+            tools: &[],
+            level: "high",
+            session_id: "s",
+            cache_hints: false,
+        };
         let body = serde_json::to_value(build_request(&req)).unwrap();
         assert!(body["thinking"].is_null());
         assert_eq!(body["max_tokens"], 16000);
@@ -929,22 +1086,53 @@ mod tests {
         let messages = vec![
             Message::Assistant {
                 content: vec![
-                    Block::ToolCall { id: "a".into(), name: "read".into(), arguments: serde_json::json!({}) },
-                    Block::ToolCall { id: "b".into(), name: "read".into(), arguments: serde_json::json!({}) },
+                    Block::ToolCall {
+                        id: "a".into(),
+                        name: "read".into(),
+                        arguments: serde_json::json!({}),
+                    },
+                    Block::ToolCall {
+                        id: "b".into(),
+                        name: "read".into(),
+                        arguments: serde_json::json!({}),
+                    },
                 ],
                 stop_reason: Some(StopReason::ToolUse),
             },
-            Message::Tool { status: crate::llm::ToolStatus::Success, tool_call_id: "a".into(), name: "read".into(), content: "A".into() },
-            Message::Tool { status: crate::llm::ToolStatus::Error, tool_call_id: "b".into(), name: "read".into(), content: "B".into() },
+            Message::Tool {
+                status: crate::llm::ToolStatus::Success,
+                tool_call_id: "a".into(),
+                name: "read".into(),
+                content: "A".into(),
+            },
+            Message::Tool {
+                status: crate::llm::ToolStatus::Error,
+                tool_call_id: "b".into(),
+                name: "read".into(),
+                content: "B".into(),
+            },
         ];
-        let req = Request { model: &model, provider: &provider, messages: &messages, tools: &[], level: "high", session_id: "s", cache_hints: false };
+        let req = Request {
+            model: &model,
+            provider: &provider,
+            messages: &messages,
+            tools: &[],
+            level: "high",
+            session_id: "s",
+            cache_hints: false,
+        };
         let body = serde_json::to_value(build_request(&req)).unwrap();
         assert_eq!(body["messages"].as_array().unwrap().len(), 2);
         assert_eq!(body["messages"][1]["role"], "user");
         assert_eq!(body["messages"][1]["content"].as_array().unwrap().len(), 2);
         assert_eq!(body["messages"][1]["content"][0]["is_error"], false);
         assert_eq!(body["messages"][1]["content"][1]["is_error"], true);
-        assert!(body["messages"][1]["content"][1]["content"].as_str().unwrap().contains("失败"));
+        assert!(
+            body["messages"][1]["content"][1]["content"]
+                .as_str()
+                .unwrap()
+                .contains("失败")
+        );
     }
 
     #[test]
@@ -956,15 +1144,42 @@ mod tests {
             Delta::Thinking(_) | Delta::Notice(_) => {}
         };
         let events = [
-            ("message_start", r#"{"type":"message_start","message":{"usage":{"input_tokens":10,"cache_read_input_tokens":90}}}"#),
-            ("content_block_start", r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#),
-            ("content_block_delta", r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"hmm"}}"#),
-            ("content_block_start", r#"{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#),
-            ("content_block_delta", r#"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"hi"}}"#),
-            ("content_block_start", r#"{"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"t1","name":"read"}}"#),
-            ("content_block_delta", r#"{"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"path\":"}}"#),
-            ("content_block_delta", r#"{"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"\"a\"}"}}"#),
-            ("message_delta", r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":7}}"#),
+            (
+                "message_start",
+                r#"{"type":"message_start","message":{"usage":{"input_tokens":10,"cache_read_input_tokens":90}}}"#,
+            ),
+            (
+                "content_block_start",
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+            ),
+            (
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"hmm"}}"#,
+            ),
+            (
+                "content_block_start",
+                r#"{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#,
+            ),
+            (
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"hi"}}"#,
+            ),
+            (
+                "content_block_start",
+                r#"{"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"t1","name":"read"}}"#,
+            ),
+            (
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"path\":"}}"#,
+            ),
+            (
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"\"a\"}"}}"#,
+            ),
+            (
+                "message_delta",
+                r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":7}}"#,
+            ),
         ];
         for (name, frame) in events {
             let event = parse_event(Some(name), frame).unwrap().unwrap();
@@ -985,7 +1200,12 @@ mod tests {
     fn an_error_event_produces_an_error_completion() {
         let mut assembler = Assembler::default();
         let mut sink = |_: Delta| {};
-        let event = parse_event(None, r#"{"type":"error","error":{"message":"prompt is too long"}}"#).unwrap().unwrap();
+        let event = parse_event(
+            None,
+            r#"{"type":"error","error":{"message":"prompt is too long"}}"#,
+        )
+        .unwrap()
+        .unwrap();
         assembler.feed(event, &mut sink);
         let completion = assembler.finish();
         assert_eq!(completion.stop_reason, StopReason::Error);
@@ -994,7 +1214,10 @@ mod tests {
 
     #[test]
     fn endpoint_handles_both_base_url_shapes() {
-        assert_eq!(endpoint("https://api.anthropic.com"), "https://api.anthropic.com/v1/messages");
+        assert_eq!(
+            endpoint("https://api.anthropic.com"),
+            "https://api.anthropic.com/v1/messages"
+        );
         assert_eq!(endpoint("https://x/v1"), "https://x/v1/messages");
         assert_eq!(endpoint("https://x/v1/messages"), "https://x/v1/messages");
     }
@@ -1020,7 +1243,9 @@ mod tests {
                     model: "other".into(),
                     payload: serde_json::json!({"type": "server_tool_use", "id": "nope", "name": "web_search", "input": {}}),
                 },
-                Block::Text { text: "answer".into() },
+                Block::Text {
+                    text: "answer".into(),
+                },
             ],
             stop_reason: Some(StopReason::Pause),
         }];
@@ -1074,13 +1299,19 @@ mod tests {
         let completion = assembler.finish();
         assert_eq!(completion.stop_reason, StopReason::Pause);
         assert!(completion.tool_calls().is_empty());
-        let Message::Assistant { content, .. } = &completion.message else { panic!() };
-        assert!(matches!(&content[0], Block::Hosted { payload, provider: origin, model: origin_model }
+        let Message::Assistant { content, .. } = &completion.message else {
+            panic!()
+        };
+        assert!(
+            matches!(&content[0], Block::Hosted { payload, provider: origin, model: origin_model }
             if payload["id"] == "srv_1"
                 && payload["input"]["query"] == "pi"
                 && origin == &provider.base_url
-                && origin_model == &model.id));
-        assert!(matches!(&content[1], Block::Hosted { payload, .. } if payload["type"] == "web_search_tool_result"));
+                && origin_model == &model.id)
+        );
+        assert!(
+            matches!(&content[1], Block::Hosted { payload, .. } if payload["type"] == "web_search_tool_result")
+        );
         assert!(matches!(&content[2], Block::Text { text } if text == "yes"));
         assert!(matches!(&content[3], Block::Citation { url, .. } if url == "https://example.com"));
     }

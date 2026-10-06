@@ -31,14 +31,20 @@ pub async fn execute(arguments: &serde_json::Value, cwd: &Path) -> Result<ToolOu
     if meta.is_dir() {
         return Err(format!("{path} 是目录；请用 ls 或 find"));
     }
-    let offset = crate::tools::optional_u64(arguments, "offset").unwrap_or(1).max(1);
+    let offset = crate::tools::optional_u64(arguments, "offset")
+        .unwrap_or(1)
+        .max(1);
     let limit = crate::tools::optional_u64(arguments, "limit").unwrap_or(2000);
     let out = tokio::task::spawn_blocking(move || read_window(&resolved, offset, limit))
-        .await.map_err(|err| format!("读取任务失败：{err}"))??;
+        .await
+        .map_err(|err| format!("读取任务失败：{err}"))??;
 
     Ok(ToolOutput {
         content: out,
-        display: crate::tools::Display::File { verb: "读取", path: path.to_string() },
+        display: crate::tools::Display::File {
+            verb: "读取",
+            path: path.to_string(),
+        },
         is_error: false,
         duration: None,
     })
@@ -65,15 +71,20 @@ fn read_window(path: &Path, offset: u64, limit: u64) -> Result<String, String> {
             if buf.is_empty() {
                 if number < offset {
                     return Err(std::io::Error::other(format!(
-                        "offset {offset} 超出文件行数（共 {number} 行）")));
+                        "offset {offset} 超出文件行数（共 {number} 行）"
+                    )));
                 }
                 if number >= offset && number < end {
-                    if !prefixed { write!(output.file, "{number}\t")?; }
+                    if !prefixed {
+                        write!(output.file, "{number}\t")?;
+                    }
                     writeln!(output.file)?;
                 }
                 break;
             }
-            if number >= end { break; }
+            if number >= end {
+                break;
+            }
             let newline = buf.iter().position(|b| *b == b'\n');
             let used = newline.map_or(buf.len(), |at| at + 1);
             if number >= offset {
@@ -106,7 +117,9 @@ mod tests {
         let path = dir.join("huge-line.txt");
         let mut file = std::fs::File::create(&path).unwrap();
         let chunk = [b'a'; 8192];
-        for _ in 0..256 { file.write_all(&chunk).unwrap(); }
+        for _ in 0..256 {
+            file.write_all(&chunk).unwrap();
+        }
         file.write_all("\n目标\n结尾".as_bytes()).unwrap();
         assert_eq!(read_window(&path, 2, 1).unwrap(), "2\t目标");
         assert_eq!(read_window(&path, 2, u64::MAX).unwrap(), "2\t目标\n3\t结尾");
@@ -119,10 +132,16 @@ mod tests {
         let dir = temp_dir();
         let path = dir.join("huge-selected.txt");
         let mut file = std::fs::File::create(&path).unwrap();
-        for _ in 0..32 { file.write_all(&[b'x'; 8192]).unwrap(); }
+        for _ in 0..32 {
+            file.write_all(&[b'x'; 8192]).unwrap();
+        }
         let text = read_window(&path, 1, 1).unwrap();
         assert!(text.len() <= crate::util::MAX_OUTPUT_BYTES);
-        let log = text.split("完整输出：").nth(1).unwrap().trim_end_matches(']');
+        let log = text
+            .split("完整输出：")
+            .nth(1)
+            .unwrap()
+            .trim_end_matches(']');
         assert!(std::fs::metadata(log).unwrap().len() > 262144);
         std::fs::remove_file(log).unwrap();
         std::fs::remove_file(path).unwrap();
@@ -133,7 +152,6 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
-
 
     #[test]
     fn reads_with_line_numbers_and_no_trailing_note() {
@@ -153,8 +171,16 @@ mod tests {
         assert!(out.content.contains("2\tb"));
         assert!(out.content.contains("3\tc"));
         assert!(!out.content.contains("1\ta"));
-        assert!(!out.content.contains("仅显示"), "no window note: {:?}", out.content);
-        assert!(!out.content.contains("offset="), "no follow-up advice: {:?}", out.content);
+        assert!(
+            !out.content.contains("仅显示"),
+            "no window note: {:?}",
+            out.content
+        );
+        assert!(
+            !out.content.contains("offset="),
+            "no follow-up advice: {:?}",
+            out.content
+        );
         // The rows are the output: nothing before them, nothing after them.
         assert_eq!(out.content.lines().count(), 2, "{:?}", out.content);
     }
@@ -162,7 +188,11 @@ mod tests {
     #[test]
     fn a_directory_is_rejected_with_a_hint() {
         let dir = temp_dir();
-        let error = block(execute(&serde_json::json!({"path": dir.to_string_lossy()}), &dir)).unwrap_err();
+        let error = block(execute(
+            &serde_json::json!({"path": dir.to_string_lossy()}),
+            &dir,
+        ))
+        .unwrap_err();
         assert!(error.contains("是目录"));
     }
 
@@ -171,7 +201,11 @@ mod tests {
         let dir = temp_dir();
         let file = dir.join("bin.dat");
         std::fs::write(&file, [0u8, 1, 2, 3, 4]).unwrap();
-        let error = block(execute(&serde_json::json!({"path": file.to_string_lossy()}), &dir)).unwrap_err();
+        let error = block(execute(
+            &serde_json::json!({"path": file.to_string_lossy()}),
+            &dir,
+        ))
+        .unwrap_err();
         assert!(error.contains("二进制"));
     }
 

@@ -10,7 +10,9 @@ pub enum ColorMode {
 
 impl ColorMode {
     pub fn detect() -> Self {
-        let env = std::env::var("COLORTERM").unwrap_or_default().to_lowercase();
+        let env = std::env::var("COLORTERM")
+            .unwrap_or_default()
+            .to_lowercase();
         if env.contains("truecolor") || env.contains("24bit") {
             return ColorMode::True;
         }
@@ -81,7 +83,9 @@ pub struct Theme {
 
 impl Default for Theme {
     fn default() -> Self {
-        Theme { mode: ColorMode::detect() }
+        Theme {
+            mode: ColorMode::detect(),
+        }
     }
 }
 
@@ -155,13 +159,20 @@ mod tests {
 
     #[test]
     fn truecolor_uses_24bit_sgr() {
-        let theme = Theme { mode: ColorMode::True };
-        assert_eq!(theme.fg(Color::Cyan, "x"), "\u{1b}[38;2;115;194;207mx\u{1b}[39m");
+        let theme = Theme {
+            mode: ColorMode::True,
+        };
+        assert_eq!(
+            theme.fg(Color::Cyan, "x"),
+            "\u{1b}[38;2;115;194;207mx\u{1b}[39m"
+        );
     }
 
     #[test]
     fn fallback_uses_256_colour_sgr() {
-        let theme = Theme { mode: ColorMode::Ansi256 };
+        let theme = Theme {
+            mode: ColorMode::Ansi256,
+        };
         assert_eq!(theme.fg(Color::Cyan, "x"), "\u{1b}[38;5;80mx\u{1b}[39m");
     }
 
@@ -170,7 +181,9 @@ mod tests {
         // Painting body text an explicit grey overrides the foreground the user chose and
         // makes every non-accent line the same colour — the transcript read as one dark
         // wash. Body text and tool output therefore carry no escape at all.
-        let theme = Theme { mode: ColorMode::True };
+        let theme = Theme {
+            mode: ColorMode::True,
+        };
         assert_eq!(theme.fg(Color::Text, "hello"), "hello");
         assert_eq!(theme.fg(Color::Output, "command output"), "command output");
         // An empty string stays empty rather than emitting a lone escape pair.

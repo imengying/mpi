@@ -50,7 +50,9 @@ mod tests {
         let with_id = Cli::try_parse_from(["pi", "resume", "01a0b8d0"]).unwrap();
         assert_eq!(
             with_id.command,
-            Some(Command::Resume { id: Some("01a0b8d0".to_string()) })
+            Some(Command::Resume {
+                id: Some("01a0b8d0".to_string())
+            })
         );
         let without = Cli::try_parse_from(["pi", "resume"]).unwrap();
         assert_eq!(without.command, Some(Command::Resume { id: None }));
