@@ -13,7 +13,7 @@ pub mod write;
 mod output;
 mod process;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::llm::ToolSpec;
 use crate::util;
@@ -148,8 +148,36 @@ pub(crate) fn verb_for(name: &str) -> &'static str {
 pub const TOOL_ORDER: [&str; 7] =
     ["read", "write", "edit", "bash", "grep", "find", "ls"];
 
-pub(crate) fn is_parallel_read(name: &str) -> bool {
-    matches!(name, "read" | "grep" | "find" | "ls")
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionMode {
+    Parallel,
+    Exclusive,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolMetadata {
+    pub execution: ExecutionMode,
+    pub replay_safe: bool,
+}
+
+pub fn metadata(name: &str) -> Option<ToolMetadata> {
+    let execution = match name {
+        "read" | "grep" | "find" | "ls" => ExecutionMode::Parallel,
+        "write" | "edit" | "bash" => ExecutionMode::Exclusive,
+        _ => return None,
+    };
+    Some(ToolMetadata {
+        execution,
+        replay_safe: execution == ExecutionMode::Parallel,
+    })
+}
+
+pub fn execution_mode(name: &str) -> ExecutionMode {
+    metadata(name).map(|meta| meta.execution).unwrap_or(ExecutionMode::Exclusive)
+}
+
+pub fn replay_safe(name: &str) -> bool {
+    metadata(name).is_some_and(|meta| meta.replay_safe)
 }
 
 pub fn specs() -> Vec<ToolSpec> {
@@ -169,24 +197,23 @@ pub fn specs() -> Vec<ToolSpec> {
 pub async fn execute(
     name: &str,
     arguments: &serde_json::Value,
-    cwd: &Path,
-    shell: &str,
+    context: &ToolContext,
 ) -> ToolOutput {
     // Timed here, around the tool itself, so every tool reports the same way and none can
     // forget to. Not around the render: the call is shown before the authorization panel
     // asks, so a render-based number would include the time spent reading the dialog.
     let started = std::time::Instant::now();
     let result = match name {
-        "read" => read::execute(arguments, cwd).await,
-        "write" => write::execute(arguments, cwd).await,
-        "edit" => edit::execute(arguments, cwd).await,
+        "read" => read::execute(arguments, &context.cwd).await,
+        "write" => write::execute(arguments, &context.cwd).await,
+        "edit" => edit::execute(arguments, &context.cwd).await,
         "bash" => match required_str(arguments, "command") {
-            Ok(command) => bash::execute_with_shell(command, cwd, shell).await,
+            Ok(command) => bash::execute_with_shell(command, &context.cwd, &context.shell).await,
             Err(err) => Err(err),
         },
-        "grep" => grep::execute(arguments, cwd).await,
-        "find" => find::execute(arguments, cwd).await,
-        "ls" => ls::execute(arguments, cwd).await,
+        "grep" => grep::execute(arguments, &context.cwd).await,
+        "find" => find::execute(arguments, &context.cwd).await,
+        "ls" => ls::execute(arguments, &context.cwd).await,
         other => return ToolOutput::error(format!("未知工具：{other}")),
     };
     let elapsed = started.elapsed();
@@ -194,6 +221,13 @@ pub async fn execute(
         .unwrap_or_else(|err| ToolOutput::error(err.to_string()))
         .budget()
         .timed(elapsed)
+}
+
+/// Immutable execution inputs shared by every tool in a batch.
+#[derive(Debug, Clone)]
+pub struct ToolContext {
+    pub cwd: PathBuf,
+    pub shell: String,
 }
 
 /// Locate a command at the first of `candidates` that exists, as an absolute path.
@@ -253,5 +287,14 @@ mod tests {
             assert_eq!(spec.parameters["type"], "object", "{} schema is not an object", spec.name);
             assert!(spec.parameters.get("properties").is_some(), "{} has no properties", spec.name);
         }
+    }
+
+    #[test]
+    fn execution_and_replay_metadata_share_the_tool_policy() {
+        assert_eq!(execution_mode("read"), ExecutionMode::Parallel);
+        assert!(replay_safe("grep"));
+        assert_eq!(execution_mode("write"), ExecutionMode::Exclusive);
+        assert!(!replay_safe("bash"));
+        assert!(metadata("unknown").is_none());
     }
 }

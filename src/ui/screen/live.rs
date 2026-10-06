@@ -1,4 +1,4 @@
-//! Layout and painting of the bottom viewport.
+//! Layout and painting of the inline viewport.
 
 use super::*;
 use unicode_segmentation::UnicodeSegmentation;
@@ -206,6 +206,14 @@ impl Screen {
         if !self.interactive {
             self.commit();
             return;
+        }
+        if self.viewport.needs_position() {
+            let position = crate::ui::terminal::ensure_raw_mode().and_then(|()| cursor::position());
+            // If a terminal cannot report its cursor, reserve space from the bottom rather
+            // than painting over unknown shell output at the top of the screen.
+            let (column, row) = position.unwrap_or((0, self.height.saturating_sub(1) as u16));
+            self.viewport
+                .start_at(usize::from(row), usize::from(column));
         }
         let frame = self.live_frame();
         let _ = write!(self.out, "{frame}");

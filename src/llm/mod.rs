@@ -503,10 +503,14 @@ pub fn clamp_level(model: &ModelConfig, level: &str) -> (String, bool) {
     (clamped, true)
 }
 
-/// Rough token estimate for a whole request, used by the threshold compaction path.
-pub fn estimate_context(messages: &[Message], system: &str) -> u64 {
+/// Estimate the complete model-visible request, including stable tool definitions.
+pub fn estimate_request_context(messages: &[Message], system: &str, tools: &[ToolSpec]) -> u64 {
     let system = util::estimate_tokens(system);
-    messages.iter().map(Message::estimate_tokens).sum::<u64>() + system
+    let messages = messages.iter().map(Message::estimate_tokens).sum::<u64>();
+    let tools = tools.iter()
+        .map(|tool| util::estimate_tokens(&serde_json::to_string(tool).expect("tool schema")))
+        .sum::<u64>();
+    system + messages + tools
 }
 
 #[cfg(test)]

@@ -251,7 +251,7 @@ fn openai_requests_carry_the_prompt_cache_key() {
 }
 
 #[test]
-fn summary_requests_reuse_system_tools_and_the_selected_history_prefix() {
+fn summary_requests_keep_the_prefix_without_reusing_the_main_cache_key() {
     use mpi::agent::compact::{SummaryRequest, prepare_summary};
     use mpi::llm::{StopReason, responses, client::summary_request_body};
     let (model, provider) = fixtures();
@@ -292,7 +292,7 @@ fn summary_requests_reuse_system_tools_and_the_selected_history_prefix() {
         let summary_messages = summary[messages_key].as_array().unwrap();
         let main_messages = normal[messages_key].as_array().unwrap();
         assert_eq!(&summary_messages[..summary_messages.len() - 1], &main_messages[..summary_messages.len() - 1], "{api}: history prefix changed");
-        assert_eq!(summary["prompt_cache_key"], normal["prompt_cache_key"]);
+        assert!(summary.get("prompt_cache_key").is_none());
         assert_eq!(summary["tool_choice"], if api == "messages" { serde_json::json!({"type":"none"}) } else { serde_json::json!("none") });
         if api == "completions" {
             assert_eq!(normal["thinking"], summary["thinking"]);

@@ -7,7 +7,9 @@
 use serde::{Deserialize, Serialize};
 
 use super::compat::{Compat, SearchFormat, ThinkingFormat};
-use super::{Block, Completion, Delta, LlmError, Message, Request, StopReason, hosted_search, plan_thinking};
+use super::{
+    Block, Completion, Delta, LlmError, Message, Request, StopReason, hosted_search, plan_thinking,
+};
 use crate::config::Usage;
 
 #[derive(Debug, Clone, Serialize)]
@@ -20,7 +22,10 @@ struct CacheControl {
 
 impl CacheControl {
     fn ephemeral(long: bool) -> Self {
-        CacheControl { kind: "ephemeral", ttl: long.then_some("1h") }
+        CacheControl {
+            kind: "ephemeral",
+            ttl: long.then_some("1h"),
+        }
     }
 }
 
@@ -183,7 +188,10 @@ struct ChatMessage {
 
 impl ChatMessage {
     fn new(role: &'static str) -> Self {
-        ChatMessage { role, ..Default::default() }
+        ChatMessage {
+            role,
+            ..Default::default()
+        }
     }
 
     fn content(mut self, content: ChatContent) -> Self {
@@ -212,6 +220,10 @@ pub struct ChatRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     max_completion_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_p: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking: Option<ThinkingToggle>,
@@ -237,9 +249,15 @@ pub struct ChatRequest {
 
 impl ChatRequest {
     pub(crate) fn prohibit_tools(&mut self) {
-        if !self.tools.is_empty() { self.tool_choice = Some("none"); }
-        if let Some(toggle) = &mut self.enable_search { *toggle = false; }
-        if let Some(parameters) = &mut self.search_parameters { parameters.mode = "off"; }
+        if !self.tools.is_empty() {
+            self.tool_choice = Some("none");
+        }
+        if let Some(toggle) = &mut self.enable_search {
+            *toggle = false;
+        }
+        if let Some(parameters) = &mut self.search_parameters {
+            parameters.mode = "off";
+        }
     }
 }
 
@@ -268,11 +286,16 @@ pub fn build_request(req: &Request<'_>, stream: bool) -> ChatRequest {
         let last_block_hint = is_last && cache_marker;
         match message {
             Message::System { content } => {
-                let role = if compat.supports_developer_role { "developer" } else { "system" };
+                let role = if compat.supports_developer_role {
+                    "developer"
+                } else {
+                    "system"
+                };
                 messages.push(ChatMessage::new(role).text(content, last_block_hint));
             }
             Message::User { content } => {
-                messages.push(ChatMessage::new("user").content(user_content(content, last_block_hint)));
+                messages
+                    .push(ChatMessage::new("user").content(user_content(content, last_block_hint)));
             }
             Message::Assistant { content, .. } => {
                 let text = join_text(content);
@@ -292,9 +315,13 @@ pub fn build_request(req: &Request<'_>, stream: bool) -> ChatRequest {
                 let has_thinking = !thinking.is_empty();
                 // The field has to be present (even empty) once the history contains
                 // reasoning, or the upstream rejects the request.
-                let reasoning_content = compat
-                    .requires_reasoning_content_on_assistant
-                    .then(|| if has_thinking { thinking.clone() } else { String::new() });
+                let reasoning_content = compat.requires_reasoning_content_on_assistant.then(|| {
+                    if has_thinking {
+                        thinking.clone()
+                    } else {
+                        String::new()
+                    }
+                });
                 // Providers that cannot replay thinking blocks want the reasoning as
                 // plain text instead, inside `<thinking>` tags.
                 let text = if compat.requires_thinking_as_text && has_thinking {
@@ -323,9 +350,7 @@ pub fn build_request(req: &Request<'_>, stream: bool) -> ChatRequest {
 
     // Cache breakpoint: the very end of the conversation, so the whole history is
     // reusable on the next turn (only for gateways that accept the marker).
-    if cache_marker
-        && let Some(last) = messages.last_mut()
-    {
+    if cache_marker && let Some(last) = messages.last_mut() {
         last.cache_control = Some(CacheControl::ephemeral(compat.supports_long_cache));
     }
 
@@ -352,7 +377,10 @@ pub fn build_request(req: &Request<'_>, stream: bool) -> ChatRequest {
         // Appended after the function tools, so their bytes — the cache prefix — do not move.
         tools.push(ToolEntry::WebSearch {
             kind: "web_search",
-            web_search: WebSearchToggle { enable: true, search_result: Some(true) },
+            web_search: WebSearchToggle {
+                enable: true,
+                search_result: Some(true),
+            },
         });
     }
 
@@ -363,9 +391,17 @@ pub fn build_request(req: &Request<'_>, stream: bool) -> ChatRequest {
         tools,
         tool_choice,
         stream,
-        stream_options: stream.then_some(StreamOptions { include_usage: compat.supports_usage_in_streaming }),
+        stream_options: stream.then_some(StreamOptions {
+            include_usage: compat.supports_usage_in_streaming,
+        }),
         max_tokens: None,
         max_completion_tokens: None,
+        temperature: model
+            .sampling_params(req.level)
+            .and_then(|params| params.temperature),
+        top_p: model
+            .sampling_params(req.level)
+            .and_then(|params| params.top_p),
         reasoning_effort: None,
         thinking: None,
         enable_thinking: None,
@@ -394,11 +430,17 @@ pub fn build_request(req: &Request<'_>, stream: bool) -> ChatRequest {
                 }
             }
             ThinkingFormat::Deepseek => {
-                request.thinking = Some(ThinkingToggle { kind: "enabled", clear_thinking: None });
+                request.thinking = Some(ThinkingToggle {
+                    kind: "enabled",
+                    clear_thinking: None,
+                });
                 request.reasoning_effort = Some(level.clone());
             }
             ThinkingFormat::Zai => {
-                request.thinking = Some(ThinkingToggle { kind: "enabled", clear_thinking: Some(false) });
+                request.thinking = Some(ThinkingToggle {
+                    kind: "enabled",
+                    clear_thinking: Some(false),
+                });
                 if compat.supports_reasoning_effort {
                     request.reasoning_effort = Some(level.clone());
                 }
@@ -427,7 +469,10 @@ pub fn build_request(req: &Request<'_>, stream: bool) -> ChatRequest {
     } else if compat.thinking_format == ThinkingFormat::Deepseek {
         // DeepSeek can default to thinking even when no effort is supplied. Auxiliary
         // summary requests explicitly disable it instead of starting another long CoT.
-        request.thinking = Some(ThinkingToggle { kind: "disabled", clear_thinking: None });
+        request.thinking = Some(ThinkingToggle {
+            kind: "disabled",
+            clear_thinking: None,
+        });
     }
 
     request
@@ -466,7 +511,9 @@ fn text_content(text: &str, cache: bool) -> ChatContent {
 /// Once an image is present the array form is unavoidable, and the text goes in as its own
 /// part so the two do not run together.
 fn user_content(blocks: &[Block], last_block_hint: bool) -> ChatContent {
-    let has_image = blocks.iter().any(|block| matches!(block, Block::Image { .. }));
+    let has_image = blocks
+        .iter()
+        .any(|block| matches!(block, Block::Image { .. }));
     if !has_image {
         return text_content(&join_text(blocks), last_block_hint);
     }
@@ -481,13 +528,14 @@ fn user_content(blocks: &[Block], last_block_hint: bool) -> ChatContent {
             Block::Image { media_type, data } => {
                 parts.push(ContentBlock::image(media_type, data));
             }
-            Block::Thinking { .. } | Block::ToolCall { .. } | Block::Hosted { .. } | Block::Citation { .. } => {}
+            Block::Thinking { .. }
+            | Block::ToolCall { .. }
+            | Block::Hosted { .. }
+            | Block::Citation { .. } => {}
         }
     }
     // The cache marker rides on the last part, which is what the prefix actually ends on.
-    if last_block_hint
-        && let Some(ContentBlock::Text { cache_control, .. }) = parts.last_mut()
-    {
+    if last_block_hint && let Some(ContentBlock::Text { cache_control, .. }) = parts.last_mut() {
         *cache_control = Some(CacheControl::ephemeral(false));
     }
     ChatContent::Blocks(parts)
@@ -640,7 +688,8 @@ impl Assembler {
         }
         for call in &delta.tool_calls {
             while self.calls.len() <= call.index {
-                self.calls.push((String::new(), String::new(), String::new()));
+                self.calls
+                    .push((String::new(), String::new(), String::new()));
             }
             let slot = &mut self.calls[call.index];
             if let Some(id) = &call.id
@@ -662,10 +711,19 @@ impl Assembler {
     }
 
     pub(crate) fn set_usage(&mut self, usage: &WireUsage) {
-        let cached = usage.prompt_cache_hit_tokens
-            .or_else(|| usage.prompt_tokens_details.as_ref().map(|d| d.cached_tokens)).unwrap_or(0);
+        let cached = usage
+            .prompt_cache_hit_tokens
+            .or_else(|| {
+                usage
+                    .prompt_tokens_details
+                    .as_ref()
+                    .map(|d| d.cached_tokens)
+            })
+            .unwrap_or(0);
         self.usage = Usage {
-            input: usage.prompt_cache_miss_tokens.unwrap_or_else(|| usage.prompt_tokens.saturating_sub(cached)),
+            input: usage
+                .prompt_cache_miss_tokens
+                .unwrap_or_else(|| usage.prompt_tokens.saturating_sub(cached)),
             output: usage.completion_tokens,
             cache_read: cached,
             cache_write: 0,
@@ -675,10 +733,15 @@ impl Assembler {
     pub fn finish(mut self) -> Completion {
         let mut content: Vec<Block> = Vec::new();
         if !self.thinking.is_empty() {
-            content.push(Block::Thinking { thinking: std::mem::take(&mut self.thinking), signature: None });
+            content.push(Block::Thinking {
+                thinking: std::mem::take(&mut self.thinking),
+                signature: None,
+            });
         }
         if !self.text.is_empty() {
-            content.push(Block::Text { text: std::mem::take(&mut self.text) });
+            content.push(Block::Text {
+                text: std::mem::take(&mut self.text),
+            });
         }
         for (url, title) in self.citations {
             content.push(Block::Citation { url, title });
@@ -693,7 +756,11 @@ impl Assembler {
                 serde_json::from_str(&args).unwrap_or(serde_json::Value::String(args))
             };
             content.push(Block::ToolCall {
-                id: if id.is_empty() { format!("call_{index}") } else { id },
+                id: if id.is_empty() {
+                    format!("call_{index}")
+                } else {
+                    id
+                },
                 name,
                 arguments,
             });
@@ -701,7 +768,10 @@ impl Assembler {
         let stop_reason = match self.error {
             Some(message) => {
                 return Completion {
-                    message: Message::Assistant { content, stop_reason: Some(StopReason::Error) },
+                    message: Message::Assistant {
+                        content,
+                        stop_reason: Some(StopReason::Error),
+                    },
                     usage: self.usage,
                     stop_reason: StopReason::Error,
                     error: Some(message),
@@ -720,7 +790,10 @@ impl Assembler {
             },
         };
         Completion {
-            message: Message::Assistant { content, stop_reason: Some(stop_reason) },
+            message: Message::Assistant {
+                content,
+                stop_reason: Some(stop_reason),
+            },
             usage: self.usage,
             stop_reason,
             error: None,
@@ -759,7 +832,9 @@ impl StreamChunk {
 impl Assembler {
     fn add_citations(&mut self, raw: &[serde_json::Value], on_delta: &mut dyn FnMut(Delta)) {
         for value in raw {
-            let Some((url, title)) = citation_of(value) else { continue };
+            let Some((url, title)) = citation_of(value) else {
+                continue;
+            };
             if self.citations.iter().any(|(have, _)| have == &url) {
                 continue;
             }
@@ -878,7 +953,10 @@ impl FullResponse {
                     .map(|(index, call)| ToolCallDelta {
                         index,
                         id: call.id,
-                        function: call.function.map(|f| FunctionDelta { name: f.name, arguments: f.arguments }),
+                        function: call.function.map(|f| FunctionDelta {
+                            name: f.name,
+                            arguments: f.arguments,
+                        }),
                     })
                     .collect(),
             };
@@ -899,36 +977,71 @@ mod tests {
     fn deepseek_gateway_replays_thinking_across_tools_and_user_turns_without_invented_budgets() {
         let provider: crate::config::Provider = serde_json::from_value(serde_json::json!({
             "name":"work", "api":"completions", "base_url":"https://gateway.example/v1"
-        })).unwrap();
+        }))
+        .unwrap();
         let mut model: crate::config::ModelConfig = serde_json::from_value(serde_json::json!({
             "id":"deepseek-v4.1-flash", "reasoning":true,"max_tokens":128000
-        })).unwrap();
-        let thought = |text: &str| Block::Thinking { thinking:text.into(), signature:None };
+        }))
+        .unwrap();
+        let thought = |text: &str| Block::Thinking {
+            thinking: text.into(),
+            signature: None,
+        };
         let history = vec![
             Message::user_text("第一项任务"),
-            Message::Assistant { content:vec![thought("已经确定方案，只需读取文件。"), Block::ToolCall {
-                id:"c1".into(), name:"read".into(), arguments:serde_json::json!({"path":"a.rs"}),
-            }], stop_reason:Some(StopReason::ToolUse) },
-            Message::Tool { status: crate::llm::ToolStatus::Success, tool_call_id:"c1".into(), name:"read".into(), content:"文件内容".into() },
-            Message::Assistant { content:vec![thought("确认完成。"), Block::Text {text:"已完成".into()}], stop_reason:Some(StopReason::Stop) },
+            Message::Assistant {
+                content: vec![
+                    thought("已经确定方案，只需读取文件。"),
+                    Block::ToolCall {
+                        id: "c1".into(),
+                        name: "read".into(),
+                        arguments: serde_json::json!({"path":"a.rs"}),
+                    },
+                ],
+                stop_reason: Some(StopReason::ToolUse),
+            },
+            Message::Tool {
+                status: crate::llm::ToolStatus::Success,
+                tool_call_id: "c1".into(),
+                name: "read".into(),
+                content: "文件内容".into(),
+            },
+            Message::Assistant {
+                content: vec![
+                    thought("确认完成。"),
+                    Block::Text {
+                        text: "已完成".into(),
+                    },
+                ],
+                stop_reason: Some(StopReason::Stop),
+            },
             Message::user_text("继续第二项任务"),
         ];
         let tools = crate::tools::specs();
         let original = history.clone();
-        let body = serde_json::to_value(build_request(&Request {
-            tools:&tools, ..request(&model, &provider, &history)
-        }, true)).unwrap();
+        let body = serde_json::to_value(build_request(
+            &Request {
+                tools: &tools,
+                ..request(&model, &provider, &history)
+            },
+            true,
+        ))
+        .unwrap();
         assert_eq!(body["thinking"]["type"], "enabled");
         assert_eq!(body["reasoning_effort"], "high");
         assert_eq!(body["max_tokens"], 128000);
         assert!(body.get("thinking_token_budget").is_none());
-        assert_eq!(body["messages"][1]["reasoning_content"], "已经确定方案，只需读取文件。");
+        assert_eq!(
+            body["messages"][1]["reasoning_content"],
+            "已经确定方案，只需读取文件。"
+        );
         assert_eq!(body["messages"][3]["reasoning_content"], "确认完成。");
         assert_eq!(body["messages"][2]["tool_call_id"], "c1");
         assert_eq!(history, original);
 
         model.reasoning = false;
-        let body = serde_json::to_value(build_request(&request(&model, &provider, &history), true)).unwrap();
+        let body = serde_json::to_value(build_request(&request(&model, &provider, &history), true))
+            .unwrap();
         assert_eq!(body["thinking"]["type"], "disabled");
         assert!(body.get("reasoning_effort").is_none());
     }
@@ -938,7 +1051,8 @@ mod tests {
         let usage: WireUsage = serde_json::from_value(serde_json::json!({
             "prompt_tokens":10000,"prompt_cache_hit_tokens":9000,
             "prompt_cache_miss_tokens":1000,"completion_tokens":200
-        })).unwrap();
+        }))
+        .unwrap();
         let mut assembler = Assembler::default();
         assembler.set_usage(&usage);
         let completion = assembler.finish();
@@ -946,9 +1060,28 @@ mod tests {
         assert_eq!(completion.usage.cache_read, 9000);
         assert_eq!(completion.usage.output, 200);
     }
+
+    #[test]
+    fn sampling_overrides_follow_the_selected_thinking_level() {
+        let model: ModelConfig = serde_json::from_value(serde_json::json!({
+            "id":"m", "sampling_params_by_thinking_level": {
+                "high": {"temperature":0.7, "top_p":0.9}
+            }
+        })).unwrap();
+        let provider: Provider = serde_json::from_value(serde_json::json!({
+            "name":"work", "api":"completions", "base_url":"https://gateway.example/v1"
+        })).unwrap();
+        let body = serde_json::to_value(build_request(&request(&model, &provider, &[]), true)).unwrap();
+        assert_eq!(body["temperature"], 0.7);
+        assert_eq!(body["top_p"], 0.9);
+    }
     use crate::config::{ModelConfig, Provider};
 
-    fn request<'a>(model: &'a ModelConfig, provider: &'a Provider, messages: &'a [Message]) -> Request<'a> {
+    fn request<'a>(
+        model: &'a ModelConfig,
+        provider: &'a Provider,
+        messages: &'a [Message],
+    ) -> Request<'a> {
         Request {
             model,
             provider,
@@ -965,10 +1098,9 @@ mod tests {
             r#"{"id":"m","reasoning":true,"max_tokens":64000,"thinking_levels":["low","high","max"]}"#,
         )
         .unwrap();
-        let provider: Provider = serde_json::from_str(
-            r#"{"name":"name","api":"completions","base_url":"url"}"#,
-        )
-        .unwrap();
+        let provider: Provider =
+            serde_json::from_str(r#"{"name":"name","api":"completions","base_url":"url"}"#)
+                .unwrap();
         (model, provider)
     }
 
@@ -976,7 +1108,9 @@ mod tests {
     fn session_id_is_sent_as_the_prompt_cache_key() {
         let (model, provider) = anthropic_style_model();
         let messages = vec![Message::user_text("hi")];
-        let body = serde_json::to_value(build_request(&request(&model, &provider, &messages), true)).unwrap();
+        let body =
+            serde_json::to_value(build_request(&request(&model, &provider, &messages), true))
+                .unwrap();
         assert_eq!(body["prompt_cache_key"], "sess-1");
         assert_eq!(body["model"], "m");
         assert_eq!(body["stream"], true);
@@ -987,16 +1121,26 @@ mod tests {
     fn reasoning_style_fields_follow_the_configured_format() {
         let (mut model, mut provider) = anthropic_style_model();
         model.compat = Some(serde_json::from_str(r#"{"thinking_format":"deepseek"}"#).unwrap());
-        provider.compat = Some(serde_json::from_str(r#"{"requires_reasoning_content_on_assistant":true}"#).unwrap());
+        provider.compat = Some(
+            serde_json::from_str(r#"{"requires_reasoning_content_on_assistant":true}"#).unwrap(),
+        );
         let messages = vec![
             Message::user_text("hi"),
             Message::Assistant {
-                content: vec![Block::Thinking { thinking: "why".into(), signature: None }, Block::Text { text: "ok".into() }],
+                content: vec![
+                    Block::Thinking {
+                        thinking: "why".into(),
+                        signature: None,
+                    },
+                    Block::Text { text: "ok".into() },
+                ],
                 stop_reason: Some(StopReason::Stop),
             },
             Message::user_text("again"),
         ];
-        let body = serde_json::to_value(build_request(&request(&model, &provider, &messages), true)).unwrap();
+        let body =
+            serde_json::to_value(build_request(&request(&model, &provider, &messages), true))
+                .unwrap();
         assert_eq!(body["thinking"]["type"], "enabled");
         assert_eq!(body["reasoning_effort"], "high");
         // DeepSeek exposes effort and a combined output cap, not this numeric CoT knob.
@@ -1009,15 +1153,24 @@ mod tests {
     fn thinking_can_be_replayed_as_plain_text() {
         let (mut model, mut provider) = anthropic_style_model();
         model.compat = Some(serde_json::from_str(r#"{"thinking_format":"none"}"#).unwrap());
-        provider.compat = Some(serde_json::from_str(r#"{"requires_thinking_as_text":true}"#).unwrap());
+        provider.compat =
+            Some(serde_json::from_str(r#"{"requires_thinking_as_text":true}"#).unwrap());
         let messages = vec![
             Message::user_text("hi"),
             Message::Assistant {
-                content: vec![Block::Thinking { thinking: "why".into(), signature: None }, Block::Text { text: "ok".into() }],
+                content: vec![
+                    Block::Thinking {
+                        thinking: "why".into(),
+                        signature: None,
+                    },
+                    Block::Text { text: "ok".into() },
+                ],
                 stop_reason: Some(StopReason::Stop),
             },
         ];
-        let body = serde_json::to_value(build_request(&request(&model, &provider, &messages), false)).unwrap();
+        let body =
+            serde_json::to_value(build_request(&request(&model, &provider, &messages), false))
+                .unwrap();
         let text = body["messages"][1]["content"].as_str().unwrap();
         assert!(text.starts_with("<thinking>\nwhy\n</thinking>"));
         assert!(text.ends_with("ok"));
@@ -1034,9 +1187,17 @@ mod tests {
             }],
             stop_reason: Some(StopReason::ToolUse),
         }];
-        let body = serde_json::to_value(build_request(&request(&model, &provider, &messages), true)).unwrap();
-        assert_eq!(body["messages"][0]["tool_calls"][0]["function"]["name"], "read");
-        assert_eq!(body["messages"][0]["tool_calls"][0]["function"]["arguments"], "{\"path\":\"a.txt\"}");
+        let body =
+            serde_json::to_value(build_request(&request(&model, &provider, &messages), true))
+                .unwrap();
+        assert_eq!(
+            body["messages"][0]["tool_calls"][0]["function"]["name"],
+            "read"
+        );
+        assert_eq!(
+            body["messages"][0]["tool_calls"][0]["function"]["arguments"],
+            "{\"path\":\"a.txt\"}"
+        );
         assert!(body["messages"][0]["content"].is_null());
     }
 
@@ -1077,7 +1238,9 @@ mod tests {
     fn an_in_band_error_becomes_an_error_completion() {
         let mut assembler = Assembler::default();
         let mut sink = |_: Delta| {};
-        let chunk = parse_frame(r#"{"error":{"message":"context length exceeded"}}"#).unwrap().unwrap();
+        let chunk = parse_frame(r#"{"error":{"message":"context length exceeded"}}"#)
+            .unwrap()
+            .unwrap();
         chunk.feed(&mut assembler, &mut sink);
         let completion = assembler.finish();
         assert_eq!(completion.stop_reason, StopReason::Error);
@@ -1088,7 +1251,10 @@ mod tests {
     fn base_url_gets_the_right_endpoint() {
         assert_eq!(endpoint("http://x/v1"), "http://x/v1/chat/completions");
         assert_eq!(endpoint("http://x/v1/"), "http://x/v1/chat/completions");
-        assert_eq!(endpoint("http://x/v1/chat/completions"), "http://x/v1/chat/completions");
+        assert_eq!(
+            endpoint("http://x/v1/chat/completions"),
+            "http://x/v1/chat/completions"
+        );
     }
 
     #[test]
@@ -1096,7 +1262,9 @@ mod tests {
         let (model, mut provider) = anthropic_style_model();
         provider.base_url = "https://api.x.ai/v1".into();
         let messages = vec![Message::user_text("hi")];
-        let body = serde_json::to_value(build_request(&request(&model, &provider, &messages), false)).unwrap();
+        let body =
+            serde_json::to_value(build_request(&request(&model, &provider, &messages), false))
+                .unwrap();
         assert!(body.get("search_parameters").is_none());
         assert!(body.get("enable_search").is_none());
     }
@@ -1108,18 +1276,24 @@ mod tests {
         model.search = true;
 
         provider.base_url = "https://api.x.ai/v1".into();
-        let body = serde_json::to_value(build_request(&request(&model, &provider, &messages), false)).unwrap();
+        let body =
+            serde_json::to_value(build_request(&request(&model, &provider, &messages), false))
+                .unwrap();
         assert_eq!(body["search_parameters"]["mode"], "auto");
         assert_eq!(body["search_parameters"]["return_citations"], true);
         assert!(body.get("enable_search").is_none());
 
         provider.base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1".into();
-        let body = serde_json::to_value(build_request(&request(&model, &provider, &messages), false)).unwrap();
+        let body =
+            serde_json::to_value(build_request(&request(&model, &provider, &messages), false))
+                .unwrap();
         assert_eq!(body["enable_search"], true);
         assert!(body.get("search_parameters").is_none());
 
         provider.base_url = "https://open.bigmodel.cn/api/paas/v4".into();
-        let body = serde_json::to_value(build_request(&request(&model, &provider, &messages), false)).unwrap();
+        let body =
+            serde_json::to_value(build_request(&request(&model, &provider, &messages), false))
+                .unwrap();
         let tools = body["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["type"], "web_search");
@@ -1146,7 +1320,9 @@ mod tests {
         assert_eq!(completion.text(), "yes");
         assert!(completion.tool_calls().is_empty());
         assert_eq!(notices, vec!["搜索了网页".to_string()]);
-        let Message::Assistant { content, .. } = &completion.message else { panic!() };
+        let Message::Assistant { content, .. } = &completion.message else {
+            panic!()
+        };
         assert!(matches!(&content[1], Block::Citation { url, .. } if url == "https://example.com"));
     }
 
@@ -1161,7 +1337,9 @@ mod tests {
         .unwrap();
         chunk.feed(&mut assembler, &mut sink);
         let completion = assembler.finish();
-        let Message::Assistant { content, .. } = &completion.message else { panic!() };
+        let Message::Assistant { content, .. } = &completion.message else {
+            panic!()
+        };
         let urls: Vec<&str> = content
             .iter()
             .filter_map(|block| match block {
@@ -1169,7 +1347,10 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(urls, vec!["https://news.example/a", "https://news.example/b"]);
+        assert_eq!(
+            urls,
+            vec!["https://news.example/a", "https://news.example/b"]
+        );
         assert!(matches!(&content[1], Block::Citation { title, .. } if title == "财报"));
     }
 }

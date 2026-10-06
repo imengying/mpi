@@ -142,6 +142,20 @@ pub fn one_line(input: &str) -> String {
     out
 }
 
+/// A small deterministic digest for request metadata and cache diagnostics.
+///
+/// This is an identity marker, not a security hash: it lets a session prove that the same
+/// prompt/tool projection was prepared without pulling another hashing dependency into the
+/// binary.
+pub fn stable_digest(input: &str) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in input.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
 pub fn width(s: &str) -> usize {
     s.width()
 }
@@ -393,7 +407,9 @@ mod tests {
 
     #[test]
     fn huge_output_keeps_the_tail_and_reports_a_path() {
-        let raw: String = (0..MAX_OUTPUT_LINES + 10).map(|i| format!("line{i}\n")).collect();
+        let raw: String = (0..MAX_OUTPUT_LINES + 10)
+            .map(|i| format!("line{i}\n"))
+            .collect();
         let out = truncate_output(&raw);
         assert!(out.truncated);
         assert!(out.text.contains("line2009"));

@@ -143,6 +143,7 @@ impl Agent {
             }
             let level = self.level.clone();
             let session_id = self.session.header().id.clone();
+            let request_id = uuid::Uuid::now_v7().to_string();
             let request = Request {
                 model: &model,
                 provider: &provider,
@@ -152,6 +153,7 @@ impl Agent {
                 session_id: &session_id,
                 cache_hints: true,
             };
+            self.session.push_request_context(&request_id, &request)?;
 
             self.streaming = true;
             self.screen.begin_stream();
@@ -254,7 +256,6 @@ impl Agent {
 
             self.session
                 .push_message(completion.message.clone(), Some(completion.usage), Some(completion.stop_reason))?;
-            self.compaction.observe_usage();
             self.render_footer(None);
 
             if let Some(error) = &completion.error {

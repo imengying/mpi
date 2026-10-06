@@ -140,6 +140,7 @@ async fn broad_and_explicit_glob_searches_cannot_read_secrets() {
     std::fs::write(dir.join(".ssh/config"), "policy-secret-sentinel\n").unwrap();
     std::fs::write(dir.join("ordinary.txt"), "ordinary-sentinel\n").unwrap();
     let gate = PermissionGate::new(false, Dialect::Zsh);
+    let context = mpi::tools::ToolContext { cwd: dir.clone(), shell: "/usr/bin/zsh".into() };
     for command in [
         "rg --hidden --no-ignore policy-secret-sentinel .",
         "rg --hidden --no-ignore --glob .env -- policy-secret-sentinel .",
@@ -150,7 +151,7 @@ async fn broad_and_explicit_glob_searches_cannot_read_secrets() {
         let approved = gate
             .check("bash", &serde_json::json!({"command":command}), &dir)
             .unwrap();
-        let out = mpi::tools::execute("bash", &approved, &dir, "/usr/bin/zsh").await;
+        let out = mpi::tools::execute("bash", &approved, &context).await;
         assert!(
             !out.content.contains("policy-secret-sentinel"),
             "{command}: {}",
@@ -164,7 +165,7 @@ async fn broad_and_explicit_glob_searches_cannot_read_secrets() {
         let approved = gate
             .check("bash", &serde_json::json!({"command":command}), &dir)
             .unwrap();
-        let out = mpi::tools::execute("bash", &approved, &dir, "/usr/bin/zsh").await;
+        let out = mpi::tools::execute("bash", &approved, &context).await;
         assert!(
             !out.is_error && out.content.contains("ordinary-sentinel"),
             "{command}: {}",
@@ -173,7 +174,7 @@ async fn broad_and_explicit_glob_searches_cannot_read_secrets() {
     }
     let input = serde_json::json!({"pattern":"policy-secret-sentinel", "glob":".env"});
     let approved = gate.check("grep", &input, &dir).unwrap();
-    let out = mpi::tools::execute("grep", &approved, &dir, "/usr/bin/zsh").await;
+    let out = mpi::tools::execute("grep", &approved, &context).await;
     assert!(!out.content.contains("policy-secret-sentinel"));
     std::fs::remove_dir_all(dir).unwrap();
 }

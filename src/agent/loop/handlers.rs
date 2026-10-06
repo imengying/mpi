@@ -7,14 +7,7 @@ impl Agent {
         if let Some(used) = self.session.measured_context_tokens() {
             return used;
         }
-        compact::estimate_context(
-            messages,
-            self.system_prompt.as_deref().unwrap_or_default(),
-            None,
-        ) + tools
-            .iter()
-            .map(|tool| util::estimate_tokens(&serde_json::to_string(tool).expect("tool schema")))
-            .sum::<u64>()
+        llm::estimate_request_context(messages, self.system_prompt.as_deref().unwrap_or_default(), tools)
     }
 
     pub(super) fn prune_context(&mut self) -> anyhow::Result<bool> {
@@ -22,7 +15,6 @@ impl Agent {
             compact::prune_tool_results(&self.session.context_messages(), self.session.path())
         {
             self.session.push_pruning(outcome)?;
-            self.compaction.tokens_unknown = true;
             return Ok(true);
         }
         Ok(false)
@@ -44,11 +36,11 @@ impl Agent {
                 return Ok(stopped);
             }
             let first = &calls[next];
-            let count = if tools::is_parallel_read(&first.1) {
+            let count = if tools::execution_mode(&first.1) == tools::ExecutionMode::Parallel {
                 calls[next..]
                     .iter()
                     .take(4)
-                    .take_while(|(_, name, _)| tools::is_parallel_read(name))
+                    .take_while(|(_, name, _)| tools::execution_mode(name) == tools::ExecutionMode::Parallel)
                     .count()
             } else {
                 1
@@ -65,7 +57,7 @@ impl Agent {
             self.screen.set_running(running.clone());
             self.screen.suspend_live();
             // Every call keeps its own authorization decision; no batch-wide grant.
-            let approved = batch
+            let approved: Vec<_> = batch
                 .iter()
                 .map(|(_, name, arguments)| {
                     self.gate
@@ -75,10 +67,20 @@ impl Agent {
                         })
                 })
                 .collect();
+            let started: Vec<_> = approved.iter().map(Result::is_ok).collect();
             self.screen.set_running(running);
+            for ((id, name, _), approval) in batch.iter().zip(approved.iter()) {
+                if let Ok(arguments) = approval {
+                    self.session.push_tool_start(id, name, arguments.clone(), tools::replay_safe(name))?;
+                }
+            }
             let (results, stopped) = self.run_tool_batch(batch, approved).await;
             self.screen.clear_running();
-            for ((id, name, arguments), (output, status)) in batch.iter().zip(results) {
+            for (((id, name, arguments), (output, status)), started) in batch.iter().zip(results).zip(started) {
+                let duration_ms = output.duration.map(|duration| duration.as_millis().min(u64::MAX as u128) as u64);
+                if started {
+                    self.session.push_tool_end(id, name, status, duration_ms)?;
+                }
                 self.session.push_message(
                     Message::Tool {
                         tool_call_id: id.clone(),
@@ -134,15 +136,15 @@ impl Agent {
         let mut workers = tokio::task::JoinSet::new();
         let mut task_indices = std::collections::HashMap::new();
         let mut results = vec![None; calls.len()];
+        let context = tools::ToolContext { cwd: self.cwd.clone(), shell: self.config.shell.path.clone() };
         for (index, approval) in approved.into_iter().enumerate() {
             match approval {
                 Err(output) => results[index] = Some((output, ToolStatus::Error)),
                 Ok(arguments) => {
                     let name = calls[index].1.clone();
-                    let cwd = self.cwd.clone();
-                    let shell = self.config.shell.path.clone();
+                    let context = context.clone();
                     let task = workers.spawn(async move {
-                        (index, tools::execute(&name, &arguments, &cwd, &shell).await)
+                        (index, tools::execute(&name, &arguments, &context).await)
                     });
                     task_indices.insert(task.id(), index);
                 }

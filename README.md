@@ -100,6 +100,7 @@ pi 没有内置模型目录，也不会去猜。没配置 providers 会直接报
 | `models[].reasoning` | 是否支持推理，决定 `/model` 选完要不要问级别 |
 | `models[].search` | 是否使用该接口的原生搜索，缺省 `false`。整段会话要么一直开要么一直关 |
 | `models[].thinking_levels` | 该模型支持的级别；`reasoning` 为真但缺失时表示五档全支持 |
+| `models[].sampling_params_by_thinking_level` | 按级别设置 `temperature` / `top_p`；非推理模型用 `off`，只在 Completions 请求发送 |
 | `models[].compat` | 覆盖兼容开关，见下 |
 | `models[].compaction.reserve_tokens` | 压缩的安全余量；缺省为 16384 与窗口四分之一中的较小值 |
 | `models[].compaction.keep_recent_tokens` | 摘要后保留的最近历史预算；缺省最多 20000，小窗口自动缩小 |
@@ -280,7 +281,8 @@ Linux 二进制依赖 runner 自带的 glibc（当前 2.39），构建摘要里�
 输入区最多占终端高度的三分之一、上限八行，完整文本仍保留在编辑器里。
 
 **回合进行中输入行照常可用**：模型在答、命令在跑的时候照样能打字、粘贴图片、
-按 `Ctrl+O` 展开输出、输入 `/` 看菜单。输入和状态固定在终端底部，上面的输出增长不会推走光标。
+按 `Ctrl+O` 展开输出、输入 `/` 看菜单。输入和状态从进入时 shell 的光标处接管，空间不足时才滚动；
+上面的已完成输出不会被覆盖，退出后 shell 紧接最后一条输出继续。
 
 输出直接使用终端自带的选择和复制快捷键。回复和流式预览由终端自动折行，
 复制时按终端的软折行规则还原真实换行；代码块不添加展示缩进，原有空格缩进保持不变。
@@ -485,7 +487,8 @@ DeepSeek 使用 `thinking.type` 和 `reasoning_effort` 控制思考，不发送�
   这些每轮固定但会变的信息放在会话首条消息里。工具定义顺序固定，消息用 struct 序列化
   以保证字段顺序稳定。Anthropic 打三个 `cache_control` 断点（系统提示词、最后一个工具、
   最后一条消息），OpenAI 兼容接口发 `prompt_cache_key`。
-- **流式 + 底部视口**：参考 [Codex CLI 0.159.3 的终端实现](https://github.com/openai/codex/blob/rust-v0.159.3/codex-rs/tui/src/insert_history.rs)，
-  用绝对坐标、差量重绘和同步更新维护底部输入区，聊天记录留在终端自己的 scrollback 里。
+- **流式 + inline 视口**：参考 [Codex CLI 的终端实现](https://github.com/openai/codex/blob/main/codex-rs/tui/src/insert_history.rs)，
+  从 shell 当前光标处接管输入，只有空间不足时才滚动；用绝对坐标、差量重绘和同步更新维护输入区，
+  聊天记录留在终端自己的 scrollback 里。
 - **依赖少**：不引入 `toml`（配置是 JSON）、`ratatui`（全屏缓冲模型不匹配）、
   任何编辑器/语法高亮 crate（代码块不着色，见「回答的排版」）。禁止 `unsafe`。

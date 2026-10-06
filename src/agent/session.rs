@@ -58,6 +58,65 @@ pub enum Record {
         level: String,
         timestamp: String,
     },
+    /// The immutable request projection used for one model call. It is bookkeeping, never
+    /// part of the model-visible history, and makes pressure decisions reconstructable.
+    RequestContext {
+        parent_id: Option<String>,
+        /// This record's identity also identifies the request.
+        id: String,
+        request_id: String,
+        provider: String,
+        model: String,
+        level: String,
+        context_window: Option<u64>,
+        token_estimate: u64,
+        system_prompt_hash: Option<String>,
+        tools_hash: String,
+        cache_hints: bool,
+        timestamp: String,
+    },
+    /// Opens a durable compaction lifecycle. An unmatched start is an interrupted attempt.
+    CompactionStart {
+        parent_id: Option<String>,
+        id: String,
+        compaction_id: String,
+        reason: String,
+        provider: String,
+        model: String,
+        level: String,
+        token_before: u64,
+        timestamp: String,
+    },
+    /// Closes a compaction lifecycle after its summary/checkpoint has been persisted.
+    CompactionEnd {
+        parent_id: Option<String>,
+        id: String,
+        compaction_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+        timestamp: String,
+    },
+    /// The intent of one accepted tool call, committed before its body runs.
+    ToolExecutionStart {
+        parent_id: Option<String>,
+        id: String,
+        tool_call_id: String,
+        name: String,
+        arguments: serde_json::Value,
+        replay_safe: bool,
+        timestamp: String,
+    },
+    /// The durable outcome of a tool call.
+    ToolExecutionEnd {
+        parent_id: Option<String>,
+        id: String,
+        tool_call_id: String,
+        name: String,
+        status: crate::llm::ToolStatus,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
+        timestamp: String,
+    },
     /// The session name. Appended, never a rewrite of the header.
     SessionInfo {
         parent_id: Option<String>,
@@ -70,12 +129,22 @@ pub enum Record {
     Compacted {
         parent_id: Option<String>,
         id: String,
+        compaction_id: String,
         reason: String,
+        provider: String,
+        model: String,
+        level: String,
         summary: String,
         /// Full message list that supersedes everything before this record.
         replacement_history: Vec<Message>,
+        /// Logical message identities aligned with the replacement, including retained items.
+        replacement_ids: Vec<String>,
         read_files: Vec<String>,
         modified_files: Vec<String>,
+        shadowed_ids: Vec<String>,
+        token_before: u64,
+        token_after: u64,
+        summary_prompt_version: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         usage: Option<Usage>,
         timestamp: String,
@@ -85,10 +154,17 @@ pub enum Record {
         parent_id: Option<String>,
         id: String,
         replacement_history: Vec<Message>,
+        replacement_ids: Vec<String>,
         tool_results: usize,
         saved_tokens: u64,
         timestamp: String,
     },
+}
+
+/// One immutable model-visible projection and the identities needed to checkpoint it.
+pub struct ContextSnapshot {
+    pub messages: Vec<Message>,
+    pub entry_ids: Vec<String>,
 }
 
 impl Record {
@@ -97,6 +173,11 @@ impl Record {
             Record::SessionMeta { header, .. } => &header.id,
             Record::ResponseItem { id, .. }
             | Record::TurnContext { id, .. }
+            | Record::RequestContext { id, .. }
+            | Record::CompactionStart { id, .. }
+            | Record::CompactionEnd { id, .. }
+            | Record::ToolExecutionStart { id, .. }
+            | Record::ToolExecutionEnd { id, .. }
             | Record::SessionInfo { id, .. }
             | Record::Compacted { id, .. }
             | Record::Pruned { id, .. } => id,
@@ -108,6 +189,11 @@ impl Record {
             Record::SessionMeta { .. } => None,
             Record::ResponseItem { parent_id, .. }
             | Record::TurnContext { parent_id, .. }
+            | Record::RequestContext { parent_id, .. }
+            | Record::CompactionStart { parent_id, .. }
+            | Record::CompactionEnd { parent_id, .. }
+            | Record::ToolExecutionStart { parent_id, .. }
+            | Record::ToolExecutionEnd { parent_id, .. }
             | Record::SessionInfo { parent_id, .. }
             | Record::Compacted { parent_id, .. }
             | Record::Pruned { parent_id, .. } => parent_id.as_deref(),
@@ -136,10 +222,26 @@ impl Record {
 
     pub fn usage(&self) -> Option<Usage> {
         match self {
-            Record::ResponseItem { usage, .. }
-            | Record::Compacted { usage, .. } => *usage,
+            Record::ResponseItem { usage, .. } | Record::Compacted { usage, .. } => *usage,
             _ => None,
         }
+    }
+
+    fn validate(&self) -> Result<(), &'static str> {
+        match self {
+            Record::Compacted { replacement_history, replacement_ids, .. }
+            | Record::Pruned { replacement_history, replacement_ids, .. } => {
+                if replacement_history.len() != replacement_ids.len() {
+                    return Err("检查点消息与记录 ID 数量不一致");
+                }
+                let mut seen = std::collections::HashSet::new();
+                if replacement_ids.iter().any(|id| id.is_empty() || !seen.insert(id)) {
+                    return Err("检查点记录 ID 不能为空或重复");
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
 }
 
@@ -251,7 +353,9 @@ impl Session {
         };
         // Nothing is written here. A file appears with the first record that makes this a
         // conversation, so launching pi and leaving does not add a session to the list.
-        let record = Record::SessionMeta { header: header.clone() };
+        let record = Record::SessionMeta {
+            header: header.clone(),
+        };
         Ok(Session {
             header,
             path,
@@ -332,6 +436,9 @@ impl Session {
             }
             match serde_json::from_slice::<Record>(&line) {
                 Ok(record) => {
+                    record.validate().map_err(|err| SessionError::Parse(format!(
+                        "{} 第 {number} 行：{err}", path.display()
+                    )))?;
                     records.push(record);
                     valid_len += line.len() as u64;
                     needs_newline = !terminated;
@@ -417,59 +524,92 @@ impl Session {
     }
 
     /// Keep short user corrections verbatim across repeated summaries, within a fixed budget.
-    pub fn checkpoint_facts(&self, max_request_chars: usize) -> crate::agent::compact::CheckpointFacts {
+    pub fn checkpoint_facts(
+        &self,
+        max_request_chars: usize,
+    ) -> crate::agent::compact::CheckpointFacts {
         let mut remaining = max_request_chars;
         let mut requests = Vec::new();
         for message in self.records.iter().rev().filter_map(Record::message) {
-            if !matches!(message, Message::User { .. }) || crate::agent::r#loop::is_environment_block(message) {
+            if !matches!(message, Message::User { .. })
+                || crate::agent::r#loop::is_environment_block(message)
+            {
                 continue;
             }
             let text = message.text();
             let chars = text.chars().count();
-            if chars == 0 || chars > remaining { continue; }
+            if chars == 0 || chars > remaining {
+                continue;
+            }
             requests.push(text);
             remaining -= chars;
-            if remaining == 0 || requests.len() == 8 { break; }
+            if remaining == 0 || requests.len() == 8 {
+                break;
+            }
         }
         requests.reverse();
-        crate::agent::compact::CheckpointFacts { files: self.file_operations(), user_requests: requests }
+        crate::agent::compact::CheckpointFacts {
+            files: self.file_operations(),
+            user_requests: requests,
+        }
     }
 
     /// The conversation as the model should see it: everything after the last
     /// checkpoint, using the checkpoint's replacement history in its place.
-    pub fn context_messages(&self) -> Vec<Message> {
-        let start = self.last_checkpoint_index();
-        let messages: Vec<Message> = match start {
-            Some(index) => {
-                let replacement_history = match &self.records[index] {
-                    Record::Compacted { replacement_history, .. } | Record::Pruned { replacement_history, .. } => replacement_history,
-                    _ => unreachable!(),
-                };
-                let mut messages = replacement_history.clone();
-                for record in &self.records[index + 1..] {
-                    if let Some(message) = record.message() {
-                        messages.push(message.clone());
-                    }
+    fn context_entries(&self) -> impl Iterator<Item = (&Message, &str)> {
+        let checkpoint = self.last_checkpoint_index();
+        let replacement = checkpoint.map(|index| {
+            match &self.records[index] {
+                Record::Compacted { replacement_history, replacement_ids, .. }
+                | Record::Pruned { replacement_history, replacement_ids, .. } => {
+                    (replacement_history, replacement_ids)
                 }
-                messages
+                _ => unreachable!(),
             }
-            None => self.records.iter().filter_map(Record::message).cloned().collect(),
-        };
+        }).into_iter().flat_map(|(messages, ids)| {
+            messages.iter().zip(ids.iter().map(String::as_str))
+        });
+        let start = checkpoint.map_or(0, |index| index + 1);
+        replacement.chain(self.records[start..].iter().filter_map(|record| {
+            record.message().map(|message| (message, record.id()))
+        }))
+    }
 
-        messages
+    pub fn context_snapshot(&self) -> ContextSnapshot {
+        let (messages, entry_ids) = self.context_entries()
+            .map(|(message, id)| (message.clone(), id.to_string())).unzip();
+        ContextSnapshot { messages, entry_ids }
+    }
+
+    pub fn context_messages(&self) -> Vec<Message> {
+        self.context_entries().map(|(message, _)| message.clone()).collect()
     }
 
     /// Latest observed prompt+answer plus messages appended since that observation.
     pub fn measured_context_tokens(&self) -> Option<u64> {
         let usage = self.last_usage?;
-        if usage.input.saturating_add(usage.cache_read).saturating_add(usage.cache_write) == 0 {
+        if usage
+            .input
+            .saturating_add(usage.cache_read)
+            .saturating_add(usage.cache_write)
+            == 0
+        {
             return None;
         }
         let index = self.last_usage_index?;
-        let appended = self.records[index + 1..].iter().filter_map(Record::message)
-            .map(Message::estimate_tokens).sum::<u64>();
-        Some(usage.input.saturating_add(usage.output).saturating_add(usage.cache_read)
-            .saturating_add(usage.cache_write).saturating_add(appended))
+        let appended = self.records[index + 1..]
+            .iter()
+            .filter_map(Record::message)
+            .map(Message::estimate_tokens)
+            .sum::<u64>();
+        Some(
+            usage
+                .input
+                .saturating_add(usage.output)
+                .saturating_add(usage.cache_read)
+                .saturating_add(usage.cache_write)
+                .saturating_add(appended),
+        )
     }
 
     pub fn last_checkpoint_index(&self) -> Option<usize> {
@@ -515,13 +655,18 @@ impl Session {
     pub fn user_history(&self) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
         for record in &self.records {
-            let Some(message) = record.message() else { continue };
-            if !matches!(message, Message::User { .. }) || crate::agent::r#loop::is_environment_block(message) {
+            let Some(message) = record.message() else {
+                continue;
+            };
+            if !matches!(message, Message::User { .. })
+                || crate::agent::r#loop::is_environment_block(message)
+            {
                 continue;
             }
             let text = message.text();
-            if !text.trim().is_empty() { out.push(text); }
-
+            if !text.trim().is_empty() {
+                out.push(text);
+            }
         }
         out
     }
@@ -609,6 +754,7 @@ impl Session {
         usage: Option<Usage>,
         stop_reason: Option<StopReason>,
     ) -> Result<(), SessionError> {
+        let usage = usage.filter(Usage::is_meaningful);
         let id = self.next_id();
         let record = Record::ResponseItem {
             parent_id: self.last_id.clone(),
@@ -627,7 +773,12 @@ impl Session {
     }
 
     /// Record the per-turn environment snapshot. It is *not* part of the conversation.
-    pub fn push_turn_context(&mut self, cwd: &Path, model: &str, level: &str) -> Result<(), SessionError> {
+    pub fn push_turn_context(
+        &mut self,
+        cwd: &Path,
+        model: &str,
+        level: &str,
+    ) -> Result<(), SessionError> {
         let id = self.next_id();
         let record = Record::TurnContext {
             parent_id: self.last_id.clone(),
@@ -640,27 +791,106 @@ impl Session {
         self.append(record, id)
     }
 
-    /// Append a compaction checkpoint. The original messages stay on disk but stop being
-    /// part of the context.
-    #[allow(clippy::too_many_arguments)]
-    pub fn push_compaction(
+    /// Persist the exact request projection before the provider call starts.
+    pub fn push_request_context(
         &mut self,
-        reason: &str,
-        summary: &str,
-        replacement_history: Vec<Message>,
-        read_files: Vec<String>,
-        modified_files: Vec<String>,
-        usage: Option<Usage>,
+        request_id: &str,
+        request: &crate::llm::Request<'_>,
     ) -> Result<(), SessionError> {
         let id = self.next_id();
+        let system_prompt_hash = request.messages.iter().find_map(|message| match message {
+            Message::System { content } => Some(crate::util::stable_digest(content)),
+            _ => None,
+        });
+        let tools_hash = crate::util::stable_digest(
+            &serde_json::to_string(request.tools).expect("tool schema is serializable")
+        );
+        let record = Record::RequestContext {
+            parent_id: self.last_id.clone(),
+            id: id.clone(),
+            request_id: request_id.to_string(),
+            provider: request.provider.name.clone(),
+            model: request.model.id.clone(),
+            level: request.level.to_string(),
+            context_window: request.model.context_window,
+            token_estimate: crate::llm::estimate_request_context(request.messages, "", request.tools),
+            system_prompt_hash,
+            tools_hash,
+            cache_hints: request.cache_hints,
+            timestamp: now(),
+        };
+        self.append(record, id)
+    }
+
+    pub fn push_compaction_start(
+        &mut self,
+        compaction_id: &str,
+        reason: &str,
+        provider: &str,
+        model: &str,
+        level: &str,
+        token_before: u64,
+    ) -> Result<(), SessionError> {
+        let id = self.next_id();
+        let record = Record::CompactionStart {
+            parent_id: self.last_id.clone(),
+            id: id.clone(),
+            compaction_id: compaction_id.to_string(),
+            reason: reason.to_string(),
+            provider: provider.to_string(),
+            model: model.to_string(),
+            level: level.to_string(),
+            token_before,
+            timestamp: now(),
+        };
+        self.append(record, id)
+    }
+
+    pub fn push_compaction_end(
+        &mut self,
+        compaction_id: &str,
+        error: Option<&str>,
+    ) -> Result<(), SessionError> {
+        let id = self.next_id();
+        let record = Record::CompactionEnd {
+            parent_id: self.last_id.clone(),
+            id: id.clone(),
+            compaction_id: compaction_id.to_string(),
+            error: error.map(str::to_string),
+            timestamp: now(),
+        };
+        self.append(record, id)
+    }
+
+    /// Append a compaction checkpoint. The original messages stay on disk but stop being
+    /// part of the context.
+    pub fn push_compaction(
+        &mut self,
+        outcome: crate::agent::compact::CompactionOutcome,
+        reason: &str,
+        provider: &str,
+        model: &str,
+        level: &str,
+    ) -> Result<(), SessionError> {
+        let id = self.next_id();
+        let usage = outcome.usage.is_meaningful().then_some(outcome.usage);
         let record = Record::Compacted {
             parent_id: self.last_id.clone(),
             id: id.clone(),
+            compaction_id: outcome.compaction_id,
             reason: reason.to_string(),
-            summary: summary.to_string(),
-            replacement_history,
-            read_files,
-            modified_files,
+            provider: provider.to_string(),
+            model: model.to_string(),
+            level: level.to_string(),
+            summary: outcome.summary,
+            replacement_history: outcome.replacement,
+            replacement_ids: outcome.replacement_ids,
+            read_files: outcome.read_files,
+            modified_files: outcome.modified_files,
+            shadowed_ids: outcome.shadowed_ids,
+            token_before: outcome.token_before,
+            token_after: outcome.token_after,
+            summary_prompt_version: crate::agent::compact::SUMMARY_PROMPT_VERSION.to_string(),
             usage,
             timestamp: now(),
         };
@@ -672,12 +902,57 @@ impl Session {
         Ok(())
     }
 
-    pub fn push_pruning(&mut self, outcome: crate::agent::compact::PruneOutcome) -> Result<(), SessionError> {
+    pub fn push_tool_start(
+        &mut self,
+        tool_call_id: &str,
+        name: &str,
+        arguments: serde_json::Value,
+        replay_safe: bool,
+    ) -> Result<(), SessionError> {
         let id = self.next_id();
+        let record = Record::ToolExecutionStart {
+            parent_id: self.last_id.clone(),
+            id: id.clone(),
+            tool_call_id: tool_call_id.to_string(),
+            name: name.to_string(),
+            arguments,
+            replay_safe,
+            timestamp: now(),
+        };
+        self.append(record, id)
+    }
+
+    pub fn push_tool_end(
+        &mut self,
+        tool_call_id: &str,
+        name: &str,
+        status: crate::llm::ToolStatus,
+        duration_ms: Option<u64>,
+    ) -> Result<(), SessionError> {
+        let id = self.next_id();
+        let record = Record::ToolExecutionEnd {
+            parent_id: self.last_id.clone(),
+            id: id.clone(),
+            tool_call_id: tool_call_id.to_string(),
+            name: name.to_string(),
+            status,
+            duration_ms,
+            timestamp: now(),
+        };
+        self.append(record, id)
+    }
+
+    pub fn push_pruning(
+        &mut self,
+        outcome: crate::agent::compact::PruneOutcome,
+    ) -> Result<(), SessionError> {
+        let id = self.next_id();
+        let replacement_ids = self.context_snapshot().entry_ids;
         let record = Record::Pruned {
             parent_id: self.last_id.clone(),
             id: id.clone(),
             replacement_history: outcome.replacement,
+            replacement_ids,
             tool_results: outcome.tool_results,
             saved_tokens: outcome.saved_tokens,
             timestamp: now(),
@@ -715,6 +990,7 @@ impl Session {
     }
 
     fn append(&mut self, record: Record, id: String) -> Result<(), SessionError> {
+        record.validate().map_err(|err| SessionError::Parse(err.into()))?;
         // The file is created by the record that turns an empty launch into a conversation;
         // until then everything is buffered, including the header and the environment block,
         // and is written out in one go. Keeping those out of the file is not only about
@@ -799,8 +1075,10 @@ impl Session {
         for (index, record) in self.records.iter().enumerate() {
             if let Some(usage) = record.usage() {
                 totals.add(&usage);
-                last_usage = Some(usage);
-                last_index = Some(index);
+                if usage.is_meaningful() {
+                    last_usage = Some(usage);
+                    last_index = Some(index);
+                }
             }
         }
         // Usage recorded before the last checkpoint describes the *old*, larger context,
@@ -832,7 +1110,11 @@ pub fn now() -> String {
 fn civil_from_unix(seconds: u64) -> (i64, u32, u32, u32, u32, u32) {
     let days = (seconds / 86_400) as i64;
     let rem = seconds % 86_400;
-    let (hour, minute, second) = ((rem / 3600) as u32, ((rem % 3600) / 60) as u32, (rem % 60) as u32);
+    let (hour, minute, second) = (
+        (rem / 3600) as u32,
+        ((rem % 3600) / 60) as u32,
+        (rem % 60) as u32,
+    );
     // Howard Hinnant's civil_from_days.
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
@@ -945,7 +1227,9 @@ pub fn list(cwd: &Path) -> Vec<SessionSummary> {
 /// taking the whole list down with it.
 pub fn list_in(dir: &Path) -> Vec<SessionSummary> {
     let dir = dir.to_path_buf();
-    let Ok(entries) = std::fs::read_dir(&dir) else { return Vec::new() };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
     let mut summaries: Vec<SessionSummary> = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
@@ -998,7 +1282,9 @@ pub fn list_in(dir: &Path) -> Vec<SessionSummary> {
 /// A one-line summary of a message, for the transcript and the resume list.
 pub fn message_preview(message: &Message, width: usize) -> String {
     match message {
-        Message::User { .. } => crate::util::truncate(&crate::util::one_line(&message.text()), width, "…"),
+        Message::User { .. } => {
+            crate::util::truncate(&crate::util::one_line(&message.text()), width, "…")
+        }
         Message::Assistant { content, .. } => {
             let text = content
                 .iter()
@@ -1027,14 +1313,39 @@ mod tests {
     fn pruning_and_repeated_checkpoints_preserve_original_execution_facts() {
         use crate::llm::ToolStatus;
         let (mut session, dir) = temp_session("pruned-facts");
-        session.push_message(Message::user_text("不用 /copy，保留代码缩进"), None, None).unwrap();
-        session.push_message(Message::Assistant {
-            content: vec![Block::ToolCall { id: "c".into(), name: "edit".into(), arguments: serde_json::json!({"path":"a.rs"}) }],
-            stop_reason: Some(StopReason::ToolUse),
-        }, None, None).unwrap();
+        session
+            .push_message(Message::user_text("不用 /copy，保留代码缩进"), None, None)
+            .unwrap();
+        session
+            .push_message(
+                Message::Assistant {
+                    content: vec![Block::ToolCall {
+                        id: "c".into(),
+                        name: "edit".into(),
+                        arguments: serde_json::json!({"path":"a.rs"}),
+                    }],
+                    stop_reason: Some(StopReason::ToolUse),
+                },
+                None,
+                None,
+            )
+            .unwrap();
         let original = "重要日志\n".repeat(4000);
-        session.push_message(Message::Tool { tool_call_id: "c".into(), name: "edit".into(), content: original.clone(), status: ToolStatus::Error }, None, None).unwrap();
-        let outcome = crate::agent::compact::prune_tool_results(&session.context_messages(), session.path()).unwrap();
+        session
+            .push_message(
+                Message::Tool {
+                    tool_call_id: "c".into(),
+                    name: "edit".into(),
+                    content: original.clone(),
+                    status: ToolStatus::Error,
+                },
+                None,
+                None,
+            )
+            .unwrap();
+        let outcome =
+            crate::agent::compact::prune_tool_results(&session.context_messages(), session.path())
+                .unwrap();
         session.push_pruning(outcome).unwrap();
         assert!(session.measured_context_tokens().is_none());
         assert!(session.context_messages()[2].text().contains("中间已裁剪"));
@@ -1042,15 +1353,31 @@ mod tests {
         for round in 0..2 {
             let facts = session.checkpoint_facts(4096);
             assert_eq!(facts.user_requests, ["不用 /copy，保留代码缩进"]);
-            assert!(facts.files.lists().1.is_empty(), "failed edit must never become a modified file");
-            session.push_compaction("manual", &format!("summary {round}"), vec![Message::user_text("模型摘要没有保留用户原话")], vec![], vec![], None).unwrap();
+            assert!(
+                facts.files.lists().1.is_empty(),
+                "failed edit must never become a modified file"
+            );
+            push_test_compaction(
+                &mut session,
+                "manual",
+                &format!("summary {round}"),
+                vec![Message::user_text("模型摘要没有保留用户原话")],
+                vec![],
+                None,
+            );
         }
         let path = session.path().to_path_buf();
         drop(session);
         let resumed = Session::open(&path).unwrap();
-        assert_eq!(resumed.checkpoint_facts(4096).user_requests, ["不用 /copy，保留代码缩进"]);
+        assert_eq!(
+            resumed.checkpoint_facts(4096).user_requests,
+            ["不用 /copy，保留代码缩进"]
+        );
         assert!(resumed.file_operations().lists().1.is_empty());
-        assert_eq!(resumed.context_messages()[0].text(), "模型摘要没有保留用户原话");
+        assert_eq!(
+            resumed.context_messages()[0].text(),
+            "模型摘要没有保留用户原话"
+        );
         drop(resumed);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -1120,10 +1447,16 @@ mod tests {
     fn a_write_cut_inside_a_utf8_character_can_be_recovered() {
         let (mut session, dir) = temp_session_with_a_message("partial-utf8");
         let path = session.path().to_path_buf();
-        session.push_message(Message::user_text("中文"), None, None).unwrap();
+        session
+            .push_message(Message::user_text("中文"), None, None)
+            .unwrap();
         drop(session);
         let mut bytes = std::fs::read(&path).unwrap();
-        let cut = bytes.windows("中".len()).position(|part| part == "中".as_bytes()).unwrap() + 1;
+        let cut = bytes
+            .windows("中".len())
+            .position(|part| part == "中".as_bytes())
+            .unwrap()
+            + 1;
         bytes.truncate(cut);
         std::fs::write(&path, bytes).unwrap();
         let resumed = Session::open(&path).unwrap();
@@ -1278,15 +1611,35 @@ mod tests {
     #[test]
     fn context_pressure_includes_new_input_and_ignores_summary_usage_after_reopen() {
         let (mut session, dir) = temp_session("pressure");
-        session.push_message(Message::assistant_text("answer"), Some(Usage {
-            input:100,output:20,cache_read:50,cache_write:0,
-        }), Some(StopReason::Stop)).unwrap();
+        session
+            .push_message(
+                Message::assistant_text("answer"),
+                Some(Usage {
+                    input: 100,
+                    output: 20,
+                    cache_read: 50,
+                    cache_write: 0,
+                }),
+                Some(StopReason::Stop),
+            )
+            .unwrap();
         let input = Message::user_text("新的输入".repeat(1000));
         let cost = input.estimate_tokens();
         session.push_message(input, None, None).unwrap();
         assert_eq!(session.measured_context_tokens(), Some(170 + cost));
-        session.push_compaction("manual", "summary", vec![Message::user_text("summary")],
-            vec![], vec![], Some(Usage { input:999,output:20,cache_read:0,cache_write:0 })).unwrap();
+        push_test_compaction(
+            &mut session,
+            "manual",
+            "summary",
+            vec![Message::user_text("summary")],
+            vec![],
+            Some(Usage {
+                input: 999,
+                output: 20,
+                cache_read: 0,
+                cache_write: 0,
+            }),
+        );
         let path = session.path().to_path_buf();
         drop(session);
         let reopened = Session::open(&path).unwrap();
@@ -1300,6 +1653,39 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let session = Session::create_in(&dir, &dir, "work/m").unwrap();
         (session, dir)
+    }
+
+    fn push_test_compaction(
+        session: &mut Session,
+        reason: &str,
+        summary: &str,
+        replacement_history: Vec<Message>,
+        read_files: Vec<String>,
+        usage: Option<Usage>,
+    ) {
+        let replacement_ids = (0..replacement_history.len())
+            .map(|index| format!("test-replacement-{index}"))
+            .collect();
+        session
+            .push_compaction(
+                crate::agent::compact::CompactionOutcome {
+                    compaction_id: "test-compaction".into(),
+                    summary: summary.to_string(),
+                    replacement: replacement_history,
+                    replacement_ids,
+                    read_files,
+                    modified_files: vec![],
+                    shadowed_ids: vec![],
+                    token_before: 100,
+                    token_after: 10,
+                    usage: usage.unwrap_or_default(),
+                },
+                reason,
+                "test-provider",
+                "test-model",
+                "",
+            )
+            .unwrap();
     }
 
     /// A session that has already said something, and therefore has a file. Tests about
@@ -1337,11 +1723,21 @@ mod tests {
             )
             .unwrap();
         session
-            .push_message(Message::System { content: "系统".into() }, None, None)
+            .push_message(
+                Message::System {
+                    content: "系统".into(),
+                },
+                None,
+                None,
+            )
             .unwrap();
         // The environment block is a user message by type but bookkeeping by intent.
         session
-            .push_message(Message::user_text("<environment>\n工作目录: /tmp"), None, None)
+            .push_message(
+                Message::user_text("<environment>\n工作目录: /tmp"),
+                None,
+                None,
+            )
             .unwrap();
 
         // Each line of a multi-line message is its own entry: the editor is single-line, so
@@ -1358,11 +1754,22 @@ mod tests {
         // user typed, and those turns did happen. Reading the records instead of the context
         // is what keeps them reachable.
         let (mut session, dir) = temp_session("history-compacted");
-        session.push_message(Message::user_text("被压缩掉的话"), None, None).unwrap();
         session
-            .push_compaction("test", "摘要", vec![Message::user_text("摘要占位")], vec![], vec![], None)
+            .push_message(Message::user_text("被压缩掉的话"), None, None)
             .unwrap();
-        assert_eq!(session.context_messages().len(), 1, "the summary replaced the turn");
+        push_test_compaction(
+            &mut session,
+            "test",
+            "摘要",
+            vec![Message::user_text("摘要占位")],
+            vec![],
+            None,
+        );
+        assert_eq!(
+            session.context_messages().len(),
+            1,
+            "the summary replaced the turn"
+        );
         assert_eq!(session.user_history(), vec!["被压缩掉的话".to_string()]);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1378,7 +1785,10 @@ mod tests {
         assert_eq!(find_by_prefix_in(&dir, &id).unwrap(), session.path());
         assert_eq!(find_by_prefix_in(&dir, &id[..8]).unwrap(), session.path());
         // Whitespace from a sloppy copy-paste is tolerated.
-        assert_eq!(find_by_prefix_in(&dir, &format!("  {}  ", &id[..8])).unwrap(), session.path());
+        assert_eq!(
+            find_by_prefix_in(&dir, &format!("  {}  ", &id[..8])).unwrap(),
+            session.path()
+        );
 
         // An unknown id is an error: silently starting a blank session would hide the typo
         // until the user noticed the missing history.
@@ -1434,7 +1844,10 @@ mod tests {
 
         // A prefix one character longer than the shared run picks exactly one session.
         let unique = &ids[0][..shared + 1];
-        assert_eq!(find_by_prefix_in(&dir, unique).unwrap(), dir_for(&dir, unique));
+        assert_eq!(
+            find_by_prefix_in(&dir, unique).unwrap(),
+            dir_for(&dir, unique)
+        );
         // And the full id stays unambiguous.
         assert!(find_by_prefix_in(&dir, &ids[0]).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
@@ -1482,7 +1895,10 @@ mod tests {
         };
         assert_eq!(summary.label(40), "(空白会话)");
         // A name wins over the missing snippet.
-        let named = SessionSummary { name: Some("我的会话".into()), ..summary };
+        let named = SessionSummary {
+            name: Some("我的会话".into()),
+            ..summary
+        };
         assert_eq!(named.label(40), "我的会话");
     }
 
@@ -1511,11 +1927,16 @@ mod tests {
     #[test]
     fn deleting_removes_the_file_and_refuses_later_writes() {
         let (mut session, dir) = temp_session("delete");
-        session.push_message(Message::user_text("hello"), None, None).unwrap();
+        session
+            .push_message(Message::user_text("hello"), None, None)
+            .unwrap();
         let path = session.path().to_path_buf();
         assert!(path.is_file());
 
-        assert!(session.delete().unwrap(), "a saved session had a file to remove");
+        assert!(
+            session.delete().unwrap(),
+            "a saved session had a file to remove"
+        );
         assert!(!path.exists(), "the file is gone");
 
         // A write after the delete must not bring the file back: the user asked for it to
@@ -1537,10 +1958,16 @@ mod tests {
         let project = root.join("proj");
         std::fs::create_dir_all(&project).unwrap();
 
-        let mut session = Session::create_in(&crate::config::sessions_dir_in(&store, &project), &project, "work/m")
-            .unwrap();
+        let mut session = Session::create_in(
+            &crate::config::sessions_dir_in(&store, &project),
+            &project,
+            "work/m",
+        )
+        .unwrap();
         session.register_under = Some(store.clone());
-        session.push_message(Message::user_text("你好"), None, None).unwrap();
+        session
+            .push_message(Message::user_text("你好"), None, None)
+            .unwrap();
         let dir = session.path().parent().unwrap().to_path_buf();
         assert!(dir.is_dir());
 
@@ -1560,7 +1987,10 @@ mod tests {
         assert_eq!(list_in(&dir).len(), 1);
 
         session.delete().unwrap();
-        assert!(list_in(&dir).is_empty(), "the deleted session is no longer offered");
+        assert!(
+            list_in(&dir).is_empty(),
+            "the deleted session is no longer offered"
+        );
         assert!(!path.exists());
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1591,11 +2021,18 @@ mod tests {
     fn reopening_replays_the_conversation() {
         let (mut session, dir) = temp_session("replay");
         let path = session.path().to_path_buf();
-        session.push_message(Message::user_text("hello"), None, None).unwrap();
+        session
+            .push_message(Message::user_text("hello"), None, None)
+            .unwrap();
         session
             .push_message(
                 Message::assistant_text("hi there"),
-                Some(Usage { input: 10, output: 3, cache_read: 0, cache_write: 0 }),
+                Some(Usage {
+                    input: 10,
+                    output: 3,
+                    cache_read: 0,
+                    cache_write: 0,
+                }),
                 Some(StopReason::Stop),
             )
             .unwrap();
@@ -1608,7 +2045,12 @@ mod tests {
         assert_eq!(messages[0].text(), "hello");
         assert_eq!(messages[1].text(), "hi there");
         // The turn context is stored but is not part of the conversation.
-        assert!(reopened.records().iter().any(|r| matches!(r, Record::TurnContext { .. })));
+        assert!(
+            reopened
+                .records()
+                .iter()
+                .any(|r| matches!(r, Record::TurnContext { .. }))
+        );
         assert_eq!(reopened.totals.input, 10);
         assert_eq!(reopened.last_usage.unwrap().output, 3);
         let _ = std::fs::remove_dir_all(dir);
@@ -1621,10 +2063,18 @@ mod tests {
         // back from the turn contexts, and the newest one is the answer.
         let (mut session, dir) = temp_session("model-switch");
         let path = session.path().to_path_buf();
-        session.push_message(Message::user_text("hello"), None, None).unwrap();
-        session.push_turn_context(&dir, "work/first", "low").unwrap();
-        session.push_message(Message::user_text("again"), None, None).unwrap();
-        session.push_turn_context(&dir, "work/second", "max").unwrap();
+        session
+            .push_message(Message::user_text("hello"), None, None)
+            .unwrap();
+        session
+            .push_turn_context(&dir, "work/first", "low")
+            .unwrap();
+        session
+            .push_message(Message::user_text("again"), None, None)
+            .unwrap();
+        session
+            .push_turn_context(&dir, "work/second", "max")
+            .unwrap();
         drop(session);
 
         let reopened = Session::open(&path).unwrap();
@@ -1667,12 +2117,17 @@ mod tests {
         // A current session may be saved before the first turn context is recorded.
         let (mut session, dir) = temp_session("no-turn-context");
         let path = session.path().to_path_buf();
-        session.push_message(Message::user_text("hello"), None, None).unwrap();
+        session
+            .push_message(Message::user_text("hello"), None, None)
+            .unwrap();
         drop(session);
 
         let reopened = Session::open(&path).unwrap();
         assert_eq!(reopened.current_model(), None);
-        assert!(!reopened.header().model.is_empty(), "the header still names one");
+        assert!(
+            !reopened.header().model.is_empty(),
+            "the header still names one"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1682,14 +2137,24 @@ mod tests {
         session
             .push_message(
                 Message::assistant_text("big"),
-                Some(Usage { input: 900_000, output: 100, cache_read: 0, cache_write: 0 }),
+                Some(Usage {
+                    input: 900_000,
+                    output: 100,
+                    cache_read: 0,
+                    cache_write: 0,
+                }),
                 Some(StopReason::Stop),
             )
             .unwrap();
         assert_eq!(session.last_usage.unwrap().input, 900_000);
-        session
-            .push_compaction("manual", "summary", vec![Message::user_text("hello")], vec![], vec![], None)
-            .unwrap();
+        push_test_compaction(
+            &mut session,
+            "manual",
+            "summary",
+            vec![Message::user_text("hello")],
+            vec![],
+            None,
+        );
         assert!(session.last_usage.is_none());
         assert_eq!(session.context_messages().len(), 1);
         let _ = std::fs::remove_dir_all(dir);
@@ -1698,19 +2163,23 @@ mod tests {
     #[test]
     fn context_messages_come_from_the_last_checkpoint() {
         let (mut session, dir) = temp_session("checkpoint");
-        session.push_message(Message::user_text("old one"), None, None).unwrap();
-        session.push_message(Message::assistant_text("old answer"), None, None).unwrap();
         session
-            .push_compaction(
-                "threshold",
-                "summary text",
-                vec![Message::user_text("old one")],
-                vec!["a.rs".into()],
-                vec![],
-                None,
-            )
+            .push_message(Message::user_text("old one"), None, None)
             .unwrap();
-        session.push_message(Message::user_text("new question"), None, None).unwrap();
+        session
+            .push_message(Message::assistant_text("old answer"), None, None)
+            .unwrap();
+        push_test_compaction(
+            &mut session,
+            "threshold",
+            "summary text",
+            vec![Message::user_text("old one")],
+            vec!["a.rs".into()],
+            None,
+        );
+        session
+            .push_message(Message::user_text("new question"), None, None)
+            .unwrap();
 
         let messages = session.context_messages();
         assert_eq!(messages.len(), 2);
@@ -1718,12 +2187,17 @@ mod tests {
         assert_eq!(messages[1].text(), "new question");
         // The summary itself is a checkpoint field, not a message in the history.
         assert!(messages.iter().all(|m| !m.text().contains("summary text")));
+        let snapshot = session.context_snapshot();
+        assert_eq!(snapshot.messages.len(), snapshot.entry_ids.len());
+        assert!(snapshot.entry_ids.iter().all(|id| !id.is_empty()));
 
         // Reopening must produce exactly the same view.
         let path = session.path().to_path_buf();
         drop(session);
         let reopened = Session::open(&path).unwrap();
         assert_eq!(reopened.context_messages().len(), 2);
+        let snapshot = reopened.context_snapshot();
+        assert_eq!(snapshot.messages.len(), snapshot.entry_ids.len());
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1757,7 +2231,10 @@ mod tests {
         let summaries = list_in(&dir);
         assert_eq!(summaries.len(), 1);
         let summary = &summaries[0];
-        assert_eq!(summary.messages, 2, "the environment block must not be counted");
+        assert_eq!(
+            summary.messages, 2,
+            "the environment block must not be counted"
+        );
         assert_eq!(summary.snippet, "帮我重构 config.rs", "{}", summary.snippet);
         assert!(!summary.snippet.contains("<environment>"));
         assert_eq!(summary.label(40), "帮我重构 config.rs");
@@ -1782,7 +2259,8 @@ mod tests {
         let dir_a = crate::config::sessions_dir_in(&store, &a);
         let dir_b = crate::config::sessions_dir_in(&store, &b);
         let mut in_a = Session::create_in(&dir_a, &a, "work/m").unwrap();
-        in_a.push_message(Message::user_text("在 a 里"), None, None).unwrap();
+        in_a.push_message(Message::user_text("在 a 里"), None, None)
+            .unwrap();
 
         // The two directories are separate stores, so `b` cannot see `a`'s session.
         assert_eq!(list_in(&dir_a).len(), 1);
@@ -1806,14 +2284,22 @@ mod tests {
 
         let first = crate::config::register_dir_in(&store, &project);
         assert_eq!(crate::config::register_dir_in(&store, &project), first);
-        assert_eq!(crate::config::dir_id_in(&store, &project).as_deref(), Some(first.as_str()));
         assert_eq!(
-            crate::config::sessions_dir_in(&store, &project).file_name().unwrap(),
+            crate::config::dir_id_in(&store, &project).as_deref(),
+            Some(first.as_str())
+        );
+        assert_eq!(
+            crate::config::sessions_dir_in(&store, &project)
+                .file_name()
+                .unwrap(),
             first.as_str()
         );
         // A table written here is readable by the next process, which is the whole point.
         let index = crate::config::read_dirs_index_for_test(&store);
-        assert_eq!(index.get(&first).map(String::as_str), Some(project.to_string_lossy().as_ref()));
+        assert_eq!(
+            index.get(&first).map(String::as_str),
+            Some(project.to_string_lossy().as_ref())
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1838,7 +2324,10 @@ mod tests {
 
         // Creating a session is what registers it, and then the id is stable.
         let id = crate::config::register_dir_in(&store, &project);
-        assert_eq!(crate::config::dir_id_in(&store, &project).as_deref(), Some(id.as_str()));
+        assert_eq!(
+            crate::config::dir_id_in(&store, &project).as_deref(),
+            Some(id.as_str())
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1861,7 +2350,10 @@ mod tests {
                 None,
             )
             .unwrap();
-        assert!(!session.path().exists(), "the environment block alone is not a session");
+        assert!(
+            !session.path().exists(),
+            "the environment block alone is not a session"
+        );
         assert!(list_in(&dir).is_empty());
 
         // The first real message brings the whole beginning with it, in order, so the file
@@ -1914,7 +2406,9 @@ mod tests {
         assert_eq!(session.current_cwd().as_deref(), Some(elsewhere.as_path()));
 
         let block = crate::agent::r#loop::environment_block(&elsewhere, "sid", "/usr/bin/zsh");
-        session.push_message(Message::user_text(block), None, None).unwrap();
+        session
+            .push_message(Message::user_text(block), None, None)
+            .unwrap();
         assert_eq!(session.current_cwd().as_deref(), Some(elsewhere.as_path()));
 
         // Relocating to the same place is a no-op.
@@ -1929,10 +2423,14 @@ mod tests {
         let (mut session, dir) = temp_session("cwd-blocks");
         for cwd in ["/tmp/one", "/tmp/two", "/tmp/three"] {
             let block = crate::agent::r#loop::environment_block(Path::new(cwd), "sid", "zsh");
-            session.push_message(Message::user_text(block), None, None).unwrap();
+            session
+                .push_message(Message::user_text(block), None, None)
+                .unwrap();
         }
         assert!(session.current_cwd().is_none());
-        session.push_turn_context(Path::new("/tmp/current"), "p/m", "high").unwrap();
+        session
+            .push_turn_context(Path::new("/tmp/current"), "p/m", "high")
+            .unwrap();
         assert_eq!(
             session.current_cwd().as_deref(),
             Some(Path::new("/tmp/current")),

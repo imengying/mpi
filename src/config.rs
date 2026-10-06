@@ -28,7 +28,9 @@ pub struct ShellConfig {
 
 impl Default for ShellConfig {
     fn default() -> Self {
-        ShellConfig { path: DEFAULT_SHELL.into() }
+        ShellConfig {
+            path: DEFAULT_SHELL.into(),
+        }
     }
 }
 
@@ -61,10 +63,40 @@ pub struct ModelConfig {
     /// Use the provider's hosted search. Off unless asked: most models cannot search, and
     /// a tool that appears and disappears between turns breaks the cache prefix.
     pub search: bool,
+    /// Sampling overrides keyed by the effective thinking level. These are sent on
+    /// OpenAI-compatible chat-completions routes; other protocols keep their defaults.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub sampling_params_by_thinking_level: BTreeMap<String, SamplingParams>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compat: Option<CompatPatch>,
     #[serde(skip_serializing_if = "CompactionConfig::is_default")]
     pub compaction: CompactionConfig,
+}
+
+/// Provider-neutral sampling knobs that can be selected with a thinking level.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct SamplingParams {
+    pub temperature: Option<f64>,
+    pub top_p: Option<f64>,
+}
+
+impl SamplingParams {
+    fn validate(&self) -> Result<(), &'static str> {
+        if self
+            .temperature
+            .is_some_and(|value| !value.is_finite() || !(0.0..=2.0).contains(&value))
+        {
+            return Err("temperature 必须是 0 到 2 之间的有限数字");
+        }
+        if self
+            .top_p
+            .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+        {
+            return Err("top_p 必须是 0 到 1 之间的有限数字");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -96,7 +128,12 @@ pub fn level_index(level: &str) -> Option<usize> {
 
 impl ModelConfig {
     fn is_deepseek(&self) -> bool {
-        self.id.rsplit('/').next().unwrap_or(&self.id).to_ascii_lowercase().starts_with("deepseek-")
+        self.id
+            .rsplit('/')
+            .next()
+            .unwrap_or(&self.id)
+            .to_ascii_lowercase()
+            .starts_with("deepseek-")
     }
 
     pub fn display_name(&self) -> &str {
@@ -112,7 +149,9 @@ impl ModelConfig {
             return Err("配置 compaction 时必须指定 context_window".into());
         }
         let window = self.context_window.unwrap_or(128_000);
-        let reserve = self.compaction.reserve_tokens
+        let reserve = self
+            .compaction
+            .reserve_tokens
             .unwrap_or(Defaults::RESERVE_TOKENS.min(window / 4));
         // With an unknown window, only manual summaries use this fallback. Their output
         // is capped at 16k; do not reject a model based on a window it never declared.
@@ -121,16 +160,25 @@ impl ModelConfig {
         } else {
             self.max_tokens().min(16_384)
         };
-        let reserved = output.checked_add(reserve)
+        let reserved = output
+            .checked_add(reserve)
             .filter(|tokens| *tokens < window)
-            .ok_or_else(|| "max_tokens 与 reserve_tokens 之和必须小于 context_window".to_string())?;
+            .ok_or_else(|| {
+                "max_tokens 与 reserve_tokens 之和必须小于 context_window".to_string()
+            })?;
         let threshold = window - reserved;
-        let keep_recent = self.compaction.keep_recent_tokens
-            .unwrap_or(Defaults::KEEP_RECENT_TOKENS.min(window / 3).min(threshold / 2));
+        let keep_recent = self.compaction.keep_recent_tokens.unwrap_or(
+            Defaults::KEEP_RECENT_TOKENS
+                .min(window / 3)
+                .min(threshold / 2),
+        );
         if keep_recent >= threshold {
             return Err("keep_recent_tokens 必须小于压缩触发阈值".into());
         }
-        Ok(CompactionBudget { threshold, keep_recent })
+        Ok(CompactionBudget {
+            threshold,
+            keep_recent,
+        })
     }
 
     /// The levels this model actually supports, defaulting to all of them.
@@ -143,6 +191,11 @@ impl ModelConfig {
         } else {
             self.thinking_levels.clone()
         }
+    }
+
+    pub fn sampling_params(&self, level: &str) -> Option<&SamplingParams> {
+        let level = if level.is_empty() { "off" } else { level };
+        self.sampling_params_by_thinking_level.get(level)
     }
 
     /// Clamp a level into this model's supported set, preferring the nearest one.
@@ -163,7 +216,9 @@ impl ModelConfig {
         let mut best = candidates[0].clone();
         let mut best_distance = usize::MAX;
         for candidate in candidates {
-            let distance = level_index(candidate).map(|i| i.abs_diff(target)).unwrap_or(usize::MAX);
+            let distance = level_index(candidate)
+                .map(|i| i.abs_diff(target))
+                .unwrap_or(usize::MAX);
             if distance <= best_distance {
                 best_distance = distance;
                 best = candidate.clone();
@@ -180,13 +235,22 @@ pub enum ConfigError {
     #[error("配置文件读取失败：{0}")]
     Read(#[from] std::io::Error),
     #[error("无法写出示例配置 {path}：{source}")]
-    Init { path: PathBuf, source: std::io::Error },
+    Init {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error("配置文件解析失败：{0}")]
     Parse(#[from] serde_json::Error),
     #[error("配置缺少 providers：请在 {0} 里至少配置一个 provider")]
     NoProviders(PathBuf),
-    #[error("provider「{provider}」的模型「{model}」思考级别「{level}」无效（可用：low、medium、high、xhigh、max）")]
-    BadLevel { provider: String, model: String, level: String },
+    #[error(
+        "provider「{provider}」的模型「{model}」思考级别「{level}」无效（可用：low、medium、high、xhigh、max）"
+    )]
+    BadLevel {
+        provider: String,
+        model: String,
+        level: String,
+    },
     #[error("provider「{0}」的 api 必须是 messages、completions 或 responses")]
     BadApi(String),
     #[error("{0}")]
@@ -194,7 +258,18 @@ pub enum ConfigError {
     #[error("default_model「{0}」不是「<provider>/<model>」形式，或指向了未配置的模型")]
     BadDefaultModel(String),
     #[error("provider「{provider}」的模型「{model}」上下文预算无效：{reason}")]
-    BadCompaction { provider: String, model: String, reason: String },
+    BadCompaction {
+        provider: String,
+        model: String,
+        reason: String,
+    },
+    #[error("provider「{provider}」的模型「{model}」思考级别「{level}」的采样参数无效：{reason}")]
+    BadSampling {
+        provider: String,
+        model: String,
+        level: String,
+        reason: String,
+    },
     #[error(
         "provider「{provider}」的模型「{model}」打开了 search，但这个接口没有可用的原生搜索写法。在 compat.search_format 里指定：responses 用 web_search 或 web_and_x，messages 用 anthropic，completions 用 xai、qwen 或 zhipu。DeepSeek 官方接口不能原生搜索，请把 search 设为 false"
     )]
@@ -211,9 +286,16 @@ pub enum ConfigError {
 mod fields {
     pub const ROOT: [&str; 3] = ["shell", "providers", "default_model"];
     pub const SHELL: [&str; 1] = ["path"];
-    pub const PROVIDER: [&str; 7] =
-        ["name", "api", "base_url", "api_key_env", "api_key", "compat", "models"];
-    pub const MODEL: [&str; 9] = [
+    pub const PROVIDER: [&str; 7] = [
+        "name",
+        "api",
+        "base_url",
+        "api_key_env",
+        "api_key",
+        "compat",
+        "models",
+    ];
+    pub const MODEL: [&str; 10] = [
         "id",
         "name",
         "context_window",
@@ -221,10 +303,12 @@ mod fields {
         "reasoning",
         "thinking_levels",
         "search",
+        "sampling_params_by_thinking_level",
         "compat",
         "compaction",
     ];
     pub const COMPACTION: [&str; 2] = ["reserve_tokens", "keep_recent_tokens"];
+    pub const SAMPLING: [&str; 2] = ["temperature", "top_p"];
     pub const COMPAT: [&str; 13] = [
         "max_tokens_field",
         "supports_developer_role",
@@ -243,7 +327,10 @@ mod fields {
 }
 
 /// Report the first key in `object` that is not in `known`.
-fn unknown_key(object: &serde_json::Map<String, serde_json::Value>, known: &[&str]) -> Option<String> {
+fn unknown_key(
+    object: &serde_json::Map<String, serde_json::Value>,
+    known: &[&str],
+) -> Option<String> {
     object
         .keys()
         .find(|key| !known.contains(&key.as_str()))
@@ -276,14 +363,16 @@ fn unknown_field_error(location: &str, key: &str) -> ConfigError {
     };
     ConfigError::UnknownField(format!(
         "{location}里的「{key}」不是配置项，也不会生效（{hint}）\
-         配置字段一律 snake_case，且写错的键会被忽略而不是报错——\
-         与其让请求发到别处，不如在这里停下。"
+         配置字段一律 snake_case；写错的键不能静默忽略，程序会在这里停下，\
+         避免请求发到别处。"
     ))
 }
 
 /// Walk the raw JSON and reject keys the structs would silently drop.
 fn check_unknown_fields(raw: &serde_json::Value) -> Result<(), ConfigError> {
-    let Some(root) = raw.as_object() else { return Ok(()) };
+    let Some(root) = raw.as_object() else {
+        return Ok(());
+    };
     if let Some(key) = unknown_key(root, &fields::ROOT) {
         return Err(unknown_field_error("配置", &key));
     }
@@ -296,22 +385,35 @@ fn check_unknown_fields(raw: &serde_json::Value) -> Result<(), ConfigError> {
         return Ok(());
     };
     for provider in providers {
-        let Some(provider) = provider.as_object() else { continue };
-        let name = provider.get("name").and_then(|value| value.as_str()).unwrap_or("?");
+        let Some(provider) = provider.as_object() else {
+            continue;
+        };
+        let name = provider
+            .get("name")
+            .and_then(|value| value.as_str())
+            .unwrap_or("?");
         if let Some(key) = unknown_key(provider, &fields::PROVIDER) {
             return Err(unknown_field_error(&format!("provider「{name}」"), &key));
         }
         if let Some(compat) = provider.get("compat").and_then(|value| value.as_object())
             && let Some(key) = unknown_key(compat, &fields::COMPAT)
         {
-            return Err(unknown_field_error(&format!("provider「{name}」的 compat"), &key));
+            return Err(unknown_field_error(
+                &format!("provider「{name}」的 compat"),
+                &key,
+            ));
         }
         let Some(models) = provider.get("models").and_then(|value| value.as_array()) else {
             continue;
         };
         for model in models {
-            let Some(model) = model.as_object() else { continue };
-            let id = model.get("id").and_then(|value| value.as_str()).unwrap_or("?");
+            let Some(model) = model.as_object() else {
+                continue;
+            };
+            let id = model
+                .get("id")
+                .and_then(|value| value.as_str())
+                .unwrap_or("?");
             if let Some(key) = unknown_key(model, &fields::MODEL) {
                 return Err(unknown_field_error(
                     &format!("provider「{name}」的模型「{id}」"),
@@ -329,7 +431,25 @@ fn check_unknown_fields(raw: &serde_json::Value) -> Result<(), ConfigError> {
             if let Some(compaction) = model.get("compaction").and_then(|value| value.as_object())
                 && let Some(key) = unknown_key(compaction, &fields::COMPACTION)
             {
-                return Err(unknown_field_error(&format!("provider「{name}」的模型「{id}」的 compaction"), &key));
+                return Err(unknown_field_error(
+                    &format!("provider「{name}」的模型「{id}」的 compaction"),
+                    &key,
+                ));
+            }
+            if let Some(sampling) = model
+                .get("sampling_params_by_thinking_level")
+                .and_then(|value| value.as_object())
+            {
+                for (level, params) in sampling {
+                    if let Some(params) = params.as_object()
+                        && let Some(key) = unknown_key(params, &fields::SAMPLING)
+                    {
+                        return Err(unknown_field_error(
+                            &format!("provider「{name}」的模型「{id}」的采样级别「{level}」"),
+                            &key,
+                        ));
+                    }
+                }
             }
         }
     }
@@ -346,7 +466,9 @@ fn check_unknown_fields(raw: &serde_json::Value) -> Result<(), ConfigError> {
 /// `pi`, and a directory they have to find by hand is far more likely to be looked for
 /// under the name of the command than under the name of the repository.
 pub fn home_dir() -> PathBuf {
-    dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join(NEW_HOME)
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(NEW_HOME)
 }
 
 /// The directory name the store lives under.
@@ -392,18 +514,32 @@ pub const TEMPLATE: &str = r#"{
 /// error, because from the caller's side the file it wanted to create is there now.
 fn init_config(path: &Path) -> Result<(), ConfigError> {
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)
-            .map_err(|source| ConfigError::Init { path: path.to_path_buf(), source })?;
+        std::fs::create_dir_all(dir).map_err(|source| ConfigError::Init {
+            path: path.to_path_buf(),
+            source,
+        })?;
     }
-    let mut file = match std::fs::OpenOptions::new().write(true).create_new(true).open(path) {
+    let mut file = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
         Ok(file) => file,
         // Another process wrote it between the `exists` check and here: use that one.
         Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
-        Err(source) => return Err(ConfigError::Init { path: path.to_path_buf(), source }),
+        Err(source) => {
+            return Err(ConfigError::Init {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
     };
     use std::io::Write as _;
     file.write_all(TEMPLATE.as_bytes())
-        .map_err(|source| ConfigError::Init { path: path.to_path_buf(), source })
+        .map_err(|source| ConfigError::Init {
+            path: path.to_path_buf(),
+            source,
+        })
 }
 
 impl Config {
@@ -446,15 +582,41 @@ impl Config {
                 return Err(ConfigError::NoProviders(path.to_path_buf()));
             }
             for model in &provider.models {
-                model.compaction_budget().map_err(|reason| ConfigError::BadCompaction {
-                    provider: provider.name.clone(), model: model.id.clone(), reason,
-                })?;
+                model
+                    .compaction_budget()
+                    .map_err(|reason| ConfigError::BadCompaction {
+                        provider: provider.name.clone(),
+                        model: model.id.clone(),
+                        reason,
+                    })?;
                 for level in &model.thinking_levels {
                     if level_index(level).is_none() {
                         return Err(ConfigError::BadLevel {
                             provider: provider.name.clone(),
                             model: model.id.clone(),
                             level: level.clone(),
+                        });
+                    }
+                }
+                let supported_levels = model.levels();
+                for (level, sampling) in &model.sampling_params_by_thinking_level {
+                    if level != "off"
+                        && (level_index(level).is_none()
+                            || !supported_levels.iter().any(|supported| supported == level))
+                    {
+                        return Err(ConfigError::BadSampling {
+                            provider: provider.name.clone(),
+                            model: model.id.clone(),
+                            level: level.clone(),
+                            reason: "级别必须是该模型支持的 thinking_levels，或 off".into(),
+                        });
+                    }
+                    if let Err(reason) = sampling.validate() {
+                        return Err(ConfigError::BadSampling {
+                            provider: provider.name.clone(),
+                            model: model.id.clone(),
+                            level: level.clone(),
+                            reason: reason.into(),
                         });
                     }
                 }
@@ -542,7 +704,10 @@ impl Config {
         let mut out = Vec::new();
         for provider in &self.providers {
             for model in &provider.models {
-                out.push((provider.name.clone(), format!("{}/{}", provider.name, model.id)));
+                out.push((
+                    provider.name.clone(),
+                    format!("{}/{}", provider.name, model.id),
+                ));
             }
         }
         out
@@ -602,6 +767,10 @@ pub struct Usage {
 }
 
 impl Usage {
+    pub fn is_meaningful(&self) -> bool {
+        self.input > 0 || self.output > 0 || self.cache_read > 0 || self.cache_write > 0
+    }
+
     pub fn add(&mut self, other: &Usage) {
         self.input += other.input;
         self.output += other.output;
@@ -874,26 +1043,66 @@ mod tests {
 
     #[test]
     fn model_budgets_reserve_output_and_scale_recent_context() {
-        let model = ModelConfig { context_window: Some(6000), max_tokens: Some(1000), ..Default::default() };
+        let model = ModelConfig {
+            context_window: Some(6000),
+            max_tokens: Some(1000),
+            ..Default::default()
+        };
         let budget = model.compaction_budget().unwrap();
         assert_eq!(budget.threshold, 3500);
         assert_eq!(budget.keep_recent, 1750);
-        let large = ModelConfig { context_window: Some(1_000_000), max_tokens: Some(64_000), ..Default::default() };
+        let large = ModelConfig {
+            context_window: Some(1_000_000),
+            max_tokens: Some(64_000),
+            ..Default::default()
+        };
         let budget = large.compaction_budget().unwrap();
         assert_eq!(budget.threshold, 919_616);
         assert_eq!(budget.keep_recent, 20_000);
-        let tuned = ModelConfig { compaction: CompactionConfig { reserve_tokens: Some(512), keep_recent_tokens: Some(1000) }, ..model.clone() };
+        let tuned = ModelConfig {
+            compaction: CompactionConfig {
+                reserve_tokens: Some(512),
+                keep_recent_tokens: Some(1000),
+            },
+            ..model.clone()
+        };
         assert_eq!(tuned.compaction_budget().unwrap().threshold, 4488);
         assert_eq!(tuned.compaction_budget().unwrap().keep_recent, 1000);
         for compaction in [
-            CompactionConfig { reserve_tokens: Some(5000), keep_recent_tokens: None },
-            CompactionConfig { reserve_tokens: Some(u64::MAX), keep_recent_tokens: None },
-            CompactionConfig { reserve_tokens: None, keep_recent_tokens: Some(3500) },
+            CompactionConfig {
+                reserve_tokens: Some(5000),
+                keep_recent_tokens: None,
+            },
+            CompactionConfig {
+                reserve_tokens: Some(u64::MAX),
+                keep_recent_tokens: None,
+            },
+            CompactionConfig {
+                reserve_tokens: None,
+                keep_recent_tokens: Some(3500),
+            },
         ] {
-            assert!(ModelConfig { compaction, ..model.clone() }.compaction_budget().is_err());
+            assert!(
+                ModelConfig {
+                    compaction,
+                    ..model.clone()
+                }
+                .compaction_budget()
+                .is_err()
+            );
         }
-        assert!(ModelConfig { context_window: None, ..tuned }.compaction_budget().is_err());
-        let unknown = ModelConfig { max_tokens: Some(200_000), ..Default::default() };
+        assert!(
+            ModelConfig {
+                context_window: None,
+                ..tuned
+            }
+            .compaction_budget()
+            .is_err()
+        );
+        let unknown = ModelConfig {
+            max_tokens: Some(200_000),
+            ..Default::default()
+        };
         assert_eq!(unknown.compaction_budget().unwrap().keep_recent, 20_000);
         let raw = serde_json::json!({"providers":[{"name":"p","models":[{"id":"m","compaction":{"keepRecentTokens":100}}]}]});
         assert!(check_unknown_fields(&raw).is_err());
@@ -904,23 +1113,76 @@ mod tests {
         use crate::llm::compat::ThinkingFormat;
         let provider: Provider = serde_json::from_value(serde_json::json!({
             "name":"gateway", "api":"completions", "base_url":"https://gateway.example/v1"
-        })).unwrap();
+        }))
+        .unwrap();
         for id in ["deepseek-v4.1-flash", "deepseek-ai/DeepSeek-V4.1-Flash"] {
-            let model = ModelConfig { id:id.into(), ..Default::default() };
+            let model = ModelConfig {
+                id: id.into(),
+                ..Default::default()
+            };
             let compat = provider.compat(&model);
             assert_eq!(compat.thinking_format, ThinkingFormat::Deepseek);
             assert!(compat.requires_reasoning_content_on_assistant);
         }
-        let mut model = ModelConfig { id:"deepseek-v4.1-flash".into(), ..Default::default() };
-        model.compat = Some(serde_json::from_value(serde_json::json!({
-            "thinking_format":"none", "requires_reasoning_content_on_assistant":false
-        })).unwrap());
+        let mut model = ModelConfig {
+            id: "deepseek-v4.1-flash".into(),
+            ..Default::default()
+        };
+        model.compat = Some(
+            serde_json::from_value(serde_json::json!({
+                "thinking_format":"none", "requires_reasoning_content_on_assistant":false
+            }))
+            .unwrap(),
+        );
         let compat = provider.compat(&model);
         assert_eq!(compat.thinking_format, ThinkingFormat::None);
         assert!(!compat.requires_reasoning_content_on_assistant);
-        assert_eq!(provider.compat(&ModelConfig { id:"another-model".into(), ..Default::default() }).thinking_format, ThinkingFormat::Openai);
-        let provider = Provider { api:"responses".into(), ..provider };
-        assert!(!provider.compat(&ModelConfig { id:"deepseek-v4.1-flash".into(), ..Default::default() }).requires_reasoning_content_on_assistant);
+        assert_eq!(
+            provider
+                .compat(&ModelConfig {
+                    id: "another-model".into(),
+                    ..Default::default()
+                })
+                .thinking_format,
+            ThinkingFormat::Openai
+        );
+        let provider = Provider {
+            api: "responses".into(),
+            ..provider
+        };
+        assert!(
+            !provider
+                .compat(&ModelConfig {
+                    id: "deepseek-v4.1-flash".into(),
+                    ..Default::default()
+                })
+                .requires_reasoning_content_on_assistant
+        );
+    }
+
+    #[test]
+    fn sampling_params_follow_the_effective_level_and_validate_ranges() {
+        let raw = serde_json::json!({
+            "providers": [{"name":"p", "api":"completions", "models": [{
+                "id":"m",
+                "sampling_params_by_thinking_level": {
+                    "off": {"temperature": 0.2},
+                    "high": {"temperature": 0.7, "top_p": 0.9}
+                }
+            }]}]
+        });
+        let config: Config = serde_json::from_value(raw).unwrap();
+        let model = &config.providers[0].models[0];
+        assert_eq!(model.sampling_params("").unwrap().temperature, Some(0.2));
+        assert_eq!(model.sampling_params("high").unwrap().top_p, Some(0.9));
+
+        let invalid = serde_json::json!({
+            "providers": [{"name":"p", "api":"completions", "models": [{
+                "id":"m", "sampling_params_by_thinking_level": {"high": {"top_p": 2.0}}
+            }]}]
+        });
+        let config: Config = serde_json::from_value(invalid).unwrap();
+        assert!(config.validate(Path::new("config.json")).is_err());
     }
 
     fn sample() -> Config {
@@ -948,7 +1210,11 @@ mod tests {
         assert!(provider.base_url.contains("127.0.0.1"), "not a real host");
         assert_eq!(provider.name, "provider-name");
         assert!(
-            config.default_model.as_deref().unwrap_or_default().contains("provider-name"),
+            config
+                .default_model
+                .as_deref()
+                .unwrap_or_default()
+                .contains("provider-name"),
             "the default model names the placeholder provider"
         );
     }
@@ -997,7 +1263,10 @@ mod tests {
         std::fs::remove_file(dir.join("one.jsonl")).unwrap();
         assert!(forget_dir_if_empty_in(&store, &project));
         assert!(!dir.exists());
-        assert!(dir_id_in(&store, &project).is_none(), "the id must not linger");
+        assert!(
+            dir_id_in(&store, &project).is_none(),
+            "the id must not linger"
+        );
         // Forgetting twice is not an error, just a no-op.
         assert!(!forget_dir_if_empty_in(&store, &project));
 
@@ -1032,7 +1301,10 @@ mod tests {
         assert_eq!(cfg.shell.path, DEFAULT_SHELL);
         assert_eq!(cfg.default_model.as_deref(), Some("work/m1"));
         assert_eq!(cfg.providers[0].models[1].display_name(), "m2");
-        assert_eq!(cfg.providers[0].api_key_env.as_deref(), Some("WORK_API_KEY"));
+        assert_eq!(
+            cfg.providers[0].api_key_env.as_deref(),
+            Some("WORK_API_KEY")
+        );
     }
 
     #[test]
@@ -1053,7 +1325,10 @@ mod tests {
     fn unknown_level_is_rejected() {
         let raw = r#"{"providers":[{"name":"p","api":"completions","models":[{"id":"m","thinking_levels":["off"]}]}]}"#;
         let cfg: Config = serde_json::from_str(raw).unwrap();
-        assert!(matches!(cfg.validate(&PathBuf::from("x")), Err(ConfigError::BadLevel { .. })));
+        assert!(matches!(
+            cfg.validate(&PathBuf::from("x")),
+            Err(ConfigError::BadLevel { .. })
+        ));
     }
 
     #[test]
@@ -1069,7 +1344,10 @@ mod tests {
     fn an_api_that_is_not_a_protocol_is_rejected() {
         let raw = r#"{"providers":[{"name":"p","api":"openai-respones","models":[{"id":"m"}]}]}"#;
         let cfg: Config = serde_json::from_str(raw).unwrap();
-        assert!(matches!(cfg.validate(&PathBuf::from("x")), Err(ConfigError::BadApi(_))));
+        assert!(matches!(
+            cfg.validate(&PathBuf::from("x")),
+            Err(ConfigError::BadApi(_))
+        ));
     }
 
     #[test]
@@ -1104,7 +1382,10 @@ mod tests {
         let err = check_unknown_fields(&raw).unwrap_err();
         let text = err.to_string();
         assert!(text.contains("baseUrl"), "{text}");
-        assert!(text.contains("base_url"), "the suggestion must name the right key: {text}");
+        assert!(
+            text.contains("base_url"),
+            "the suggestion must name the right key: {text}"
+        );
         assert!(text.contains("grok"), "{text}");
     }
 
@@ -1128,8 +1409,8 @@ mod tests {
                 "api":"completions","models":[{"id":"m"}]}]}),
         ];
         for case in cases {
-            let err = check_unknown_fields(&case)
-                .expect_err(&format!("this must be rejected: {case}"));
+            let err =
+                check_unknown_fields(&case).expect_err(&format!("this must be rejected: {case}"));
             assert!(
                 err.to_string().contains("不是配置项"),
                 "the message must say what is wrong: {err}"
@@ -1190,7 +1471,10 @@ mod tests {
     #[test]
     fn empty_providers_is_an_error_not_a_builtin_list() {
         let cfg = Config::default();
-        assert!(matches!(cfg.validate(&PathBuf::from("x")), Err(ConfigError::NoProviders(_))));
+        assert!(matches!(
+            cfg.validate(&PathBuf::from("x")),
+            Err(ConfigError::NoProviders(_))
+        ));
     }
 
     #[test]
@@ -1204,5 +1488,4 @@ mod tests {
             ]
         );
     }
-
 }

@@ -8,6 +8,10 @@ use crate::config::{ModelConfig, Provider};
 use crate::llm::{Completion, Message, Request, StopReason, ToolSpec, client::Client};
 use crate::util;
 
+/// Bumped whenever the summary contract changes. It is stored with each checkpoint so a
+/// replay/debugger can tell which projection rules produced the text.
+pub const SUMMARY_PROMPT_VERSION: &str = "v2";
+
 /// Why a compaction is happening. The three paths share this implementation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reason {
@@ -64,18 +68,6 @@ pub enum CompactError {
     Session(String),
 }
 
-/// Estimate the tokens in a message list, preferring real usage when it is still valid.
-///
-/// `real_usage` must only be passed when it describes the *current* context: usage from
-/// before the last checkpoint measures the old, larger history and would make the
-/// threshold fire again immediately after a compaction.
-pub fn estimate_context(messages: &[Message], system: &str, real_usage: Option<u64>) -> u64 {
-    match real_usage {
-        Some(tokens) if tokens > 0 => tokens,
-        _ => crate::llm::estimate_context(messages, system),
-    }
-}
-
 pub struct PruneOutcome {
     pub replacement: Vec<Message>,
     pub tool_results: usize,
@@ -84,30 +76,63 @@ pub struct PruneOutcome {
 
 /// Run only under token pressure. This changes result text, never calls, status or user input.
 /// Each replacement points to the append-only session containing the complete original.
-pub fn prune_tool_results(messages: &[Message], session_path: &std::path::Path) -> Option<PruneOutcome> {
+pub fn prune_tool_results(
+    messages: &[Message],
+    session_path: &std::path::Path,
+) -> Option<PruneOutcome> {
     const THRESHOLD: usize = 8192;
     const HEAD: usize = 4096;
     const TAIL: usize = 1024;
     let mut edits = Vec::new();
     let mut saved_tokens = 0;
     for (index, message) in messages.iter().enumerate() {
-        let Message::Tool { tool_call_id, content, .. } = message else { continue };
+        let Message::Tool {
+            tool_call_id,
+            content,
+            ..
+        } = message
+        else {
+            continue;
+        };
         let chars = content.chars().count();
-        if chars <= THRESHOLD { continue; }
+        if chars <= THRESHOLD {
+            continue;
+        }
         let head: String = content.chars().take(HEAD).collect();
-        let tail: String = content.chars().rev().take(TAIL).collect::<String>().chars().rev().collect();
-        let trimmed = format!("{head}\n\n[工具结果中间已裁剪；原始内容保存在 {}，tool_call_id={tool_call_id}]\n\n{tail}", session_path.display());
-        if trimmed.chars().count() >= chars { continue; }
-        saved_tokens += util::estimate_tokens(content).saturating_sub(util::estimate_tokens(&trimmed));
+        let tail: String = content
+            .chars()
+            .rev()
+            .take(TAIL)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+        let trimmed = format!(
+            "{head}\n\n[工具结果中间已裁剪；原始内容保存在 {}，tool_call_id={tool_call_id}]\n\n{tail}",
+            session_path.display()
+        );
+        if trimmed.chars().count() >= chars {
+            continue;
+        }
+        saved_tokens +=
+            util::estimate_tokens(content).saturating_sub(util::estimate_tokens(&trimmed));
         edits.push((index, trimmed));
     }
-    if edits.is_empty() { return None; }
+    if edits.is_empty() {
+        return None;
+    }
     let tool_results = edits.len();
     let mut replacement = messages.to_vec();
     for (index, trimmed) in edits {
-        if let Message::Tool { content, .. } = &mut replacement[index] { *content = trimmed; }
+        if let Message::Tool { content, .. } = &mut replacement[index] {
+            *content = trimmed;
+        }
     }
-    Some(PruneOutcome { replacement, tool_results, saved_tokens })
+    Some(PruneOutcome {
+        replacement,
+        tool_results,
+        saved_tokens,
+    })
 }
 
 /// Where to cut, and whether the cut lands in the middle of a turn.
@@ -129,10 +154,6 @@ impl CutPoint {
 /// it must follow the call that produced it.
 pub fn is_cut_point(message: &Message) -> bool {
     matches!(message, Message::User { .. } | Message::Assistant { .. })
-}
-
-fn is_turn_start(message: &Message) -> bool {
-    matches!(message, Message::User { .. })
 }
 
 fn is_user(message: &Message) -> bool {
@@ -168,16 +189,21 @@ pub fn find_cut_point(messages: &[Message], keep_recent_tokens: u64) -> Option<C
         if cut == 0 || !is_cut_point(&messages[cut]) {
             return None;
         }
-        let turn_start = if is_turn_start(&messages[cut]) {
+        let turn_start = if is_user(&messages[cut]) {
             None
         } else {
-            (0..cut).rev().find(|index| is_turn_start(&messages[*index]))
+            (0..cut)
+                .rev()
+                .find(|index| is_user(&messages[*index]))
         };
         // A cut inside the first turn would summarise nothing.
         if turn_start == Some(0) && cut == 1 {
             return None;
         }
-        Some(CutPoint { first_kept: cut, turn_start })
+        Some(CutPoint {
+            first_kept: cut,
+            turn_start,
+        })
     };
     // Nearest valid cut at or after the budget boundary: the tool results that belong to
     // an assistant cut stay attached to it automatically, because they come after.
@@ -244,13 +270,23 @@ impl FileOps {
                     pending.insert(id, (name, path.to_string()));
                 }
             }
-            if let Message::Tool { tool_call_id, name, status, .. } = message
+            if let Message::Tool {
+                tool_call_id,
+                name,
+                status,
+                ..
+            } = message
                 && let Some((expected, path)) = pending.remove(tool_call_id.as_str())
-                && name.as_str() == expected && *status == crate::llm::ToolStatus::Success
+                && name.as_str() == expected
+                && *status == crate::llm::ToolStatus::Success
             {
                 match name.as_str() {
-                    "read" | "grep" | "find" | "ls" => { ops.read.insert(path); }
-                    "write" | "edit" => { ops.modified.insert(path); }
+                    "read" | "grep" | "find" | "ls" => {
+                        ops.read.insert(path);
+                    }
+                    "write" | "edit" => {
+                        ops.modified.insert(path);
+                    }
                     _ => {}
                 }
             }
@@ -277,15 +313,26 @@ pub struct CheckpointFacts {
 }
 
 fn user_request_block(requests: &[String]) -> String {
-    if requests.is_empty() { return String::new(); }
-    format!("\n\n<user-requests>\n用户近期要求的原文，按时间排列；后续纠正优先：\n{}\n</user-requests>",
-        requests.iter().map(|text| format!("- {text}")).collect::<Vec<_>>().join("\n"))
+    if requests.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n\n<user-requests>\n用户近期要求的原文，按时间排列；后续纠正优先：\n{}\n</user-requests>",
+        requests
+            .iter()
+            .map(|text| format!("- {text}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    )
 }
 
 pub fn format_file_blocks(read_files: &[String], modified_files: &[String]) -> String {
     let mut sections = Vec::new();
     if !read_files.is_empty() {
-        sections.push(format!("<read-files>\n{}\n</read-files>", read_files.join("\n")));
+        sections.push(format!(
+            "<read-files>\n{}\n</read-files>",
+            read_files.join("\n")
+        ));
     }
     if !modified_files.is_empty() {
         sections.push(format!(
@@ -323,7 +370,10 @@ pub fn serialize_conversation(messages: &[Message]) -> String {
             Message::User { .. } => {
                 let text = message.text();
                 if !text.trim().is_empty() {
-                    parts.push(format!("[用户]: {}", truncate_chars(&text, ASSISTANT_TEXT_MAX_CHARS)));
+                    parts.push(format!(
+                        "[用户]: {}",
+                        truncate_chars(&text, ASSISTANT_TEXT_MAX_CHARS)
+                    ));
                 }
             }
             Message::Assistant { .. } => {
@@ -351,15 +401,30 @@ pub fn serialize_conversation(messages: &[Message]) -> String {
                 let calls: Vec<String> = message
                     .tool_calls()
                     .into_iter()
-                    .map(|(_, name, arguments)| format!("{name}({})", truncate_chars(&arguments.to_string(), TOOL_RESULT_MAX_CHARS)))
+                    .map(|(_, name, arguments)| {
+                        format!(
+                            "{name}({})",
+                            truncate_chars(&arguments.to_string(), TOOL_RESULT_MAX_CHARS)
+                        )
+                    })
                     .collect();
                 if !calls.is_empty() {
                     parts.push(format!("[助手工具调用]: {}", calls.join("; ")));
                 }
             }
-            Message::Tool { name, content, status, .. } => {
+            Message::Tool {
+                name,
+                content,
+                status,
+                ..
+            } => {
                 if !content.trim().is_empty() {
-                    parts.push(format!("[工具结果 {}，{}]: {}", name, status.label(), truncate_for_summary(content)));
+                    parts.push(format!(
+                        "[工具结果 {}，{}]: {}",
+                        name,
+                        status.label(),
+                        truncate_for_summary(content)
+                    ));
                 }
             }
             Message::System { .. } => {}
@@ -381,14 +446,21 @@ fn truncate_chars(text: &str, max: usize) -> String {
         return text.to_string();
     }
     let head: String = text.chars().take(max * 3 / 4).collect();
-    let tail: String = text.chars().rev().take(max / 4).collect::<String>().chars().rev().collect();
+    let tail: String = text
+        .chars()
+        .rev()
+        .take(max / 4)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
     format!("{head}\n[... 已截断中间内容]\n{tail}")
 }
 
 /// The only new user-role item on the prefix-preserving summary path.
 pub fn summary_prompt(conversation: &str, custom: Option<&str>, split_turn: bool) -> String {
     let mut prompt = String::from(
-        "请将此前对话整理成上下文检查点，供后续继续工作。不要继续执行原任务、不要调用工具或搜索。\n\n"
+        "请将此前对话整理成上下文检查点，供后续继续工作。不要继续执行原任务、不要调用工具或搜索。\n\n",
     );
     if !conversation.is_empty() {
         prompt.push_str("以下是因输入预算限制整理的历史；请保留其中的原始任务、约束、决策和未完成事项。\n<conversation>\n");
@@ -410,13 +482,21 @@ pub fn summary_prompt(conversation: &str, custom: Option<&str>, split_turn: bool
 /// A summary that came back truncated must never be stored as a checkpoint.
 pub fn check_summary(completion: &Completion) -> Result<String, CompactError> {
     if let Message::Assistant { content, .. } = &completion.message
-        && content.iter().any(|block| matches!(block, crate::llm::Block::ToolCall { .. } | crate::llm::Block::Hosted { .. }))
+        && content.iter().any(|block| {
+            matches!(
+                block,
+                crate::llm::Block::ToolCall { .. } | crate::llm::Block::Hosted { .. }
+            )
+        })
     {
         return Err(CompactError::ToolCallInSummary);
     }
     match completion.stop_reason {
         StopReason::Error => Err(CompactError::Summarize(
-            completion.error.clone().unwrap_or_else(|| "未知错误".into()),
+            completion
+                .error
+                .clone()
+                .unwrap_or_else(|| "未知错误".into()),
         )),
         StopReason::Length => Err(CompactError::Truncated),
         StopReason::ToolUse => Err(CompactError::ToolCallInSummary),
@@ -457,32 +537,53 @@ pub struct PreparedSummary {
 impl PreparedSummary {
     pub fn request<'a>(&'a self, settings: &'a SummaryRequest<'_>) -> Request<'a> {
         Request {
-            model: &self.model, provider: settings.provider, messages: &self.messages,
-            tools: settings.tools, level: settings.level, session_id: settings.session_id,
-            cache_hints: true,
+            model: &self.model,
+            provider: settings.provider,
+            messages: &self.messages,
+            tools: settings.tools,
+            level: settings.level,
+            session_id: settings.session_id,
+            // A summary is a separate routing operation. Reusing the conversation cache key
+            // lets an auxiliary prompt poison the normal-turn prefix and makes a provider pin
+            // the summary to the conversation's backend session.
+            cache_hints: false,
         }
     }
 }
 
 /// Prefer the untouched history prefix. Fall back only when that request cannot fit.
 pub fn prepare_summary(
-    settings: &SummaryRequest<'_>, summarized: &[Message], split_turn: bool,
+    settings: &SummaryRequest<'_>,
+    summarized: &[Message],
+    split_turn: bool,
 ) -> Result<PreparedSummary, CompactError> {
-    crate::llm::validate_tool_history(summarized).map_err(|err| CompactError::Summarize(err.to_string()))?;
+    crate::llm::validate_tool_history(summarized)
+        .map_err(|err| CompactError::Summarize(err.to_string()))?;
     let mut model = settings.model.clone();
     let window = model.context_window.unwrap_or(128_000);
     model.max_tokens = Some(model.max_tokens().min(16_384).min(window / 4).max(1));
-    let tools_cost = settings.tools.iter().map(|tool| {
-        serde_json::to_string(tool).map(|text| util::estimate_tokens(&text))
-    }).collect::<Result<Vec<_>, _>>().map_err(|err| CompactError::Summarize(err.to_string()))?
-        .into_iter().sum::<u64>();
+    let tools_cost = settings
+        .tools
+        .iter()
+        .map(|tool| serde_json::to_string(tool).map(|text| util::estimate_tokens(&text)))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| CompactError::Summarize(err.to_string()))?
+        .into_iter()
+        .sum::<u64>();
     // Reserve room for protocol framing, tool-choice controls and the requested output.
-    let budget = window.saturating_sub(model.max_tokens()).saturating_sub(tools_cost).saturating_sub(512);
-    let system = settings.system_prompt.map(|content| Message::System { content: content.to_string() });
+    let budget = window
+        .saturating_sub(model.max_tokens())
+        .saturating_sub(tools_cost)
+        .saturating_sub(512);
+    let system = settings.system_prompt.map(|content| Message::System {
+        content: content.to_string(),
+    });
     let directive = summary_prompt("", settings.custom_instructions, split_turn);
     let fixed = system.as_ref().map_or(0, Message::estimate_tokens)
         + Message::user_text(directive.clone()).estimate_tokens();
-    if fixed >= budget { return Err(CompactError::InputTooLarge); }
+    if fixed >= budget {
+        return Err(CompactError::InputTooLarge);
+    }
     let history_cost = summarized.iter().map(Message::estimate_tokens).sum::<u64>();
     let mut messages: Vec<Message> = system.into_iter().collect();
     let reuses_history_prefix = history_cost.saturating_add(fixed) <= budget;
@@ -496,21 +597,36 @@ pub fn prepare_summary(
         let room = budget.saturating_sub(fixed).saturating_sub(256) as usize;
         let conversation = if util::estimate_tokens(&conversation) > room as u64 {
             truncate_chars(&conversation, room)
-        } else { conversation };
-        messages.push(Message::user_text(summary_prompt(&conversation, settings.custom_instructions, split_turn)));
+        } else {
+            conversation
+        };
+        messages.push(Message::user_text(summary_prompt(
+            &conversation,
+            settings.custom_instructions,
+            split_turn,
+        )));
     }
-    if crate::llm::estimate_context(&messages, "") > budget {
+    if crate::llm::estimate_request_context(&messages, "", &[]) > budget {
         return Err(CompactError::InputTooLarge);
     }
-    Ok(PreparedSummary { model, messages, reuses_history_prefix })
+    Ok(PreparedSummary {
+        model,
+        messages,
+        reuses_history_prefix,
+    })
 }
 
 /// Summary calls use the same routing, prompt, tools and effort, and never execute tools.
 pub async fn summarize(
-    client: &Client, settings: SummaryRequest<'_>, summarized: &[Message], split_turn: bool,
+    client: &Client,
+    settings: SummaryRequest<'_>,
+    summarized: &[Message],
+    split_turn: bool,
 ) -> Result<(String, crate::config::Usage), CompactError> {
     let prepared = prepare_summary(&settings, summarized, split_turn)?;
-    let completion = client.complete(&prepared.request(&settings)).await
+    let completion = client
+        .complete(&prepared.request(&settings))
+        .await
         .map_err(|err| CompactError::Summarize(err.message()))?;
     let summary = check_summary(&completion)?;
     Ok((summary, completion.usage))
@@ -558,7 +674,9 @@ pub fn looks_like_overflow(error: &str) -> bool {
     if NOT_OVERFLOW.iter().any(|pattern| lower.contains(pattern)) {
         return false;
     }
-    OVERFLOW_PATTERNS.iter().any(|pattern| lower.contains(pattern))
+    OVERFLOW_PATTERNS
+        .iter()
+        .any(|pattern| lower.contains(pattern))
 }
 
 /// Why a turn should be compacted and retried. Each variant is a distinct symptom.
@@ -568,7 +686,10 @@ pub enum OverflowSignal {
     ExplicitError,
     /// The request succeeded but the prompt alone filled (or overfilled) the window, which
     /// some gateways do silently.
-    SilentOverflow { prompt_tokens: u64, context_window: u64 },
+    SilentOverflow {
+        prompt_tokens: u64,
+        context_window: u64,
+    },
 }
 
 /// Detect an overflow from a finished turn.
@@ -586,12 +707,16 @@ pub fn detect_overflow(
     if completion.stop_reason == StopReason::Error {
         return None;
     }
-    let prompt_tokens = completion.usage.input + completion.usage.cache_read + completion.usage.cache_write;
+    let prompt_tokens =
+        completion.usage.input + completion.usage.cache_read + completion.usage.cache_write;
     if let Some(window) = context_window
         && window > 0
         && prompt_tokens > window
     {
-        return Some(OverflowSignal::SilentOverflow { prompt_tokens, context_window: window });
+        return Some(OverflowSignal::SilentOverflow {
+            prompt_tokens,
+            context_window: window,
+        });
     }
 
     None
@@ -624,14 +749,11 @@ impl RetryBudget {
     }
 }
 
-/// True when the conversation is long enough that a cut exists at all.
-#[cfg(test)]
-fn can_compact(messages: &[Message], keep_recent_tokens: u64) -> bool {
-    find_cut_point(messages, keep_recent_tokens).is_some()
-}
-
 /// Build the replacement history for a compaction, given the current messages.
-pub fn plan(messages: &[Message], keep_recent_tokens: u64) -> Option<(CutPoint, Vec<Message>, Vec<Message>)> {
+pub fn plan(
+    messages: &[Message],
+    keep_recent_tokens: u64,
+) -> Option<(CutPoint, Vec<Message>, Vec<Message>)> {
     let cut = find_cut_point(messages, keep_recent_tokens)?;
     let summarized = messages_to_summarize(messages, cut);
     let kept = messages_to_keep(messages, cut);
@@ -640,10 +762,15 @@ pub fn plan(messages: &[Message], keep_recent_tokens: u64) -> Option<(CutPoint, 
 
 /// Everything a compaction needs, so the caller in `loop.rs` stays readable.
 pub struct CompactionOutcome {
+    pub compaction_id: String,
     pub summary: String,
     pub replacement: Vec<Message>,
+    pub replacement_ids: Vec<String>,
     pub read_files: Vec<String>,
     pub modified_files: Vec<String>,
+    pub shadowed_ids: Vec<String>,
+    pub token_before: u64,
+    pub token_after: u64,
     pub usage: crate::config::Usage,
 }
 
@@ -654,28 +781,57 @@ pub async fn run(
     client: &Client,
     request: SummaryRequest<'_>,
     messages: &[Message],
-    system_prompt: &str,
+    context_ids: &[String],
+    compaction_id: &str,
     keep_recent_tokens: u64,
     facts: CheckpointFacts,
 ) -> Result<CompactionOutcome, CompactError> {
+    if context_ids.len() != messages.len() {
+        return Err(CompactError::Session("上下文记录与消息数量不一致".into()));
+    }
     // Bound the request itself, not just the caps inside it: a long session can still add up
     // to more than the model's window, and a summary request that does not fit cannot be
     // sent at all.
-    let (cut, summarized, kept) = plan(messages, keep_recent_tokens).ok_or(CompactError::TooShort)?;
+    let (cut, summarized, kept) =
+        plan(messages, keep_recent_tokens).ok_or(CompactError::TooShort)?;
+    let system_prompt = request.system_prompt.unwrap_or_default();
+    let tools = request.tools;
+    let token_before = crate::llm::estimate_request_context(messages, system_prompt, tools);
     let (summary, usage) = summarize(client, request, &summarized, cut.is_split_turn()).await?;
     let (read_files, modified_files) = facts.files.lists();
-    let summary = format!("{summary}{}{}", format_file_blocks(&read_files, &modified_files), user_request_block(&facts.user_requests));
+    let summary = format!(
+        "{summary}{}{}",
+        format_file_blocks(&read_files, &modified_files),
+        user_request_block(&facts.user_requests)
+    );
     let replacement = replacement_history(&summarized, &kept, &summary);
-    let tokens_after = replacement.iter().map(Message::estimate_tokens).sum::<u64>()
-        + util::estimate_tokens(system_prompt);
-    if tokens_after >= crate::llm::estimate_context(messages, system_prompt) {
+    let token_after = crate::llm::estimate_request_context(&replacement, system_prompt, tools);
+    if token_after >= token_before {
         return Err(CompactError::NotSmaller);
     }
+    let mut replacement_ids = vec![format!("summary:{compaction_id}")];
+    if !kept.first().is_some_and(is_user)
+        && let Some(index) = summarized.iter().rposition(is_user)
+    {
+        replacement_ids.push(context_ids[index].clone());
+    }
+    replacement_ids.extend_from_slice(&context_ids[cut.first_kept..]);
+    let retained: std::collections::HashSet<_> = replacement_ids.iter().collect();
+    let shadowed_ids = context_ids[..cut.first_kept]
+        .iter()
+        .filter(|id| !retained.contains(id))
+        .cloned()
+        .collect();
     Ok(CompactionOutcome {
+        compaction_id: compaction_id.to_string(),
         summary,
         replacement,
+        replacement_ids,
         read_files,
         modified_files,
+        shadowed_ids,
+        token_before,
+        token_after,
         usage,
     })
 }
@@ -685,30 +841,19 @@ pub async fn run(
 #[derive(Debug, Default)]
 pub struct CompactionState {
     pub running: bool,
-    pub reason: Option<Reason>,
-    /// Set right after a compaction until a fresh usage reading arrives.
-    pub tokens_unknown: bool,
 }
 
 impl CompactionState {
-    pub fn begin(&mut self, reason: Reason) -> Result<(), CompactError> {
+    pub fn begin(&mut self) -> Result<(), CompactError> {
         if self.running {
             return Err(CompactError::InProgress);
         }
         self.running = true;
-        self.reason = Some(reason);
         Ok(())
     }
 
     pub fn finish(&mut self) {
         self.running = false;
-        self.reason = None;
-        self.tokens_unknown = true;
-    }
-
-    /// A real usage reading makes the count trustworthy again.
-    pub fn observe_usage(&mut self) {
-        self.tokens_unknown = false;
     }
 }
 
@@ -719,7 +864,7 @@ mod tests {
     use crate::llm::Block;
 
     #[tokio::test]
-    async fn compaction_sends_the_cached_prefix_and_session_headers_to_the_server() {
+    async fn compaction_has_separate_session_headers_and_no_main_cache_key() {
         use std::io::{BufRead, Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -730,19 +875,26 @@ mod tests {
                 match listener.accept() {
                     Ok((socket, _)) => break socket,
                     Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                        assert!(std::time::Instant::now() < deadline, "summary request did not arrive");
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "summary request did not arrive"
+                        );
                         std::thread::sleep(std::time::Duration::from_millis(10));
                     }
                     Err(err) => panic!("{err}"),
                 }
             };
-            socket.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
             let mut reader = std::io::BufReader::new(socket.try_clone().unwrap());
             let mut headers = std::collections::HashMap::new();
             loop {
                 let mut line = String::new();
                 assert!(reader.read_line(&mut line).unwrap() > 0);
-                if line == "\r\n" { break; }
+                if line == "\r\n" {
+                    break;
+                }
                 if let Some((key, value)) = line.split_once(':') {
                     headers.insert(key.to_ascii_lowercase(), value.trim().to_string());
                 }
@@ -758,21 +910,54 @@ mod tests {
         let provider: Provider = serde_json::from_value(serde_json::json!({
             "api":"completions","base_url":format!("http://{address}/v1"),"api_key":"local-test",
             "compat":{"send_session_affinity":true}
-        })).unwrap();
-        let model = ModelConfig { id:"deepseek-v4.1-flash".into(), reasoning:true,
-            max_tokens:Some(8000), context_window:Some(128000), ..Default::default() };
+        }))
+        .unwrap();
+        let model = ModelConfig {
+            id: "deepseek-v4.1-flash".into(),
+            reasoning: true,
+            max_tokens: Some(8000),
+            context_window: Some(128000),
+            ..Default::default()
+        };
         let tools = crate::tools::specs();
-        let source = vec![user("第一项任务"), assistant(&"工作细节".repeat(3000)), user("接下来做第二项任务")];
+        let source = vec![
+            user("第一项任务"),
+            assistant(&"工作细节".repeat(3000)),
+            user("接下来做第二项任务"),
+        ];
         let original = source.clone();
-        let settings = SummaryRequest { provider:&provider, model:&model, tools:&tools, level:"max",
-            session_id:"summary-session", system_prompt:Some("固定系统提示"), custom_instructions:None };
-        let facts = CheckpointFacts { files: FileOps::collect(&source), user_requests: vec!["不做7和8，不用 /copy".into()] };
-        let outcome = run(&Client::local_test_client(), settings, &source, "固定系统提示", 10, facts).await.unwrap();
+        let settings = SummaryRequest {
+            provider: &provider,
+            model: &model,
+            tools: &tools,
+            level: "max",
+            session_id: "summary-session",
+            system_prompt: Some("固定系统提示"),
+            custom_instructions: None,
+        };
+        let facts = CheckpointFacts {
+            files: FileOps::collect(&source),
+            user_requests: vec!["不做7和8，不用 /copy".into()],
+        };
+        let ids = (0..source.len())
+            .map(|index| format!("entry-{index}"))
+            .collect::<Vec<_>>();
+        let outcome = run(
+            &Client::local_test_client(),
+            settings,
+            &source,
+            &ids,
+            "compaction-test",
+            10,
+            facts,
+        )
+        .await
+        .unwrap();
         assert!(outcome.summary.contains("不做7和8，不用 /copy"));
         let (request, headers) = server.join().unwrap();
         assert_eq!(headers["x-session-id"], "summary-session");
         assert_eq!(headers["x-session-affinity"], "summary-session");
-        assert_eq!(request["prompt_cache_key"], "summary-session");
+        assert!(request.get("prompt_cache_key").is_none());
         assert_eq!(request["tool_choice"], "none");
         assert_eq!(request["tools"].as_array().unwrap().len(), tools.len());
         assert_eq!(request["messages"][0]["content"], "固定系统提示");
@@ -786,17 +971,42 @@ mod tests {
 
     #[test]
     fn oversized_history_falls_back_without_changing_system_tools_or_recent_request() {
-        let provider = Provider { api:"completions".into(), ..Default::default() };
-        let model = ModelConfig { id:"deepseek-v4.1-flash".into(), reasoning:true,
-            context_window:Some(12_000), max_tokens:Some(4000), ..Default::default() };
+        let provider = Provider {
+            api: "completions".into(),
+            ..Default::default()
+        };
+        let model = ModelConfig {
+            id: "deepseek-v4.1-flash".into(),
+            reasoning: true,
+            context_window: Some(12_000),
+            max_tokens: Some(4000),
+            ..Default::default()
+        };
         let tools = crate::tools::specs();
-        let settings = SummaryRequest { provider:&provider, model:&model, session_id:"s",
-            system_prompt:Some("原系统提示"), tools:&tools, level:"max", custom_instructions:None };
-        let source = vec![Message::user_text("原始要求"), Message::Assistant {
-            content:vec![Block::Thinking { thinking:"推理".repeat(30_000), signature:None },
-                Block::Text { text:"首部结论".to_string() + &"过长说明".repeat(20_000) + "尾部待办" }],
-            stop_reason:Some(StopReason::Stop),
-        }];
+        let settings = SummaryRequest {
+            provider: &provider,
+            model: &model,
+            session_id: "s",
+            system_prompt: Some("原系统提示"),
+            tools: &tools,
+            level: "max",
+            custom_instructions: None,
+        };
+        let source = vec![
+            Message::user_text("原始要求"),
+            Message::Assistant {
+                content: vec![
+                    Block::Thinking {
+                        thinking: "推理".repeat(30_000),
+                        signature: None,
+                    },
+                    Block::Text {
+                        text: "首部结论".to_string() + &"过长说明".repeat(20_000) + "尾部待办",
+                    },
+                ],
+                stop_reason: Some(StopReason::Stop),
+            },
+        ];
         let original = source.clone();
         let plan = prepare_summary(&settings, &source, false).unwrap();
         assert!(!plan.reuses_history_prefix);
@@ -805,8 +1015,17 @@ mod tests {
         assert!(!text.contains("推理推理"));
         assert!(text.contains("原始要求"));
         assert!(text.contains("尾部待办"));
-        let tool_tokens: u64 = tools.iter().map(|t| util::estimate_tokens(&serde_json::to_string(t).unwrap())).sum();
-        assert!(crate::llm::estimate_context(&plan.messages, "") + tool_tokens + plan.model.max_tokens() + 512 <= 12_000);
+        let tool_tokens: u64 = tools
+            .iter()
+            .map(|t| util::estimate_tokens(&serde_json::to_string(t).unwrap()))
+            .sum();
+        assert!(
+            crate::llm::estimate_request_context(&plan.messages, "", &[])
+                + tool_tokens
+                + plan.model.max_tokens()
+                + 512
+                <= 12_000
+        );
         assert_eq!(source, original);
         assert_eq!(plan.request(&settings).tools, tools);
         let recent = vec![Message::user_text("最近任务")];
@@ -816,26 +1035,65 @@ mod tests {
 
     #[test]
     fn summary_preserves_absent_system_and_rejects_an_unfit_fixed_prefix() {
-        let provider = Provider { api:"completions".into(), ..Default::default() };
-        let model = ModelConfig { context_window:Some(8000), max_tokens:Some(2000), ..Default::default() };
+        let provider = Provider {
+            api: "completions".into(),
+            ..Default::default()
+        };
+        let model = ModelConfig {
+            context_window: Some(8000),
+            max_tokens: Some(2000),
+            ..Default::default()
+        };
         let source = vec![Message::user_text("已有任务")];
-        let settings = SummaryRequest { provider:&provider, model:&model, session_id:"s", tools:&[],
-            system_prompt:None, level:"", custom_instructions:None };
+        let settings = SummaryRequest {
+            provider: &provider,
+            model: &model,
+            session_id: "s",
+            tools: &[],
+            system_prompt: None,
+            level: "",
+            custom_instructions: None,
+        };
         let plan = prepare_summary(&settings, &source, false).unwrap();
         assert!(plan.reuses_history_prefix);
-        assert!(plan.messages.iter().all(|m| !matches!(m, Message::System { .. })));
-        let small_model = ModelConfig { context_window:Some(100), ..model.clone() };
-        let settings = SummaryRequest { model:&small_model, ..settings };
-        assert!(matches!(prepare_summary(&settings, &source, false), Err(CompactError::InputTooLarge)));
+        assert!(
+            plan.messages
+                .iter()
+                .all(|m| !matches!(m, Message::System { .. }))
+        );
+        let small_model = ModelConfig {
+            context_window: Some(100),
+            ..model.clone()
+        };
+        let settings = SummaryRequest {
+            model: &small_model,
+            ..settings
+        };
+        assert!(matches!(
+            prepare_summary(&settings, &source, false),
+            Err(CompactError::InputTooLarge)
+        ));
     }
 
     #[test]
     fn summary_never_accepts_tool_calls_even_with_a_success_stop() {
-        let completion = Completion { message:Message::Assistant {
-            content:vec![Block::ToolCall { id:"c1".into(), name:"write".into(), arguments:serde_json::json!({}) }],
-            stop_reason:Some(StopReason::Stop),
-        }, stop_reason:StopReason::Stop, usage:Usage::default(), error:None };
-        assert!(matches!(check_summary(&completion), Err(CompactError::ToolCallInSummary)));
+        let completion = Completion {
+            message: Message::Assistant {
+                content: vec![Block::ToolCall {
+                    id: "c1".into(),
+                    name: "write".into(),
+                    arguments: serde_json::json!({}),
+                }],
+                stop_reason: Some(StopReason::Stop),
+            },
+            stop_reason: StopReason::Stop,
+            usage: Usage::default(),
+            error: None,
+        };
+        assert!(matches!(
+            check_summary(&completion),
+            Err(CompactError::ToolCallInSummary)
+        ));
     }
 
     fn user(text: &str) -> Message {
@@ -843,7 +1101,10 @@ mod tests {
     }
 
     fn assistant(text: &str) -> Message {
-        Message::Assistant { content: vec![Block::Text { text: text.into() }], stop_reason: None }
+        Message::Assistant {
+            content: vec![Block::Text { text: text.into() }],
+            stop_reason: None,
+        }
     }
 
     fn call(id: &str, name: &str, path: &str) -> Message {
@@ -858,7 +1119,12 @@ mod tests {
     }
 
     fn result(id: &str, content: &str) -> Message {
-        Message::Tool { status: crate::llm::ToolStatus::Success, tool_call_id: id.into(), name: "read".into(), content: content.into() }
+        Message::Tool {
+            status: crate::llm::ToolStatus::Success,
+            tool_call_id: id.into(),
+            name: "read".into(),
+            content: content.into(),
+        }
     }
 
     /// Roughly `tokens` tokens, given the chars/4 estimate.
@@ -876,9 +1142,15 @@ mod tests {
             messages.push(assistant(&sized("a", 4000)));
         }
         let cut = find_cut_point(&messages, 20_000).expect("a cut exists");
-        assert!(is_cut_point(&messages[cut.first_kept]), "cut landed on a tool result");
+        assert!(
+            is_cut_point(&messages[cut.first_kept]),
+            "cut landed on a tool result"
+        );
         // The kept window really is around the budget, not wildly off.
-        let kept: u64 = messages[cut.first_kept..].iter().map(Message::estimate_tokens).sum();
+        let kept: u64 = messages[cut.first_kept..]
+            .iter()
+            .map(Message::estimate_tokens)
+            .sum();
         assert!(kept >= 20_000, "kept only {kept} tokens");
     }
 
@@ -895,7 +1167,10 @@ mod tests {
         ];
         let cut = find_cut_point(&messages, 30_000).expect("a cut exists");
         assert_eq!(cut.first_kept, 3);
-        assert!(cut.is_split_turn(), "an assistant cut has to remember its turn start");
+        assert!(
+            cut.is_split_turn(),
+            "an assistant cut has to remember its turn start"
+        );
         assert_eq!(cut.turn_start, Some(2));
         let kept = messages_to_keep(&messages, cut);
         // The tool result stays together with its call.
@@ -911,7 +1186,10 @@ mod tests {
             .filter(|m| is_user(m))
             .map(Message::text)
             .collect();
-        assert!(user_texts.iter().any(|t| t.starts_with("ask again")), "{user_texts:?}");
+        assert!(
+            user_texts.iter().any(|t| t.starts_with("ask again")),
+            "{user_texts:?}"
+        );
     }
 
     #[test]
@@ -943,10 +1221,16 @@ mod tests {
         let summarized = messages_to_summarize(&messages, cut);
         let kept = messages_to_keep(&messages, cut);
         let replacement = replacement_history(&summarized, &kept, "S");
-        let user_texts: Vec<String> =
-            replacement.iter().filter(|m| is_user(m)).map(Message::text).collect();
+        let user_texts: Vec<String> = replacement
+            .iter()
+            .filter(|m| is_user(m))
+            .map(Message::text)
+            .collect();
         assert!(!user_texts.iter().any(|t| t.starts_with("first")));
-        assert!(user_texts.iter().any(|t| t.starts_with("second")), "{user_texts:?}");
+        assert!(
+            user_texts.iter().any(|t| t.starts_with("second")),
+            "{user_texts:?}"
+        );
     }
 
     #[test]
@@ -971,7 +1255,7 @@ mod tests {
     fn too_little_history_has_no_cut_point() {
         let messages = vec![user("hi"), assistant("hello")];
         assert!(find_cut_point(&messages, 20_000).is_none());
-        assert!(!can_compact(&messages, 20_000));
+        assert!(find_cut_point(&messages, 20_000).is_none());
     }
 
     #[test]
@@ -992,18 +1276,34 @@ mod tests {
         assert!(text.iter().any(|t| t == "recent question"));
         // Assistant and tool traffic from the summarised part is gone.
         assert!(!text.iter().any(|t| t.contains("noise")));
-        assert!(!replacement.iter().any(|m| matches!(m, Message::Tool { .. })));
+        assert!(
+            !replacement
+                .iter()
+                .any(|m| matches!(m, Message::Tool { .. }))
+        );
     }
 
     #[test]
     fn file_blocks_separate_read_files_from_modified_ones() {
         let messages = vec![
-            call("1", "read", "src/a.rs"), result("1", "read"),
-            call("2", "read", "src/b.rs"), result("2", "read"),
+            call("1", "read", "src/a.rs"),
+            result("1", "read"),
+            call("2", "read", "src/b.rs"),
+            result("2", "read"),
             call("3", "edit", "src/b.rs"),
-            Message::Tool { tool_call_id: "3".into(), name: "edit".into(), content: "done".into(), status: crate::llm::ToolStatus::Success },
+            Message::Tool {
+                tool_call_id: "3".into(),
+                name: "edit".into(),
+                content: "done".into(),
+                status: crate::llm::ToolStatus::Success,
+            },
             call("4", "write", "src/c.rs"),
-            Message::Tool { tool_call_id: "4".into(), name: "write".into(), content: "done".into(), status: crate::llm::ToolStatus::Success },
+            Message::Tool {
+                tool_call_id: "4".into(),
+                name: "write".into(),
+                content: "done".into(),
+                status: crate::llm::ToolStatus::Success,
+            },
         ];
         let ops = FileOps::collect(&messages);
         let (read, modified) = ops.lists();
@@ -1038,14 +1338,23 @@ mod tests {
             user("what changed?"),
             Message::Assistant {
                 content: vec![
-                    Block::Thinking { thinking: sized("scratch ", 40_000), signature: None },
-                    Block::Text { text: "I edited a.rs".into() },
+                    Block::Thinking {
+                        thinking: sized("scratch ", 40_000),
+                        signature: None,
+                    },
+                    Block::Text {
+                        text: "I edited a.rs".into(),
+                    },
                 ],
                 stop_reason: Some(StopReason::Stop),
             },
         ];
         let text = serialize_conversation(&messages);
-        assert!(!text.contains("scratch "), "the trace must not be sent: {}", text.chars().count());
+        assert!(
+            !text.contains("scratch "),
+            "the trace must not be sent: {}",
+            text.chars().count()
+        );
         assert!(!text.contains("助手思考"), "{text}");
         // The answer itself is still there — that is the part worth summarising.
         assert!(text.contains("[助手]: I edited a.rs"), "{text}");
@@ -1056,12 +1365,18 @@ mod tests {
         // The per-message cap is the other half: one very long write-up should not decide how
         // big the request is either.
         let messages = vec![Message::Assistant {
-            content: vec![Block::Text { text: sized("word ", 80_000) }],
+            content: vec![Block::Text {
+                text: sized("word ", 80_000),
+            }],
             stop_reason: Some(StopReason::Stop),
         }];
         let text = serialize_conversation(&messages);
         assert!(text.contains("已截断"), "a capped message says so");
-        assert!(text.chars().count() < ASSISTANT_TEXT_MAX_CHARS * 2, "{}", text.chars().count());
+        assert!(
+            text.chars().count() < ASSISTANT_TEXT_MAX_CHARS * 2,
+            "{}",
+            text.chars().count()
+        );
     }
 
     #[test]
@@ -1098,14 +1413,20 @@ mod tests {
             stop_reason: StopReason::Length,
             error: None,
         };
-        assert!(matches!(check_summary(&completion), Err(CompactError::Truncated)));
+        assert!(matches!(
+            check_summary(&completion),
+            Err(CompactError::Truncated)
+        ));
         let failed = Completion {
             message: Message::assistant_text(""),
             usage: Usage::default(),
             stop_reason: StopReason::Error,
             error: Some("boom".into()),
         };
-        assert!(matches!(check_summary(&failed), Err(CompactError::Summarize(_))));
+        assert!(matches!(
+            check_summary(&failed),
+            Err(CompactError::Summarize(_))
+        ));
     }
 
     #[test]
@@ -1121,15 +1442,23 @@ mod tests {
 
     #[test]
     fn overflows_are_recognised_across_providers() {
-        assert!(looks_like_overflow("prompt is too long: 210000 tokens > 200000 maximum"));
-        assert!(looks_like_overflow("This model's maximum context length is 128000 tokens"));
-        assert!(looks_like_overflow("Your request exceeds the context window"));
+        assert!(looks_like_overflow(
+            "prompt is too long: 210000 tokens > 200000 maximum"
+        ));
+        assert!(looks_like_overflow(
+            "This model's maximum context length is 128000 tokens"
+        ));
+        assert!(looks_like_overflow(
+            "Your request exceeds the context window"
+        ));
         assert!(looks_like_overflow("输入超过了最大长度"));
     }
 
     #[test]
     fn rate_limits_are_not_overflows() {
-        assert!(!looks_like_overflow("Rate limit reached for gpt-4 in organization org-x"));
+        assert!(!looks_like_overflow(
+            "Rate limit reached for gpt-4 in organization org-x"
+        ));
         assert!(!looks_like_overflow("Too many requests, please slow down"));
         assert!(!looks_like_overflow("Throttling error: 429"));
         assert!(!looks_like_overflow("insufficient_quota"));
@@ -1138,12 +1467,18 @@ mod tests {
     #[test]
     fn an_explicit_overflow_error_is_detected() {
         let completion = Completion {
-            message: Message::Assistant { content: vec![], stop_reason: Some(StopReason::Error) },
+            message: Message::Assistant {
+                content: vec![],
+                stop_reason: Some(StopReason::Error),
+            },
             usage: Usage::default(),
             stop_reason: StopReason::Error,
             error: Some("prompt is too long".into()),
         };
-        assert_eq!(detect_overflow(&completion, Some(200_000)), Some(OverflowSignal::ExplicitError));
+        assert_eq!(
+            detect_overflow(&completion, Some(200_000)),
+            Some(OverflowSignal::ExplicitError)
+        );
     }
 
     #[test]
@@ -1151,36 +1486,57 @@ mod tests {
         // The request "succeeded", but the prompt alone did not fit.
         let completion = Completion {
             message: Message::assistant_text("ok"),
-            usage: Usage { input: 210_000, output: 5, cache_read: 0, cache_write: 0 },
+            usage: Usage {
+                input: 210_000,
+                output: 5,
+                cache_read: 0,
+                cache_write: 0,
+            },
             stop_reason: StopReason::Stop,
             error: None,
         };
         assert_eq!(
             detect_overflow(&completion, Some(200_000)),
-            Some(OverflowSignal::SilentOverflow { prompt_tokens: 210_000, context_window: 200_000 })
+            Some(OverflowSignal::SilentOverflow {
+                prompt_tokens: 210_000,
+                context_window: 200_000
+            })
         );
     }
 
     #[test]
     fn output_exhaustion_is_not_context_overflow() {
         let completion = Completion {
-            message: Message::Assistant { content: vec![], stop_reason: Some(StopReason::Length) },
-            usage: Usage { input: 99_000, output: 0, cache_read: 0, cache_write: 0 },
+            message: Message::Assistant {
+                content: vec![],
+                stop_reason: Some(StopReason::Length),
+            },
+            usage: Usage {
+                input: 99_000,
+                output: 0,
+                cache_read: 0,
+                cache_write: 0,
+            },
             stop_reason: StopReason::Length,
             error: None,
         };
-        assert_eq!(
-            detect_overflow(&completion, Some(100_000)),
-            None
-        );
+        assert_eq!(detect_overflow(&completion, Some(100_000)), None);
         assert_eq!(detect_overflow(&completion, None), None);
     }
 
     #[test]
     fn a_genuine_length_stop_near_the_cap_is_not_an_overflow() {
         let completion = Completion {
-            message: Message::Assistant { content: vec![], stop_reason: Some(StopReason::Length) },
-            usage: Usage { input: 1000, output: 8000, cache_read: 0, cache_write: 0 },
+            message: Message::Assistant {
+                content: vec![],
+                stop_reason: Some(StopReason::Length),
+            },
+            usage: Usage {
+                input: 1000,
+                output: 8000,
+                cache_read: 0,
+                cache_write: 0,
+            },
             stop_reason: StopReason::Length,
             error: None,
         };
@@ -1191,7 +1547,12 @@ mod tests {
     fn a_healthy_turn_is_not_an_overflow() {
         let completion = Completion {
             message: Message::assistant_text("done"),
-            usage: Usage { input: 1000, output: 50, cache_read: 0, cache_write: 0 },
+            usage: Usage {
+                input: 1000,
+                output: 50,
+                cache_read: 0,
+                cache_write: 0,
+            },
             stop_reason: StopReason::Stop,
             error: None,
         };
@@ -1211,30 +1572,40 @@ mod tests {
     #[test]
     fn a_second_compaction_cannot_start_while_one_is_running() {
         let mut state = CompactionState::default();
-        state.begin(Reason::Manual).unwrap();
-        assert!(matches!(state.begin(Reason::Threshold), Err(CompactError::InProgress)));
+        state.begin().unwrap();
+        assert!(matches!(state.begin(), Err(CompactError::InProgress)));
         state.finish();
-        assert!(state.tokens_unknown);
-        state.observe_usage();
-        assert!(!state.tokens_unknown);
-        assert!(state.begin(Reason::Overflow).is_ok());
+        assert!(state.begin().is_ok());
     }
 
     #[test]
     fn real_usage_is_preferred_over_the_estimate() {
         let messages = vec![user("short")];
-        assert_eq!(estimate_context(&messages, "system", Some(123_456)), 123_456);
-        assert!(estimate_context(&messages, "system", None) < 100);
+        assert!(crate::llm::estimate_request_context(&messages, "system", &[]) < 100);
     }
 
     #[test]
     fn failed_cancelled_skipped_and_unknown_operations_are_not_completed_files() {
         use crate::llm::ToolStatus;
         let mut messages = Vec::new();
-        for (index, status) in [ToolStatus::Error, ToolStatus::Cancelled, ToolStatus::Skipped, ToolStatus::Unknown, ToolStatus::Success].into_iter().enumerate() {
+        for (index, status) in [
+            ToolStatus::Error,
+            ToolStatus::Cancelled,
+            ToolStatus::Skipped,
+            ToolStatus::Unknown,
+            ToolStatus::Success,
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let id = index.to_string();
             messages.push(call(&id, "edit", &format!("{index}.rs")));
-            messages.push(Message::Tool { tool_call_id: id, name: "edit".into(), content: "result".into(), status });
+            messages.push(Message::Tool {
+                tool_call_id: id,
+                name: "edit".into(),
+                content: "result".into(),
+                status,
+            });
         }
         messages.push(call("pending", "write", "never-executed.rs"));
         let (read, modified) = FileOps::collect(&messages).lists();
@@ -1245,8 +1616,13 @@ mod tests {
     #[test]
     fn pruning_preserves_unicode_tool_pairing_status_and_original_history() {
         let original = format!("HEAD{}TAIL", "中文🦀\n".repeat(4000));
-        let messages = vec![user("不要提交，也不要执行部署"), call("c", "read", "a.rs"), result("c", &original)];
-        let outcome = prune_tool_results(&messages, std::path::Path::new("/tmp/session.jsonl")).unwrap();
+        let messages = vec![
+            user("不要提交，也不要执行部署"),
+            call("c", "read", "a.rs"),
+            result("c", &original),
+        ];
+        let outcome =
+            prune_tool_results(&messages, std::path::Path::new("/tmp/session.jsonl")).unwrap();
         assert_eq!(outcome.tool_results, 1);
         assert!(outcome.saved_tokens > 0);
         assert_eq!(messages[2].text(), original);
@@ -1258,6 +1634,12 @@ mod tests {
         assert!(text.contains("/tmp/session.jsonl"));
         assert!(text.contains("tool_call_id=c"));
         crate::llm::validate_tool_history(&outcome.replacement).unwrap();
-        assert!(prune_tool_results(&outcome.replacement, std::path::Path::new("/tmp/session.jsonl")).is_none());
+        assert!(
+            prune_tool_results(
+                &outcome.replacement,
+                std::path::Path::new("/tmp/session.jsonl")
+            )
+            .is_none()
+        );
     }
 }

@@ -84,12 +84,6 @@ pub fn is_environment_block(message: &Message) -> bool {
     message.text().trim_start().starts_with("<environment>")
 }
 
-/// What the user typed.
-pub enum Input {
-    Line(String),
-    Exit,
-}
-
 /// The outcome of one assistant turn.
 enum TurnEnd {
     /// The model finished and there is nothing left to do.
@@ -374,8 +368,10 @@ impl Agent {
             Err(_) => (None, self.level.clone()),
         };
         let cache_hit = self.session.totals.hit_rate();
-        let context_tokens = self.session.last_usage.as_ref().map(|usage| {
-            usage.input + usage.output + usage.cache_read + usage.cache_write
+        let context_tokens = self.session.measured_context_tokens().or_else(|| {
+            let messages = self.session.context_messages();
+            let tools = tools::specs();
+            Some(llm::estimate_request_context(&messages, self.system_prompt.as_deref().unwrap_or_default(), &tools))
         });
         let context_window = model.and_then(|model| model.context_window);
         let state = FooterState {
@@ -384,7 +380,7 @@ impl Agent {
             session_name: self.session.name(),
             totals: self.session.totals,
             cache_hit_rate: cache_hit,
-            context_tokens: if self.compaction.tokens_unknown { None } else { context_tokens },
+            context_tokens,
             context_window,
             model: model.cloned(),
             level,

@@ -15,10 +15,19 @@ fn steering_preserves_submission_order_and_waits_behind_commands() {
     screen.queue(Queued::Command("/model".into()));
     screen.queue(Queued::Message("调整后的任务".into(), Vec::new()));
     assert!(screen.has_steering());
-    assert_eq!(screen.take_steering(), [Queued::Message("不要提交".into(), Vec::new())]);
+    assert_eq!(
+        screen.take_steering(),
+        [Queued::Message("不要提交".into(), Vec::new())]
+    );
     assert!(!screen.has_steering());
     assert!(screen.take_steering().is_empty());
-    assert_eq!(drain_queued(&mut screen), [Queued::Command("/model".into()), Queued::Message("调整后的任务".into(), Vec::new())]);
+    assert_eq!(
+        drain_queued(&mut screen),
+        [
+            Queued::Command("/model".into()),
+            Queued::Message("调整后的任务".into(), Vec::new())
+        ]
+    );
 }
 
 #[test]
@@ -29,10 +38,13 @@ fn draining_a_command_keeps_older_messages_ahead_of_new_steering() {
     screen.queue(Queued::Message("先前提交的补充".into(), Vec::new()));
     assert_eq!(screen.pop_queued(), Some(Queued::Command("/model".into())));
     screen.queue(Queued::Message("新提交的补充".into(), Vec::new()));
-    assert_eq!(screen.take_steering(), [
-        Queued::Message("先前提交的补充".into(), Vec::new()),
-        Queued::Message("新提交的补充".into(), Vec::new()),
-    ]);
+    assert_eq!(
+        screen.take_steering(),
+        [
+            Queued::Message("先前提交的补充".into(), Vec::new()),
+            Queued::Message("新提交的补充".into(), Vec::new()),
+        ]
+    );
     assert!(screen.pop_queued().is_none());
 }
 
@@ -56,7 +68,34 @@ fn an_error_exit_erases_the_composer_before_the_shell_resumes() {
 }
 
 #[test]
-fn streaming_blocks_enter_scrollback_once_and_keep_the_draft_fixed() {
+fn leaving_places_the_shell_after_queued_output_without_an_empty_block() {
+    let mut terminal = vt100::Parser::new(24, 40, 100);
+    terminal.process(b"previous shell output\r\n");
+    let captured = CapturedOutput::default();
+    let mut screen = screen();
+    screen.out = Box::new(captured.clone());
+    screen.interactive = true;
+    screen.viewport.start_at(1, 0);
+    set_input(&mut screen, "unsent draft");
+    screen.set_footer(vec![Line::plain("directory"), Line::plain("stats")]);
+    screen.push_lines(vec![Line::plain("answer")]);
+    screen.render();
+    terminal.process(&captured.take());
+    screen.push_lines(vec![Line::plain("resume hint")]);
+    screen.leave();
+    let exit = captured.take();
+    assert!(!exit.windows(3).any(|bytes| bytes == b"\x1b[J"));
+    terminal.process(&exit);
+    assert_eq!(terminal.screen().cursor_position(), (3, 0));
+    terminal.process(b"shell prompt> ");
+    assert_eq!(
+        terminal.screen().contents(),
+        "previous shell output\nanswer\nresume hint\nshell prompt> "
+    );
+}
+
+#[test]
+fn streaming_blocks_enter_scrollback_once_and_keep_the_draft_below_output() {
     let mut screen = screen();
     let captured = CapturedOutput::default();
     screen.out = Box::new(captured.clone());
@@ -71,7 +110,8 @@ fn streaming_blocks_enter_scrollback_once_and_keep_the_draft_fixed() {
         screen.push_text(&format!("paragraph {index}\n\n"));
         screen.render();
         terminal.process(&captured.take());
-        assert_eq!(terminal.screen().cursor_position(), (21, 7));
+        let expected_row = (4 + index * 2).min(21) as u16;
+        assert_eq!(terminal.screen().cursor_position(), (expected_row, 7));
         assert!(
             terminal
                 .screen()
@@ -431,7 +471,7 @@ fn resizing_and_modal_overlays_restore_history_at_the_current_width() {
     screen.height = 10;
     terminal.screen_mut().set_size(10, 16);
     terminal.process(screen.live_frame().as_bytes());
-    assert_eq!(terminal.screen().cursor_position(), (8, 7));
+    assert_eq!(terminal.screen().cursor_position(), (4, 7));
     assert!(
         terminal.screen().contents().contains("narrowed"),
         "{}",
@@ -516,6 +556,7 @@ fn screen() -> Screen {
     screen.interactive = false;
     screen.width = 40;
     screen.height = 24;
+    screen.viewport.start_at(0, 0);
     screen
 }
 

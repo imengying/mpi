@@ -45,7 +45,9 @@ fn api_of(provider: &Provider) -> Result<Api, LlmError> {
 impl Client {
     #[cfg(test)]
     pub(crate) fn local_test_client() -> Self {
-        Self { http: reqwest::Client::builder().no_proxy().build().unwrap() }
+        Self {
+            http: reqwest::Client::builder().no_proxy().build().unwrap(),
+        }
     }
 
     pub fn new() -> anyhow::Result<Self> {
@@ -114,15 +116,22 @@ impl Client {
         let status = response.status();
         if !status.is_success() {
             let text = response.text().await.unwrap_or_default();
-            return Err(LlmError::Api { status: status.as_u16(), message: describe_error(&text) });
+            return Err(LlmError::Api {
+                status: status.as_u16(),
+                message: describe_error(&text),
+            });
         }
         let mut buffer = Vec::new();
         let mut assemblers = Assemblers::default();
         // Where the reasoning payloads about to arrive were issued from. A signature has to
         // be checked against the provider and model before being replayed, and this is the
         // only place that knows both.
-        assemblers.responses.issued_by(&provider.base_url, &req.model.id);
-        assemblers.anthropic.issued_by(&provider.base_url, &req.model.id);
+        assemblers
+            .responses
+            .issued_by(&provider.base_url, &req.model.id);
+        assemblers
+            .anthropic
+            .issued_by(&provider.base_url, &req.model.id);
         let mut response = response;
         // `chunk()` is inherent on `Response`, so no extra stream-trait dependency is
         // needed just to read the body incrementally.
@@ -155,7 +164,7 @@ impl Client {
         Ok(assemblers.finish(api))
     }
 
-    /// Buffered summary completion with the normal cache/routing identity and tools disabled.
+    /// Buffered auxiliary completion with its own routing identity and tools disabled.
     pub async fn complete(&self, req: &Request<'_>) -> Result<super::Completion, LlmError> {
         super::validate_tool_history(req.messages)?;
         let provider = req.provider;
@@ -169,21 +178,33 @@ impl Client {
         };
         let mut request = self.http.post(endpoint).json(&body);
         if api == Api::AnthropicMessages {
-            for (name, value) in anthropic::headers(&api_key, provider.compat(req.model).supports_long_cache) {
+            for (name, value) in
+                anthropic::headers(&api_key, provider.compat(req.model).supports_long_cache)
+            {
                 request = request.header(name, value);
             }
         } else {
             request = request.bearer_auth(&api_key);
         }
         if provider.compat(req.model).send_session_affinity {
-            request = request.header("x-session-affinity", req.session_id)
+            request = request
+                .header("x-session-affinity", req.session_id)
                 .header("x-session-id", req.session_id);
         }
-        let response = request.send().await.map_err(|err| LlmError::Transport(err.to_string()))?;
+        let response = request
+            .send()
+            .await
+            .map_err(|err| LlmError::Transport(err.to_string()))?;
         let status = response.status();
-        let text = response.text().await.map_err(|err| LlmError::Transport(err.to_string()))?;
+        let text = response
+            .text()
+            .await
+            .map_err(|err| LlmError::Transport(err.to_string()))?;
         if !status.is_success() {
-            return Err(LlmError::Api { status: status.as_u16(), message: describe_error(&text) });
+            return Err(LlmError::Api {
+                status: status.as_u16(),
+                message: describe_error(&text),
+            });
         }
         let decode = |err: serde_json::Error| {
             LlmError::Decode(format!("{err}: {}", crate::util::truncate(&text, 300, "…")))
@@ -236,9 +257,12 @@ pub fn decode_frame<T: serde::de::DeserializeOwned>(payload: &str) -> Result<Opt
     if trimmed.is_empty() || trimmed == "[DONE]" {
         return Ok(None);
     }
-    serde_json::from_str(trimmed)
-        .map(Some)
-        .map_err(|err| LlmError::Decode(format!("{err}: {}", crate::util::truncate(trimmed, 300, "…"))))
+    serde_json::from_str(trimmed).map(Some).map_err(|err| {
+        LlmError::Decode(format!(
+            "{err}: {}",
+            crate::util::truncate(trimmed, 300, "…")
+        ))
+    })
 }
 
 fn dispatch(
@@ -291,9 +315,8 @@ fn parse_sse_frame(frame: &str, api: Api) -> Result<Option<Frame>, LlmError> {
         return Ok(None);
     }
     Ok(match api {
-        Api::AnthropicMessages => {
-            anthropic::parse_event(event_name.as_deref(), &data)?.map(|e| Frame::Anthropic(Box::new(e)))
-        }
+        Api::AnthropicMessages => anthropic::parse_event(event_name.as_deref(), &data)?
+            .map(|e| Frame::Anthropic(Box::new(e))),
         Api::OpenAiCompletions => openai::parse_frame(&data)?.map(|c| Frame::OpenAi(Box::new(c))),
         Api::OpenAiResponses => {
             responses::parse_frame(&data)?.map(|e| Frame::Responses(Box::new(e)))
@@ -334,20 +357,29 @@ pub fn summary_request_body(req: &Request<'_>) -> Result<SummaryBody, LlmError> 
 
 /// Decode only complete frames, so a transport chunk may split any UTF-8 code point.
 fn drain_sse(
-    buffer: &mut Vec<u8>, api: Api, assemblers: &mut Assemblers,
+    buffer: &mut Vec<u8>,
+    api: Api,
+    assemblers: &mut Assemblers,
     on_delta: &mut dyn FnMut(Delta),
 ) -> Result<(), LlmError> {
     let mut consumed = 0;
     loop {
         let rest = &buffer[consumed..];
         let end = rest.iter().enumerate().find_map(|(i, b)| {
-            if *b != b'\n' { return None; }
-            if rest.get(i + 1) == Some(&b'\n') { return Some(i + 2); }
-            if rest.get(i + 1..i + 3) == Some(b"\r\n") { return Some(i + 3); }
+            if *b != b'\n' {
+                return None;
+            }
+            if rest.get(i + 1) == Some(&b'\n') {
+                return Some(i + 2);
+            }
+            if rest.get(i + 1..i + 3) == Some(b"\r\n") {
+                return Some(i + 3);
+            }
             None
         });
         let Some(end) = end else { break };
-        let frame = std::str::from_utf8(&rest[..end]).map_err(|err| LlmError::Decode(err.to_string()))?;
+        let frame =
+            std::str::from_utf8(&rest[..end]).map_err(|err| LlmError::Decode(err.to_string()))?;
         dispatch(frame, api, assemblers, on_delta)?;
         consumed += end;
     }
@@ -519,15 +551,27 @@ mod tests {
 
     #[test]
     fn utf8_and_crlf_frames_survive_every_transport_boundary() {
-        let bytes = "data: {\"choices\":[{\"delta\":{\"content\":\"中文🙂\"}}]}\r\n\r\ndata: [DONE]\n\n".as_bytes();
+        let bytes =
+            "data: {\"choices\":[{\"delta\":{\"content\":\"中文🙂\"}}]}\r\n\r\ndata: [DONE]\n\n"
+                .as_bytes();
         for split in 0..=bytes.len() {
             let mut buffer = Vec::new();
             let mut assemblers = Assemblers::default();
             let mut text = String::new();
-            let mut sink = |delta| if let Delta::Text(part) = delta { text.push_str(&part); };
+            let mut sink = |delta| {
+                if let Delta::Text(part) = delta {
+                    text.push_str(&part);
+                }
+            };
             for part in [&bytes[..split], &bytes[split..]] {
                 buffer.extend_from_slice(part);
-                drain_sse(&mut buffer, Api::OpenAiCompletions, &mut assemblers, &mut sink).unwrap();
+                drain_sse(
+                    &mut buffer,
+                    Api::OpenAiCompletions,
+                    &mut assemblers,
+                    &mut sink,
+                )
+                .unwrap();
             }
             assert!(buffer.is_empty());
             assert_eq!(text, "中文🙂");
@@ -546,7 +590,8 @@ mod tests {
 
     #[test]
     fn sse_frames_are_split_on_event_and_data_lines() {
-        let frame = "event: content_block_delta\ndata: {\"index\":0,\"delta\":{\"text\":\"hi\"}}\n\n";
+        let frame =
+            "event: content_block_delta\ndata: {\"index\":0,\"delta\":{\"text\":\"hi\"}}\n\n";
         match parse_sse_frame(frame, Api::AnthropicMessages).unwrap() {
             Some(Frame::Anthropic(event)) => assert_eq!(event.kind, "content_block_delta"),
             _ => panic!("expected an anthropic event"),
@@ -563,8 +608,16 @@ mod tests {
             Some(Frame::Responses(event)) => assert_eq!(event.kind, "response.output_text.delta"),
             _ => panic!("expected a responses event"),
         }
-        assert!(parse_sse_frame("data: [DONE]\n\n", Api::OpenAiCompletions).unwrap().is_none());
-        assert!(parse_sse_frame("\n", Api::OpenAiResponses).unwrap().is_none());
+        assert!(
+            parse_sse_frame("data: [DONE]\n\n", Api::OpenAiCompletions)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            parse_sse_frame("\n", Api::OpenAiResponses)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

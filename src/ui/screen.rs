@@ -1,4 +1,4 @@
-//! Native scrollback above a bottom-anchored composer and status area.
+//! Native scrollback with an inline composer and status area.
 
 // The rendered-line model and the line editor live in their own modules; re-exported here
 // because every consumer already says `ui::screen::Line` and `ui::screen::Editor`, and the
@@ -449,7 +449,7 @@ impl Screen {
     }
 
     /// Begin a streaming answer: the thinking preview and the text so far live in the live
-    /// region at the bottom of the screen until the turn ends.
+    /// region below the transcript until the turn ends.
     pub fn begin_stream(&mut self) {
         self.streaming_thinking = None;
         self.streaming_answer = Some(String::new());
@@ -532,7 +532,9 @@ impl Screen {
     /// them into the queue would send a screenshot the user was still composing, and leave
     /// the message it belonged to without it.
     pub fn pop_queued(&mut self) -> Option<Queued> {
-        if self.pending.is_empty() { return None; }
+        if self.pending.is_empty() {
+            return None;
+        }
         let item = self.pending.remove(0);
         self.render();
         Some(item)
@@ -544,9 +546,15 @@ impl Screen {
 
     /// Commands remain idle-only and block later messages from overtaking them.
     pub fn take_steering(&mut self) -> Vec<Queued> {
-        let count = self.pending.iter().take_while(|item| matches!(item, Queued::Message(..))).count();
+        let count = self
+            .pending
+            .iter()
+            .take_while(|item| matches!(item, Queued::Message(..)))
+            .count();
         let messages = self.pending.drain(..count).collect();
-        if count > 0 { self.render(); }
+        if count > 0 {
+            self.render();
+        }
         messages
     }
 }
