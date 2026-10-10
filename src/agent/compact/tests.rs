@@ -466,6 +466,26 @@ fn file_blocks_separate_read_files_from_modified_ones() {
 }
 
 #[test]
+fn searching_a_directory_is_not_recorded_as_having_read_a_file() {
+    // A real checkpoint listed `/home/Code/CPA-Management/src` under `<read-files>`,
+    // because `ls` and `grep` are handed a directory as often as a file. The block exists
+    // so a resumed session knows which files' *contents* it already has; a directory is not
+    // one, and listing it points the next session at nothing.
+    let messages = vec![
+        call("1", "read", "src/a.rs"),
+        result("1", "read"),
+        call("2", "ls", "src"),
+        result("2", "ls"),
+        call("3", "grep", "src"),
+        result("3", "grep"),
+        call("4", "find", "."),
+        result("4", "find"),
+    ];
+    let (read, _) = FileOps::collect(&messages).lists();
+    assert_eq!(read, vec!["src/a.rs"]);
+}
+
+#[test]
 fn serialization_flattens_tools_and_caps_a_giant_result() {
     let messages = vec![
         user("do the thing"),

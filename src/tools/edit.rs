@@ -49,7 +49,10 @@ pub async fn execute(arguments: &serde_json::Value, cwd: &Path) -> Result<ToolOu
         .map_err(|err| format!("无法读取：{err}"))?;
     let occurrences = before.matches(old_text).count();
     if occurrences == 0 {
-        return Err("找不到 old_text：它必须与文件内容逐字一致（含缩进与换行）。".to_string());
+        return Err(format!(
+            "找不到 old_text：它必须与文件内容逐字一致（含缩进与换行）。{}",
+            nearest_region(&before, old_text)
+        ));
     }
     if occurrences > 1 && !replace_all {
         return Err(format!(
@@ -73,6 +76,62 @@ pub async fn execute(arguments: &serde_json::Value, cwd: &Path) -> Result<ToolOu
         is_error: false,
         duration: None,
     })
+}
+
+/// The line range whose text is most similar to `old_text`, as a hint after a failed match.
+///
+/// A miss is almost never a wrong file: the model edited from a stale or half-remembered
+/// reading, so its `old_text` is real content that has since drifted — a duplicated line, a
+/// changed indent, one renamed identifier. Telling it only "must match exactly" leaves it to
+/// re-read the whole file and find that itself; naming the region it meant is the one fact the
+/// caller cannot infer from its own arguments.
+///
+/// Bounded on purpose: at most [`HINT_LINES`] lines, and nothing at all when even the best
+/// window is a poor match (in that case there is no "region it meant" to point at, and a
+/// guess would be worse than silence).
+fn nearest_region(before: &str, old_text: &str) -> String {
+    const HINT_LINES: usize = 12;
+    const MIN_SCORE: f64 = 0.25;
+    let lines: Vec<&str> = before.lines().collect();
+    if lines.is_empty() || old_text.is_empty() {
+        return String::new();
+    }
+    // The window height follows the caller's own text, so the hint covers about as much as
+    // it asked about rather than a fixed guess at the right size.
+    let height = old_text.lines().count().clamp(1, HINT_LINES);
+    let wanted: std::collections::HashSet<&str> = old_text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    if wanted.is_empty() {
+        return String::new();
+    }
+    let mut best = (0usize, 0f64);
+    for start in 0..lines.len() {
+        let window = &lines[start..(start + height).min(lines.len())];
+        let matching = window
+            .iter()
+            .filter(|line| wanted.contains(line.trim()))
+            .count();
+        let score = matching as f64 / wanted.len().max(1) as f64;
+        if score > best.1 {
+            best = (start, score);
+        }
+    }
+    if best.1 < MIN_SCORE {
+        return String::new();
+    }
+    let start = best.0;
+    let end = (start + height).min(lines.len());
+    let body: Vec<String> = (start..end)
+        .map(|index| format!("{}\t{}", index + 1, lines[index]))
+        .collect();
+    format!(
+        "\n最相似的位置在第 {}-{end} 行：\n{}",
+        start + 1,
+        body.join("\n")
+    )
 }
 
 #[cfg(test)]
@@ -138,6 +197,51 @@ mod tests {
         // not need to be told to read the file it just failed to edit.
         assert!(error.contains("逐字一致"));
         assert!(!error.contains("请先 read"));
+    }
+
+    #[test]
+    fn a_drifted_match_points_at_the_region_it_meant() {
+        // The shape of every real miss in the sessions: the caller edited from a stale
+        // reading, so its text is real content that has since changed by a line or an
+        // indent. Naming the region is the one thing it cannot get from its own arguments.
+        let dir = temp_dir();
+        let path = file(
+            &dir,
+            "drift.txt",
+            "fn main() {\n    let a = 1;\n    let b = 2;\n    let c = 3;\n}\n",
+        );
+        let error = block(execute(
+            &serde_json::json!({
+                "path": path,
+                "old_text": "    let a = 1;\n    let b = 2;\n    let bb = 2;",
+                "new_text": "x",
+            }),
+            &dir,
+        ))
+        .unwrap_err();
+        assert!(error.contains("找不到 old_text"));
+        assert!(error.contains("最相似的位置"), "{error}");
+        // Numbered the way `read` numbers, so the caller can go straight there.
+        assert!(error.contains("2\t    let a = 1;"), "{error}");
+    }
+
+    #[test]
+    fn an_unrelated_miss_does_not_invent_a_region() {
+        // Nothing in the file resembles the request, so there is no "region it meant".
+        // A guess here would send the caller to a line that has nothing to do with it.
+        let dir = temp_dir();
+        let path = file(&dir, "other.txt", "alpha\nbeta\ngamma\n");
+        let error = block(execute(
+            &serde_json::json!({
+                "path": path,
+                "old_text": "完全不相干的一段文本，与文件内容没有任何重叠部分",
+                "new_text": "x",
+            }),
+            &dir,
+        ))
+        .unwrap_err();
+        assert!(error.contains("找不到 old_text"));
+        assert!(!error.contains("最相似的位置"), "{error}");
     }
 
     #[test]

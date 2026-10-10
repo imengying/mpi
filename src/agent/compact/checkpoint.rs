@@ -162,7 +162,11 @@ impl FileOps {
                 && *status == crate::llm::ToolStatus::Success
             {
                 match name.as_str() {
-                    "read" | "grep" | "find" | "ls" => {
+                    // Only `read` names a file whose contents are now known. `ls`, `grep`
+                    // and `find` are handed a directory as often as a file, and recording
+                    // that as "read" listed things like `/home/Code/CPA-Management/src`
+                    // among the files a resumed session should not have to re-read.
+                    "read" => {
                         ops.read.insert(path);
                     }
                     "write" | "edit" => {
