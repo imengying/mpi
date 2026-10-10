@@ -268,6 +268,26 @@ pub(crate) fn block<F: std::future::Future>(future: F) -> F::Output {
         .block_on(future)
 }
 
+/// Test-only helper for the engine-preference tests: report whether `path` exists, and make
+/// its absence a failure where the binary is supposed to be installed.
+///
+/// Those tests skip when the preferred engine is missing, which is right on a developer's
+/// machine — `fd-find` and `eza` are not installed by default. It is wrong wherever the
+/// binaries were installed *for* the tests: there the skip is invisible, and CI would pass
+/// while covering only the fallback the tests exist to rule out. `PI_TEST_REQUIRE_ENGINES`
+/// marks such a machine; the install step sets it, so removing an install turns the skip
+/// into a failure instead of a green run.
+#[cfg(test)]
+pub(crate) fn engine_present(path: &str) -> bool {
+    let present = Path::new(path).is_file();
+    assert!(
+        present || std::env::var_os("PI_TEST_REQUIRE_ENGINES").is_none(),
+        "{path} is not installed, but PI_TEST_REQUIRE_ENGINES is set: this test would skip \
+         instead of checking that the preferred engine is reached"
+    );
+    present
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

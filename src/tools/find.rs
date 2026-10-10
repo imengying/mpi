@@ -211,7 +211,7 @@ mod tests {
         // already taken. Looking only for `/usr/bin/fd` meant the install was invisible and
         // every search quietly fell back to `find` — the tool's own description says it
         // prefers fd, so the fallback was silent and wrong.
-        if Path::new("/usr/bin/fdfind").is_file() {
+        if super::super::engine_present("/usr/bin/fdfind") {
             match engine() {
                 Some(Engine::Fd(path)) => assert!(
                     path.ends_with("fdfind"),

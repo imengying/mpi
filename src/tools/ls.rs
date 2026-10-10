@@ -98,7 +98,7 @@ mod tests {
         // which binary the tool reached. Without this the preference in the description
         // ("存在 eza 时优先使用 eza") would be unverified: the fallback output looks close
         // enough that a silent downgrade would go unnoticed.
-        if !Path::new("/usr/bin/eza").is_file() {
+        if !super::super::engine_present("/usr/bin/eza") {
             return;
         }
         let dir = std::env::temp_dir().join(format!("pi-ls-eza-{}", uuid::Uuid::now_v7()));

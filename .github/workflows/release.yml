@@ -58,15 +58,22 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Install test dependencies
-        # The tools shell out to zsh, and the policy's allow-list names rg. The runners do
-        # not ship both, and the tests assert on their real behaviour, so they have to be
-        # there rather than skipped.
+        # These are the programs the tools shell out to, named by the allow-list or preferred
+        # by the tool descriptions. The runners do not ship most of them, and the tests that
+        # cover the engine preference *skip silently* when the preferred binary is missing —
+        # so leaving them out made CI pass while verifying the fallback path only. `fd-find`
+        # is the package that installs `/usr/bin/fdfind`: Debian and Ubuntu name it that
+        # because `fd` was taken, which is exactly the case those tests exist for.
         if: matrix.os == 'ubuntu-24.04'
         run: |
           set -euo pipefail
           sudo apt-get update -q
-          sudo apt-get install -y --no-install-recommends zsh ripgrep
-          which zsh; which rg
+          sudo apt-get install -y --no-install-recommends zsh ripgrep fd-find eza
+          # Fail here rather than in a test that would skip quietly if this ever changes.
+          test -x /usr/bin/zsh
+          test -x /usr/bin/rg
+          test -x /usr/bin/fdfind
+          test -x /usr/bin/eza
           zsh --version
 
       - name: Build
@@ -86,6 +93,11 @@ jobs:
       - name: Test
         # The host toolchain runs the tests; nothing here is target-specific.
         if: matrix.os == 'ubuntu-24.04'
+        env:
+          # The engine tests skip when their binary is missing, which is right on a
+          # developer's machine but wrong here, where those binaries were installed for them:
+          # a skip would be an invisible hole in what CI claims to check.
+          PI_TEST_REQUIRE_ENGINES: "1"
         run: cargo test --release --locked
 
       - name: Package

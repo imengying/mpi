@@ -221,7 +221,7 @@ mod tests {
         // The two engines print the same shape, so content alone cannot tell them apart.
         // `rg` honours `.gitignore` and GNU `grep` does not, which is a difference a test
         // can see — and the reason to prefer rg in a checkout in the first place.
-        if !Path::new("/usr/bin/rg").is_file() {
+        if !super::super::engine_present("/usr/bin/rg") {
             return;
         }
         let dir = std::env::temp_dir().join(format!("pi-grep-engine-{}", uuid::Uuid::now_v7()));
