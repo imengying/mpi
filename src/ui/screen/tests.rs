@@ -440,7 +440,8 @@ fn large_pickers_keep_every_selected_item_visible() {
         let mut screen = screen();
         screen.height = height;
         for selected in [0, 1, 50, 99] {
-            let rows = screen.menu_lines("模型", "Enter 确认", &items, selected);
+            let choices: Vec<Choice> = items.iter().map(Choice::new).collect();
+            let rows = screen.choice_lines("模型", "Enter 确认", &choices, selected);
             assert!(rows.len() <= height);
             assert!(
                 rows.iter()
@@ -449,6 +450,97 @@ fn large_pickers_keep_every_selected_item_visible() {
             );
         }
     }
+}
+
+#[test]
+fn a_described_choice_stacks_its_detail_under_the_label() {
+    // The shape the authorization panel uses, and what `/permissions` asked for: one entry
+    // per block, the detail on its own row, only the label painted as selected. A single
+    // line holding both ("需要审核 — 执行前先问你一句") spends the row on an em dash and
+    // reads as prose rather than as a choice.
+    use crate::auth::guard::PermissionMode;
+    let choices = vec![
+        Choice::with_detail(PermissionMode::Ask.label(), PermissionMode::Ask.detail()),
+        Choice::with_detail(
+            PermissionMode::Allow.label(),
+            PermissionMode::Allow.detail(),
+        ),
+    ];
+    let mut screen = screen();
+    screen.height = 24;
+    let rows = screen.choice_lines("命令审核", "Enter 确认", &choices, 0);
+    let text: Vec<String> = rows.iter().map(|line| line.text().to_string()).collect();
+
+    assert_eq!(text[0], "命令审核");
+    assert_eq!(text[1].trim(), "› 需要审核");
+    assert_eq!(text[2].trim(), PermissionMode::Ask.detail());
+    assert_eq!(text[3].trim(), "自动放行");
+    assert_eq!(text[4].trim(), PermissionMode::Allow.detail());
+
+    // The two details differ by the thing being decided, and neither repeats the sentence
+    // the other one says: both entries run the same policy, so the shared half belongs in
+    // neither row.
+    assert_ne!(PermissionMode::Ask.detail(), PermissionMode::Allow.detail());
+    assert!(!PermissionMode::Ask.detail().contains("需要确认"));
+    assert!(!PermissionMode::Allow.detail().contains("需要确认"));
+
+    // Only the label row carries the selection, and it is painted to the full width: a
+    // second highlighted row would read as a second choice.
+    let selected = &rows[1];
+    assert_eq!(selected.spans[0].style.bg, Bg::Selected);
+    assert_eq!(util::width(&selected.text()), screen.width);
+    assert_ne!(rows[2].spans[0].style.bg, Bg::Selected);
+    assert_ne!(rows[3].spans[0].style.bg, Bg::Selected);
+}
+
+#[test]
+fn every_described_choice_fits_the_shortest_terminal() {
+    // Two rows per entry means half as many entries fit; the window has to account for that
+    // rather than deciding it has room for twice what it can draw.
+    let choices: Vec<Choice> = (0..6)
+        .map(|index| Choice::with_detail(format!("选项 {index}"), format!("说明 {index}")))
+        .collect();
+    for height in [1, 2, 3, 4, 8, 24] {
+        let mut screen = screen();
+        screen.height = height;
+        for selected in 0..choices.len() {
+            let rows = screen.choice_lines("标题", "Enter 确认", &choices, selected);
+            assert!(
+                rows.len() <= height,
+                "{height}: {selected} -> {}",
+                rows.len()
+            );
+            assert!(
+                rows.iter()
+                    .any(|line| line.text().trim_start_matches('›').trim()
+                        == format!("选项 {selected}")),
+                "{height}: {selected}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_fitting_list_is_not_numbered() {
+    // The counter is for a list that does not fit. With two entries both on screen, "1/2"
+    // is a number the user has to read and then dismiss.
+    let choices = vec![Choice::new("甲"), Choice::new("乙")];
+    let mut screen = screen();
+    screen.height = 24;
+    let rows = screen.choice_lines("命令审核", "Enter 确认", &choices, 0);
+    assert_eq!(rows[0].text(), "命令审核");
+
+    // Past the window it comes back, because there it is answering "how much is there".
+    let many: Vec<Choice> = (0..40)
+        .map(|index| Choice::new(format!("项 {index}")))
+        .collect();
+    screen.height = 8;
+    let rows = screen.choice_lines("模型", "Enter 确认", &many, 3);
+    assert!(
+        rows[0].text().starts_with("模型  4/40"),
+        "{}",
+        rows[0].text()
+    );
 }
 
 #[test]

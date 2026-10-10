@@ -215,6 +215,34 @@ fn select_matches(mut raw: super::output::Capture, max_results: u64) -> std::io:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_ripgrep_engine_is_the_one_actually_reached() {
+        // The two engines print the same shape, so content alone cannot tell them apart.
+        // `rg` honours `.gitignore` and GNU `grep` does not, which is a difference a test
+        // can see — and the reason to prefer rg in a checkout in the first place.
+        if !Path::new("/usr/bin/rg").is_file() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("pi-grep-engine-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::write(dir.join(".gitignore"), "ignored.txt\n").unwrap();
+        std::fs::write(dir.join("ignored.txt"), "target\n").unwrap();
+        std::fs::write(dir.join("kept.txt"), "target\n").unwrap();
+
+        let out = block(execute(
+            &serde_json::json!({"pattern": "target", "path": dir.to_string_lossy()}),
+            &dir,
+        ))
+        .unwrap();
+        assert!(out.content.contains("kept.txt"), "{}", out.content);
+        assert!(
+            !out.content.contains("ignored.txt"),
+            "GNU grep was used, not rg: {}",
+            out.content
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     use crate::tools::block;
     use std::path::PathBuf;
 

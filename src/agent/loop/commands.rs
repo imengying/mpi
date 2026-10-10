@@ -148,19 +148,30 @@ impl Agent {
 
     /// `/permissions`: choose whether the policy's questions are asked.
     ///
-    /// Only two answers, and the current one starts highlighted, so Enter keeps it. Nothing
-    /// the policy *allows* is affected: this decides whether the user is asked about the rest,
-    /// not what the rest is.
+    /// Two answers, stacked the way the authorization panel stacks its own: one entry per
+    /// block, the selected one painted across the width. The current answer starts
+    /// highlighted, so Enter keeps it.
+    ///
+    /// Only the *asking* is decided here. Nothing the policy already allows is affected.
     pub(super) fn command_permissions(&mut self) -> anyhow::Result<()> {
         use crate::auth::guard::PermissionMode;
+        use crate::ui::screen::Choice;
         let modes = [PermissionMode::Ask, PermissionMode::Allow];
         let current = self.gate.mode();
         let current_index = modes.iter().position(|mode| *mode == current).unwrap_or(0);
-        let items: Vec<String> = modes
+        // The label is the answer; the second row is what picking it changes. Without that
+        // row the two entries are a pair of names, and the difference between them — whether
+        // the agent asks before acting — is the whole decision.
+        let choices: Vec<Choice> = modes
             .iter()
-            .map(|mode| format!("{} — {}", mode.label(), mode.hint()))
+            .map(|mode| Choice::with_detail(mode.label(), mode.detail()))
             .collect();
-        let Some(index) = self.screen.pick_at("命令审核", &items, current_index) else {
+        let Some(index) = self.screen.pick_choices(
+            "命令审核",
+            "↑↓ 选择 · Enter 确认 · Esc 取消",
+            &choices,
+            current_index,
+        ) else {
             return Ok(());
         };
         let chosen = modes[index];

@@ -564,5 +564,7 @@ mod live;
 mod menu;
 mod picker;
 
+pub use picker::Choice;
+
 #[cfg(test)]
 mod tests;

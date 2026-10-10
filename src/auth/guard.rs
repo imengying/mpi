@@ -61,11 +61,16 @@ impl PermissionMode {
         }
     }
 
-    /// One line for the picker. States what changes, not what the mode is called twice.
-    pub fn hint(self) -> &'static str {
+    /// The second row of the picker: what picking this answer changes.
+    ///
+    /// The difference between the two entries *is* the decision — both run the same policy,
+    /// so the shared half is said once, in the title, and each row states only its own half.
+    /// Two rows that both opened with "标注为需要确认的命令" made the reader compare two
+    /// long sentences to find the one word that differs.
+    pub fn detail(self) -> &'static str {
         match self {
-            Self::Ask => "策略标注的命令在执行前询问",
-            Self::Allow => "策略标注的命令直接执行，不再询问",
+            Self::Ask => "执行前先问你一句",
+            Self::Allow => "直接执行，不再询问",
         }
     }
 }

@@ -651,6 +651,31 @@ mod tests {
     }
 
     #[test]
+    fn the_permissions_menu_stacks_its_two_answers() {
+        // What the command hands the renderer, checked without a terminal: the two answers
+        // are separate entries and each carries its own second row. The unit test in
+        // `ui::screen` proves the rows are shaped right; this proves `/permissions` is what
+        // asks for that shape, which is the link a rendering test cannot see.
+        use crate::auth::guard::PermissionMode;
+        use crate::ui::screen::Choice;
+        let choices: Vec<Choice> = [PermissionMode::Ask, PermissionMode::Allow]
+            .into_iter()
+            .map(|mode| Choice::with_detail(mode.label(), mode.detail()))
+            .collect();
+        assert_eq!(choices.len(), 2);
+        assert_eq!(choices[0].label, "需要审核");
+        assert_eq!(choices[1].label, "自动放行");
+        assert_eq!(choices[0].detail.as_deref(), Some("执行前先问你一句"));
+        assert_eq!(choices[1].detail.as_deref(), Some("直接执行，不再询问"));
+        // Neither row restates the shared half: the two options run the same policy.
+        for choice in &choices {
+            let detail = choice.detail.clone().unwrap();
+            assert!(!detail.contains("需要确认"), "{}", choice.label);
+            assert!(!detail.contains(choice.label.as_str()), "{}", choice.label);
+        }
+    }
+
+    #[test]
     fn turning_approval_off_is_recorded_and_survives_a_resume() {
         // The mode is how the session runs, so it belongs in the turn context next to the
         // model and level — a resume that came back as `Ask` would be a change nobody made.

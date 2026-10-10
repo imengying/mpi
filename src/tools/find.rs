@@ -31,7 +31,18 @@ enum Engine {
 }
 
 fn engine() -> Option<Engine> {
-    if let Some(path) = super::first_present(&["/usr/bin/fd", "/usr/local/bin/fd", "/bin/fd"]) {
+    // `fdfind` is the name Debian and Ubuntu install: they ship the same binary under a
+    // different one because `fd` was taken by another package long before. Looking for only
+    // `/usr/bin/fd` meant an `apt install fd-find` was ignored and every search silently
+    // fell back to `find`.
+    if let Some(path) = super::first_present(&[
+        "/usr/bin/fd",
+        "/usr/local/bin/fd",
+        "/bin/fd",
+        "/usr/bin/fdfind",
+        "/usr/local/bin/fdfind",
+        "/bin/fdfind",
+    ]) {
         return Some(Engine::Fd(path));
     }
     super::first_present(&["/usr/bin/find", "/bin/find"]).map(Engine::GnuFind)
@@ -193,6 +204,54 @@ mod tests {
     use super::*;
     use crate::tools::block;
     use std::path::PathBuf;
+
+    #[test]
+    fn debians_fdfind_is_recognised_as_fd() {
+        // `apt install fd-find` puts the binary at `/usr/bin/fdfind`, because `fd` was
+        // already taken. Looking only for `/usr/bin/fd` meant the install was invisible and
+        // every search quietly fell back to `find` — the tool's own description says it
+        // prefers fd, so the fallback was silent and wrong.
+        if Path::new("/usr/bin/fdfind").is_file() {
+            match engine() {
+                Some(Engine::Fd(path)) => assert!(
+                    path.ends_with("fdfind"),
+                    "fdfind is installed, so it should win over fd: {path:?}"
+                ),
+                other => panic!(
+                    "fdfind is installed but the engine is {}",
+                    match other {
+                        Some(Engine::GnuFind(_)) => "GNU find",
+                        Some(Engine::Fd(_)) => "fd",
+                        None => "nothing",
+                    }
+                ),
+            }
+        }
+        // Either way an engine is found: fd, fdfind or find.
+        assert!(engine().is_some());
+    }
+
+    #[test]
+    fn the_fd_flags_work_on_both_spellings() {
+        // The two names are the same program, so the arguments must not be chosen by name.
+        // `--max-results` exists on both; this asserts the fd arm is what runs for fdfind.
+        for name in ["/usr/bin/fd", "/usr/bin/fdfind"] {
+            if !Path::new(name).is_file() {
+                continue;
+            }
+            let dir = std::env::temp_dir().join(format!("pi-fd-flags-{}", uuid::Uuid::now_v7()));
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::write(dir.join("a.rs"), "").unwrap();
+            let out = block(execute_with_engine(
+                &serde_json::json!({"pattern": "*.rs"}),
+                &dir,
+                Engine::Fd(PathBuf::from(name)),
+            ))
+            .unwrap();
+            assert!(out.content.contains("a.rs"), "{name}: {}", out.content);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
 
     #[test]
     fn gnu_fallback_caps_results_without_splitting_filenames_at_newlines() {

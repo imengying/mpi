@@ -93,6 +93,32 @@ mod tests {
     use crate::tools::block;
 
     #[test]
+    fn the_eza_engine_is_the_one_actually_reached() {
+        // eza prints a header row and plain `ls -l` does not, which is how a test can tell
+        // which binary the tool reached. Without this the preference in the description
+        // ("存在 eza 时优先使用 eza") would be unverified: the fallback output looks close
+        // enough that a silent downgrade would go unnoticed.
+        if !Path::new("/usr/bin/eza").is_file() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("pi-ls-eza-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "x").unwrap();
+        let out = block(execute(
+            &serde_json::json!({"path": dir.to_string_lossy()}),
+            &dir,
+        ))
+        .unwrap();
+        assert!(out.content.contains("a.txt"), "{}", out.content);
+        assert!(
+            out.content.contains("Permissions") && out.content.contains("Name"),
+            "the eza header is missing, so plain ls ran: {}",
+            out.content
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn a_large_listing_retains_the_full_output_without_an_unbounded_result() {
         let dir = std::env::temp_dir().join(format!("pi-ls-large-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir(&dir).unwrap();
