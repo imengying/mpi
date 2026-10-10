@@ -75,9 +75,11 @@ pub fn prepare_summary(
         content: content.to_string(),
     });
     let directive = summary_prompt("", settings.custom_instructions, split_turn);
-    // A summary request never carries thinking: `serialize_conversation` skips those blocks,
-    // and the reused-prefix branch replaces them with text. Measure it the same way.
-    let replay = crate::llm::ThinkingReplay::Dropped;
+    // Measured the way the request will actually be built from these same messages: the
+    // reused-prefix branch sends the history verbatim, so on a protocol that replays
+    // thinking (Anthropic, Responses) those blocks are prompt space here too, even though
+    // the flattened branch below deliberately leaves them out.
+    let replay = crate::llm::ThinkingReplay::for_provider(settings.provider);
     let fixed = system
         .as_ref()
         .map_or(0, |message| message.estimate_tokens(replay))
