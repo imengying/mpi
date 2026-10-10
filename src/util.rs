@@ -306,12 +306,10 @@ pub fn truncate_output(raw: &str) -> Truncated {
         };
     }
     let kept = tail(raw, &lines);
-    let note = format!(
-        "\n\n[输出过长，已截断：保留末尾 {} 行 / {} 字节。完整输出：{}]",
-        kept.lines().count(),
-        kept.len(),
-        full_path.display()
-    );
+    // What the reader cannot work out for themselves: that this is a tail, and where the
+    // whole thing is. How many lines and bytes were kept is countable from the content, so
+    // it is left out — the same rule that keeps `read` from appending "仅显示第 X–Y 行".
+    let note = format!("\n\n[输出过长，已截断。完整输出：{}]", full_path.display());
     Truncated {
         // The kept tail ends with the newline the last line had, and the note opens with a
         // blank row of its own: without this the note sits two rows under the output.

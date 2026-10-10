@@ -214,6 +214,9 @@ impl Session {
             cwd: cwd.to_string_lossy().to_string(),
             model,
             level,
+            // Relocating is about where the session runs, not about permissions: carry the
+            // mode the user last chose rather than resetting it to the default.
+            permission_mode: self.current_permission_mode(),
             timestamp: now(),
         };
         self.append(record, id)?;
@@ -306,6 +309,7 @@ impl Session {
         cwd: &Path,
         model: &str,
         level: &str,
+        permission_mode: crate::auth::guard::PermissionMode,
     ) -> Result<(), SessionError> {
         let id = self.next_id();
         let record = Record::TurnContext {
@@ -314,9 +318,27 @@ impl Session {
             cwd: cwd.to_string_lossy().to_string(),
             model: model.to_string(),
             level: level.to_string(),
+            permission_mode,
             timestamp: now(),
         };
         self.append(record, id)
+    }
+
+    /// The `/permissions` choice of the newest recorded turn.
+    ///
+    /// `Ask` until a turn is recorded, which is also what an older file's absent field
+    /// means: the session asked, because that is the only thing it could do.
+    pub fn current_permission_mode(&self) -> crate::auth::guard::PermissionMode {
+        self.records
+            .iter()
+            .rev()
+            .find_map(|record| match record {
+                Record::TurnContext {
+                    permission_mode, ..
+                } => Some(*permission_mode),
+                _ => None,
+            })
+            .unwrap_or_default()
     }
 
     /// Persist the exact request projection before the provider call starts.

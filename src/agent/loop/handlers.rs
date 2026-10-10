@@ -637,4 +637,39 @@ mod tests {
         drop(resumed);
         std::fs::remove_dir_all(dir).unwrap();
     }
+
+    #[test]
+    fn permissions_is_a_no_op_without_a_terminal() {
+        // The picker returns the *current* entry when there is no terminal, so a piped
+        // `/permissions` cannot flip the switch: changing it takes a person clicking.
+        let (mut agent, dir) = test_agent();
+        assert!(!agent.screen.interactive());
+        let before = agent.gate.mode();
+        agent.command_permissions().unwrap();
+        assert_eq!(agent.gate.mode(), before);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn turning_approval_off_is_recorded_and_survives_a_resume() {
+        // The mode is how the session runs, so it belongs in the turn context next to the
+        // model and level — a resume that came back as `Ask` would be a change nobody made.
+        use crate::auth::guard::PermissionMode;
+        let (mut agent, dir) = test_agent();
+        agent.gate.set_mode(PermissionMode::Allow);
+        agent
+            .session
+            .push_turn_context(&agent.cwd, "test/m", "high", PermissionMode::Allow)
+            .unwrap();
+        agent
+            .session
+            .push_message(Message::user_text("你好"), None, None)
+            .unwrap();
+        let path = agent.session.path().to_path_buf();
+        drop(agent);
+
+        let reopened = Session::open(&path).unwrap();
+        assert_eq!(reopened.current_permission_mode(), PermissionMode::Allow);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

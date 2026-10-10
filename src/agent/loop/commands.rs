@@ -16,6 +16,7 @@ impl Agent {
             "exit" | "quit" => return Ok(false),
             "model" => self.command_model().await?,
             "name" => self.command_name(argument)?,
+            "permissions" => self.command_permissions()?,
             "compact" => self.command_compact(argument).await?,
             "new" => self.command_new()?,
             "resume" => self.command_resume().await?,
@@ -69,7 +70,7 @@ impl Agent {
         if !self.session.is_saved() {
             self.deleted = true;
             self.screen.push_lines(ui_compact::note_lines(
-                "本会话没有内容，未生成文件。",
+                "没有内容，未生成文件。",
                 crate::ui::screen::Style::new(Color::Dim),
             ));
             return Ok(false);
@@ -80,7 +81,7 @@ impl Agent {
         // to do it deliberately.
         if !self.screen.interactive() {
             self.screen.push_lines(ui_compact::note_lines(
-                &format!("未删除：需要交互确认。手动删除：rm {}", path),
+                &format!("未删除（需要交互确认）。rm {}", path),
                 crate::ui::screen::Style::new(Color::Yellow),
             ));
             return Ok(true);
@@ -145,11 +146,50 @@ impl Agent {
         Ok(())
     }
 
+    /// `/permissions`: choose whether the policy's questions are asked.
+    ///
+    /// Only two answers, and the current one starts highlighted, so Enter keeps it. Nothing
+    /// the policy *allows* is affected: this decides whether the user is asked about the rest,
+    /// not what the rest is.
+    pub(super) fn command_permissions(&mut self) -> anyhow::Result<()> {
+        use crate::auth::guard::PermissionMode;
+        let modes = [PermissionMode::Ask, PermissionMode::Allow];
+        let current = self.gate.mode();
+        let current_index = modes.iter().position(|mode| *mode == current).unwrap_or(0);
+        let items: Vec<String> = modes
+            .iter()
+            .map(|mode| format!("{} — {}", mode.label(), mode.hint()))
+            .collect();
+        let Some(index) = self.screen.pick_at("命令审核", &items, current_index) else {
+            return Ok(());
+        };
+        let chosen = modes[index];
+        if chosen == current {
+            return Ok(());
+        }
+        self.gate.set_mode(chosen);
+        // Recorded with the turn context, which is what a resume reads back — the mode is
+        // part of how the session runs, like the model and the thinking level beside it.
+        self.session
+            .push_turn_context(&self.cwd, &self.model_spec, &self.level, chosen)?;
+        // Turning the questions off is the one direction the user cannot see from the footer:
+        // the next command simply runs. Saying it once is the whole reason this is not
+        // silent. Turning them back on needs no line — the panel appearing again is itself
+        // the answer, and a note would land in a transcript the panel is about to cover.
+        if chosen == PermissionMode::Allow {
+            self.screen.push_lines(ui_compact::note_lines(
+                "已关闭命令审核：策略标注的命令将直接执行。",
+                crate::ui::screen::Style::new(Color::Yellow),
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) async fn command_resume(&mut self) -> anyhow::Result<()> {
         let summaries = crate::agent::session::list(&self.cwd);
         if summaries.is_empty() {
             self.screen.push_lines(ui_compact::note_lines(
-                "还没有可恢复的会话。",
+                "没有可恢复的会话。",
                 crate::ui::screen::Style::new(Color::Dim),
             ));
             return Ok(());
@@ -268,8 +308,12 @@ impl Agent {
                 crate::ui::screen::Style::new(Color::Dim),
             ));
         }
-        self.session
-            .push_turn_context(&self.cwd, &self.model_spec, &self.level)?;
+        self.session.push_turn_context(
+            &self.cwd,
+            &self.model_spec,
+            &self.level,
+            self.gate.mode(),
+        )?;
         Ok(())
     }
 

@@ -59,8 +59,12 @@ impl Agent {
         // be created with. It is written per turn because the choice can change between them:
         // `/model` mid-conversation has to be remembered, and the newest record is the one
         // that answers "what was this session using".
-        self.session
-            .push_turn_context(&self.cwd, &self.model_spec, &self.level)?;
+        self.session.push_turn_context(
+            &self.cwd,
+            &self.model_spec,
+            &self.level,
+            self.gate.mode(),
+        )?;
         self.retry.reset();
         // The spinner covers the whole turn, not one request: the model may think for a
         // while before its first token, and a command may run for minutes. Both are times

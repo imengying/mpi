@@ -284,7 +284,12 @@ fn relocation_preserves_the_latest_model_level_and_immutable_header() {
     let (mut session, dir) = temp_session_with_a_message("relocation-model");
     let path = session.path().to_path_buf();
     session
-        .push_turn_context(&dir, "work/changed", "high")
+        .push_turn_context(
+            &dir,
+            "work/changed",
+            "high",
+            crate::auth::guard::PermissionMode::default(),
+        )
         .unwrap();
     let elsewhere = dir.join("elsewhere");
     session.relocate(&elsewhere).unwrap();
@@ -737,7 +742,14 @@ fn reopening_replays_the_conversation() {
             Some(StopReason::Stop),
         )
         .unwrap();
-    session.push_turn_context(&dir, "work/m", "high").unwrap();
+    session
+        .push_turn_context(
+            &dir,
+            "work/m",
+            "high",
+            crate::auth::guard::PermissionMode::default(),
+        )
+        .unwrap();
     drop(session);
 
     let reopened = Session::open(&path).unwrap();
@@ -768,13 +780,23 @@ fn the_newest_turn_context_names_the_model_in_use() {
         .push_message(Message::user_text("hello"), None, None)
         .unwrap();
     session
-        .push_turn_context(&dir, "work/first", "low")
+        .push_turn_context(
+            &dir,
+            "work/first",
+            "low",
+            crate::auth::guard::PermissionMode::default(),
+        )
         .unwrap();
     session
         .push_message(Message::user_text("again"), None, None)
         .unwrap();
     session
-        .push_turn_context(&dir, "work/second", "max")
+        .push_turn_context(
+            &dir,
+            "work/second",
+            "max",
+            crate::auth::guard::PermissionMode::default(),
+        )
         .unwrap();
     drop(session);
 
@@ -1119,12 +1141,78 @@ fn current_cwd_uses_turn_context_instead_of_parsing_conversation_text() {
     }
     assert!(session.current_cwd().is_none());
     session
-        .push_turn_context(Path::new("/tmp/current"), "p/m", "high")
+        .push_turn_context(
+            Path::new("/tmp/current"),
+            "p/m",
+            "high",
+            crate::auth::guard::PermissionMode::default(),
+        )
         .unwrap();
     assert_eq!(
         session.current_cwd().as_deref(),
         Some(Path::new("/tmp/current")),
         "conversation text is not session metadata"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn the_permission_mode_is_read_back_from_the_newest_turn() {
+    use crate::auth::guard::PermissionMode;
+    let (mut session, dir) = temp_session("permission-mode");
+    // Nothing recorded yet: the default, which is also what an old file with no such field
+    // has to mean.
+    assert_eq!(session.current_permission_mode(), PermissionMode::Ask);
+    session
+        .push_turn_context(Path::new("/tmp/a"), "p/m", "high", PermissionMode::Allow)
+        .unwrap();
+    assert_eq!(session.current_permission_mode(), PermissionMode::Allow);
+    // The newest turn wins: a user who turned it back on must not resume into `Allow`.
+    session
+        .push_turn_context(Path::new("/tmp/a"), "p/m", "high", PermissionMode::Ask)
+        .unwrap();
+    assert_eq!(session.current_permission_mode(), PermissionMode::Ask);
+
+    // And it survives a reopen, which is what makes a resume honor the last choice.
+    session
+        .push_message(Message::user_text("你好"), None, None)
+        .unwrap();
+    let path = session.path().to_path_buf();
+    drop(session);
+    let reopened = Session::open(&path).unwrap();
+    assert_eq!(reopened.current_permission_mode(), PermissionMode::Ask);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn a_session_file_without_the_permission_field_still_opens_as_ask() {
+    // Files written before `/permissions` existed have no `permission_mode`, and the record
+    // denies unknown fields — so the absent *and* the defaulted case both have to parse.
+    // Reading such a file back as `Allow` would be a permission change made by an upgrade.
+    let dir = std::env::temp_dir().join(format!("pi-perm-legacy-{}", uuid::Uuid::now_v7()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("legacy.jsonl");
+    let line = serde_json::json!({
+        "type": "turn_context",
+        "parent_id": null,
+        "id": "01a11bb4-d484-7656-adc2-8633eea30320",
+        "cwd": "/tmp/legacy",
+        "model": "p/m",
+        "level": "high",
+        "timestamp": "2026-10-08T13:29:58Z"
+    });
+    let header = serde_json::json!({
+        "type": "session_meta",
+        "id": "01a11bb4-d47b-70e5-a157-23ac6dcfc96f",
+        "timestamp": "2026-10-08T13:29:58Z",
+        "cwd": "/tmp/legacy",
+        "model": "p/m"
+    });
+    std::fs::write(&path, format!("{header}\n{line}\n")).unwrap();
+    let session = Session::open(&path).unwrap();
+    assert_eq!(
+        session.current_permission_mode(),
+        crate::auth::guard::PermissionMode::Ask
     );
     let _ = std::fs::remove_dir_all(dir);
 }

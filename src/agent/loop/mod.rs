@@ -40,6 +40,7 @@ use crate::util;
 pub const COMMANDS: &[(&str, &str)] = &[
     ("model", "选择模型（支持推理的会接着问思考级别）"),
     ("name", "设置会话名；不带参数则清空"),
+    ("permissions", "设置命令是否需要审核"),
     ("compact", "手动压缩上下文，可带一段自定义指示"),
     ("new", "新会话"),
     ("resume", "恢复历史会话"),
@@ -183,13 +184,12 @@ impl Agent {
         let agents = load_agents_md(&cwd);
         let system_prompt = agents.as_ref().map(|(_, text)| text.clone());
         // Which file shapes the session is invisible otherwise and worth a line; how long it
-        // is, is not — the file is one `read` away if that matters.
+        // is, is not — the file is one `read` away if that matters. The path alone says it:
+        // a bare `AGENTS.md` in the transcript is understood, and a label in front of it is
+        // the sort of prose this project keeps out of the way.
         if let Some((path, _)) = &agents {
             screen.push_lines(ui_compact::note_lines(
-                &format!(
-                    "系统提示词：{}",
-                    util::shorten_home(path, dirs::home_dir().as_deref())
-                ),
+                util::shorten_home(path, dirs::home_dir().as_deref()).as_str(),
                 crate::ui::screen::Style::new(Color::Dim),
             ));
         }
@@ -198,12 +198,17 @@ impl Agent {
         let block = environment_block(&cwd, &session.header().id, &config.shell.path);
         let mut session = session;
         session.push_message(Message::user_text(block), None, None)?;
+        // The mode the user last chose, not the default: a resume that silently went back to
+        // asking would be a permission change nobody asked for, and one that went the other
+        // way would be a worse one.
+        let mut gate = PermissionGate::new(interactive, dialect);
+        gate.set_mode(session.current_permission_mode());
         Ok(Agent {
             config,
             client,
             screen,
             session,
-            gate: PermissionGate::new(interactive, dialect),
+            gate,
             cwd,
             model_spec,
             level,
@@ -293,12 +298,15 @@ impl Agent {
             session.relocate(&cwd)?;
         }
         screen.flush();
+        // Same rule as the resume path below: the file carries the mode the user last chose.
+        let mut gate = PermissionGate::new(interactive, dialect);
+        gate.set_mode(session.current_permission_mode());
         let mut agent = Agent {
             config,
             client,
             screen,
             session,
-            gate: PermissionGate::new(interactive, dialect),
+            gate,
             cwd,
             model_spec,
             level,
@@ -318,6 +326,9 @@ impl Agent {
 
     fn restore_session(&mut self, session: Session) -> anyhow::Result<()> {
         let (model_spec, level) = restored_selection(&self.config, &session)?;
+        // The mode travels with the session the same way the model and level do. This is the
+        // `/resume` path taken mid-session, so nothing else would put it back.
+        self.gate.set_mode(session.current_permission_mode());
         self.session = session;
         self.model_spec = model_spec;
         self.level = level;
@@ -607,7 +618,12 @@ mod tests {
             .push_message(Message::user_text("之前的任务"), None, None)
             .unwrap();
         session
-            .push_turn_context(&dir, "test/second", "high")
+            .push_turn_context(
+                &dir,
+                "test/second",
+                "high",
+                crate::auth::guard::PermissionMode::default(),
+            )
             .unwrap();
         drop(session);
         let mut agent = Agent::new(config.clone(), dir.clone(), false).unwrap();

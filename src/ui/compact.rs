@@ -43,15 +43,18 @@ pub fn status_mark(status: crate::llm::ToolStatus) -> (Style, &'static str) {
 
 /// The text of a result to draw in the transcript, which is not always the text stored.
 ///
-/// A cancelled or skipped call has no result. What it stores is written for the model — it
-/// has to know the call did not complete and must check before retrying — and showing that
-/// to the user puts an instruction addressed to the machine in front of a person who
-/// pressed Esc and already knows. The stored message keeps it; the transcript does not.
+/// A cancelled, skipped or unknown call has no result of its own. What it stores is written
+/// for the model — it has to know the call did not complete and must check before retrying —
+/// and showing that to the user puts an instruction addressed to the machine in front of a
+/// person who pressed Esc or whose last session died, both of which they already know. The
+/// stored message keeps it; the transcript does not. `Unknown` was the one status left out of
+/// this list, so an interrupted call printed `请先检查文件或实际状态，再决定是否重试。`
+/// under a `×` — advice for the model, in the user's transcript.
 fn result_text(status: crate::llm::ToolStatus, content: &str) -> &str {
     use crate::llm::ToolStatus;
     match status {
-        ToolStatus::Success | ToolStatus::Error | ToolStatus::Unknown => content,
-        ToolStatus::Cancelled | ToolStatus::Skipped => "",
+        ToolStatus::Success | ToolStatus::Error => content,
+        ToolStatus::Cancelled | ToolStatus::Skipped | ToolStatus::Unknown => "",
     }
 }
 
@@ -728,6 +731,32 @@ mod tests {
         );
         // The environment block is bookkeeping, not something the user said.
         assert!(!text.contains("<environment>"), "{text}");
+    }
+
+    #[test]
+    fn an_interrupted_call_does_not_print_the_advice_written_for_the_model() {
+        // `Unknown` is what a session that died mid-call leaves behind. Its stored text is
+        // addressed to the model ("请先检查文件或实际状态，再决定是否重试"), and that used to
+        // reach the transcript under a `×`, because this status was left out of the list of
+        // statuses with no result to show. Live and resumed agree, as they must.
+        use crate::llm::ToolStatus;
+        let model_facing =
+            "上次会话意外中断，此工具调用的执行结果未知。请先检查文件或实际状态，再决定是否重试。";
+        let mut output = ToolOutput::text(model_facing);
+        output.display = arguments_display("bash", &serde_json::json!({"command": "cargo build"}));
+        let rendered = plain(
+            &tool_block(
+                "bash",
+                &serde_json::json!({"command": "cargo build"}),
+                &output,
+                ToolStatus::Unknown,
+            )
+            .render(80),
+        );
+        let text = rendered.join("\n");
+        assert!(text.contains("cargo build"), "{text}");
+        assert!(!text.contains("请先检查"), "{text}");
+        assert!(!text.contains("重试"), "{text}");
     }
 
     #[test]

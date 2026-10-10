@@ -51,6 +51,15 @@ pub enum Record {
         cwd: String,
         model: String,
         level: String,
+        /// The `/permissions` choice in force for this turn.
+        ///
+        /// Defaulted so a file written before the command existed still opens: an absent
+        /// value means the session asked, which is what it did. Recorded per turn rather
+        /// than in the header because `/permissions` changes it mid-session, and a resume
+        /// must come back to the mode the user last chose rather than the one the file
+        /// started with.
+        #[serde(default)]
+        permission_mode: crate::auth::guard::PermissionMode,
         timestamp: String,
     },
     /// The immutable request projection used for one model call. It is bookkeeping, never
