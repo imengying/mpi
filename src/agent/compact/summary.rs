@@ -75,12 +75,20 @@ pub fn prepare_summary(
         content: content.to_string(),
     });
     let directive = summary_prompt("", settings.custom_instructions, split_turn);
-    let fixed = system.as_ref().map_or(0, Message::estimate_tokens)
-        + Message::user_text(directive.clone()).estimate_tokens();
+    // A summary request never carries thinking: `serialize_conversation` skips those blocks,
+    // and the reused-prefix branch replaces them with text. Measure it the same way.
+    let replay = crate::llm::ThinkingReplay::Dropped;
+    let fixed = system
+        .as_ref()
+        .map_or(0, |message| message.estimate_tokens(replay))
+        + Message::user_text(directive.clone()).estimate_tokens(replay);
     if fixed >= budget {
         return Err(CompactError::InputTooLarge);
     }
-    let history_cost = summarized.iter().map(Message::estimate_tokens).sum::<u64>();
+    let history_cost = summarized
+        .iter()
+        .map(|message| message.estimate_tokens(replay))
+        .sum::<u64>();
     let mut messages: Vec<Message> = system.into_iter().collect();
     let reuses_history_prefix = history_cost.saturating_add(fixed) <= budget;
     if reuses_history_prefix {
@@ -102,7 +110,7 @@ pub fn prepare_summary(
             split_turn,
         )));
     }
-    if crate::llm::estimate_request_context(&messages, "", &[]) > budget {
+    if crate::llm::estimate_request_context(&messages, "", &[], replay) > budget {
         return Err(CompactError::InputTooLarge);
     }
     Ok(PreparedSummary {

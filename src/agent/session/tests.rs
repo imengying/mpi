@@ -7,7 +7,10 @@ use std::io::Write;
 
 use super::store::{find_by_prefix_in, list_in};
 use super::*;
-use crate::llm::{Block, ToolStatus};
+use crate::llm::{Block, ThinkingReplay, ToolStatus};
+
+/// The fixtures build no thinking blocks, so both readings agree.
+const REPLAY: ThinkingReplay = ThinkingReplay::Dropped;
 
 #[test]
 fn pruning_and_repeated_checkpoints_preserve_original_execution_facts() {
@@ -46,7 +49,7 @@ fn pruning_and_repeated_checkpoints_preserve_original_execution_facts() {
         crate::agent::compact::prune_tool_results(&session.context_messages(), session.path())
             .unwrap();
     session.push_pruning(outcome).unwrap();
-    assert!(session.measured_context_tokens().is_none());
+    assert!(session.measured_context_tokens(REPLAY).is_none());
     assert!(session.context_messages()[2].text().contains("中间已裁剪"));
     assert!(session.records().iter().filter_map(Record::message).any(|message| matches!(message, Message::Tool { content, status: ToolStatus::Error, .. } if content == &original)));
     for round in 0..2 {
@@ -321,9 +324,9 @@ fn context_pressure_includes_new_input_and_ignores_summary_usage_after_reopen() 
         )
         .unwrap();
     let input = Message::user_text("新的输入".repeat(1000));
-    let cost = input.estimate_tokens();
+    let cost = input.estimate_tokens(REPLAY);
     session.push_message(input, None, None).unwrap();
-    assert_eq!(session.measured_context_tokens(), Some(170 + cost));
+    assert_eq!(session.measured_context_tokens(REPLAY), Some(170 + cost));
     push_test_compaction(
         &mut session,
         "manual",
@@ -340,7 +343,7 @@ fn context_pressure_includes_new_input_and_ignores_summary_usage_after_reopen() 
     let path = session.path().to_path_buf();
     drop(session);
     let reopened = Session::open(&path).unwrap();
-    assert_eq!(reopened.measured_context_tokens(), None);
+    assert_eq!(reopened.measured_context_tokens(REPLAY), None);
     std::fs::remove_dir_all(dir).unwrap();
 }
 

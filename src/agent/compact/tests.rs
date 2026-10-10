@@ -167,7 +167,7 @@ fn oversized_history_falls_back_without_changing_system_tools_or_recent_request(
         .map(|t| util::estimate_tokens(&serde_json::to_string(t).unwrap()))
         .sum();
     assert!(
-        crate::llm::estimate_request_context(&plan.messages, "", &[])
+        crate::llm::estimate_request_context(&plan.messages, "", &[], REPLAY)
             + tool_tokens
             + plan.model.max_tokens()
             + 512
@@ -279,6 +279,10 @@ fn sized(text: &str, tokens: usize) -> String {
     format!("{text}{}", "x".repeat(tokens * 4))
 }
 
+/// The readings these fixtures are measured with. None of them builds a thinking block, so
+/// both modes agree; `Dropped` is used because it is the common case.
+const REPLAY: crate::llm::ThinkingReplay = crate::llm::ThinkingReplay::Dropped;
+
 #[test]
 fn the_cut_never_lands_on_a_tool_result() {
     let mut messages = Vec::new();
@@ -288,7 +292,7 @@ fn the_cut_never_lands_on_a_tool_result() {
         messages.push(result(&format!("c{i}"), &sized("r", 8000)));
         messages.push(assistant(&sized("a", 4000)));
     }
-    let cut = find_cut_point(&messages, 20_000).expect("a cut exists");
+    let cut = find_cut_point(&messages, 20_000, REPLAY).expect("a cut exists");
     assert!(
         is_cut_point(&messages[cut.first_kept]),
         "cut landed on a tool result"
@@ -296,7 +300,7 @@ fn the_cut_never_lands_on_a_tool_result() {
     // The kept window really is around the budget, not wildly off.
     let kept: u64 = messages[cut.first_kept..]
         .iter()
-        .map(Message::estimate_tokens)
+        .map(|message| message.estimate_tokens(REPLAY))
         .sum();
     assert!(kept >= 20_000, "kept only {kept} tokens");
 }
@@ -312,7 +316,7 @@ fn cutting_on_an_assistant_tool_call_keeps_its_results() {
         call("c1", "read", "a.rs"),
         result("c1", &sized("r", 40_000)),
     ];
-    let cut = find_cut_point(&messages, 30_000).expect("a cut exists");
+    let cut = find_cut_point(&messages, 30_000, REPLAY).expect("a cut exists");
     assert_eq!(cut.first_kept, 3);
     assert!(
         cut.is_split_turn(),
@@ -349,7 +353,7 @@ fn a_single_open_turn_cannot_be_compacted() {
     // The only cut candidates sit inside the first turn, so there is nothing to
     // summarise: compaction reports "too short" instead of producing an empty
     // checkpoint.
-    assert!(find_cut_point(&messages, 10_000).is_none());
+    assert!(find_cut_point(&messages, 10_000, REPLAY).is_none());
 }
 
 #[test]
@@ -362,7 +366,7 @@ fn a_cut_inside_an_enormous_turn_still_keeps_the_whole_turn_start() {
         user(&sized("second ", 200_000)),
         assistant(&sized("long answer ", 300_000)),
     ];
-    let cut = find_cut_point(&messages, 20_000).expect("a cut exists");
+    let cut = find_cut_point(&messages, 20_000, REPLAY).expect("a cut exists");
     assert!(cut.is_split_turn());
     assert_eq!(cut.turn_start, Some(2));
     let summarized = messages_to_summarize(&messages, cut);
@@ -388,7 +392,7 @@ fn a_mid_turn_cut_records_the_user_message_that_opened_it() {
         user("second"),
         assistant(&sized("b", 40_000)),
     ];
-    let cut = find_cut_point(&messages, 25_000).unwrap();
+    let cut = find_cut_point(&messages, 25_000, REPLAY).unwrap();
     assert!(cut.is_split_turn());
     assert_eq!(cut.turn_start, Some(2));
     // Everything before the cut goes into the summary, and the split turn is announced
@@ -401,8 +405,8 @@ fn a_mid_turn_cut_records_the_user_message_that_opened_it() {
 #[test]
 fn too_little_history_has_no_cut_point() {
     let messages = vec![user("hi"), assistant("hello")];
-    assert!(find_cut_point(&messages, 20_000).is_none());
-    assert!(find_cut_point(&messages, 20_000).is_none());
+    assert!(find_cut_point(&messages, 20_000, REPLAY).is_none());
+    assert!(find_cut_point(&messages, 20_000, REPLAY).is_none());
 }
 
 #[test]
@@ -728,7 +732,7 @@ fn a_second_compaction_cannot_start_while_one_is_running() {
 #[test]
 fn real_usage_is_preferred_over_the_estimate() {
     let messages = vec![user("short")];
-    assert!(crate::llm::estimate_request_context(&messages, "system", &[]) < 100);
+    assert!(crate::llm::estimate_request_context(&messages, "system", &[], REPLAY) < 100);
 }
 
 #[test]

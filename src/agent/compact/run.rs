@@ -135,8 +135,9 @@ impl RetryBudget {
 pub fn plan(
     messages: &[Message],
     keep_recent_tokens: u64,
+    replay: crate::llm::ThinkingReplay,
 ) -> Option<(CutPoint, Vec<Message>, Vec<Message>)> {
-    let cut = find_cut_point(messages, keep_recent_tokens)?;
+    let cut = find_cut_point(messages, keep_recent_tokens, replay)?;
     let summarized = messages_to_summarize(messages, cut);
     let kept = messages_to_keep(messages, cut);
     Some((cut, summarized, kept))
@@ -174,11 +175,15 @@ pub async fn run(
     // Bound the request itself, not just the caps inside it: a long session can still add up
     // to more than the model's window, and a summary request that does not fit cannot be
     // sent at all.
+    let replay = crate::llm::ThinkingReplay::for_provider(request.provider);
     let (cut, summarized, kept) =
-        plan(messages, keep_recent_tokens).ok_or(CompactError::TooShort)?;
+        plan(messages, keep_recent_tokens, replay).ok_or(CompactError::TooShort)?;
     let system_prompt = request.system_prompt.unwrap_or_default();
     let tools = request.tools;
-    let token_before = crate::llm::estimate_request_context(messages, system_prompt, tools);
+    // The before/after pair only has to be comparable to each other — the check is that the
+    // replacement is smaller — but it is also the number the checkpoint records, so it uses
+    // the same protocol-aware reading as the threshold check that triggered it.
+    let token_before = crate::llm::estimate_request_context(messages, system_prompt, tools, replay);
     let (summary, usage) = summarize(client, request, &summarized, cut.is_split_turn()).await?;
     let (read_files, modified_files) = facts.files.lists();
     let summary = format!(
@@ -187,7 +192,8 @@ pub async fn run(
         user_request_block(&facts.user_requests)
     );
     let replacement = replacement_history(&summarized, &kept, &summary);
-    let token_after = crate::llm::estimate_request_context(&replacement, system_prompt, tools);
+    let token_after =
+        crate::llm::estimate_request_context(&replacement, system_prompt, tools, replay);
     if token_after >= token_before {
         return Err(CompactError::NotSmaller);
     }

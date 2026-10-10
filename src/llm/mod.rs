@@ -77,6 +77,48 @@ impl Api {
             Api::OpenAiCompletions | Api::OpenAiResponses => "https://api.openai.com/v1",
         }
     }
+
+    /// Whether this protocol sends a thinking block back on the next request.
+    ///
+    /// Anthropic replays the block it signed, and Responses replays the reasoning item with
+    /// its encrypted payload, so there the draft occupies prompt space and has to be
+    /// counted. Chat completions drops it — `openai::join_text` keeps only text — and what
+    /// the DeepSeek-shaped hosts ask for instead is an empty `reasoning_content` field,
+    /// which carries no content and is not billed: measured against the local gateway, a
+    /// 40k-character echo moved `prompt_tokens` by exactly 0.
+    ///
+    /// The first two count as replayed even when a particular block would be dropped (a
+    /// signature from another provider, a reasoning item whose envelope does not match).
+    /// Over-counting a handful of blocks is the cheap side of this estimate; the expensive
+    /// side was treating 77% of everything ever produced as prompt space on a protocol that
+    /// never sends it.
+    pub fn replays_thinking(self) -> bool {
+        !matches!(self, Api::OpenAiCompletions)
+    }
+}
+
+/// Whether the request being measured sends thinking blocks back to the model.
+///
+/// Not a per-block property: it is the protocol that decides, once per request. See
+/// [`Api::replays_thinking`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThinkingReplay {
+    Replayed,
+    Dropped,
+}
+
+impl ThinkingReplay {
+    /// The reading that applies to a request about to be sent to `provider`.
+    ///
+    /// A provider whose `api` does not parse cannot be reached with a live request — the
+    /// value is rejected at start-up — so this falls back to `Dropped`, which is both the
+    /// common case and the reading that never overstates the prompt.
+    pub fn for_provider(provider: &Provider) -> Self {
+        match provider.api() {
+            Some(api) if api.replays_thinking() => Self::Replayed,
+            _ => Self::Dropped,
+        }
+    }
 }
 
 /// One block of assistant output or user input.
@@ -236,13 +278,19 @@ impl Message {
             .collect()
     }
 
-    /// chars/4 estimate, counting text, thinking and tool-call arguments.
+    /// chars/4 estimate of what this message costs the request it is part of.
+    ///
+    /// `replay` decides whether thinking counts, because the three protocols do not agree
+    /// on it. Anthropic sends back the block it signed and Responses sends back the
+    /// encrypted reasoning item, so there the draft is prompt space. Plain chat
+    /// completions sends nothing back — [`crate::llm::openai`]'s `join_text` drops the
+    /// block — so counting it there reads the request several times its real size.
     ///
     /// An image is charged a fixed cost rather than its byte length: providers bill by
     /// tiles or by a visual-token formula, not by how well a PNG compressed, so measuring
     /// the encoded bytes would be wildly wrong in both directions. The constant comes from
     /// the observed cost of a typical screenshot.
-    pub fn estimate_tokens(&self) -> u64 {
+    pub fn estimate_tokens(&self, replay: ThinkingReplay) -> u64 {
         const IMAGE_TOKENS: u64 = 1_200;
         let mut tokens = 0u64;
         let mut images = 0u64;
@@ -254,7 +302,9 @@ impl Message {
                     match block {
                         Block::Text { text } => tokens += util::estimate_tokens(text),
                         Block::Thinking { thinking, .. } => {
-                            tokens += util::estimate_tokens(thinking)
+                            if replay == ThinkingReplay::Replayed {
+                                tokens += util::estimate_tokens(thinking)
+                            }
                         }
                         Block::ToolCall {
                             name, arguments, ..
@@ -566,9 +616,22 @@ pub fn clamp_level(model: &ModelConfig, level: &str) -> (String, bool) {
 }
 
 /// Estimate the complete model-visible request, including stable tool definitions.
-pub fn estimate_request_context(messages: &[Message], system: &str, tools: &[ToolSpec]) -> u64 {
+///
+/// `replay` comes from the protocol this request is going to; see
+/// [`Api::replays_thinking`]. Pass it rather than guessing: the same history costs
+/// different amounts on `messages` and on `completions`, and every threshold in the agent
+/// is built on this number.
+pub fn estimate_request_context(
+    messages: &[Message],
+    system: &str,
+    tools: &[ToolSpec],
+    replay: ThinkingReplay,
+) -> u64 {
     let system = util::estimate_tokens(system);
-    let messages = messages.iter().map(Message::estimate_tokens).sum::<u64>();
+    let messages = messages
+        .iter()
+        .map(|message| message.estimate_tokens(replay))
+        .sum::<u64>();
     let tools = tools
         .iter()
         .map(|tool| util::estimate_tokens(&serde_json::to_string(tool).expect("tool schema")))
@@ -644,6 +707,44 @@ mod tests {
         let mut m = model();
         m.reasoning = false;
         assert_eq!(clamp_level(&m, "high"), (String::new(), true));
+    }
+
+    #[test]
+    fn thinking_is_counted_only_where_the_protocol_sends_it_back() {
+        // A session that produced a long draft next to a short answer. The draft is the
+        // whole difference between the two readings, and on `completions` it never reaches
+        // the upstream — measured against the local gateway, a 40k-character
+        // `reasoning_content` echo moved `prompt_tokens` by exactly 0. Counting it made
+        // real sessions estimate 3-6x over the prompt the upstream reported.
+        let message = Message::Assistant {
+            content: vec![
+                Block::Thinking {
+                    thinking: "思".repeat(8000),
+                    signature: None,
+                },
+                Block::Text {
+                    text: "答案".into(),
+                },
+            ],
+            stop_reason: Some(StopReason::Stop),
+        };
+        let dropped = message.estimate_tokens(ThinkingReplay::Dropped);
+        let replayed = message.estimate_tokens(ThinkingReplay::Replayed);
+        assert!(
+            dropped < 100,
+            "a draft nobody replays must not dominate the estimate: {dropped}"
+        );
+        assert!(
+            replayed > 8_000,
+            "anthropic and responses do send the block back: {replayed}"
+        );
+    }
+
+    #[test]
+    fn only_chat_completions_drops_thinking_from_the_request() {
+        assert!(Api::AnthropicMessages.replays_thinking());
+        assert!(Api::OpenAiResponses.replays_thinking());
+        assert!(!Api::OpenAiCompletions.replays_thinking());
     }
 
     #[test]

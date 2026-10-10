@@ -3,14 +3,27 @@
 use super::*;
 
 impl Agent {
+    /// Whether the protocol the current model speaks sends thinking back to the model.
+    ///
+    /// Both callers of [`Self::context_tokens`] run only after `context_window` was found,
+    /// which already implies the model resolved; the `Dropped` fallback is therefore not
+    /// reachable from a live request and exists to keep this total.
+    pub(super) fn thinking_replay(&self) -> llm::ThinkingReplay {
+        self.model()
+            .map(|(provider, _)| llm::ThinkingReplay::for_provider(provider))
+            .unwrap_or(llm::ThinkingReplay::Dropped)
+    }
+
     pub(super) fn context_tokens(&self, messages: &[Message], tools: &[llm::ToolSpec]) -> u64 {
-        if let Some(used) = self.session.measured_context_tokens() {
+        let replay = self.thinking_replay();
+        if let Some(used) = self.session.measured_context_tokens(replay) {
             return used;
         }
         llm::estimate_request_context(
             messages,
             self.system_prompt.as_deref().unwrap_or_default(),
             tools,
+            replay,
         )
     }
 
@@ -295,6 +308,9 @@ fn settle_tool_task(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The fixtures build no thinking blocks, so both readings agree.
+    const REPLAY: llm::ThinkingReplay = llm::ThinkingReplay::Dropped;
 
     fn test_agent() -> (Agent, PathBuf) {
         let dir = std::env::temp_dir().join(format!("pi-boundaries-{}", uuid::Uuid::now_v7()));
@@ -610,7 +626,7 @@ mod tests {
         drop(agent);
         let resumed = Session::open(&path).unwrap();
         assert_eq!(resumed.context_messages(), expected);
-        assert_eq!(resumed.measured_context_tokens(), Some(1703));
+        assert_eq!(resumed.measured_context_tokens(REPLAY), Some(1703));
         assert!(
             resumed
                 .records()

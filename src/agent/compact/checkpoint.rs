@@ -47,14 +47,18 @@ pub(super) fn is_user(message: &Message) -> bool {
 /// Returns `None` when no usable cut exists: either the history is shorter than the
 /// budget, or the only candidate sits in the first turn, which would leave nothing to
 /// summarise.
-pub fn find_cut_point(messages: &[Message], keep_recent_tokens: u64) -> Option<CutPoint> {
+pub fn find_cut_point(
+    messages: &[Message],
+    keep_recent_tokens: u64,
+    replay: crate::llm::ThinkingReplay,
+) -> Option<CutPoint> {
     if messages.is_empty() {
         return None;
     }
     let mut accumulated = 0u64;
     let mut target = 0usize;
     for index in (0..messages.len()).rev() {
-        let tokens = messages[index].estimate_tokens();
+        let tokens = messages[index].estimate_tokens(replay);
         if tokens == 0 {
             continue;
         }
