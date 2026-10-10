@@ -236,13 +236,11 @@ impl Agent {
         // Read from the directory the session is being resumed in: the instructions are
         // about the code being worked on, and that is where the work happens now.
         let system_prompt = system_prompt_from(&cwd);
-        // The transcript below is the session, so the note does not repeat what it says:
-        // only the name it goes under, which the replay itself does not carry.
-        let name = session.name().unwrap_or_else(|| "未命名".into());
-        screen.push_lines(ui_compact::note_lines(
-            &format!("已恢复会话 {name}"),
-            crate::ui::screen::Style::new(Color::Dim),
-        ));
+        // No "已恢复会话" line. The footer already prints the session name next to the
+        // directory, and 3.6 of the spec lists the session name among the things the footer
+        // draws and the transcript must not repeat. The replay below is the other half of
+        // the answer — a resumed session with its transcript on screen needs no prose to
+        // introduce it.
         // Replay the transcript so the user can see where the work stopped. The whole
         // conversation is replayed, not just the user's lines: a resume that showed only the
         // questions would look like the answers were lost. Environment blocks are skipped —
