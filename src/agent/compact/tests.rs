@@ -114,6 +114,210 @@ async fn compaction_has_separate_session_headers_and_no_main_cache_key() {
     assert_eq!(outcome.usage.cache_read, 9000);
     assert_eq!(outcome.replacement.last(), source.last());
     assert_eq!(source, original);
+    // Ids line up one-for-one with the replacement messages, in the same order: `push_compaction`
+    // validates this, and an off-by-one here would file the summary under a conversation entry
+    // and shadow the wrong records.
+    assert_eq!(outcome.replacement.len(), outcome.replacement_ids.len());
+    assert_eq!(outcome.replacement_ids[0], "summary:compaction-test");
+}
+
+#[tokio::test]
+async fn a_compaction_carries_the_environment_block_through_the_real_path() {
+    // The whole path, not just the pieces: the block has to come out of `run` at the head of
+    // the replacement, and its id has to line up with it so `push_compaction` accepts the
+    // checkpoint. This is the pairing a unit test on `replacement_history` cannot see.
+    use std::io::{BufRead, Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut socket = loop {
+            match listener.accept() {
+                Ok((socket, _)) => break socket,
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "summary request did not arrive"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(err) => panic!("{err}"),
+            }
+        };
+        let mut reader = std::io::BufReader::new(socket.try_clone().unwrap());
+        let mut headers = std::collections::HashMap::new();
+        loop {
+            let mut line = String::new();
+            assert!(reader.read_line(&mut line).unwrap() > 0);
+            if line == "\r\n" {
+                break;
+            }
+            if let Some((key, value)) = line.split_once(':') {
+                headers.insert(key.to_ascii_lowercase(), value.trim().to_string());
+            }
+        }
+        let mut bytes = vec![0; headers["content-length"].parse::<usize>().unwrap()];
+        reader.read_exact(&mut bytes).unwrap();
+        let response = serde_json::json!({"choices":[{"message":{"content":"## Goal\n继续"},"finish_reason":"stop"}],
+                "usage":{"prompt_tokens":10000,"completion_tokens":30}}).to_string();
+        write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).unwrap();
+    });
+    let provider: Provider = serde_json::from_value(
+        serde_json::json!({"api":"completions","base_url":format!("http://{address}/v1"),"api_key":"k"}),
+    )
+    .unwrap();
+    let model = ModelConfig {
+        id: "deepseek-v4.1-flash".into(),
+        max_tokens: Some(8000),
+        context_window: Some(128000),
+        ..Default::default()
+    };
+    let tools = crate::tools::specs();
+    let settings = SummaryRequest {
+        provider: &provider,
+        model: &model,
+        tools: &tools,
+        level: "max",
+        session_id: "summary-session",
+        system_prompt: None,
+        custom_instructions: None,
+    };
+    let env = "<environment>\n工作目录: /home/x/proj\n</environment>";
+    let mut source = vec![Message::user_text(env)];
+    for index in 0..12 {
+        source.push(user(&format!("问题 {index} {}", "x".repeat(400))));
+        source.push(assistant(&format!("回答 {index} {}", "y".repeat(400))));
+    }
+    let ids = (0..source.len())
+        .map(|i| format!("entry-{i}"))
+        .collect::<Vec<_>>();
+    let facts = CheckpointFacts {
+        files: FileOps::collect(&source),
+        user_requests: vec![],
+    };
+    let outcome = run(
+        &Client::local_test_client(),
+        settings,
+        &source,
+        &ids,
+        "carry-env",
+        500,
+        facts,
+    )
+    .await
+    .unwrap();
+    server.join().unwrap();
+    assert_eq!(
+        outcome.replacement.first().map(Message::text),
+        Some(env.to_string())
+    );
+    assert_eq!(
+        outcome.replacement_ids.first().map(String::as_str),
+        Some("entry-0")
+    );
+    assert_eq!(outcome.replacement_ids[1], "summary:carry-env");
+    assert_eq!(outcome.replacement.len(), outcome.replacement_ids.len());
+    // The block is not "shadowed": it survives, so it must not be listed as dropped.
+    assert!(!outcome.shadowed_ids.contains(&"entry-0".to_string()));
+}
+
+#[tokio::test]
+async fn a_block_that_opens_a_split_turn_is_still_pushed_only_once() {
+    // The narrow shape where the carried block and the split-turn opener would collide: the
+    // block is the last user message in the prefix. Both lists have to skip it, or the block
+    // is pushed twice under one id and `push_compaction` rejects the checkpoint.
+    use std::io::Write;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 8192];
+        let _ = std::io::Read::read(&mut socket, &mut buf);
+        let response = serde_json::json!({"choices":[{"message":{"content":"## Goal\n继续"},"finish_reason":"stop"}],
+                "usage":{"prompt_tokens":10,"completion_tokens":3}}).to_string();
+        let _ = write!(
+            socket,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+            response.len()
+        );
+    });
+    let provider: Provider = serde_json::from_value(
+        serde_json::json!({"api":"completions","base_url":format!("http://{address}/v1"),"api_key":"k"}),
+    )
+    .unwrap();
+    let model = ModelConfig {
+        id: "m".into(),
+        max_tokens: Some(8000),
+        context_window: Some(128000),
+        ..Default::default()
+    };
+    let tools = crate::tools::specs();
+    let settings = SummaryRequest {
+        provider: &provider,
+        model: &model,
+        tools: &tools,
+        level: "max",
+        session_id: "s",
+        system_prompt: None,
+        custom_instructions: None,
+    };
+    let env = "<environment>\n工作目录: /p\n</environment>";
+    // The block, one assistant turn, then a long assistant tail so the cut falls mid-turn
+    // with the block as the only user message before it.
+    let source = vec![
+        Message::user_text(env),
+        Message::assistant_text("a".repeat(2000)),
+        Message::user_text("b".repeat(2000)),
+        Message::assistant_text("c".repeat(80_000)),
+    ];
+    let ids = (0..source.len())
+        .map(|i| format!("entry-{i}"))
+        .collect::<Vec<_>>();
+    let facts = CheckpointFacts {
+        files: FileOps::collect(&source),
+        user_requests: vec![],
+    };
+    let cut = find_cut_point(&source, 100, REPLAY).unwrap();
+    assert!(
+        cut.is_split_turn(),
+        "precondition: the cut has to land mid-turn"
+    );
+    let outcome = run(
+        &Client::local_test_client(),
+        settings,
+        &source,
+        &ids,
+        "once",
+        100,
+        facts,
+    )
+    .await
+    .unwrap();
+    server.join().unwrap();
+    let blocks = outcome
+        .replacement
+        .iter()
+        .filter(|m| m.text().contains("<environment>"))
+        .count();
+    assert_eq!(
+        blocks,
+        1,
+        "carried once, got {:?}",
+        outcome
+            .replacement
+            .iter()
+            .map(Message::text)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(outcome.replacement.len(), outcome.replacement_ids.len());
+    let unique: std::collections::HashSet<&String> = outcome.replacement_ids.iter().collect();
+    assert_eq!(
+        unique.len(),
+        outcome.replacement_ids.len(),
+        "{:?}",
+        outcome.replacement_ids
+    );
 }
 
 #[test]
@@ -811,5 +1015,112 @@ fn pruning_preserves_unicode_tool_pairing_status_and_original_history() {
             std::path::Path::new("/tmp/session.jsonl")
         )
         .is_none()
+    );
+}
+
+#[test]
+fn the_environment_block_survives_a_compaction() {
+    // The block is the head of every session: cwd, platform, shell, session id. It is the
+    // first user message, so a cut anywhere puts it in the summarised prefix — and a summary
+    // is prose, which does not carry a working directory back verbatim. Dropping it left the
+    // model without the cwd for everything after the checkpoint.
+    let env = "<environment>\n工作目录: /home/x/proj\n平台: linux\n</environment>";
+    let mut messages = vec![Message::user_text(env)];
+    for index in 0..12 {
+        messages.push(Message::user_text(format!(
+            "问题 {index} {}",
+            "x".repeat(400)
+        )));
+        messages.push(Message::assistant_text(format!(
+            "回答 {index} {}",
+            "y".repeat(400)
+        )));
+    }
+    let (_cut, summarized, kept) = plan(&messages, 500, REPLAY).expect("a cut exists");
+    assert!(
+        summarized
+            .iter()
+            .any(|m| m.text().contains("<environment>")),
+        "precondition: the block is inside the summarised prefix"
+    );
+    let replacement = replacement_history(&summarized, &kept, "S");
+    assert_eq!(
+        replacement.first().map(Message::text),
+        Some(env.to_string()),
+        "the environment block has to stay at the head: {:?}",
+        replacement
+            .iter()
+            .map(|m| m.text().chars().take(30).collect::<String>())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn a_relocated_session_keeps_its_newest_environment_block() {
+    // Resuming in another directory appends a fresh block rather than rewriting the old one
+    // ("the newest block is the one the model should trust"). Carrying the first one across a
+    // compaction would hand the model the directory it no longer works in.
+    let old = "<environment>\n工作目录: /old/place\n</environment>";
+    let new = "<environment>\n工作目录: /new/place\n</environment>";
+    let mut messages = vec![Message::user_text(old)];
+    for index in 0..6 {
+        messages.push(Message::user_text(format!(
+            "问题 {index} {}",
+            "x".repeat(400)
+        )));
+        messages.push(Message::assistant_text(format!(
+            "回答 {index} {}",
+            "y".repeat(400)
+        )));
+    }
+    messages.push(Message::user_text(new));
+    for index in 6..12 {
+        messages.push(Message::user_text(format!(
+            "问题 {index} {}",
+            "x".repeat(400)
+        )));
+        messages.push(Message::assistant_text(format!(
+            "回答 {index} {}",
+            "y".repeat(400)
+        )));
+    }
+    let (_cut, summarized, kept) = plan(&messages, 500, REPLAY).expect("a cut exists");
+    let replacement = replacement_history(&summarized, &kept, "S");
+    let blocks: Vec<String> = replacement
+        .iter()
+        .filter(|m| m.text().contains("<environment>"))
+        .map(Message::text)
+        .collect();
+    assert_eq!(blocks, vec![new.to_string()], "newest block, exactly once");
+}
+
+#[test]
+fn a_block_inside_the_kept_window_is_not_duplicated() {
+    // Nothing to carry when the kept window already holds the block: the same heading twice
+    // would be two working directories as far as the model can tell.
+    let env = "<environment>\n工作目录: /home/x/proj\n</environment>";
+    let mut messages = Vec::new();
+    for index in 0..12 {
+        messages.push(Message::user_text(format!(
+            "问题 {index} {}",
+            "x".repeat(400)
+        )));
+        messages.push(Message::assistant_text(format!(
+            "回答 {index} {}",
+            "y".repeat(400)
+        )));
+    }
+    messages.push(Message::user_text(env));
+    let (_cut, summarized, kept) = plan(&messages, 500, REPLAY).expect("a cut exists");
+    if !kept.iter().any(|m| m.text().contains("<environment>")) {
+        return; // the cut landed past it; the other test covers that shape
+    }
+    let replacement = replacement_history(&summarized, &kept, "S");
+    assert_eq!(
+        replacement
+            .iter()
+            .filter(|m| m.text().contains("<environment>"))
+            .count(),
+        1
     );
 }

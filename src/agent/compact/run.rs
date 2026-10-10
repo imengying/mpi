@@ -10,8 +10,9 @@ use crate::llm::{Completion, Message, StopReason, client::Client};
 
 use super::CompactError;
 use super::checkpoint::{
-    CheckpointFacts, CutPoint, find_cut_point, format_file_blocks, is_user, messages_to_keep,
-    messages_to_summarize, replacement_history, user_request_block,
+    CheckpointFacts, CutPoint, carried_environment, find_cut_point, format_file_blocks, is_user,
+    messages_to_keep, messages_to_summarize, replacement_history, turn_opener_index,
+    user_request_block,
 };
 use super::summary::{SummaryRequest, summarize};
 
@@ -197,13 +198,33 @@ pub async fn run(
     if token_after >= token_before {
         return Err(CompactError::NotSmaller);
     }
-    let mut replacement_ids = vec![format!("summary:{compaction_id}")];
+    // The ids line up one-for-one with the replacement history, in the same order — and they are
+    // built from the same lookups, so the two cannot drift apart.
+    let mut replacement_ids = Vec::new();
+    let carried = carried_environment(&summarized, &kept);
+    if let Some(index) = carried {
+        replacement_ids.push(context_ids[index].clone());
+    }
+    replacement_ids.push(format!("summary:{compaction_id}"));
     if !kept.first().is_some_and(is_user)
-        && let Some(index) = summarized.iter().rposition(is_user)
+        && let Some(index) = turn_opener_index(&summarized)
+        && Some(index) != carried
     {
         replacement_ids.push(context_ids[index].clone());
     }
     replacement_ids.extend_from_slice(&context_ids[cut.first_kept..]);
+    debug_assert_eq!(
+        replacement.len(),
+        replacement_ids.len(),
+        "id/message misalignment"
+    );
+    debug_assert!(
+        {
+            let mut seen = std::collections::HashSet::new();
+            replacement_ids.iter().all(|id| seen.insert(id))
+        },
+        "replacement ids must be unique: {replacement_ids:?}"
+    );
     let retained: std::collections::HashSet<_> = replacement_ids.iter().collect();
     let shadowed_ids = context_ids[..cut.first_kept]
         .iter()

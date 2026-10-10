@@ -10,6 +10,7 @@
 //! is bad at preserving exactly — which files were read or modified, and what the user's own
 //! corrections said. Those are quoted verbatim rather than paraphrased.
 
+use crate::agent::r#loop::is_environment_block;
 use crate::llm::{Completion, Message, StopReason};
 
 use super::CompactError;
@@ -113,6 +114,37 @@ pub fn messages_to_keep(messages: &[Message], cut: CutPoint) -> Vec<Message> {
     messages[cut.first_kept.min(messages.len())..].to_vec()
 }
 
+/// Which environment block the replacement history has to carry over, as an index into
+/// `summarized`; `None` when the kept window already carries one.
+///
+/// The block opens the session and stays at the head of the context, so a cut leaves it in the
+/// summarised prefix — and a summary is prose, which does not carry a working directory back
+/// verbatim. Without it the model loses the cwd, the platform and the shell for everything
+/// after the checkpoint, and starts guessing at paths.
+///
+/// A relocated session has a fresh block *appended* rather than the old one rewritten ("the
+/// newest block is the one the model should trust"), so when there is a choice the newest is
+/// the one worth keeping, and a block already inside the kept window needs nothing.
+pub(super) fn carried_environment(summarized: &[Message], kept: &[Message]) -> Option<usize> {
+    if kept.iter().any(is_environment_block) {
+        return None;
+    }
+    summarized.iter().rposition(is_environment_block)
+}
+
+/// The user message that opened the turn a mid-turn cut splits, as an index into `summarized`.
+///
+/// The environment block is a user message too, but it is not something the user asked for, and
+/// it is carried separately at the head of the replacement — so it is skipped here. Both the
+/// replacement history and its id list go through this one function, which is what keeps them in
+/// step: looked up separately they could pick different messages, and an id repeated across two
+/// entries is rejected when the checkpoint is written.
+pub(super) fn turn_opener_index(summarized: &[Message]) -> Option<usize> {
+    summarized
+        .iter()
+        .rposition(|message| is_user(message) && !is_environment_block(message))
+}
+
 /// One checkpoint, the active request when needed, and the untouched recent window.
 pub fn replacement_history(
     summarized: &[Message],
@@ -120,14 +152,19 @@ pub fn replacement_history(
     summary: &str,
 ) -> Vec<Message> {
     let mut out: Vec<Message> = Vec::new();
+    let carried = carried_environment(summarized, kept);
+    if let Some(index) = carried {
+        out.push(summarized[index].clone());
+    }
     out.push(Message::user_text(format!(
         "以下是本次会话此前工作的上下文检查点，请把它当作已经发生过的历史继续工作。\n\n{summary}"
     )));
     // Keep the active turn's original request, including its images, only for a mid-turn cut.
     if !kept.first().is_some_and(is_user)
-        && let Some(message) = summarized.iter().rev().find(|m| is_user(m))
+        && let Some(index) = turn_opener_index(summarized)
+        && Some(index) != carried
     {
-        out.push(message.clone());
+        out.push(summarized[index].clone());
     }
     out.extend(kept.iter().cloned());
     out
