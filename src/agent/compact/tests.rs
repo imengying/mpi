@@ -1124,3 +1124,27 @@ fn a_block_inside_the_kept_window_is_not_duplicated() {
         1
     );
 }
+
+#[test]
+fn trailing_tool_results_larger_than_the_budget_still_compact() {
+    // The shape pi had to fix in #9740: the tool results at the end of the history are by
+    // themselves bigger than the retained budget, so the backwards walk reaches the end without
+    // ever coming up short. Their fix was to keep the assistant tool call those results belong
+    // to rather than giving up and keeping everything — giving up means an un-compactable
+    // history, which is exactly when compaction is needed.
+    let messages = vec![
+        Message::user_text("old history"),
+        Message::assistant_text("old answer"),
+        Message::user_text("read the large file"),
+        call("call-1", "read", "big.txt"),
+        result("call-1", &"x".repeat(60_000)),
+    ];
+    let (cut, summarized, kept) = plan(&messages, 1000, REPLAY).expect("this history must compact");
+    // The cut lands on the assistant tool call, so the call and its result stay together.
+    assert_eq!(cut.first_kept, 3);
+    assert!(matches!(kept.first(), Some(Message::Assistant { .. })));
+    assert!(kept.iter().any(|m| matches!(m, Message::Tool { .. })));
+    // The older turns are summarised rather than kept.
+    assert_eq!(summarized.len(), 3);
+    assert_eq!(cut.turn_start, Some(2));
+}
