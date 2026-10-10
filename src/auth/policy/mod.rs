@@ -107,6 +107,38 @@ pub use command::assess_command;
 pub(crate) use path::search_exclusions;
 pub use path::{assess_path, resolve_tool_path};
 
+/// Vet a `bash` call's `cwd` argument, by the rule a leading `cd` already has to satisfy.
+///
+/// An absent or empty value means "the session's directory", which the rest of the check
+/// already assumes. Anything else is held to exactly the standard [`command::cd_target`]
+/// applies to `cd X`: it must resolve, it must be a directory, and it must not reach its
+/// target through a symlink — because a command that runs in `link` would then have its
+/// relative paths mean one thing to zsh and another to this checker.
+///
+/// The symlink rule is also what keeps the vetted path and the executed path identical:
+/// `resolve_tool_path` is the same helper `bash::resolve_cwd` uses, so what is checked here
+/// is what the child process is handed.
+fn assess_bash_cwd(raw: &str, cwd: &Path) -> Assessment {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Assessment::allow();
+    }
+    if raw.contains('\0') {
+        return Assessment::ask("cwd 含无法确认的字符");
+    }
+    let lexical = resolve_tool_path(raw, cwd);
+    let Ok(target) = path::canonical_path(&lexical, 0) else {
+        return Assessment::ask("cwd 无法可靠解析，需要人工确认");
+    };
+    if !target.is_dir() {
+        return Assessment::ask("cwd 不是目录");
+    }
+    if path::normalize(&lexical) != target {
+        return Assessment::ask("cwd 经过符号链接，其后的相对路径无法确认");
+    }
+    Assessment::allow()
+}
+
 /// Tools that only ever read.
 pub fn assess_tool(
     name: &str,
@@ -116,7 +148,18 @@ pub fn assess_tool(
 ) -> Assessment {
     let string = |key: &str| input.get(key).and_then(|v| v.as_str()).unwrap_or("");
     match name {
-        "bash" => assess_command(string("command"), cwd, dialect),
+        "bash" => {
+            let command = string("command");
+            // A caller-supplied `cwd` decides what every relative path in the command means,
+            // so it is vetted before the command itself — and against the same rule the
+            // gate already applies to a leading `cd`. Rejecting it here rather than letting
+            // the command through is what keeps `cwd` from being a way around the check
+            // that a bare `cd /elsewhere && ...` has to pass.
+            match assess_bash_cwd(string("cwd"), cwd) {
+                Assessment::Allow { .. } => assess_command(command, cwd, dialect),
+                refusal => refusal,
+            }
+        }
         "write" | "edit" => {
             let path = string("path");
             assess_path(Operation::Write, path, cwd)

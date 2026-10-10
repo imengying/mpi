@@ -108,7 +108,20 @@ pub fn tool_block(
                 .get("command")
                 .and_then(|v| v.as_str())
                 .unwrap_or(name);
-            lines.extend(command_header(&mark_span, command));
+            let mut header = command_header(&mark_span, command);
+            // Where the command ran, when that is not the session's own directory. Without
+            // it the block is only true for the default case, and a call that ran elsewhere
+            // reads as if it had run here — the relative paths in its output mean otherwise.
+            if let Some(cwd) = arguments.get("cwd").and_then(|v| v.as_str())
+                && !cwd.trim().is_empty()
+                && let Some(line) = header.last_mut()
+            {
+                line.spans.push(Span::new(
+                    format!("（在 {}）", util::one_line(cwd)),
+                    Style::new(Color::Dim),
+                ));
+            }
+            lines.extend(header);
             // A header with no result under it is a complete statement — "this command, no
             // output" — so the blank separator only appears when something follows.
             if !body.is_empty() {
@@ -803,6 +816,11 @@ mod tests {
 
         let cases: Vec<(&str, serde_json::Value)> = vec![
             ("bash", serde_json::json!({"command": "ls -l"})),
+            (
+                "bash",
+                serde_json::json!({"command": "ls -l", "cwd": "/tmp"}),
+            ),
+            ("bash", serde_json::json!({"command": "ls -l", "cwd": "  "})),
             ("read", serde_json::json!({"path": "src/a.rs"})),
             ("read", serde_json::json!({"path": "nope.rs"})),
             ("write", serde_json::json!({"path": "a.rs", "content": "x"})),
@@ -1182,6 +1200,42 @@ mod tests {
         assert!(text[0].contains("echo one"), "{text:?}");
         assert!(!text[0].contains("echo two"));
         assert!(text[0].contains("…（3 行命令）"), "{text:?}");
+    }
+
+    #[test]
+    fn a_command_that_ran_elsewhere_says_where() {
+        // `cwd` decides what every relative path in the output means, so a block that
+        // omitted it would be describing a different command than the one ran.
+        let output_with = |arguments: &serde_json::Value| {
+            let mut output = ToolOutput::text("ok\n");
+            output.display = arguments_display("bash", arguments);
+            output
+        };
+        let here = plain(
+            &tool_block(
+                "bash",
+                &serde_json::json!({"command": "ls"}),
+                &output_with(&serde_json::json!({"command": "ls"})),
+                ToolStatus::Success,
+            )
+            .render(80),
+        );
+        assert!(!here.join("\n").contains("（在 "), "{here:?}");
+
+        let args = serde_json::json!({"command": "ls", "cwd": "/tmp"});
+        let elsewhere =
+            plain(&tool_block("bash", &args, &output_with(&args), ToolStatus::Success).render(80));
+        assert!(elsewhere[0].contains("（在 /tmp）"), "{elsewhere:?}");
+    }
+
+    #[test]
+    fn a_blank_cwd_is_not_shown_as_a_directory() {
+        // An empty value means "the session's directory", not "some directory called space".
+        let args = serde_json::json!({"command": "ls", "cwd": "   "});
+        let mut output = ToolOutput::text("ok\n");
+        output.display = arguments_display("bash", &args);
+        let rendered = plain(&tool_block("bash", &args, &output, ToolStatus::Success).render(80));
+        assert!(!rendered[0].contains("（在 "), "{rendered:?}");
     }
 
     #[test]

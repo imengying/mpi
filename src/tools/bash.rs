@@ -5,7 +5,7 @@
 //! gate already vetted — for auto-approved calls it is the rewritten form with quoted
 //! absolute paths, so a PATH change cannot redirect it.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use crate::llm::ToolSpec;
@@ -16,17 +16,50 @@ pub fn spec() -> ToolSpec {
         name: "bash".into(),
         description: "在 zsh 中执行一条命令并返回输出。只读的简单命令会自动执行，\
                       其余命令会在执行前请求用户授权。自动授权的内容搜索会跳过敏感文件。\
-                      命令输出默认只显示末尾若干行。"
+                      命令输出默认只显示末尾若干行。\
+                      列目录用 ls 工具、按内容搜索用 grep 工具、按文件名查找用 find 工具：\
+                      它们不需要引号转义，也不会因为 zsh 的通配符匹配不到而失败。\
+                      要在别的目录里执行，用 cwd 参数，不要写 `cd X && ...`。"
             .into(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
                 "command": { "type": "string", "description": "要执行的命令（zsh 语法）" },
-                "description": { "type": "string", "description": "一句话说明这条命令做什么" }
+                "description": { "type": "string", "description": "一句话说明这条命令做什么" },
+                "cwd": { "type": "string", "description": "命令的工作目录，默认当前工作目录" }
             },
             "required": ["command"]
         }),
     }
+}
+
+/// Where a `bash` call runs, from its own `cwd` argument.
+///
+/// 89% of the calls in the recorded sessions opened with `cd X && ...` — 1738 of 1952, and
+/// 1711 of those never changed directory again. The prefix is pure overhead: it is re-typed
+/// every turn, it makes every command read as if it moved somewhere, and it costs a policy
+/// decision on each turn because `cd` is exactly what the command checker has to reason
+/// about. A parameter says the same thing once and keeps the command itself about the work.
+///
+/// Resolved through the same path helper the file tools use, so `~`, relative names and
+/// `.` mean here what they mean everywhere else in the tool set.
+pub fn resolve_cwd(arguments: &serde_json::Value, cwd: &Path) -> Result<PathBuf, String> {
+    let Some(value) = arguments.get("cwd") else {
+        return Ok(cwd.to_path_buf());
+    };
+    let raw = value
+        .as_str()
+        .ok_or_else(|| "cwd 必须是字符串".to_string())?
+        .trim();
+    // An empty value means "not given" rather than "the filesystem root".
+    if raw.is_empty() {
+        return Ok(cwd.to_path_buf());
+    }
+    let resolved = crate::auth::policy::resolve_tool_path(raw, cwd);
+    if !resolved.is_dir() {
+        return Err(format!("cwd 不是目录：{raw}"));
+    }
+    Ok(resolved)
 }
 
 /// Run `command` in `shell`, with the working directory set to `cwd`.

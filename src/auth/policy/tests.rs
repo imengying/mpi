@@ -132,6 +132,83 @@ fn allows(command: &str) -> bool {
     assess_command(command, &cwd(), Dialect::Zsh).allows()
 }
 
+/// A `bash` call with an optional `cwd`, assessed the way the gate assesses it.
+fn allows_bash(command: &str, cwd_arg: Option<&str>) -> bool {
+    let mut input = serde_json::json!({ "command": command });
+    if let Some(value) = cwd_arg {
+        input["cwd"] = serde_json::Value::String(value.to_string());
+    }
+    crate::auth::policy::assess_tool("bash", &input, &cwd(), Dialect::Zsh).allows()
+}
+
+fn bash_reason(command: &str, cwd_arg: Option<&str>) -> String {
+    let mut input = serde_json::json!({ "command": command });
+    if let Some(value) = cwd_arg {
+        input["cwd"] = serde_json::Value::String(value.to_string());
+    }
+    crate::auth::policy::assess_tool("bash", &input, &cwd(), Dialect::Zsh)
+        .reason()
+        .unwrap_or_default()
+        .to_string()
+}
+
+#[test]
+fn an_absent_or_empty_cwd_means_the_session_directory() {
+    assert!(allows_bash("pwd", None));
+    assert!(allows_bash("pwd", Some("")));
+    assert!(allows_bash("pwd", Some("   ")));
+}
+
+#[test]
+fn a_cwd_must_resolve_to_a_directory() {
+    // Not inventing a directory for a name that is not there: the child would fail with
+    // zsh's own message, after the policy had already called the call safe.
+    let missing = cwd().join("definitely-not-here");
+    assert!(!allows_bash("pwd", missing.to_str()));
+    assert!(bash_reason("pwd", missing.to_str()).contains("cwd"));
+    // A file is not a directory either.
+    let file = std::env::temp_dir().join(format!("pi-cwd-file-{}", uuid::Uuid::now_v7()));
+    std::fs::write(&file, b"x").unwrap();
+    assert!(!allows_bash("pwd", file.to_str()));
+    std::fs::remove_file(&file).unwrap();
+}
+
+#[test]
+fn a_cwd_that_is_a_symlink_asks_like_a_symlinked_cd_does() {
+    // The same rule `cd_target` enforces: the shell keeps the name it was given while the
+    // paths resolve through the link, so what the checker validated and what the child
+    // opens would be two different directories.
+    let dir = std::env::temp_dir().join(format!("pi-cwd-link-{}", uuid::Uuid::now_v7()));
+    let real = dir.join("real");
+    std::fs::create_dir_all(&real).unwrap();
+    let link = dir.join("link");
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(!allows_bash("pwd", link.to_str()));
+        assert!(bash_reason("pwd", link.to_str()).contains("符号链接"));
+    }
+    // The resolved path itself is fine — refusing the link is about ambiguity, not location.
+    assert!(allows_bash("pwd", real.to_str()));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn a_bad_cwd_is_refused_even_when_the_command_alone_would_be_allowed() {
+    // The command must not be the thing that gets judged: `pwd` on its own is safe, and it
+    // still has to be refused when the directory it would run in cannot be confirmed.
+    assert!(allows_bash("pwd", None));
+    assert!(!allows_bash("pwd", Some("/definitely/not/a/directory")));
+}
+
+#[test]
+fn a_cwd_does_not_widen_what_the_command_may_do() {
+    // `cwd` says where to run, not "this is allowed": a writing command is still judged on
+    // its own merits after the directory checks out.
+    assert!(!allows_bash("rm -rf /tmp/x && touch /tmp/y", Some("/tmp")));
+    assert!(allows_bash("ls", Some("/tmp")));
+}
+
 fn reason(command: &str) -> String {
     assess_command(command, &cwd(), Dialect::Zsh)
         .reason()

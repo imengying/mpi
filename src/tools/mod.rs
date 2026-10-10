@@ -197,7 +197,13 @@ pub async fn execute(
         "write" => write::execute(arguments, &context.cwd).await,
         "edit" => edit::execute(arguments, &context.cwd).await,
         "bash" => match required_str(arguments, "command") {
-            Ok(command) => bash::execute_with_shell(command, &context.cwd, &context.shell).await,
+            Ok(command) => {
+                let cwd = bash::resolve_cwd(arguments, &context.cwd);
+                match cwd {
+                    Ok(cwd) => bash::execute_with_shell(command, &cwd, &context.shell).await,
+                    Err(err) => Err(err),
+                }
+            }
             Err(err) => Err(err),
         },
         "grep" => grep::execute(arguments, &context.cwd).await,
