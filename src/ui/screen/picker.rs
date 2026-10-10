@@ -6,6 +6,14 @@
 
 use super::*;
 
+/// Columns between the widest label and the detail column beside it.
+const LABEL_GAP: usize = 2;
+
+/// Below this there is no room for a detail column, so the detail is left out entirely.
+/// Fourteen covers the shortest real one ("直接执行，不再询问" is 9) with room for an
+/// ellipsis, and keeps a squeezed terminal from printing a stub no one can read.
+const MIN_DETAIL_WIDTH: usize = 14;
+
 /// One entry in a picker: a label, and an optional second row explaining it.
 ///
 /// The second row exists for the menus where the label alone does not say what picking it
@@ -180,41 +188,33 @@ impl Screen {
         choices: &[Choice],
         cursor: usize,
     ) -> Vec<Line> {
-        // Rows are the scarce resource, not entries: a described entry is two rows, so the
-        // window is planned in rows and the details are spent out of what is left. Reserving
-        // first and filling second is what keeps a two-row entry from drawing past the
-        // bottom of a one-row terminal.
+        // One row per entry, as every other picker has. The detail is a second *column*
+        // rather than a second row: the two things being compared are side by side, so the
+        // eye reads them against each other, and a two-entry menu still fits in two rows.
         let title_rows = usize::from(self.height >= 3);
         let hint_rows = usize::from(self.height >= 2);
         let room = self.height.saturating_sub(title_rows + hint_rows).max(1);
-        // One row per entry is the floor; anything beyond that can go to details.
         let cap = room.clamp(1, 12);
         let first = cursor
             .saturating_sub(cap / 2)
             .min(choices.len().saturating_sub(cap));
         let end = (first + cap).min(choices.len());
-        let mut spare = room.saturating_sub(end - first);
 
-        // Which entries get to show their second row. The selected one first: that is the
-        // explanation currently being read, and it is the one that must not be the one
-        // dropped when the space runs out.
-        let selected_local = cursor
-            .checked_sub(first)
-            .filter(|index| *index < end - first);
-        let mut explained = vec![false; end - first];
-        let spend_detail = |index: usize, explained: &mut Vec<bool>, spare: &mut usize| {
-            let local = index - first;
-            if *spare > 0 && explained[local].eq(&false) && choices[index].detail.is_some() {
-                explained[local] = true;
-                *spare -= 1;
-            }
-        };
-        if let Some(local) = selected_local {
-            spend_detail(first + local, &mut explained, &mut spare);
-        }
-        for index in first..end {
-            spend_detail(index, &mut explained, &mut spare);
-        }
+        // Where the detail column starts. It is one column past the widest label, so the
+        // entries line up whatever their labels are; `LABEL_GAP` keeps the two apart when a
+        // label is as wide as the terminal allows.
+        let marker_width = 2;
+        let labels_wide = choices[first..end]
+            .iter()
+            .map(|choice| util::width(&choice.label))
+            .max()
+            .unwrap_or(0);
+        let detail_at = marker_width + labels_wide + LABEL_GAP;
+        // With no room left for a column, the detail is dropped rather than wrapped: a
+        // second line per entry is the layout this one replaced, and a truncated detail
+        // beside a label it cannot be told apart from is worse than no detail.
+        let detail_room = self.width.saturating_sub(detail_at);
+        let show_details = detail_at < self.width && detail_room >= MIN_DETAIL_WIDTH;
 
         let mut lines = Vec::new();
         let all_visible = first == 0 && end == choices.len();
@@ -242,7 +242,6 @@ impl Screen {
             } else {
                 "  "
             };
-            let text = util::truncate(&format!("{marker}{}", choice.label), self.width, "…");
             let style = if selected {
                 Style {
                     bg: Bg::Selected,
@@ -260,19 +259,37 @@ impl Screen {
             } else {
                 style
             };
-            lines.push(Line::new(util::pad(&text, self.width), style));
-            if explained[index]
-                && let Some(detail) = &choice.detail
-            {
-                // Aligned under the label, and never highlighted: the background is what
-                // marks the entry being chosen, and a second painted row reads as a second
-                // choice.
-                let text = util::truncate(&format!("  {detail}"), self.width, "…");
-                lines.push(Line::new(
-                    util::pad(&text, self.width),
-                    Style::new(Color::Dim),
-                ));
+
+            if !show_details {
+                let text = util::truncate(&format!("{marker}{}", choice.label), self.width, "…");
+                lines.push(Line::new(util::pad(&text, self.width), style));
+                continue;
             }
+
+            // Two spans on one row: the label, padded out to the column, and the detail
+            // in its own dim style. The selection covers both — it marks the entry, and an
+            // entry is its label and its explanation together.
+            let mut spans = vec![
+                Span::new(
+                    util::pad(&format!("{marker}{}", choice.label), detail_at),
+                    style,
+                ),
+                Span::new(
+                    util::truncate(choice.detail.as_deref().unwrap_or(""), detail_room, "…"),
+                    Style {
+                        fg: Color::Dim,
+                        bg: style.bg,
+                        ..Style::new(Color::Dim)
+                    },
+                ),
+            ];
+            // Paint the rest of the row so the transcript cannot show through a selected
+            // entry that is shorter than the terminal is wide.
+            let used = detail_at + spans.last().map(|s| util::width(&s.text)).unwrap_or(0);
+            if used < self.width {
+                spans.push(Span::new(" ".repeat(self.width - used), style));
+            }
+            lines.push(Line::spans(spans));
         }
         if hint_rows == 1 {
             lines.push(Line::new(

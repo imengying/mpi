@@ -453,11 +453,11 @@ fn large_pickers_keep_every_selected_item_visible() {
 }
 
 #[test]
-fn a_described_choice_stacks_its_detail_under_the_label() {
-    // The shape the authorization panel uses, and what `/permissions` asked for: one entry
-    // per block, the detail on its own row, only the label painted as selected. A single
-    // line holding both ("需要审核 — 执行前先问你一句") spends the row on an em dash and
-    // reads as prose rather than as a choice.
+fn a_described_choice_puts_its_detail_in_the_column_beside_it() {
+    // What `/permissions` draws: the label on the left, the explanation in its own column on
+    // the same row. Reading down that column is how the two answers are compared; putting
+    // the detail on a second row instead would make the reader hold one entry in their head
+    // while reading the other.
     use crate::auth::guard::PermissionMode;
     let choices = vec![
         Choice::with_detail(PermissionMode::Ask.label(), PermissionMode::Ask.detail()),
@@ -469,34 +469,76 @@ fn a_described_choice_stacks_its_detail_under_the_label() {
     let mut screen = screen();
     screen.height = 24;
     let rows = screen.choice_lines("命令审核", "Enter 确认", &choices, 0);
-    let text: Vec<String> = rows.iter().map(|line| line.text().to_string()).collect();
 
-    assert_eq!(text[0], "命令审核");
-    assert_eq!(text[1].trim(), "› 需要审核");
-    assert_eq!(text[2].trim(), PermissionMode::Ask.detail());
-    assert_eq!(text[3].trim(), "自动放行");
-    assert_eq!(text[4].trim(), PermissionMode::Allow.detail());
+    assert_eq!(rows[0].text(), "命令审核");
+    // Two entries, two rows: no entry is ever two rows tall.
+    assert_eq!(
+        rows.len(),
+        4,
+        "{:?}",
+        rows.iter().map(|r| r.text()).collect::<Vec<_>>()
+    );
 
-    // The two details differ by the thing being decided, and neither repeats the sentence
-    // the other one says: both entries run the same policy, so the shared half belongs in
-    // neither row.
+    let first = rows[1].text();
+    assert!(first.starts_with("› 需要审核"), "{first:?}");
+    assert!(first.contains(PermissionMode::Ask.detail()), "{first:?}");
+    let second = rows[2].text();
+    assert!(second.starts_with("  自动放行"), "{second:?}");
+    assert!(
+        second.contains(PermissionMode::Allow.detail()),
+        "{second:?}"
+    );
+
+    // Both details start at the same column — past the widest label — so the two read as one
+    // aligned column rather than each hugging its own label. The column is measured on the
+    // spans, not by searching the padded text: the padding is spaces, and `find` on a string
+    // that has already been padded would count them.
+    let detail_at = |row: &Line| {
+        let label = util::width(&row.spans[0].text);
+        assert!(row.spans.len() > 1, "no detail span: {:?}", row.text());
+        label
+    };
+    assert_eq!(
+        detail_at(&rows[1]),
+        detail_at(&rows[2]),
+        "{first:?} / {second:?}"
+    );
+    assert!(detail_at(&rows[1]) > util::width("› 需要审核"));
+    // The label column is the widest label plus the gap, so both entries share one start.
+    assert_eq!(
+        detail_at(&rows[1]),
+        2 + util::width("需要审核") + 2,
+        "{first:?}"
+    );
+
+    // Each detail says only its own half: both entries run the same policy, so the shared
+    // part belongs in neither column.
     assert_ne!(PermissionMode::Ask.detail(), PermissionMode::Allow.detail());
     assert!(!PermissionMode::Ask.detail().contains("需要确认"));
     assert!(!PermissionMode::Allow.detail().contains("需要确认"));
 
-    // Only the label row carries the selection, and it is painted to the full width: a
-    // second highlighted row would read as a second choice.
-    let selected = &rows[1];
-    assert_eq!(selected.spans[0].style.bg, Bg::Selected);
-    assert_eq!(util::width(&selected.text()), screen.width);
-    assert_ne!(rows[2].spans[0].style.bg, Bg::Selected);
-    assert_ne!(rows[3].spans[0].style.bg, Bg::Selected);
+    // The selection paints the whole entry — label, detail and the rest of the row — so a
+    // selected line is one bar rather than two painted islands.
+    assert_eq!(util::width(&first), screen.width);
+    assert!(
+        rows[1]
+            .spans
+            .iter()
+            .all(|span| span.style.bg == Bg::Selected)
+    );
+    assert!(
+        rows[2]
+            .spans
+            .iter()
+            .all(|span| span.style.bg != Bg::Selected)
+    );
 }
 
 #[test]
 fn every_described_choice_fits_the_shortest_terminal() {
-    // Two rows per entry means half as many entries fit; the window has to account for that
-    // rather than deciding it has room for twice what it can draw.
+    // A detail column is optional, so the row count never depends on it: whatever the
+    // height, the entries that fit are drawn and the rest scroll. This is the invariant that
+    // a per-entry second row used to break at height 1.
     let choices: Vec<Choice> = (0..6)
         .map(|index| Choice::with_detail(format!("选项 {index}"), format!("说明 {index}")))
         .collect();
@@ -511,13 +553,60 @@ fn every_described_choice_fits_the_shortest_terminal() {
                 rows.len()
             );
             assert!(
-                rows.iter()
-                    .any(|line| line.text().trim_start_matches('›').trim()
-                        == format!("选项 {selected}")),
-                "{height}: {selected}"
+                rows.iter().any(|line| line
+                    .text()
+                    .trim_start_matches(['›', '↑', '↓', ' '])
+                    .starts_with(&format!("选项 {selected}"))),
+                "{height}: {selected} -> {:?}",
+                rows.iter().map(|r| r.text()).collect::<Vec<_>>()
             );
         }
     }
+}
+
+#[test]
+fn a_detail_column_that_does_not_fit_is_dropped_not_wrapped() {
+    // On a narrow terminal the detail is left out. Wrapping it onto a second row would give
+    // back the layout this replaced, and truncating it to a stub would print a few characters
+    // the reader cannot connect to anything.
+    let choices = vec![
+        Choice::with_detail("需要审核", "执行前先问你一句"),
+        Choice::with_detail("自动放行", "直接执行，不再询问"),
+    ];
+    let mut screen = screen();
+    screen.height = 24;
+    // Wide enough for the labels, short of the detail column.
+    screen.width = util::width("  自动放行") + 2;
+    let rows = screen.choice_lines("标题", "Enter 确认", &choices, 0);
+    // The rows are the title, the two entries in order, and the hint — every one of them
+    // present, because dropping the column must not cost anything else.
+    let drawn: Vec<String> = rows.iter().map(|row| row.text()).collect();
+    assert_eq!(drawn.len(), 4, "{drawn:?}");
+    assert_eq!(drawn[0], "标题");
+    assert!(drawn[1].starts_with("› 需要审核"), "{drawn:?}");
+    assert!(drawn[2].starts_with("  自动放行"), "{drawn:?}");
+    assert!(drawn[3].contains("Enter 确认"), "{drawn:?}");
+    // No entry grew a second row and no detail survived in any form.
+    for row in &rows {
+        let text = row.text();
+        assert!(!text.contains('…'), "{text:?}");
+        assert!(!text.contains("执行前"), "{text:?}");
+    }
+    // Entry rows are still painted to the full width, so the selection stays a solid bar.
+    for row in &rows[1..3] {
+        assert_eq!(util::width(&row.text()), screen.width, "{:?}", row.text());
+    }
+    // The labels survive: dropping the column must not cost the reader the choice itself.
+    assert!(
+        rows[1].text().starts_with("› 需要审核"),
+        "{:?}",
+        rows[1].text()
+    );
+    assert!(
+        rows[2].text().starts_with("  自动放行"),
+        "{:?}",
+        rows[2].text()
+    );
 }
 
 #[test]
