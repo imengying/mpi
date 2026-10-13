@@ -190,6 +190,9 @@ impl Agent {
             let mut sink = |delta: Delta| {
                 let _ = sender.send(delta);
             };
+            // Timed around the whole stream, retries included: this is the wait the user
+            // actually sat through, and the number worth comparing between providers.
+            let started = std::time::Instant::now();
             let stream = self.client.stream(&request, &mut sink);
             tokio::pin!(stream);
             let mut ticker = ticker();
@@ -227,7 +230,10 @@ impl Agent {
                 }
             }
             drain_deltas(&mut self.screen, &mut deltas);
-            TurnOutcome { result }
+            TurnOutcome {
+                result,
+                elapsed: started.elapsed(),
+            }
         };
         self.streaming = false;
         // A stop keeps the half-written answer, because it is a real answer the user chose to
@@ -289,6 +295,10 @@ impl Agent {
             Some(completion.usage),
             Some(completion.stop_reason),
         )?;
+        // Recorded before the footer is drawn, so the number appears in the same update as
+        // the tokens it describes. A response that carried an error is not timed: the seconds
+        // it spent failing are not the provider's answer speed.
+        self.output_rate = output_rate(completion.usage.output, outcome.elapsed);
         self.render_footer(None);
 
         if let Some(error) = &completion.error {

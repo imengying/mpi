@@ -528,6 +528,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_finished_turn_records_its_output_rate() {
+        // The wiring, not the arithmetic: the rate has to come out of a real turn. A unit test
+        // on `output_rate` cannot see a number that is computed and then never read.
+        use std::io::{BufRead, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "request never arrived"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("{error}"),
+                }
+            };
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = std::io::BufReader::new(socket.try_clone().unwrap());
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).unwrap() > 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((key, value)) = line.split_once(':')
+                    && key.eq_ignore_ascii_case("content-length")
+                {
+                    length = value.trim().parse::<usize>().unwrap();
+                }
+            }
+            let mut bytes = vec![0; length];
+            reader.read_exact(&mut bytes).unwrap();
+            // A real response takes longer than the resolution floor. Answering instantly
+            // would leave no rate to check, and the floor is deliberately not loosened for
+            // the test: it exists so an instantaneous reply cannot print a fake number.
+            std::thread::sleep(std::time::Duration::from_millis(120));
+            let event = serde_json::json!({"choices":[{"delta":{"content":"答案"},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":30}});
+            let response = format!("data: {event}\n\ndata: [DONE]\n\n");
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                response.len()
+            )
+            .unwrap();
+        });
+        let (mut agent, dir) = test_agent();
+        agent.config.providers[0].base_url = format!("http://{address}/v1");
+        agent
+            .session
+            .push_message(Message::user_text("你好"), None, None)
+            .unwrap();
+        assert!(agent.output_rate.is_none(), "nothing has been timed yet");
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(10), agent.assistant_turn())
+                .await
+                .unwrap()
+                .unwrap(),
+            TurnEnd::Done
+        ));
+        server.join().unwrap();
+        let rate = agent
+            .output_rate
+            .expect("a finished turn leaves a rate behind");
+        assert!(rate > 0.0, "{rate}");
+        drop(agent);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn pressure_relief_skips_the_summary_request_and_resumes_durably() {
         use std::io::{BufRead, Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

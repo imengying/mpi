@@ -103,6 +103,11 @@ enum TurnEnd {
 /// completion to return, and the caller has to tell that apart from a request that failed.
 struct TurnOutcome {
     result: Option<Result<llm::Completion, llm::LlmError>>,
+    /// How long the request took, from the first poll to the last token.
+    ///
+    /// Measured around the stream rather than inside it, so retries and the wait for the
+    /// first token are both included: that is the time the user spent waiting.
+    elapsed: std::time::Duration,
 }
 
 impl TurnOutcome {
@@ -132,6 +137,17 @@ pub struct Agent {
     system_prompt: Option<String>,
     /// Set by `/delete`: there is no file left to report as saved on the way out.
     deleted: bool,
+    /// Output speed of the most recent response, in tokens per second.
+    ///
+    /// Measured over the whole request — the wait before the first token included — because
+    /// that is the time the user actually spent waiting, and the number they compare between
+    /// providers. Timing only the tokens after the first would flatter a slow start: a
+    /// prefill that takes twenty seconds would not show up in the rate at all.
+    ///
+    /// `None` until a response has been timed, and for a response with no recorded time. It
+    /// is not a live reading: a rate computed from a partial response swings wildly as the
+    /// first tokens land, and the footer is a place for a settled number.
+    output_rate: Option<f64>,
 }
 
 fn restored_selection(config: &Config, session: &Session) -> anyhow::Result<(String, String)> {
@@ -217,6 +233,7 @@ impl Agent {
             streaming: false,
             system_prompt,
             deleted: false,
+            output_rate: None,
         })
     }
 
@@ -313,6 +330,7 @@ impl Agent {
             streaming: false,
             system_prompt,
             deleted: false,
+            output_rate: None,
         };
         // Draw the footer now rather than waiting for the first prompt. It is the row that
         // says which model and level the session came back with, and until the first
@@ -332,6 +350,9 @@ impl Agent {
         self.level = level;
         self.compaction = CompactionState::default();
         self.retry = RetryBudget::default();
+        // The rate is a property of the responses in *this* conversation. Left over from the
+        // one just left, it would read as this session's speed.
+        self.output_rate = None;
         self.deleted = false;
         self.system_prompt = system_prompt_from(&self.cwd);
         self.screen.clear_transcript();
@@ -413,6 +434,7 @@ impl Agent {
             session_name: self.session.name(),
             totals: self.session.totals,
             cache_hit_rate: cache_hit,
+            output_rate: self.output_rate,
             context_usage,
             context_window,
             model: model.cloned(),
@@ -488,6 +510,20 @@ pub(crate) fn queue_mid_turn(
     } else {
         screen.queue(Queued::Message(text.to_string(), images));
     }
+}
+
+/// Output tokens per second for the response that just finished.
+///
+/// `None` when there is nothing to divide: a response that produced no tokens (a tool call
+/// only, which is a normal shape and not a slow one), or one that came back in under the
+/// resolution of the clock. Reporting a rate from a response that took a millisecond would
+/// print a number in the thousands that says nothing about the provider.
+fn output_rate(tokens: u64, elapsed: std::time::Duration) -> Option<f64> {
+    const MINIMUM: std::time::Duration = std::time::Duration::from_millis(50);
+    if tokens == 0 || elapsed < MINIMUM {
+        return None;
+    }
+    Some(tokens as f64 / elapsed.as_secs_f64())
 }
 
 /// A ticker that fires every [`WORKING_INTERVAL`], starting one interval from now.
@@ -732,6 +768,61 @@ mod tests {
         assert!(block.contains("/usr/bin/zsh"));
         assert!(block.contains("abc123"));
         assert!(block.starts_with("<environment>"));
+    }
+
+    #[test]
+    fn switching_sessions_clears_the_recorded_rate() {
+        // The rate describes the responses in one conversation, or from one provider. Carried
+        // across a switch it would be read as the new session's speed.
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "providers":[{"name":"test", "api":"completions", "base_url":"http://127.0.0.1", "api_key":"unused",
+                "models":[{"id":"m","reasoning":true}]}],
+            "default_model":"test/m"
+        }))
+        .unwrap();
+        let dir = std::env::temp_dir().join(format!("pi-rate-reset-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir(&dir).unwrap();
+        let dir_b = dir.join("other");
+        std::fs::create_dir(&dir_b).unwrap();
+        let mut other = Session::create_in(&dir_b, &dir_b, "test/m").unwrap();
+        let path = other.path().to_path_buf();
+        other
+            .push_message(Message::user_text("另一段对话"), None, None)
+            .unwrap();
+        drop(other);
+
+        let mut agent = Agent::new(config.clone(), dir.clone(), false).unwrap();
+        agent.output_rate = Some(99.0);
+        agent
+            .restore_session(Session::open(&path).unwrap())
+            .unwrap();
+        assert_eq!(
+            agent.output_rate, None,
+            "a resumed session inherits no rate from the one before it"
+        );
+        drop(agent);
+
+        let mut agent = Agent::resume(config, dir.clone(), &path, false).unwrap();
+        agent.output_rate = Some(99.0);
+        agent.start_new_session().unwrap();
+        assert_eq!(agent.output_rate, None, "/new starts with nothing timed");
+        drop(agent);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_rate_needs_tokens_and_a_measurable_duration() {
+        use std::time::Duration;
+        // The ordinary case: 200 tokens in 4 seconds.
+        let rate = output_rate(200, Duration::from_secs(4)).unwrap();
+        assert!((rate - 50.0).abs() < 0.01, "{rate}");
+        // A tool-call-only response produces no output tokens. That is a normal shape, not a
+        // slow one, and there is no rate to report.
+        assert_eq!(output_rate(0, Duration::from_secs(4)), None);
+        // A response that came back inside the clock's resolution would divide by ~0 and
+        // print a number in the thousands that says nothing about the provider.
+        assert_eq!(output_rate(200, Duration::from_millis(10)), None);
+        assert!(output_rate(200, Duration::from_millis(50)).is_some());
     }
 
     #[test]

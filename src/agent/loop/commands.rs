@@ -130,6 +130,8 @@ impl Agent {
     pub(super) fn start_new_session(&mut self) -> anyhow::Result<()> {
         let model_spec = self.model_spec.clone();
         self.session = Session::create(&self.cwd, &model_spec)?;
+        // Nothing has been timed in the new session yet.
+        self.output_rate = None;
         self.system_prompt = system_prompt_from(&self.cwd);
         let block = environment_block(
             &self.cwd,
@@ -319,6 +321,9 @@ impl Agent {
                 crate::ui::screen::Style::new(Color::Dim),
             ));
         }
+        // The rate measured the previous provider. Keeping it under a new model name would
+        // attribute one vendor's speed to another.
+        self.output_rate = None;
         self.session.push_turn_context(
             &self.cwd,
             &self.model_spec,

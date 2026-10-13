@@ -71,6 +71,8 @@ pub struct FooterState {
     pub session_name: Option<String>,
     pub totals: Usage,
     pub cache_hit_rate: Option<f64>,
+    /// Output speed of the most recent response, in tokens per second.
+    pub output_rate: Option<f64>,
     pub context_usage: ContextUsage,
     pub context_window: Option<u64>,
     pub model: Option<ModelConfig>,
@@ -136,9 +138,34 @@ fn location_line(state: &FooterState, width: usize) -> Line {
     Line::spans(spans)
 }
 
+/// Total display width of a run of spans.
+fn spans_width(spans: &[Span]) -> usize {
+    spans.iter().map(|span| util::width(&span.text)).sum()
+}
+
+/// Output speed, for the footer.
+///
+/// One decimal below 100 and none above: a rate is measured over a few seconds, so the
+/// tenths stop meaning anything once there are three digits before the point, and a long
+/// footer number is one the eye has to parse.
+fn format_rate(rate: f64) -> String {
+    if rate < 100.0 {
+        format!("{rate:.1} tok/s")
+    } else {
+        format!("{rate:.0} tok/s")
+    }
+}
+
 fn stats_line(state: &FooterState, theme: &Theme, width: usize) -> Line {
     let hit = match state.cache_hit_rate {
         Some(rate) => format!("{rate:.1}%"),
+        None => "—".to_string(),
+    };
+    // Absent until a response has been timed, and absent for a response that produced no
+    // tokens: a dash says "no reading", where "0.0 tok/s" would claim the model produced
+    // nothing at a speed.
+    let rate = match state.output_rate {
+        Some(rate) => format_rate(rate),
         None => "—".to_string(),
     };
     let context = match state.context_usage {
@@ -164,14 +191,7 @@ fn stats_line(state: &FooterState, theme: &Theme, width: usize) -> Line {
     let context_color = theme.context(percent);
 
     let usage = Style::new(Color::Green);
-    let left = format!(
-        "↑ {}   ↓ {}   {CACHE_ICON} {hit}   {context_text}",
-        util::fmt_tokens(state.totals.input, false),
-        util::fmt_tokens(state.totals.output, false),
-    );
-    // Split the left half back into its four runs so each context field can carry its own
-    // colour: usage keeps its theme accent, while the gauge highlights warnings and errors.
-    let mut spans = vec![
+    let mut fields = vec![
         Span::new(
             format!("↑ {}", util::fmt_tokens(state.totals.input, false)),
             usage,
@@ -183,10 +203,37 @@ fn stats_line(state: &FooterState, theme: &Theme, width: usize) -> Line {
         ),
         Span::new("   ", Style::plain()),
         Span::new(format!("{CACHE_ICON} {hit}"), usage),
-        Span::new("   ", Style::plain()),
-        Span::new(context_text.clone(), Style::new(context_color)),
     ];
-    let mut left_width = util::width(&left);
+    // The rate is dropped before anything else, and as a whole field: it is the newest and
+    // the least missed of the five, and it is the only one spelled with a unit, so truncating
+    // it would leave a number without its meaning. Dropping just this field is what keeps a
+    // 45-column terminal showing the usage and the cache rate it showed before the rate
+    // existed; letting the whole left half collapse would have taken those away too.
+    let with_rate = {
+        let mut fields = fields.clone();
+        fields.push(Span::new("   ", Style::plain()));
+        fields.push(Span::new(rate.clone(), usage));
+        fields
+    };
+    let gauge = Span::new(context_text.clone(), Style::new(context_color));
+    // `+ 4` is the clearance the model name needs on the right; it was the original
+    // threshold and it still decides when the left half has to shrink.
+    let joined = |fields: &Vec<Span>| spans_width(fields) + 3 + util::width(&context_text);
+    let mut spans = if joined(&with_rate) + 4 <= width {
+        let mut fields = with_rate;
+        fields.push(Span::new("   ", Style::plain()));
+        fields.push(gauge.clone());
+        fields
+    } else if joined(&fields) + 4 <= width {
+        fields.push(Span::new("   ", Style::plain()));
+        fields.push(gauge.clone());
+        fields
+    } else {
+        // Nothing but the gauge fits. The context count is the one field the user cannot read
+        // anywhere else on screen, so it is what survives.
+        vec![gauge.clone()]
+    };
+    let mut left_width = spans_width(&spans);
 
     if left_width + 4 > width {
         let context = util::truncate(
@@ -319,6 +366,7 @@ mod tests {
                 cache_write: 0,
             },
             cache_hit_rate: Some(99.5),
+            output_rate: Some(42.5),
             context_usage: ContextUsage::Tokens(17_300),
             context_window: Some(1_000_000),
             model: None,
@@ -338,7 +386,7 @@ mod tests {
         let lines = render(&state, &theme, 120);
         let text = &plain(&lines)[1];
         assert!(
-            text.starts_with("↑ 173k   ↓ 173k   \u{f1632} 99.5%   17.3k/1M"),
+            text.starts_with("↑ 173k   ↓ 173k   \u{f1632} 99.5%   42.5 tok/s   17.3k/1M"),
             "{text:?}"
         );
         assert!(text.ends_with("deepseek-v4.1-flash • high"), "{text:?}");
@@ -485,12 +533,9 @@ mod tests {
         let mut state = state("/tmp");
         let gauge = |state: &FooterState| {
             let line = render(state, &theme, 120)[1].clone();
-            let span = line
-                .spans
-                .iter()
-                .find(|span| span.text.contains('/'))
-                .unwrap()
-                .clone();
+            // The context gauge is the last field on the left half. It cannot be found by
+            // looking for a `/`: the rate beside it is spelled `tok/s`.
+            let span = line.spans.last().expect("the gauge is drawn").clone();
             (span.text, span.style.fg)
         };
         state.context_usage = ContextUsage::Tokens(750_000);
@@ -499,6 +544,115 @@ mod tests {
         assert_eq!(gauge(&state), ("950k/1M".to_string(), Color::Red));
         state.context_usage = ContextUsage::Tokens(17_300);
         assert_eq!(gauge(&state), ("17.3k/1M".to_string(), Color::Green));
+    }
+
+    #[test]
+    fn the_rate_sits_between_the_cache_hit_field_and_the_context_gauge() {
+        let theme = Theme {
+            mode: ColorMode::True,
+        };
+        let mut state = state("/tmp");
+        state.cache_hit_rate = Some(99.5);
+        state.output_rate = Some(42.5);
+        state.context_usage = ContextUsage::Tokens(17_300);
+        state.context_window = Some(1_000_000);
+        let text = plain(&render(&state, &theme, 120))[1].to_string();
+        let hit = text.find("99.5%").expect("cache hit rate");
+        let rate = text.find("42.5 tok/s").expect("rate");
+        let gauge = text.find("17.3k/1M").expect("gauge");
+        assert!(hit < rate && rate < gauge, "{text:?}");
+        let spans = &render(&state, &theme, 120)[1].spans;
+        assert!(
+            spans.iter().any(|span| span.text == "42.5 tok/s"),
+            "the rate is its own field, so a narrow terminal can drop it: {:?}",
+            spans.iter().map(|s| &s.text).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_response_with_no_rate_reads_as_a_dash() {
+        // A turn that only called a tool produces no output tokens, and neither does one
+        // that has not happened yet. The dash says "no reading"; `0.0 tok/s` would claim the
+        // model produced nothing at a speed.
+        let theme = Theme {
+            mode: ColorMode::Ansi256,
+        };
+        let mut state = state("/tmp");
+        state.output_rate = None;
+        let text = plain(&render(&state, &theme, 120))[1].to_string();
+        assert!(text.contains("—   "), "{text:?}");
+        assert!(!text.contains("tok/s"), "{text:?}");
+    }
+
+    #[test]
+    fn a_rate_above_a_hundred_loses_its_decimal() {
+        // The tenths measure the measurement, not the provider: past three digits they are
+        // noise on a number derived from a few seconds of streaming.
+        let theme = Theme {
+            mode: ColorMode::Ansi256,
+        };
+        let mut state = state("/tmp");
+        state.output_rate = Some(1234.56);
+        let text = plain(&render(&state, &theme, 120))[1].to_string();
+        assert!(text.contains("1235 tok/s"), "{text:?}");
+    }
+
+    #[test]
+    fn the_rate_field_never_pushes_the_stats_line_past_the_width() {
+        // The row is part of the live region, so a row the terminal wraps on its own throws
+        // the region's row count off. A fifth field is exactly the kind of addition that
+        // makes the existing "too wide, drop to the gauge" fallback stop being enough.
+        let theme = Theme {
+            mode: ColorMode::True,
+        };
+        let mut state = state("/tmp");
+        state.model = Some(model());
+        for width in [12, 20, 30, 40, 60, 80, 120, 200] {
+            for rate in [None, Some(0.5), Some(42.5), Some(1234.56)] {
+                state.output_rate = rate;
+                let lines = render(&state, &theme, width);
+                for line in &lines {
+                    assert!(
+                        util::width(&line.text()) <= width,
+                        "width {width}, rate {rate:?}: {:?}",
+                        line.text()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_rate_does_not_shorten_the_range_where_usage_is_shown() {
+        // Adding a field must not take the *existing* fields away from widths that used to
+        // have them. The rate is dropped on its own first, so the width at which the left
+        // half collapses back to just the gauge is the same as before it existed.
+        let theme = Theme {
+            mode: ColorMode::True,
+        };
+        let mut state = state("/tmp");
+        state.model = Some(model());
+        state.output_rate = Some(42.5);
+        let shows_usage = |width: usize| {
+            let text = plain(&render(&state, &theme, width))[1].to_string();
+            text.contains("↑ ")
+        };
+        // 44 columns: the rate is gone but the usage and cache rate are not.
+        assert!(
+            shows_usage(44),
+            "{:?}",
+            plain(&render(&state, &theme, 44))[1]
+        );
+        assert!(
+            !plain(&render(&state, &theme, 44))[1].contains("tok/s"),
+            "the rate is the field that goes"
+        );
+        // And the collapse still happens where it used to: the row never exceeds the width.
+        for width in 12..200usize {
+            for line in render(&state, &theme, width) {
+                assert!(util::width(&line.text()) <= width, "width {width}");
+            }
+        }
     }
 
     #[test]
