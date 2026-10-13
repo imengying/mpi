@@ -64,12 +64,16 @@ fn retry_delay(base: Duration, attempt: u32) -> Duration {
 
 /// Whether a status is worth retrying, and what the server asked us to wait.
 ///
-/// 429 and the 5xx family are the transient ones. 529 is Anthropic's "overloaded", which is
-/// not standard but is the most likely 5xx-shaped answer from that API. Every other 4xx is a
-/// statement about the request itself, and resending it would spend the budget to produce
-/// the same refusal.
+/// Only the 5xx family is retried, and 529 (Anthropic's "overloaded") with it — those say
+/// the server had trouble with *this* attempt. 429 does not: it says the account has spent
+/// its allowance, and waiting out that allowance is the user's call, not something to do on
+/// their behalf while the session sits there for up to five minutes. So a rate limit ends the
+/// turn and is reported; the request is not lost, and pressing Enter sends it again.
+///
+/// Every other 4xx is a statement about the request itself, and resending it would spend the
+/// budget to produce the same refusal.
 fn retry_for_status(status: u16, retry_after: Option<Duration>) -> Retry {
-    let transient = status == 429 || status == 529 || (500..600).contains(&status);
+    let transient = status == 529 || (500..600).contains(&status);
     if !transient {
         return Retry::Never;
     }
@@ -840,9 +844,25 @@ mod tests {
     }
 
     #[test]
-    fn only_the_transient_statuses_are_retried() {
-        // Waiting is only worth it for the answers that can come out differently.
-        for status in [429u16, 500, 502, 503, 504, 529] {
+    fn rate_limits_are_reported_rather_than_waited_out() {
+        // A 429 is not "the server had trouble with this attempt" — it is "this account has
+        // spent its allowance". Waiting out an allowance can take minutes, and whether to
+        // spend that time is the user's decision, not one to make for them while the session
+        // sits there. So it ends the turn, and the request is not lost: pressing Enter sends
+        // it again.
+        assert!(
+            matches!(retry_for_status(429, None), Retry::Never),
+            "a rate limit must not be retried"
+        );
+        assert!(
+            matches!(
+                retry_for_status(429, Some(Duration::from_secs(10))),
+                Retry::Never
+            ),
+            "not even when the server offers a Retry-After"
+        );
+        // The 5xx family still means the attempt itself failed.
+        for status in [500u16, 502, 503, 504, 529] {
             assert!(
                 matches!(retry_for_status(status, None), Retry::After(_)),
                 "{status} should be retried"
@@ -859,14 +879,15 @@ mod tests {
 
     #[test]
     fn a_retry_after_longer_than_the_backoff_wins_and_is_capped() {
-        // The server asked; that beats the schedule.
+        // The server asked; that beats the schedule. 503 and not 429: a rate limit is no
+        // longer retried at all, so `Retry-After` has nothing to lengthen there.
         assert!(matches!(
-            retry_for_status(429, Some(Duration::from_secs(10))),
+            retry_for_status(503, Some(Duration::from_secs(10))),
             Retry::After(delay) if delay == Duration::from_secs(10)
         ));
         // But not without limit: an hour is a session parked with a notice on screen.
         assert!(matches!(
-            retry_for_status(429, Some(Duration::from_secs(3600))),
+            retry_for_status(503, Some(Duration::from_secs(3600))),
             Retry::After(delay) if delay == RETRY_MAX_DELAY
         ));
     }
@@ -955,7 +976,7 @@ mod tests {
     /// A server that answers with `statuses` in order, one connection each.
     ///
     /// Every response is a complete SSE body unless the status says otherwise, so a test can
-    /// say "429, then a real answer" and watch the client reconnect.
+    /// say "503, then a real answer" and watch the client reconnect.
     fn scripted_server(statuses: Vec<u16>) -> (String, std::thread::JoinHandle<Vec<String>>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -1009,7 +1030,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_transient_failure_is_retried_and_the_answer_arrives() {
-        let (base_url, server) = scripted_server(vec![429, 429, 200]);
+        // 503, not 429: the retried statuses are the ones that describe a failed *attempt*.
+        let (base_url, server) = scripted_server(vec![503, 503, 200]);
         let config: crate::config::Config = serde_json::from_value(serde_json::json!({
             "providers":[{"name":"test","api":"completions","base_url":base_url,"api_key":"k",
                 "models":[{"id":"m"}]}],

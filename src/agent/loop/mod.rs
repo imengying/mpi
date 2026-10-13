@@ -88,6 +88,7 @@ pub fn is_environment_block(message: &Message) -> bool {
 }
 
 /// The outcome of one assistant turn.
+#[derive(Debug)]
 enum TurnEnd {
     /// The model finished and there is nothing left to do.
     Done,

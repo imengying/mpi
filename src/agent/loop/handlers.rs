@@ -528,6 +528,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_rate_limited_turn_ends_without_retrying_and_the_message_survives() {
+        // Option C's premise: stopping on a 429 must not lose the user's request. It is
+        // appended before the request is sent, so the next turn carries it again — which is
+        // what makes "stop and let the user decide" a safe answer rather than a dead end.
+        use std::io::{BufRead, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut connections = 0;
+            // Waiting for a *second* connection is how this test proves a retry did not
+            // happen. Under `cfg(test)` the backoff is a millisecond, so a retry would be
+            // immediate; a short grace period is enough, and a long one just makes the suite
+            // slow. The first acceptance gets the full timeout, since that wait is real work.
+            let mut deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                match listener.accept() {
+                    Ok((mut socket, _)) => {
+                        connections += 1;
+                        socket
+                            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                            .unwrap();
+                        let mut reader = std::io::BufReader::new(socket.try_clone().unwrap());
+                        let mut length = 0;
+                        loop {
+                            let mut line = String::new();
+                            assert!(reader.read_line(&mut line).unwrap() > 0);
+                            if line == "\r\n" {
+                                break;
+                            }
+                            if let Some((key, value)) = line.split_once(':')
+                                && key.eq_ignore_ascii_case("content-length")
+                            {
+                                length = value.trim().parse::<usize>().unwrap();
+                            }
+                        }
+                        let mut bytes = vec![0; length];
+                        reader.read_exact(&mut bytes).unwrap();
+                        let body = serde_json::json!({"error":{"message":"Rate limit reached"}})
+                            .to_string();
+                        let _ = write!(
+                            socket,
+                            "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        // Only one response is scripted: if the client retried, the next
+                        // accept would land inside the grace period and `connections` would
+                        // come back as 2.
+                        deadline =
+                            std::time::Instant::now() + std::time::Duration::from_millis(300);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() >= deadline {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("{error}"),
+                }
+            }
+            connections
+        });
+        let (mut agent, dir) = test_agent();
+        agent.config.providers[0].base_url = format!("http://{address}/v1");
+        agent
+            .session
+            .push_message(Message::user_text("你好"), None, None)
+            .unwrap();
+        // The failure is raised, and the turn loop turns it into one red line and ends the
+        // turn. What matters here is that it arrives after ONE connection, not six.
+        let error =
+            tokio::time::timeout(std::time::Duration::from_secs(10), agent.assistant_turn())
+                .await
+                .expect("a rate limit must not be waited out")
+                .expect_err("the failure reaches the caller");
+        assert!(
+            error.to_string().contains("429"),
+            "the status is reported to the user: {error}"
+        );
+        let connections = server.join().unwrap();
+        assert_eq!(connections, 1, "a 429 must not be resent");
+        // The request is not lost: it is in the history the next turn will send.
+        let texts: Vec<String> = agent
+            .session
+            .context_messages()
+            .iter()
+            .map(Message::text)
+            .collect();
+        assert!(texts.iter().any(|t| t == "你好"), "{texts:?}");
+        drop(agent);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn a_finished_turn_records_its_output_rate() {
         // The wiring, not the arithmetic: the rate has to come out of a real turn. A unit test
         // on `output_rate` cannot see a number that is computed and then never read.
