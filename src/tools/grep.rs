@@ -20,6 +20,7 @@ pub fn spec() -> ToolSpec {
                 "glob": { "type": "string", "description": "文件名过滤，如 '*.rs'" },
                 "ignore_case": { "type": "boolean", "description": "是否忽略大小写" },
                 "fixed_strings": { "type": "boolean", "description": "把 pattern 当作纯文本而不是正则" },
+                "invert": { "type": "boolean", "description": "反选：返回不含 pattern 的行" },
                 "context": { "type": "integer", "description": "每条匹配前后附带的上下文行数" },
                 "max_results": { "type": "integer", "description": "最多返回多少条匹配" }
             },
@@ -29,6 +30,7 @@ pub fn spec() -> ToolSpec {
 }
 
 /// Where the search tool lives, and which dialect it speaks.
+#[derive(Debug)]
 enum Engine {
     Ripgrep(std::path::PathBuf),
     GnuGrep(std::path::PathBuf),
@@ -79,6 +81,14 @@ async fn execute_with_engine(
         .get("fixed_strings")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    // Inverting is the one option a model reaches for that this tool could not express: in
+    // the recorded sessions `-v` shows up 215 times inside `bash grep` calls. Without it the
+    // whole search falls back to the shell, which is where the escaping and the quoting cost
+    // comes from.
+    let invert = arguments
+        .get("invert")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let context = crate::tools::optional_u64(arguments, "context").unwrap_or(0);
     let max_results = crate::tools::optional_u64(arguments, "max_results").unwrap_or(200);
     if max_results == 0 {
@@ -105,6 +115,9 @@ async fn execute_with_engine(
             if fixed {
                 command.arg("--fixed-strings");
             }
+            if invert {
+                command.arg("--invert-match");
+            }
             if let Some(glob) = glob {
                 command.arg("--glob").arg(glob);
             }
@@ -127,6 +140,9 @@ async fn execute_with_engine(
             }
             if fixed {
                 command.arg("-F");
+            }
+            if invert {
+                command.arg("-v");
             }
             if let Some(glob) = glob {
                 command.arg(format!("--include={glob}"));
@@ -215,6 +231,40 @@ fn select_matches(mut raw: super::output::Capture, max_results: u64) -> std::io:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invert_returns_the_lines_that_do_not_match_on_both_engines() {
+        // Both dialects have to agree here: the flag is spelled differently and the two
+        // engines are the same tool only where their behaviour overlaps. A test on whichever
+        // one happens to be installed would leave the other path unverified.
+        for engine in [
+            crate::tools::first_present(&["/usr/bin/rg", "/usr/local/bin/rg", "/bin/rg"])
+                .map(Engine::Ripgrep),
+            crate::tools::first_present(&["/usr/bin/grep", "/bin/grep"]).map(Engine::GnuGrep),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let dir = std::env::temp_dir().join(format!("pi-grep-inv-{}", uuid::Uuid::now_v7()));
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::write(dir.join("a.txt"), "keep one\ndrop me\nkeep two\n").unwrap();
+            let label = format!("{engine:?}");
+            let out = block(execute_with_engine(
+                &serde_json::json!({"pattern": "drop", "path": dir.join("a.txt").to_string_lossy(), "invert": true}),
+                &dir,
+                engine,
+            ))
+            .unwrap();
+            assert!(out.content.contains("keep one"), "{label}: {}", out.content);
+            assert!(out.content.contains("keep two"), "{label}: {}", out.content);
+            assert!(
+                !out.content.contains("drop me"),
+                "{label} kept the matching line: {}",
+                out.content
+            );
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
 
     #[test]
     fn the_ripgrep_engine_is_the_one_actually_reached() {

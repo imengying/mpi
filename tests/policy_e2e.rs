@@ -159,6 +159,51 @@ fn the_policy_reports_a_reason_for_every_refusal() {
 }
 
 #[tokio::test]
+async fn a_single_file_search_carries_no_exclusions_but_still_cannot_leak() {
+    use mpi::auth::guard::PermissionGate;
+    // The exclusions defend a search that can walk into other files. A search aimed at one
+    // file cannot, and the guard is expensive there: 72 `--exclude` entries turned a
+    // 160-character `grep -rn pattern src/foo.rs` into a 3489-character command, which is
+    // 93% of the characters in every command that carried it.
+    let dir = std::env::temp_dir().join(format!("pi-search-single-{}", uuid::Uuid::now_v7()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("ordinary.txt"), "ordinary-sentinel\n").unwrap();
+    std::fs::write(dir.join(".env"), "policy-secret-sentinel\n").unwrap();
+    let gate = PermissionGate::new(false, Dialect::Zsh);
+    let context = mpi::tools::ToolContext {
+        cwd: dir.clone(),
+        shell: "/usr/bin/zsh".into(),
+    };
+    for command in [
+        "grep -n ordinary-sentinel ordinary.txt",
+        "grep -rn ordinary-sentinel ordinary.txt",
+    ] {
+        let approved = gate
+            .check("bash", &serde_json::json!({"command":command}), &dir)
+            .unwrap();
+        let rewritten = approved["command"].as_str().unwrap();
+        assert!(
+            !rewritten.contains("--exclude"),
+            "{command}: no exclusions are needed for one file: {rewritten}"
+        );
+        let out = mpi::tools::execute("bash", &approved, &context).await;
+        assert!(
+            out.content.contains("ordinary-sentinel") && !out.is_error,
+            "{command}: {}",
+            out.content
+        );
+    }
+    // A secret still cannot be read, exclusions or not: the path check refuses the target.
+    let refused = gate.check(
+        "bash",
+        &serde_json::json!({"command":"grep -n x .env"}),
+        &dir,
+    );
+    assert!(refused.is_err(), "reading .env has to ask: {refused:?}");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
 async fn broad_and_explicit_glob_searches_cannot_read_secrets() {
     use mpi::auth::guard::PermissionGate;
     let dir = std::env::temp_dir().join(format!("pi-search-policy-{}", uuid::Uuid::now_v7()));

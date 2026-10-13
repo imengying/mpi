@@ -148,11 +148,15 @@ fn spans_width(spans: &[Span]) -> usize {
 /// One decimal below 100 and none above: a rate is measured over a few seconds, so the
 /// tenths stop meaning anything once there are three digits before the point, and a long
 /// footer number is one the eye has to parse.
-fn format_rate(rate: f64) -> String {
-    if rate < 100.0 {
-        format!("{rate:.1} tok/s")
-    } else {
-        format!("{rate:.0} tok/s")
+///
+/// The unit travels with the dash. A bare `—` between four numbers does not say which field
+/// it belongs to — in a row of figures it reads as a broken value rather than as "nothing
+/// measured yet" — while `— tok/s` still names the field it is standing in for.
+fn format_rate(rate: Option<f64>) -> String {
+    match rate {
+        Some(rate) if rate < 100.0 => format!("{rate:.1} tok/s"),
+        Some(rate) => format!("{rate:.0} tok/s"),
+        None => "— tok/s".to_string(),
     }
 }
 
@@ -162,12 +166,9 @@ fn stats_line(state: &FooterState, theme: &Theme, width: usize) -> Line {
         None => "—".to_string(),
     };
     // Absent until a response has been timed, and absent for a response that produced no
-    // tokens: a dash says "no reading", where "0.0 tok/s" would claim the model produced
+    // tokens: the dash says "no reading", where "0.0 tok/s" would claim the model produced
     // nothing at a speed.
-    let rate = match state.output_rate {
-        Some(rate) => format_rate(rate),
-        None => "—".to_string(),
-    };
+    let rate = format_rate(state.output_rate);
     let context = match state.context_usage {
         // A count that describes the context being replaced is not printed: it would name
         // what compaction is throwing away, not what the next request will carry.
@@ -570,18 +571,23 @@ mod tests {
     }
 
     #[test]
-    fn a_response_with_no_rate_reads_as_a_dash() {
-        // A turn that only called a tool produces no output tokens, and neither does one
-        // that has not happened yet. The dash says "no reading"; `0.0 tok/s` would claim the
-        // model produced nothing at a speed.
+    fn a_response_with_no_rate_keeps_the_unit_on_the_dash() {
+        // A turn that only called a tool produces no output tokens, and neither does one that
+        // has not happened yet. The dash says "no reading"; `0.0 tok/s` would claim the model
+        // produced nothing at a speed.
+        //
+        // The unit stays: a bare `—` in a row of figures does not say which field it belongs
+        // to, and reads as a broken value rather than as "nothing measured yet".
         let theme = Theme {
             mode: ColorMode::Ansi256,
         };
         let mut state = state("/tmp");
         state.output_rate = None;
         let text = plain(&render(&state, &theme, 120))[1].to_string();
-        assert!(text.contains("—   "), "{text:?}");
-        assert!(!text.contains("tok/s"), "{text:?}");
+        assert!(text.contains("— tok/s"), "{text:?}");
+        // Alone in its field, not glued to a neighbour.
+        assert!(!text.contains("tok/s—"), "{text:?}");
+        assert!(!text.contains("—tok/s"), "{text:?}");
     }
 
     #[test]

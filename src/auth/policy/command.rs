@@ -674,6 +674,127 @@ pub(super) fn option_problem(name: &str, args: &[String]) -> Option<String> {
     None
 }
 
+/// Whether a search with these arguments can read anything beyond its own target.
+///
+/// Only a recursive search can, and recursion is a property of the *tool*, not of the
+/// path: `grep pattern dir/` walks the tree, `grep pattern file.rs` reads one file,
+/// `grep -r pattern file.rs` still reads one file. So the rule is about how the pattern
+/// and the target are written.
+///
+/// `-r`/`-R`/`--recursive`/`--dereference-recursive` ask for it. Otherwise the search is
+/// recursive when the target is a directory — which is the default when no target is named
+/// at all, because then the search runs over the working directory. A target that is a
+/// path to something that does not exist yet is treated as recursive: this decides whether
+/// to inject protective exclusions, and an unnecessary exclusion is harmless where a
+/// missing one is not.
+fn search_can_recurse(name: &str, args: &[String], cwd: &Path) -> bool {
+    let mut targets: Vec<&str> = Vec::new();
+    let mut saw_pattern = false;
+    let mut recursive = false;
+    let mut pending = false; // the next argument is a value for the previous option
+    let mut end_of_options = false;
+    for arg in args {
+        if pending {
+            pending = false;
+            continue;
+        }
+        if !end_of_options && arg == "--" {
+            end_of_options = true;
+            continue;
+        }
+        if !end_of_options && arg.starts_with("--") {
+            let flag = arg.split_once('=').map_or(arg.as_str(), |(k, _)| k);
+            if matches!(flag, "--recursive" | "--dereference-recursive") {
+                recursive = true;
+            }
+            // A value-taking option with its value glued on is self-contained; one
+            // written separately consumes the next argument.
+            if arg.contains('=') {
+                continue;
+            }
+            pending = matches!(
+                flag,
+                "--regexp"
+                    | "--file"
+                    | "--glob"
+                    | "--iglob"
+                    | "--type"
+                    | "--type-not"
+                    | "--replace"
+                    | "--max-count"
+                    | "--max-columns"
+                    | "--max-depth"
+                    | "--max-filesize"
+                    | "--encoding"
+                    | "--include"
+                    | "--exclude"
+                    | "--exclude-dir"
+                    | "--exclude-from"
+                    | "--colour"
+                    | "--colors"
+                    | "--sort"
+                    | "--sortr"
+                    | "--binary-files"
+                    | "--directories"
+                    | "--devices"
+                    | "--group-separator"
+                    | "--before-context"
+                    | "--after-context"
+                    | "--context"
+                    | "--label"
+            );
+            // `--regexp`/`--file` name the pattern, not the target.
+            if matches!(flag, "--regexp" | "--file") && !matches!(flag, "--file") {
+                saw_pattern = true;
+            }
+            continue;
+        }
+        if !end_of_options && arg.starts_with('-') && arg != "-" {
+            let value_flags = if name == "rg" {
+                "efgtrTABCm"
+            } else {
+                "efABCmdD"
+            };
+            let mut takes_value = false;
+            for (index, flag) in arg[1..].char_indices() {
+                if flag == 'r' || flag == 'R' {
+                    recursive = true;
+                }
+                if !value_flags.contains(flag) {
+                    continue;
+                }
+                if flag == 'e' {
+                    saw_pattern = true;
+                }
+                takes_value = index + flag.len_utf8() == arg.len() - 1;
+                break;
+            }
+            pending = takes_value;
+            continue;
+        }
+        // A bare word: the first one is the pattern unless an option already supplied it.
+        if !saw_pattern && name != "rg" {
+            saw_pattern = true;
+            continue;
+        }
+        saw_pattern = true;
+        targets.push(arg);
+    }
+    if targets.is_empty() {
+        // No target named: the search runs over the working directory.
+        return true;
+    }
+    // A named file is the whole search, `-r` or not: recursing into a file is still that one
+    // file. Only a target that is not a regular file can lead anywhere else, and a path that
+    // does not exist is treated as if it could.
+    let _ = recursive;
+    // Resolved against the policy's `cwd`, not the process's: `src/foo.rs` means the file in
+    // the directory the command will run in, which is not necessarily this one.
+    targets
+        .iter()
+        .any(|target| !resolve_tool_path(target, cwd).is_file())
+}
+
 pub(super) fn vet_segment(words: &[Word], cwd: &Path, dialect: Dialect) -> Assessment {
     let Some((command, raw_args)) = words.split_first() else {
         return Assessment::ask("未找到可执行命令");
@@ -794,7 +915,16 @@ pub(super) fn vet_segment(words: &[Word], cwd: &Path, dialect: Dialect) -> Asses
                 }
             }
         }
-        args.splice(boundary..boundary, search_exclusions(name == "rg"));
+        // The exclusions exist so a recursive search cannot walk into a secret. A search whose
+        // target is one file cannot reach anything else, so the exclusions would be pure
+        // weight — and they are not small: 72 `--exclude` entries, each spelling every letter
+        // as a `[aA]` character class for GNU grep, turned a 160-character `grep -rn pattern
+        // src/foo.rs` into a 3489-character command. Across the recorded sessions that
+        // injection is 93% of the characters in every command that carries it, and it is what
+        // makes those commands unreadable in the authorization panel.
+        if search_can_recurse(name.as_str(), &args, cwd) {
+            args.splice(boundary..boundary, search_exclusions(name == "rg"));
+        }
         if name == "rg" {
             args.insert(0, "--no-config".into());
         }
@@ -881,7 +1011,6 @@ pub(super) fn path_problem(name: &str, args: &[String], cwd: &Path) -> Option<As
         }
     }
 
-    /// Search patterns and formatting options are data; pattern files and operands are paths.
     fn search_path_problem(name: &str, args: &[String], cwd: &Path) -> Option<Assessment> {
         let default_root = assess_path(Operation::Read, &cwd.to_string_lossy(), cwd);
         if !default_root.allows() {

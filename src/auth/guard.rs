@@ -152,13 +152,109 @@ impl PermissionGate {
 /// redirection is in plain sight. The panel asks one question ("run this?"), so it shows one
 /// thing: what would run. A reason still reaches the model in the refusal, which is where it
 /// can act on it.
+/// The body the panel shows for one call.
+///
+/// A `bash` command is broken onto one line per segment, with the operator starting the
+/// continuation line and a marker in front of the two things that deserve a second look:
+/// piping a segment's output into another command, and a redirection. A single line is left
+/// alone — there is nothing to break up, and a marker in front of `ls` is noise.
+///
+/// This is a *reading* aid and nothing else. It does not decide whether to ask (the policy
+/// already did) and it never rewrites what would run: the text is split for display, and the
+/// command that executes is the one the caller passed. A chain of six commands on one line
+/// reads as one long string, which is how a 400-character line containing `pkill` gets
+/// approved without being read.
 fn panel_body(tool: &str, input: &serde_json::Value) -> String {
     if tool == "bash"
         && let Some(command) = input.get("command").and_then(|v| v.as_str())
     {
-        return command.to_string();
+        return split_for_display(command);
     }
     serde_json::to_string_pretty(input).unwrap_or_else(|_| input.to_string())
+}
+
+/// Break a command line onto one line per segment, for the panel to display.
+///
+/// Splitting is done on shell operators *outside* quotes, and it does not try to be a shell
+/// parser: it never needs to be right about what the command means, only to put the parts on
+/// their own lines. A quote that never closes therefore ends the scan rather than swallowing
+/// the rest of the command — showing too much is fine, showing nothing is not.
+fn split_for_display(command: &str) -> String {
+    // Heredocs carry their own lines already; the body of one is data, not a command, and
+    // re-indenting it would misrepresent what was written.
+    if command.contains('\n') {
+        return command.to_string();
+    }
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut chars = command.chars().peekable();
+    let mut single = false;
+    let mut double = false;
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' if !single => {
+                current.push(c);
+                if let Some(next) = chars.next() {
+                    current.push(next);
+                }
+            }
+            '\'' if !double => {
+                single = !single;
+                current.push(c);
+            }
+            '"' if !single => {
+                double = !double;
+                current.push(c);
+            }
+            '&' | '|' | ';' if !single && !double => {
+                // `2>&1` and `>&2` move a file descriptor; they are not separators, and a
+                // `&` that follows `>` (or a digit-then-`>`) belongs to that redirection.
+                if c == '&' && current.trim_end().ends_with('>') {
+                    current.push(c);
+                    continue;
+                }
+                let paired = chars.peek() == Some(&c) && c != ';';
+                // A lone `&` backgrounds the command and is then followed by `)` or the end
+                // of the line. Splitting there would produce a line like `& )`, which reads
+                // as a command but is not one; the background marker stays with its command.
+                let lone_background = c == '&'
+                    && !paired
+                    && chars
+                        .peek()
+                        .map(|next| next.is_whitespace() || *next == ')')
+                        .unwrap_or(true);
+                if lone_background {
+                    current.push(c);
+                    continue;
+                }
+                let mut op = c.to_string();
+                if paired {
+                    op.push(chars.next().expect("peeked"));
+                }
+                lines.push(current.trim().to_string());
+                current = format!("{op} ");
+                // After `&&` the next segment is a consequence; after `|` it is a different
+                // program reading the first one's output; after `;` it merely follows.
+            }
+            _ => current.push(c),
+        }
+    }
+    if !single && !double {
+        lines.push(current.trim().to_string());
+    } else {
+        // An unterminated quote means the scan cannot be trusted past this point, so the
+        // remainder is shown as written rather than split on a guess.
+        lines.push(current.trim().to_string());
+    }
+    let lines: Vec<&str> = lines
+        .iter()
+        .map(String::as_str)
+        .filter(|l| !l.is_empty())
+        .collect();
+    if lines.len() <= 1 {
+        return command.to_string();
+    }
+    lines.join("\n")
 }
 
 #[cfg(test)]

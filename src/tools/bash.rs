@@ -18,15 +18,14 @@ pub fn spec() -> ToolSpec {
                       其余命令会在执行前请求用户授权。自动授权的内容搜索会跳过敏感文件。\
                       命令输出默认只显示末尾若干行。\
                       列目录用 ls 工具、按内容搜索用 grep 工具、按文件名查找用 find 工具：\
-                      它们不需要引号转义，也不会因为 zsh 的通配符匹配不到而失败。\
-                      要在别的目录里执行，用 cwd 参数，不要写 `cd X && ...`。"
+                      它们不需要引号转义，也不会因为 zsh 的通配符匹配不到而失败。"
             .into(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
-                "command": { "type": "string", "description": "要执行的命令（zsh 语法）" },
+                "command": { "type": "string", "description": "要执行的命令。不要用 `cd X && ...` 换目录，用 cwd 参数" },
                 "description": { "type": "string", "description": "一句话说明这条命令做什么" },
-                "cwd": { "type": "string", "description": "命令的工作目录，默认当前工作目录" }
+                "cwd": { "type": "string", "description": "命令的工作目录。默认是当前工作目录；要在别处执行就用这个参数，命令里不要再写 cd" }
             },
             "required": ["command"]
         }),
