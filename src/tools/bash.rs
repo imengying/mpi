@@ -1,9 +1,9 @@
 //! `bash`: run a command through zsh.
 //!
 //! The shell is fixed to the configured path (default `/usr/bin/zsh`) and is invoked as
-//! `zsh -c '<command>'`. The command string handed here is the one the authorization
-//! gate already vetted — for auto-approved calls it is the rewritten form with quoted
-//! absolute paths, so a PATH change cannot redirect it.
+//! `zsh -o no_nomatch -o noequals -c '<command>'`. The command string handed here is the
+//! one the authorization gate already vetted — for auto-approved calls it is the rewritten
+//! form with quoted absolute paths, so a PATH change cannot redirect it.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -61,6 +61,35 @@ pub fn resolve_cwd(arguments: &serde_json::Value, cwd: &Path) -> Result<PathBuf,
     Ok(resolved)
 }
 
+/// The options a zsh call needs to behave the way the caller expects.
+///
+/// Both of these exist because zsh is stricter than the shell most callers have in mind, and
+/// the strictness lands as a *failed command*, not as a difference in output. Neither is a
+/// convenience: without them the command does not run at all.
+///
+/// `no_nomatch`: an unmatched glob is an error in zsh, and the error aborts the whole command
+/// before any of it runs. `grep -rn pattern src --include=*.rs` — which works in bash, and is
+/// how the option is habitually written — died with `no matches found` and searched nothing.
+/// In the recorded sessions that was 61 calls. With the option off, the pattern reaches the
+/// command unchanged, which is what every other shell does.
+///
+/// `noequals`: `echo ===` is a separator, not an equals expansion. zsh reads `=cmd` as "the
+/// path to cmd" (a shortcut for `command -v`), so a run of `=` signs becomes a lookup for a
+/// program named `=` and the line fails with `== not found`. 31 calls. Confirmed harmless to
+/// the things that look similar: `[[ x =~ y ]]`, `[ x = y ]`, `FOO=bar` and `--opt=value` all
+/// still work, and the recorded sessions never once relied on `=cmd` expansion.
+///
+/// Only applied to zsh — `-o no_nomatch` on bash is an error, not an ignored flag.
+fn shell_options(shell: &str) -> Vec<&'static str> {
+    let name = shell.rsplit('/').next().unwrap_or(shell);
+    let name = name.strip_suffix(".exe").unwrap_or(name);
+    if name.eq_ignore_ascii_case("zsh") {
+        vec!["-o", "no_nomatch", "-o", "noequals"]
+    } else {
+        Vec::new()
+    }
+}
+
 /// Run `command` in `shell`, with the working directory set to `cwd`.
 pub async fn execute_with_shell(
     command: &str,
@@ -77,6 +106,7 @@ pub async fn execute_with_shell(
     let stdout = capture.file.try_clone().map_err(|err| err.to_string())?;
     let stderr = capture.file.try_clone().map_err(|err| err.to_string())?;
     let mut process = tokio::process::Command::new(shell);
+    process.args(shell_options(shell));
     process
         .arg("-c")
         .arg(command)
@@ -237,6 +267,91 @@ mod tests {
         // `$^array` style expansion only exists in zsh; this proves the shell really is zsh.
         let out = block(execute_with_shell("echo ${(U)foo}", &cwd, "/usr/bin/zsh")).unwrap();
         assert!(!out.content.contains("bad substitution"), "{}", out.content);
+    }
+
+    #[test]
+    fn an_unmatched_glob_reaches_the_command_instead_of_aborting_it() {
+        // The shape of 61 recorded failures. `--include=*.rs` is how the option is written in
+        // bash, and zsh's default is to fail the whole command on the unmatched glob before
+        // grep ever runs — so the search silently did not happen.
+        let dir = std::env::temp_dir().join(format!("pi-nomatch-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("hit.rs"), "needle-in-glob\n").unwrap();
+        let out = block(execute_with_shell(
+            "grep -rn needle-in-glob . --include=*.rs",
+            &dir,
+            "/usr/bin/zsh",
+        ))
+        .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("needle-in-glob"), "{}", out.content);
+
+        // A glob that matches nothing is passed through as a literal, as in bash, rather than
+        // killing the command.
+        let literal = block(execute_with_shell(
+            "printf '%s' *.nomatch",
+            &dir,
+            "/usr/bin/zsh",
+        ))
+        .unwrap();
+        assert!(literal.content.contains("*.nomatch"), "{}", literal.content);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_run_of_equals_signs_is_an_argument_not_an_equals_expansion() {
+        // The other recorded failure: `echo ===` as a separator. zsh expands `=cmd` to the
+        // path of cmd, so `===` became a lookup for a program named `=` and the line failed.
+        let cwd = std::env::temp_dir();
+        let out = block(execute_with_shell("echo ===", &cwd, "/usr/bin/zsh")).unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("==="), "{}", out.content);
+
+        // The neighbouring syntax that must keep working.
+        for (command, marker) in [
+            ("[ a = a ] && echo same", "same"),
+            ("[[ abc =~ ^a ]] && echo regex", "regex"),
+            ("FOO=bar; echo \"set:$FOO\"", "set:bar"),
+        ] {
+            let out = block(execute_with_shell(command, &cwd, "/usr/bin/zsh")).unwrap();
+            assert!(
+                !out.is_error && out.content.contains(marker),
+                "{command}: {}",
+                out.content
+            );
+        }
+    }
+
+    #[test]
+    fn the_options_are_only_handed_to_zsh() {
+        // `-o no_nomatch` is not a bash flag: passing it there would be an error, not a
+        // no-op, so the guard has to be by shell name.
+        assert_eq!(
+            shell_options("/usr/bin/zsh"),
+            vec!["-o", "no_nomatch", "-o", "noequals"]
+        );
+        assert_eq!(
+            shell_options("zsh"),
+            vec!["-o", "no_nomatch", "-o", "noequals"]
+        );
+        assert_eq!(
+            shell_options("/usr/bin/zsh.exe"),
+            vec!["-o", "no_nomatch", "-o", "noequals"]
+        );
+        assert!(shell_options("/usr/bin/bash").is_empty());
+        assert!(shell_options("/bin/sh").is_empty());
+        assert!(shell_options("").is_empty());
+    }
+
+    #[test]
+    fn a_non_zsh_shell_still_runs_the_command() {
+        // The options are skipped for other shells, and the command must still work there.
+        let cwd = std::env::temp_dir();
+        for shell in ["/bin/sh", "/usr/bin/bash"] {
+            let out = block(execute_with_shell("echo plain", &cwd, shell)).unwrap();
+            assert!(!out.is_error, "{shell}: {}", out.content);
+            assert!(out.content.contains("plain"), "{shell}: {}", out.content);
+        }
     }
 
     #[test]

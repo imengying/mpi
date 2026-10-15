@@ -102,3 +102,33 @@ async fn an_empty_cwd_means_the_session_directory() {
     let got = std::fs::canonicalize(out.content.trim()).unwrap();
     assert_eq!(got, want);
 }
+
+/// The two zsh defaults that turned working commands into failures.
+///
+/// These go through `tools::execute`, so they cover the whole path a real call takes —
+/// including the authorization rewrite, which re-quotes the command before it is handed to
+/// the shell. A flag that only works on the un-rewritten form would pass a unit test on
+/// `execute_with_shell` and still fail here.
+#[tokio::test]
+async fn an_unmatched_glob_and_a_run_of_equals_signs_both_reach_the_command() {
+    let session = dir("zsh-defaults");
+    std::fs::write(session.join("hit.rs"), "needle-in-glob\n").unwrap();
+
+    // `--include=*.rs` is a bash habit; zsh aborts the command on the unmatched glob.
+    let globbed = run(
+        &session,
+        serde_json::json!({"command": "grep -rn needle-in-glob . --include=*.rs"}),
+    )
+    .await;
+    assert!(!globbed.is_error, "{}", globbed.content);
+    assert!(
+        globbed.content.contains("needle-in-glob"),
+        "{}",
+        globbed.content
+    );
+
+    // `echo ===` as a separator: `=cmd` is an expansion in zsh, not a literal.
+    let equals = run(&session, serde_json::json!({"command": "echo ==="})).await;
+    assert!(!equals.is_error, "{}", equals.content);
+    assert!(equals.content.contains("==="), "{}", equals.content);
+}
