@@ -91,7 +91,12 @@ pub async fn execute(arguments: &serde_json::Value, cwd: &Path) -> Result<ToolOu
 /// guess would be worse than silence).
 fn nearest_region(before: &str, old_text: &str) -> String {
     const HINT_LINES: usize = 12;
-    const MIN_SCORE: f64 = 0.25;
+    // Low enough to survive a real rewrite. The misses this hint explains measure 0.20-0.33
+    // on their true region: an edited block where a rename or a changed value costs most of
+    // the exact matches. 0.25 dropped the 0.20 case — the hint vanished precisely when the
+    // drift was small. What it must still exclude is a caller whose text touches nothing in
+    // the file, and that scores 0.
+    const MIN_SCORE: f64 = 0.2;
     let lines: Vec<&str> = before.lines().collect();
     if lines.is_empty() || old_text.is_empty() {
         return String::new();
@@ -99,7 +104,7 @@ fn nearest_region(before: &str, old_text: &str) -> String {
     // The window height follows the caller's own text, so the hint covers about as much as
     // it asked about rather than a fixed guess at the right size.
     let height = old_text.lines().count().clamp(1, HINT_LINES);
-    let wanted: std::collections::HashSet<&str> = old_text
+    let wanted: Vec<&str> = old_text
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
@@ -112,7 +117,7 @@ fn nearest_region(before: &str, old_text: &str) -> String {
         let window = &lines[start..(start + height).min(lines.len())];
         let matching = window
             .iter()
-            .filter(|line| wanted.contains(line.trim()))
+            .filter(|line| wanted.iter().any(|want| lines_are_alike(want, line.trim())))
             .count();
         let score = matching as f64 / wanted.len().max(1) as f64;
         if score > best.1 {
@@ -132,6 +137,39 @@ fn nearest_region(before: &str, old_text: &str) -> String {
         start + 1,
         body.join("\n")
     )
+}
+
+/// Whether two lines are close enough to be the same line after an edit.
+///
+/// Exact equality is the wrong test for the misses this hint exists to explain. A line that
+/// was renamed a word (`.codexResetCreditTime` where the file now says `.codexResetCreditRow`)
+/// or whose value changed is *the* line the caller meant, and counting it as a non-match can
+/// push a score under the threshold — losing the hint exactly when the drift was small and the
+/// hint would have been most useful.
+///
+/// The comparison is by shared prefix on the indent-stripped text, which is what a rename or
+/// an edited value leaves behind. Short lines are excluded outright: `}` and `});` share their
+/// first character, and at that length a prefix says nothing about which block is meant, so
+/// they would let an unrelated window pass as a match.
+fn lines_are_alike(want: &str, have: &str) -> bool {
+    const MIN_PREFIX: usize = 8;
+    if want == have {
+        return true;
+    }
+    let want_len = want.chars().count();
+    let have_len = have.chars().count();
+    // A line too short to carry a distinctive prefix is never evidence of a match, even
+    // against itself — the caller's `trim` already removed the indentation that would have
+    // made a short line like `}` meaningful.
+    if want_len < MIN_PREFIX || have_len < MIN_PREFIX {
+        return false;
+    }
+    let shared = want
+        .chars()
+        .zip(have.chars())
+        .take_while(|(a, b)| a == b)
+        .count();
+    shared >= MIN_PREFIX
 }
 
 #[cfg(test)]
@@ -254,5 +292,114 @@ mod tests {
         ))
         .unwrap_err();
         assert!(error.contains("没有需要修改的内容"));
+    }
+
+    #[test]
+    fn a_renamed_line_still_counts_as_the_same_line() {
+        // The shape of a real miss: the caller's block is right, but one line was renamed
+        // under it (`.codexResetCreditTime` where the file now reads `.codexResetCreditRow`).
+        // Counting that line as a non-match is what pushed the score under the threshold and
+        // lost the hint in the cases where the drift was smallest.
+        assert!(lines_are_alike(
+            ".codexResetCreditTime {",
+            ".codexResetCreditRow {"
+        ));
+        assert!(lines_are_alike("let value = 1;", "let value = 2;"));
+        assert!(lines_are_alike("    return result;", "    return totals;"));
+
+        // And the comparison is what `nearest_region` actually uses, not just what exists: here
+        // *every* line drifted, so exact comparison scores 0 and finds nothing, while the shared
+        // prefixes place the block. The closing brace is left out on purpose — an identical `}`
+        // would match exactly and carry the score on its own, hiding whether prefixes count.
+        let before = [
+            "header",
+            "    .codexResetCreditRow {",
+            "      color: var(--text-primary);",
+            "      min-width: 0;",
+            "    }",
+            "footer",
+        ]
+        .join("\n");
+        let drifted = [
+            "    .codexResetCreditTime {",
+            "      color: var(--text-secondary);",
+            "      min-width: 100%;",
+        ]
+        .join("\n");
+        assert!(
+            !nearest_region(&before, &drifted).is_empty(),
+            "a block that drifted on every line must still be located"
+        );
+
+        // Near-misses that must not count, or every window would look plausible.
+        assert!(!lines_are_alike("}", "});"));
+        assert!(!lines_are_alike("alpha", "omega"));
+        assert!(!lines_are_alike("let a = 1;", "const b = 2;"));
+        // The comparison is a shared prefix, not a general diff: change the opening of a
+        // short line and too little is left to match on. That limit is intended — guessing
+        // a region from two shared characters would name the wrong one.
+        assert!(!lines_are_alike("a: 1;", "b: 1;"));
+    }
+
+    #[test]
+    fn a_heavily_rewritten_block_still_points_at_its_region() {
+        // Taken from a recorded miss, where the caller's block was right but every line in it
+        // had drifted: one renamed (`.codexResetCreditTime` where the file reads
+        // `.codexResetCreditRow`), the rest holding different declarations. Only `min-width: 0;`
+        // and the closing brace still matched exactly, which scores 0.20 — the old 0.25
+        // threshold dropped it, so the hint vanished on the miss that needed it most.
+        let before = [
+            "  .codexResetCreditRow {",
+            "    display: flex;",
+            "    align-items: center;",
+            "    justify-content: space-between;",
+            "    gap: $spacing-sm;",
+            "    padding: 6px 8px;",
+            "    border: 1px solid var(--border-color);",
+            "    font-size: 12px;",
+            "    line-height: 1.35;",
+            "    min-width: 0;",
+            "  }",
+        ]
+        .join("\n");
+        let old_text = [
+            "    .codexResetCreditTime {",
+            "      color: var(--text-primary);",
+            "      font-weight: 600;",
+            "      text-align: right;",
+            "      overflow-wrap: anywhere;",
+            "      min-width: 0;",
+            "",
+            "      .quotaResetRelative {",
+            "        margin-left: 4px;",
+            "      }",
+            "    }",
+        ]
+        .join("\n");
+        let hint = nearest_region(&before, &old_text);
+        assert!(
+            !hint.is_empty(),
+            "a block at 0.20 on its true region must still be named"
+        );
+        // The window is where the block really is, and it is the only thing the caller
+        // cannot derive from its own text.
+        assert!(hint.contains(".codexResetCreditRow"), "{hint}");
+    }
+
+    #[test]
+    fn text_touching_nothing_in_the_file_still_gets_no_region() {
+        // The floor the threshold protects. Loosening the line comparison must not turn a
+        // caller that is editing the wrong file into one that gets sent to a real line.
+        let before = "alpha\nbeta\ngamma\n";
+        for old_text in [
+            "完全不相干的一段文本，与文件内容没有任何重叠部分",
+            "delta\nepsilon\nzeta",
+            "// nothing here resembles this\n// not even a little",
+        ] {
+            assert!(
+                nearest_region(before, old_text).is_empty(),
+                "{old_text:?} must not invent a region"
+            );
+        }
     }
 }
