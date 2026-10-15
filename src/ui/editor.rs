@@ -138,6 +138,27 @@ fn input_rows(text: &str, width: usize, prompt_width: usize) -> Vec<(String, Str
         .collect()
 }
 
+/// Whether a pasted block is big enough to be folded away instead of shown.
+///
+/// Sized from what the recorded sessions actually pasted: the large ones were a CI log (85
+/// lines), a terminal dump (47) and a diff (31), and the input area shows at most eight rows,
+/// so anything past that scrolls and pushes what the user is writing out of sight. A block
+/// trips the fold on either measure — 85 short lines are as disruptive as one long blob, and
+/// a minified line is as tall on screen as it is wide.
+fn is_large(text: &str) -> bool {
+    const CHARS: usize = 1000;
+    const LINES: usize = 8;
+    text.chars().count() >= CHARS || text.lines().count() >= LINES
+}
+
+/// What stands in for a folded paste: `[粘贴的内容 8545 字符]`.
+///
+/// The count is shown because it is the one thing the user cannot see once the block is
+/// folded, and it is what tells them the paste arrived whole.
+fn label(text: &str) -> String {
+    format!("[粘贴的内容 {} 字符]", text.chars().count())
+}
+
 /// The longest prefix shared by every name, used to fill in as much as is unambiguous.
 pub(crate) fn common_prefix(names: &[&str]) -> String {
     let Some(first) = names.first() else {
@@ -163,6 +184,11 @@ pub struct Editor {
     /// Where the next character typed goes, as an index into `chars`.
     caret: usize,
     preferred_column: Option<usize>,
+    /// Blocks too large to show, set aside until the line is sent: `(placeholder, text)`.
+    ///
+    /// The buffer holds the placeholder, so the input area stays the height of what the user
+    /// is writing. The text behind it is what the model receives.
+    pending_pastes: Vec<(String, String)>,
 }
 
 impl Editor {
@@ -177,11 +203,39 @@ impl Editor {
             chars,
             caret,
             preferred_column: None,
+            pending_pastes: Vec::new(),
         }
+    }
+
+    /// An editor holding a line recalled from history, folding any large block again.
+    ///
+    /// History keeps the line as it was sent, because that is what the model received and what
+    /// re-sending should reproduce. Putting an 85-line paste back on the input area is the
+    /// thing folding exists to prevent, so recall folds it again the same way the paste did —
+    /// and since the text is set aside rather than dropped, submitting the recalled line still
+    /// sends all of it.
+    pub fn from_history(text: &str) -> Self {
+        let mut editor = Editor::new();
+        editor.paste(text);
+        editor
     }
 
     pub fn text(&self) -> String {
         self.chars.iter().collect()
+    }
+
+    /// The line as it will be sent, with every placeholder replaced by what was pasted.
+    ///
+    /// A placeholder the user has since edited out no longer appears verbatim, and neither
+    /// does its text: a stand-in that was deleted or typed over is not a stand-in any more.
+    pub fn expanded(&self) -> String {
+        let mut text = self.text();
+        for (placeholder, original) in &self.pending_pastes {
+            if text.contains(placeholder.as_str()) {
+                text = text.replacen(placeholder.as_str(), original, 1);
+            }
+        }
+        text
     }
 
     pub fn is_empty(&self) -> bool {
@@ -232,9 +286,20 @@ impl Editor {
     }
 
     /// Both clipboard paths insert one edit, preserving paragraphs without terminal controls.
+    ///
+    /// A block large enough to swamp the input area is set aside and replaced by a one-line
+    /// label. What the model receives is the block itself: the label is for the screen, and
+    /// `expanded` puts the text back on the way out.
     pub fn paste(&mut self, text: &str) {
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
-        self.insert(&crate::util::sanitize(&text));
+        let text = crate::util::sanitize(&text);
+        if !is_large(&text) {
+            self.insert(&text);
+            return;
+        }
+        let placeholder = label(&text);
+        self.pending_pastes.push((placeholder.clone(), text));
+        self.insert(&placeholder);
     }
 
     /// Backspace: remove the character *before* the caret, if there is one.

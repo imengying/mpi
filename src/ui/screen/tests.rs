@@ -1925,3 +1925,151 @@ fn ansi_in_streamed_text_is_neutralised_before_display() {
     let (live, _) = screen.compose_live();
     assert!(live.iter().all(|line| !line.line.text().contains('\u{1b}')));
 }
+
+/// A paste big enough to swamp the input area is folded to a one-line label, and the text
+/// behind it is what gets sent.
+///
+/// Sized from the recorded sessions: the large pastes were a CI log (85 lines), a terminal
+/// dump (47) and a diff (31). The input area shows at most eight rows, so those scrolled and
+/// pushed the line being written out of sight.
+#[test]
+fn a_large_paste_is_folded_to_a_label_and_still_sent_whole() {
+    let mut screen = screen();
+    screen.begin_line();
+    let log = (1..=40)
+        .map(|line| format!("error[E0433]: line {line} of the CI log"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(screen.absorb_event(Event::Paste(log.clone())).is_none());
+
+    // One row on screen, however many lines went in.
+    let (rows, _) = screen.compose_live();
+    let shown: Vec<String> = rows.iter().map(|row| row.line.text()).collect();
+    assert_eq!(shown.len(), 1, "{shown:?}");
+    assert_eq!(
+        shown[0],
+        format!("› [粘贴的内容 {} 字符]", log.chars().count())
+    );
+
+    // And the whole thing is what leaves on Enter, character for character.
+    let action = screen.absorb_event(Event::Key(KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::NONE,
+    )));
+    assert!(
+        matches!(action, Some(Action::Line(line)) if line == log),
+        "the folded text must be sent, not the label"
+    );
+}
+
+#[test]
+fn the_fold_threshold_is_a_character_count_or_a_line_count() {
+    let pasted = |text: String| {
+        let mut screen = screen();
+        screen.begin_line();
+        assert!(screen.absorb_event(Event::Paste(text)).is_none());
+        screen.editing.as_ref().unwrap().text()
+    };
+    // Under both bounds the text is shown as pasted: a short note is not a block.
+    assert_eq!(pasted("短".repeat(20)), "短".repeat(20));
+    assert_eq!(pasted("x".repeat(999)), "x".repeat(999));
+    assert_eq!(pasted("a\nb\nc\nd\ne\nf\ng".into()), "a\nb\nc\nd\ne\nf\ng");
+    // Either bound on its own folds: 85 short lines disturb the input area as much as one
+    // long blob, and a single minified line is as tall on screen as it is wide.
+    assert!(pasted("x".repeat(1000)).contains("粘贴的内容 1000 字符"));
+    assert!(pasted("a\nb\nc\nd\ne\nf\ng\nh".into()).contains("粘贴"));
+}
+
+#[test]
+fn text_written_around_a_folded_paste_is_sent_around_its_text() {
+    let mut screen = screen();
+    screen.begin_line();
+    let block = "块".repeat(1200);
+    assert!(screen.absorb_event(Event::Paste(block.clone())).is_none());
+    // Type in front of the label, which is where a user explains what they pasted.
+    screen.editing.as_mut().unwrap().home();
+    screen.editing.as_mut().unwrap().insert("请看这个报错：");
+    let action = screen.absorb_event(Event::Key(KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::NONE,
+    )));
+    let Some(Action::Line(line)) = action else {
+        panic!("the line must be sent: {action:?}");
+    };
+    assert_eq!(line, format!("请看这个报错：{block}"));
+}
+
+#[test]
+fn a_label_the_user_typed_is_not_expanded() {
+    // Only what this editor set aside is put back. A label that was typed by hand has no text
+    // behind it, and expanding it would invent content the user never pasted.
+    let mut screen = screen();
+    screen.begin_line();
+    screen
+        .editing
+        .as_mut()
+        .unwrap()
+        .insert("[粘贴的内容 100 字符]");
+    let action = screen.absorb_event(Event::Key(KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::NONE,
+    )));
+    let Some(Action::Line(line)) = action else {
+        panic!("the line must be sent: {action:?}");
+    };
+    assert_eq!(line, "[粘贴的内容 100 字符]");
+}
+
+#[test]
+fn deleting_a_folded_label_deletes_its_text_too() {
+    // A stand-in that was removed is not a stand-in any more: leaving the text set aside would
+    // send content the user deliberately deleted.
+    let mut screen = screen();
+    screen.begin_line();
+    screen.absorb_event(Event::Paste("q".repeat(1200)));
+    screen.editing.as_mut().unwrap().home();
+    for _ in 0..40 {
+        screen.editing.as_mut().unwrap().delete();
+    }
+    assert_eq!(screen.editing.as_ref().unwrap().text(), "");
+    let action = screen.absorb_event(Event::Key(KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::NONE,
+    )));
+    // Nothing goes out: the text went with the label that was deleted.
+    let Some(Action::Line(line)) = action else {
+        panic!("empty line: {action:?}");
+    };
+    assert_eq!(line, "");
+}
+
+#[test]
+fn recalling_a_folded_line_shows_the_label_again_and_still_sends_the_text() {
+    // History holds the line as sent, because that is what re-sending reproduces. Showing it
+    // again is what would put 40 lines back on the input area.
+    let mut screen = screen();
+    screen.begin_line();
+    let block = "r".repeat(2000);
+    screen.absorb_event(Event::Paste(block.clone()));
+    let action = screen.absorb_event(Event::Key(KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::NONE,
+    )));
+    assert!(matches!(action, Some(Action::Line(line)) if line == block));
+
+    // Up recalls it: the label is back, and Enter sends the text again.
+    screen.begin_line();
+    screen.absorb_event(Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)));
+    assert_eq!(
+        screen.editing.as_ref().unwrap().text(),
+        "[粘贴的内容 2000 字符]"
+    );
+    let again = screen.absorb_event(Event::Key(KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::NONE,
+    )));
+    assert!(
+        matches!(again, Some(Action::Line(line)) if line == block),
+        "a recalled line must send what it sent before"
+    );
+}

@@ -31,7 +31,7 @@ impl Screen {
             }
         };
         self.history_index = Some(next);
-        self.editing = Some(Editor::from_text(&self.history[next]));
+        self.editing = Some(Editor::from_history(&self.history[next]));
         self.menu_dismissed = self.editing.as_ref().map(Editor::text);
     }
 
@@ -51,7 +51,7 @@ impl Screen {
         };
         if index + 1 < self.history.len() {
             self.history_index = Some(index + 1);
-            self.editing = Some(Editor::from_text(&self.history[index + 1]));
+            self.editing = Some(Editor::from_history(&self.history[index + 1]));
             self.menu_dismissed = self.editing.as_ref().map(Editor::text);
             return;
         }
@@ -215,7 +215,13 @@ impl Screen {
                 self.editing.get_or_insert_with(Editor::new).insert("\n");
             }
             KeyCode::Enter => {
-                let mut line = self.editing.as_ref().map(Editor::text).unwrap_or_default();
+                // The text behind a folded paste is what is sent: the label on screen is a
+                // stand-in, and the buffer holds the label rather than the block.
+                let mut line = self
+                    .editing
+                    .as_ref()
+                    .map(Editor::expanded)
+                    .unwrap_or_default();
                 // The line is on its way out, so clear the buffer now: the caller commits
                 // it to the transcript and redraws, and a buffer that still holds the
                 // submitted text would be drawn again as a fresh prompt.
