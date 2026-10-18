@@ -360,6 +360,18 @@ pub enum Delta {
     Notice(String),
 }
 
+impl Delta {
+    /// Whether this delta is part of what the model generated.
+    ///
+    /// A `Notice` is the harness speaking, not the model, so it does not start the decode
+    /// window: a hosted search starting can arrive seconds before the first token, and timing
+    /// from it would credit that wait to the model. Thinking does count — it is generated
+    /// output, and it is billed as output tokens.
+    pub fn carries_output(&self) -> bool {
+        matches!(self, Delta::Text(_) | Delta::Thinking(_))
+    }
+}
+
 /// Announces a hosted search exactly once per response.
 ///
 /// A search can be reported by more than one event — a start and a finish, or the same item

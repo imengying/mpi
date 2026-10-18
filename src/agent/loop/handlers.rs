@@ -666,15 +666,25 @@ mod tests {
             // A real response takes longer than the resolution floor. Answering instantly
             // would leave no rate to check, and the floor is deliberately not loosened for
             // the test: it exists so an instantaneous reply cannot print a fake number.
-            std::thread::sleep(std::time::Duration::from_millis(120));
+            //
+            // Split around the first token, so both readings have a window: the wait before
+            // it (prefill) and the time after it (decode). Sent as one body, the delay would
+            // land entirely on the prefill side.
             let event = serde_json::json!({"choices":[{"delta":{"content":"答案"},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":30}});
-            let response = format!("data: {event}\n\ndata: [DONE]\n\n");
+            let first = format!("data: {event}\n\n");
+            let rest = "data: [DONE]\n\n";
+            let response = format!("{first}{rest}");
             write!(
                 socket,
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 response.len()
             )
             .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(120));
+            write!(socket, "{first}").unwrap();
+            socket.flush().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(120));
+            write!(socket, "{rest}").unwrap();
         });
         let (mut agent, dir) = test_agent();
         agent.config.providers[0].base_url = format!("http://{address}/v1");
@@ -694,7 +704,17 @@ mod tests {
         let rate = agent
             .output_rate
             .expect("a finished turn leaves a rate behind");
-        assert!(rate > 0.0, "{rate}");
+        assert!(rate.overall > 0.0, "{}", rate.overall);
+        // The server waits 120ms before the first token and 120ms more after it, so the two
+        // readings must disagree: decode sees only the second half and comes out roughly
+        // twice as fast. Equal numbers would mean the first-token mark was never taken, and
+        // the footer would be reporting the whole-request rate under a decode label.
+        let decode = rate.decode.expect("a streamed answer has a decode window");
+        assert!(
+            decode > rate.overall,
+            "decode {decode} vs overall {}",
+            rate.overall
+        );
         drop(agent);
         std::fs::remove_dir_all(dir).unwrap();
     }

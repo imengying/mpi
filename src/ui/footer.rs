@@ -72,7 +72,7 @@ pub struct FooterState {
     pub totals: Usage,
     pub cache_hit_rate: Option<f64>,
     /// Output speed of the most recent response, in tokens per second.
-    pub output_rate: Option<f64>,
+    pub output_rate: Option<crate::agent::r#loop::Rate>,
     pub context_usage: ContextUsage,
     pub context_window: Option<u64>,
     pub model: Option<ModelConfig>,
@@ -160,6 +160,21 @@ fn format_rate(rate: Option<f64>) -> String {
     }
 }
 
+/// The footer's speed field, which is the decode rate.
+///
+/// Decode is what the model itself produced, and it is the reading that makes two providers
+/// comparable: the wait before the first token is a different cost, and folding it in here
+/// would make a fast model behind a slow prefill look slow, and a retried request look slow
+/// twice. The overall rate — the time the user actually sat through — is kept in the same
+/// value so it can be reported without measuring again, and it is what this falls back to
+/// when a response carried no text to time a decode window from.
+fn rate_text(rate: Option<crate::agent::r#loop::Rate>) -> String {
+    match rate {
+        Some(rate) => format_rate(Some(rate.decode.unwrap_or(rate.overall))),
+        None => format_rate(None),
+    }
+}
+
 fn stats_line(state: &FooterState, theme: &Theme, width: usize) -> Line {
     let hit = match state.cache_hit_rate {
         Some(rate) => format!("{rate:.1}%"),
@@ -168,7 +183,7 @@ fn stats_line(state: &FooterState, theme: &Theme, width: usize) -> Line {
     // Absent until a response has been timed, and absent for a response that produced no
     // tokens: the dash says "no reading", where "0.0 tok/s" would claim the model produced
     // nothing at a speed.
-    let rate = format_rate(state.output_rate);
+    let rate = rate_text(state.output_rate);
     let context = match state.context_usage {
         // A count that describes the context being replaced is not printed: it would name
         // what compaction is throwing away, not what the next request will carry.
@@ -326,6 +341,14 @@ mod tests {
     use crate::ui::plain;
     use crate::ui::theme::ColorMode;
 
+    /// A rate whose two readings agree, for the tests that only care about the field.
+    fn rate_of(value: f64) -> crate::agent::r#loop::Rate {
+        crate::agent::r#loop::Rate {
+            decode: Some(value),
+            overall: value,
+        }
+    }
+
     #[test]
     fn reasoning_levels_have_distinct_accents_in_the_footer() {
         let theme = Theme {
@@ -367,7 +390,7 @@ mod tests {
                 cache_write: 0,
             },
             cache_hit_rate: Some(99.5),
-            output_rate: Some(42.5),
+            output_rate: Some(rate_of(42.5)),
             context_usage: ContextUsage::Tokens(17_300),
             context_window: Some(1_000_000),
             model: None,
@@ -554,7 +577,7 @@ mod tests {
         };
         let mut state = state("/tmp");
         state.cache_hit_rate = Some(99.5);
-        state.output_rate = Some(42.5);
+        state.output_rate = Some(rate_of(42.5));
         state.context_usage = ContextUsage::Tokens(17_300);
         state.context_window = Some(1_000_000);
         let text = plain(&render(&state, &theme, 120))[1].to_string();
@@ -598,7 +621,7 @@ mod tests {
             mode: ColorMode::Ansi256,
         };
         let mut state = state("/tmp");
-        state.output_rate = Some(1234.56);
+        state.output_rate = Some(rate_of(1234.56));
         let text = plain(&render(&state, &theme, 120))[1].to_string();
         assert!(text.contains("1235 tok/s"), "{text:?}");
     }
@@ -614,7 +637,12 @@ mod tests {
         let mut state = state("/tmp");
         state.model = Some(model());
         for width in [12, 20, 30, 40, 60, 80, 120, 200] {
-            for rate in [None, Some(0.5), Some(42.5), Some(1234.56)] {
+            for rate in [
+                None,
+                Some(rate_of(0.5)),
+                Some(rate_of(42.5)),
+                Some(rate_of(1234.56)),
+            ] {
                 state.output_rate = rate;
                 let lines = render(&state, &theme, width);
                 for line in &lines {
@@ -638,7 +666,7 @@ mod tests {
         };
         let mut state = state("/tmp");
         state.model = Some(model());
-        state.output_rate = Some(42.5);
+        state.output_rate = Some(rate_of(42.5));
         let shows_usage = |width: usize| {
             let text = plain(&render(&state, &theme, width))[1].to_string();
             text.contains("↑ ")
@@ -713,5 +741,41 @@ mod tests {
         assert_eq!(render(&state, &theme, 120).len(), 2);
         state.busy = Some("等待用户授权".into());
         assert_eq!(render(&state, &theme, 120).len(), 3);
+    }
+
+    #[test]
+    fn the_footer_shows_the_decode_rate_not_the_whole_request() {
+        // 200 tokens, of which the first took 3 of the 4 seconds. Decode is 200/s — the speed
+        // the model actually ran at — and overall is 50/s, which is mostly prefill. The footer
+        // is the place for the model's own figure; folding the wait in would make a fast model
+        // behind a slow prefill look slow, and the number would not be comparable.
+        let theme = Theme {
+            mode: ColorMode::Ansi256,
+        };
+        let mut state = state("/tmp");
+        state.output_rate = Some(crate::agent::r#loop::Rate {
+            decode: Some(200.0),
+            overall: 50.0,
+        });
+        let text = plain(&render(&state, &theme, 120))[1].to_string();
+        assert!(text.contains("200 tok/s"), "{text:?}");
+        assert!(!text.contains("50.0 tok/s"), "{text:?}");
+    }
+
+    #[test]
+    fn a_reading_with_no_decode_window_falls_back_to_the_whole_request() {
+        // A response that streamed no text has no decode window, but it still took time and
+        // still produced tokens. Showing a dash would report "not measured" about something
+        // that was measured.
+        let theme = Theme {
+            mode: ColorMode::Ansi256,
+        };
+        let mut state = state("/tmp");
+        state.output_rate = Some(crate::agent::r#loop::Rate {
+            decode: None,
+            overall: 50.0,
+        });
+        let text = plain(&render(&state, &theme, 120))[1].to_string();
+        assert!(text.contains("50.0 tok/s"), "{text:?}");
     }
 }

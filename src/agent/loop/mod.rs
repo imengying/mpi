@@ -109,6 +109,11 @@ struct TurnOutcome {
     /// Measured around the stream rather than inside it, so retries and the wait for the
     /// first token are both included: that is the time the user spent waiting.
     elapsed: std::time::Duration,
+    /// When the first token arrived, measured from the same start as `elapsed`.
+    ///
+    /// `None` when nothing streamed — a response that was only a tool call produces no text —
+    /// so there is no decode window to measure.
+    first_token: Option<std::time::Duration>,
 }
 
 impl TurnOutcome {
@@ -138,17 +143,16 @@ pub struct Agent {
     system_prompt: Option<String>,
     /// Set by `/delete`: there is no file left to report as saved on the way out.
     deleted: bool,
-    /// Output speed of the most recent response, in tokens per second.
+    /// Output speed of the most recent response, both readings (see [`Rate`]).
     ///
-    /// Measured over the whole request — the wait before the first token included — because
-    /// that is the time the user actually spent waiting, and the number they compare between
-    /// providers. Timing only the tokens after the first would flatter a slow start: a
-    /// prefill that takes twenty seconds would not show up in the rate at all.
+    /// The footer shows the decode rate, which is the model's own speed and the number that
+    /// makes providers comparable; the overall rate rides along in the same value so the
+    /// decision about what to show stays in one place. Neither is a live reading: a rate
+    /// computed from a partial response swings wildly as the first tokens land, and the footer
+    /// is a place for a settled number.
     ///
-    /// `None` until a response has been timed, and for a response with no recorded time. It
-    /// is not a live reading: a rate computed from a partial response swings wildly as the
-    /// first tokens land, and the footer is a place for a settled number.
-    output_rate: Option<f64>,
+    /// `None` until a response has been timed, and for a response with no recorded time.
+    output_rate: Option<Rate>,
 }
 
 fn restored_selection(config: &Config, session: &Session) -> anyhow::Result<(String, String)> {
@@ -515,16 +519,39 @@ pub(crate) fn queue_mid_turn(
 
 /// Output tokens per second for the response that just finished.
 ///
+/// Two readings, because they answer different questions and each hides something the other
+/// shows. `decode` is tokens over the time spent producing them — the speed of the model
+/// itself, which is what makes providers comparable. `overall` is tokens over the whole
+/// request, first-token wait included — the rate the user actually sat through, which is what
+/// a slow prefill or a retry would otherwise hide. Both are settled numbers, not live ones: a
+/// rate computed from a partial response swings wildly as the first tokens land.
+///
 /// `None` when there is nothing to divide: a response that produced no tokens (a tool call
 /// only, which is a normal shape and not a slow one), or one that came back in under the
 /// resolution of the clock. Reporting a rate from a response that took a millisecond would
 /// print a number in the thousands that says nothing about the provider.
-fn output_rate(tokens: u64, elapsed: std::time::Duration) -> Option<f64> {
+fn output_rate(tokens: u64, outcome: &TurnOutcome) -> Option<Rate> {
     const MINIMUM: std::time::Duration = std::time::Duration::from_millis(50);
-    if tokens == 0 || elapsed < MINIMUM {
+    if tokens == 0 || outcome.elapsed < MINIMUM {
         return None;
     }
-    Some(tokens as f64 / elapsed.as_secs_f64())
+    let overall = tokens as f64 / outcome.elapsed.as_secs_f64();
+    let decode = outcome.first_token.and_then(|first| {
+        let window = outcome.elapsed.saturating_sub(first);
+        // A decode window under the clock's resolution cannot carry a rate, and dividing by a
+        // near-zero window would print a spike where the measurement simply ran out.
+        (window >= MINIMUM).then(|| tokens as f64 / window.as_secs_f64())
+    });
+    Some(Rate { decode, overall })
+}
+
+/// The two speed readings for one response.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Rate {
+    /// Tokens per second over the decode window alone, first-token wait excluded.
+    pub decode: Option<f64>,
+    /// Tokens per second over the whole request, first-token wait included.
+    pub overall: f64,
 }
 
 /// A ticker that fires every [`WORKING_INTERVAL`], starting one interval from now.
@@ -793,7 +820,10 @@ mod tests {
         drop(other);
 
         let mut agent = Agent::new(config.clone(), dir.clone(), false).unwrap();
-        agent.output_rate = Some(99.0);
+        agent.output_rate = Some(Rate {
+            decode: Some(99.0),
+            overall: 99.0,
+        });
         agent
             .restore_session(Session::open(&path).unwrap())
             .unwrap();
@@ -804,26 +834,64 @@ mod tests {
         drop(agent);
 
         let mut agent = Agent::resume(config, dir.clone(), &path, false).unwrap();
-        agent.output_rate = Some(99.0);
+        agent.output_rate = Some(Rate {
+            decode: Some(99.0),
+            overall: 99.0,
+        });
         agent.start_new_session().unwrap();
         assert_eq!(agent.output_rate, None, "/new starts with nothing timed");
         drop(agent);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// A `TurnOutcome` carrying only what the rate reads, for the tests below.
+    fn timed(elapsed: u64, first_token: Option<u64>) -> TurnOutcome {
+        use std::time::Duration;
+        TurnOutcome {
+            result: None,
+            elapsed: Duration::from_millis(elapsed),
+            first_token: first_token.map(Duration::from_millis),
+        }
+    }
+
     #[test]
     fn a_rate_needs_tokens_and_a_measurable_duration() {
-        use std::time::Duration;
-        // The ordinary case: 200 tokens in 4 seconds.
-        let rate = output_rate(200, Duration::from_secs(4)).unwrap();
-        assert!((rate - 50.0).abs() < 0.01, "{rate}");
+        // The ordinary case: 200 tokens in 4 seconds, all of it spent decoding.
+        let rate = output_rate(200, &timed(4000, Some(0))).unwrap();
+        assert!((rate.overall - 50.0).abs() < 0.01, "{}", rate.overall);
+        assert!((rate.decode.unwrap() - 50.0).abs() < 0.01);
         // A tool-call-only response produces no output tokens. That is a normal shape, not a
         // slow one, and there is no rate to report.
-        assert_eq!(output_rate(0, Duration::from_secs(4)), None);
+        assert_eq!(output_rate(0, &timed(4000, Some(0))), None);
         // A response that came back inside the clock's resolution would divide by ~0 and
         // print a number in the thousands that says nothing about the provider.
-        assert_eq!(output_rate(200, Duration::from_millis(10)), None);
-        assert!(output_rate(200, Duration::from_millis(50)).is_some());
+        assert_eq!(output_rate(200, &timed(10, Some(0))), None);
+        assert!(output_rate(200, &timed(50, Some(0))).is_some());
+    }
+
+    #[test]
+    fn the_two_readings_answer_different_questions() {
+        // 200 tokens, of which the first took 3 of the 4 seconds: a slow prefill and a fast
+        // model. Decode is what the model produced — 200 tokens in 1 second. Overall is what
+        // the user waited through — 200 in 4. Reporting only the first would flatter the
+        // start; only the second would blame the model for the prefill.
+        let rate = output_rate(200, &timed(4000, Some(3000))).unwrap();
+        assert!(
+            (rate.decode.unwrap() - 200.0).abs() < 0.01,
+            "{:?}",
+            rate.decode
+        );
+        assert!((rate.overall - 50.0).abs() < 0.01);
+
+        // No text streamed, so there is no decode window: the overall reading still stands.
+        let silent = output_rate(200, &timed(4000, None)).unwrap();
+        assert_eq!(silent.decode, None);
+        assert!((silent.overall - 50.0).abs() < 0.01);
+
+        // The whole request was prefill: the decode window is under the clock's resolution,
+        // and dividing by it would print a spike the model never ran at.
+        let late = output_rate(200, &timed(4000, Some(3990))).unwrap();
+        assert_eq!(late.decode, None, "a near-empty window cannot carry a rate");
     }
 
     #[test]

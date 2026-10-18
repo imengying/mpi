@@ -201,6 +201,11 @@ impl Agent {
             // not for what the model already said to be thrown away.
             let mut stop_requested = false;
             let mut result = None;
+            // Taken from the first generated token rather than from the first delta: a notice
+            // is the harness speaking, and a hosted search can start seconds before the model
+            // says anything. Measuring from the first poll instead would fold the prefill into
+            // the decode rate and report a speed the model never ran at.
+            let mut first_token: Option<std::time::Duration> = None;
             loop {
                 // Keep the input line alive while the answer arrives. The user types into
                 // the composer as they read; Enter there queues the message rather than
@@ -220,6 +225,9 @@ impl Agent {
                     // of tokens costs one redraw rather than one per token.
                     biased;
                     Some(delta) = deltas.recv() => {
+                        if first_token.is_none() && delta.carries_output() {
+                            first_token = Some(started.elapsed());
+                        }
                         apply_deltas(&mut self.screen, delta, &mut deltas);
                     }
                     _ = ticker.tick() => self.screen.tick_working(),
@@ -233,12 +241,16 @@ impl Agent {
             TurnOutcome {
                 result,
                 elapsed: started.elapsed(),
+                first_token,
             }
         };
         self.streaming = false;
         // A stop keeps the half-written answer, because it is a real answer the user chose to
         // cut short; a failure discards it, because a half-written answer that was never
         // recorded must not stay on screen.
+        // Read out before `result` is moved: the rate needs these two, and the completion
+        // comes out of the same struct.
+        let (elapsed, first_token) = (outcome.elapsed, outcome.first_token);
         let completion = match outcome.result {
             None => {
                 debug_assert!(
@@ -290,15 +302,26 @@ impl Agent {
             self.screen.push_lines(lines);
         }
 
+        // Taken before the message is moved into the session: the rate needs the outcome's
+        // timings, and the completion is consumed a line later.
+        //
+        // Recorded before the footer is drawn, so the number appears in the same update as
+        // the tokens it describes. A response that carried an error is not timed: the seconds
+        // it spent failing are not the provider's answer speed.
+        let rate = output_rate(
+            completion.usage.output,
+            &TurnOutcome {
+                result: None,
+                elapsed,
+                first_token,
+            },
+        );
         self.session.push_message(
             completion.message.clone(),
             Some(completion.usage),
             Some(completion.stop_reason),
         )?;
-        // Recorded before the footer is drawn, so the number appears in the same update as
-        // the tokens it describes. A response that carried an error is not timed: the seconds
-        // it spent failing are not the provider's answer speed.
-        self.output_rate = output_rate(completion.usage.output, outcome.elapsed);
+        self.output_rate = rate;
         self.render_footer(None);
 
         if let Some(error) = &completion.error {
