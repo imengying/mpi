@@ -254,3 +254,48 @@ async fn broad_and_explicit_glob_searches_cannot_read_secrets() {
     assert!(!out.content.contains("policy-secret-sentinel"));
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+/// The batch shape has to clear the policy gate the same way a single edit does.
+///
+/// `edits` is a new path into the write side of the tool set, and a new path is a new chance
+/// to skip a check: a batch item naming a file outside the project must ask, exactly as a
+/// single `edit` on that file would.
+#[tokio::test]
+async fn a_batch_edit_is_vetted_per_path() {
+    use mpi::auth::guard::PermissionGate;
+    let dir = std::env::temp_dir().join(format!("pi-batch-gate-{}", uuid::Uuid::now_v7()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("inside.txt"), "text\n").unwrap();
+    let gate = PermissionGate::new(false, Dialect::Zsh);
+
+    // Inside the project: allowed, like any edit there.
+    let inside = serde_json::json!({"edits": [
+        {"path": "inside.txt", "old_text": "text", "new_text": "changed"}
+    ]});
+    assert!(
+        gate.check("edit", &inside, &dir).is_ok(),
+        "a batch inside the project must be allowed"
+    );
+
+    // Any item reaching outside has to ask, even when another item stays inside.
+    let outside = serde_json::json!({"edits": [
+        {"path": "inside.txt", "old_text": "text", "new_text": "changed"},
+        {"path": "/etc/hosts", "old_text": "localhost", "new_text": "x"}
+    ]});
+    assert!(
+        gate.check("edit", &outside, &dir).is_err(),
+        "one path outside the project is enough to require approval"
+    );
+
+    // The dangerous shape: a top-level `path` that is inside, hiding a batch item that is not.
+    // Vetting only the top-level field would approve this and write to /etc.
+    let masked = serde_json::json!({
+        "path": "inside.txt",
+        "edits": [{"path": "/etc/hosts", "old_text": "localhost", "new_text": "x"}]
+    });
+    assert!(
+        gate.check("edit", &masked, &dir).is_err(),
+        "an inside path must not mask an outside item"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}

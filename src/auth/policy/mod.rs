@@ -161,8 +161,22 @@ pub fn assess_tool(
             }
         }
         "write" | "edit" => {
-            let path = string("path");
-            assess_path(Operation::Write, path, cwd)
+            // Every path the tool will write has to be vetted, not just the top-level one:
+            // a batch carries its own `path` per item, and vetting a single field would let a
+            // second item through unchecked. The first refusal wins, so a batch that reaches
+            // outside the project asks however many of its other items stay inside.
+            let batch = input.get("edits").and_then(|value| value.as_array());
+            match batch {
+                Some(items) => items
+                    .iter()
+                    .map(|item| {
+                        let path = item.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                        assess_path(Operation::Write, path, cwd)
+                    })
+                    .find(|assessment| !assessment.allows())
+                    .unwrap_or_else(Assessment::allow),
+                None => assess_path(Operation::Write, string("path"), cwd),
+            }
         }
         "read" | "grep" | "find" | "ls" => {
             let path = {
