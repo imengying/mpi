@@ -22,57 +22,215 @@ pub fn spec() -> ToolSpec {
                 "path": { "type": "string", "description": "文件路径（相对当前工作目录或绝对路径）" },
                 "old_text": { "type": "string", "description": "要被替换的原文，逐字一致" },
                 "new_text": { "type": "string", "description": "替换后的新文本" },
-                "replace_all": { "type": "boolean", "description": "是否替换全部匹配（默认 false）" }
+                "replace_all": { "type": "boolean", "description": "是否替换全部匹配（默认 false）" },
+                "edits": {
+                    "type": "array",
+                    "description": "一次改多处（可跨文件）：每项给 path、old_text、new_text，可选 replace_all。\
+                                    给出这个参数时忽略顶层的 path/old_text/new_text。全部成功才写入，\
+                                    任何一处失败则整个调用不产生修改。",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string", "description": "文件路径" },
+                            "old_text": { "type": "string", "description": "要被替换的原文，逐字一致" },
+                            "new_text": { "type": "string", "description": "替换后的新文本" },
+                            "replace_all": { "type": "boolean", "description": "是否替换全部匹配（默认 false）" }
+                        },
+                        "required": ["path", "old_text", "new_text"]
+                    }
+                }
             },
-            "required": ["path", "old_text", "new_text"]
+            // Either shape is complete on its own: one replacement, or a batch that may span
+            // files. Spelling it out keeps a caller from sending `path` without `old_text`
+            // and getting a puzzling error.
+            "anyOf": [
+                { "required": ["path", "old_text", "new_text"] },
+                { "required": ["edits"] }
+            ]
         }),
     }
 }
 
+/// One replacement: which file, what to find, what to put there.
+struct Edit<'a> {
+    path: &'a str,
+    old_text: &'a str,
+    new_text: &'a str,
+    replace_all: bool,
+}
+
 pub async fn execute(arguments: &serde_json::Value, cwd: &Path) -> Result<ToolOutput, String> {
-    let path = crate::tools::required_str(arguments, "path")?;
-    let old_text = crate::tools::required_str(arguments, "old_text")?;
-    let new_text = crate::tools::required_str(arguments, "new_text")?;
-    let replace_all = arguments
+    let edits = match arguments.get("edits") {
+        Some(serde_json::Value::Array(items)) => parse_batch(items)?,
+        Some(_) => return Err("edits 必须是数组".into()),
+        None => vec![Edit {
+            path: crate::tools::required_str(arguments, "path")?,
+            old_text: crate::tools::required_str(arguments, "old_text")?,
+            new_text: crate::tools::required_str(arguments, "new_text")?,
+            replace_all: replace_all_of(arguments),
+        }],
+    };
+    for edit in &edits {
+        check_texts(edit.old_text, edit.new_text)?;
+    }
+    if edits.len() == 1 {
+        return apply_one(&edits[0], cwd).await;
+    }
+    apply_batch(&edits, cwd).await
+}
+
+fn replace_all_of(value: &serde_json::Value) -> bool {
+    value
         .get("replace_all")
         .and_then(|value| value.as_bool())
-        .unwrap_or(false);
+        .unwrap_or(false)
+}
+
+/// The reasons a replacement cannot mean anything, whatever file it points at.
+fn check_texts(old_text: &str, new_text: &str) -> Result<(), String> {
     if old_text.is_empty() {
         return Err("old_text 不能为空".into());
     }
     if old_text == new_text {
         return Err("old_text 与 new_text 相同，没有需要修改的内容".into());
     }
-    let resolved = crate::auth::policy::resolve_tool_path(path, cwd);
+    Ok(())
+}
+
+fn parse_batch(items: &[serde_json::Value]) -> Result<Vec<Edit<'_>>, String> {
+    if items.is_empty() {
+        return Err("edits 是空的，没有需要修改的内容".into());
+    }
+    items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            let field = |name: &str| {
+                item.get(name)
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| format!("第 {} 项缺少 {name}", index + 1))
+            };
+            Ok(Edit {
+                path: field("path")?,
+                old_text: field("old_text")?,
+                new_text: field("new_text")?,
+                replace_all: replace_all_of(item),
+            })
+        })
+        .collect()
+}
+
+/// Replace one occurrence (or all of them) in one file and report the diff.
+async fn apply_one(edit: &Edit<'_>, cwd: &Path) -> Result<ToolOutput, String> {
+    let resolved = crate::auth::policy::resolve_tool_path(edit.path, cwd);
     let before = tokio::fs::read_to_string(&resolved)
         .await
         .map_err(|err| format!("无法读取：{err}"))?;
-    let occurrences = before.matches(old_text).count();
+    let (after, replaced) = replace_in(&before, edit)?;
+    tokio::fs::write(&resolved, &after)
+        .await
+        .map_err(|err| format!("无法写入：{err}"))?;
+    Ok(ToolOutput {
+        content: format!("已修改（替换 {replaced} 处）"),
+        display: diff::for_edit(&before, &after),
+        is_error: false,
+        duration: None,
+    })
+}
+
+/// Apply the replacement to `before`, refusing an ambiguous or absent match.
+fn replace_in(before: &str, edit: &Edit<'_>) -> Result<(String, usize), String> {
+    let occurrences = before.matches(edit.old_text).count();
     if occurrences == 0 {
         return Err(format!(
             "找不到 old_text：它必须与文件内容逐字一致（含缩进与换行）。{}",
-            nearest_region(&before, old_text)
+            nearest_region(before, edit.old_text)
         ));
     }
-    if occurrences > 1 && !replace_all {
+    if occurrences > 1 && !edit.replace_all {
         return Err(format!(
             "old_text 出现了 {occurrences} 次，无法确定要改哪一处（可给更长的上下文，\
              或设 replace_all=true）。"
         ));
     }
-    let after = if replace_all {
-        before.replace(old_text, new_text)
+    let after = if edit.replace_all {
+        before.replace(edit.old_text, edit.new_text)
     } else {
-        before.replacen(old_text, new_text, 1)
+        before.replacen(edit.old_text, edit.new_text, 1)
     };
-    tokio::fs::write(&resolved, &after)
-        .await
-        .map_err(|err| format!("无法写入：{err}"))?;
-    let replaced = if replace_all { occurrences } else { 1 };
-    let display = diff::for_edit(&before, &after);
+    let replaced = if edit.replace_all { occurrences } else { 1 };
+    Ok((after, replaced))
+}
+
+/// Apply several replacements as one transaction.
+///
+/// Nothing is written unless every replacement matches, because the caller asked for a set of
+/// changes, not for as many of them as happen to apply: half-applied edits across several
+/// files are a state neither the caller nor the user can reason about, and the caller has no
+/// way to tell which half landed. Edits are applied in order, so two edits in the same file
+/// see each other.
+///
+/// This is the shape a scripted rewrite used to take — the recorded sessions had 206 of them,
+/// a `python` heredoc replacing a table of `(path, old, new)` entries — and it carried none of
+/// the checks here: no uniqueness requirement, no all-or-nothing, and a mistake rewrote the
+/// file silently.
+async fn apply_batch(edits: &[Edit<'_>], cwd: &Path) -> Result<ToolOutput, String> {
+    // Group by file so each is read once and written once, keeping the caller's order.
+    let mut order: Vec<std::path::PathBuf> = Vec::new();
+    let mut pending: std::collections::HashMap<std::path::PathBuf, (String, String)> =
+        std::collections::HashMap::new();
+    let mut replaced_total = 0usize;
+    for (index, edit) in edits.iter().enumerate() {
+        let resolved = crate::auth::policy::resolve_tool_path(edit.path, cwd);
+        if !pending.contains_key(&resolved) {
+            let text = tokio::fs::read_to_string(&resolved)
+                .await
+                .map_err(|err| format!("第 {} 项无法读取 {}：{err}", index + 1, edit.path))?;
+            pending.insert(resolved.clone(), (text.clone(), text));
+            order.push(resolved.clone());
+        }
+        let (current, _) = pending.get(&resolved).expect("just inserted");
+        let (next, replaced) = replace_in(current, edit)
+            .map_err(|err| format!("第 {} 项（{}）：{err}", index + 1, edit.path))?;
+        replaced_total += replaced;
+        pending.get_mut(&resolved).expect("just inserted").0 = next;
+    }
+    // Every replacement has matched by now, so the writes are the only step that can fail
+    // partway. Reading completely before writing is what keeps that window small.
+    //
+    // One display for the whole call, each file introduced by its own line: the transcript
+    // collapses a tool result to a few rows, and a separate block per file would push the
+    // later files out of the preview.
+    let mut body = String::new();
+    let (mut added, mut removed) = (0usize, 0usize);
+    for path in &order {
+        let (after, before) = &pending[path];
+        tokio::fs::write(path, after)
+            .await
+            .map_err(|err| format!("无法写入 {}：{err}", path.display()))?;
+        let crate::tools::Display::Diff {
+            diff,
+            added: a,
+            removed: r,
+        } = diff::for_edit(before, after)
+        else {
+            continue;
+        };
+        if !body.is_empty() {
+            body.push('\n');
+        }
+        body.push_str(&format!("── {}\n", path.display()));
+        body.push_str(&diff);
+        added += a;
+        removed += r;
+    }
     Ok(ToolOutput {
-        content: format!("已修改（替换 {replaced} 处）"),
-        display,
+        content: format!("已修改 {} 个文件（替换 {replaced_total} 处）", order.len()),
+        display: crate::tools::Display::Diff {
+            diff: body,
+            added,
+            removed,
+        },
         is_error: false,
         duration: None,
     })
@@ -401,5 +559,145 @@ mod tests {
                 "{old_text:?} must not invent a region"
             );
         }
+    }
+
+    fn batch_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("pi-batch-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The shape a scripted rewrite used to take: 206 of the recorded edits were a `python`
+    /// heredoc applying a table of `(path, old, new)`, because `edit` could only change one
+    /// place at a time. Files here span more than one, which is the case that forced it.
+    #[test]
+    fn a_batch_spans_files_and_reports_every_change() {
+        let dir = batch_dir();
+        std::fs::write(dir.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+        std::fs::write(dir.join("b.txt"), "alpha\nbeta\n").unwrap();
+        let out = block(execute(
+            &serde_json::json!({"edits": [
+                {"path": "a.txt", "old_text": "two", "new_text": "TWO"},
+                {"path": "b.txt", "old_text": "beta", "new_text": "BETA"},
+            ]}),
+            &dir,
+        ))
+        .unwrap();
+        assert!(out.content.contains("2 个文件"), "{}", out.content);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+            "one\nTWO\nthree\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("b.txt")).unwrap(),
+            "alpha\nBETA\n"
+        );
+        // One block, each file introduced by its own line: the transcript collapses a result
+        // to a few rows, and a separate block per file would push the later ones out of it.
+        let crate::tools::Display::Diff {
+            diff,
+            added,
+            removed,
+        } = &out.display
+        else {
+            panic!("a batch has to show what it changed");
+        };
+        assert!(diff.contains("a.txt") && diff.contains("b.txt"), "{diff}");
+        assert_eq!((*added, *removed), (2, 2), "{diff}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_batch_that_fails_writes_nothing() {
+        // The caller asked for a set of changes, not for as many as happen to apply. A batch
+        // that stopped halfway would leave a state neither side can reason about: no way to
+        // tell which edits landed, and the file pair no longer meant to be read together.
+        let dir = batch_dir();
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        std::fs::write(dir.join("b.txt"), "alpha\n").unwrap();
+        let error = block(execute(
+            &serde_json::json!({"edits": [
+                {"path": "a.txt", "old_text": "one", "new_text": "ONE"},
+                {"path": "b.txt", "old_text": "not-here", "new_text": "X"},
+            ]}),
+            &dir,
+        ))
+        .unwrap_err();
+        // The message names which item failed, so the caller can fix that one.
+        assert!(error.contains("第 2 项"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+            "one\n",
+            "the first edit must not have been written"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("b.txt")).unwrap(),
+            "alpha\n"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn edits_in_the_same_file_apply_in_order() {
+        // Two edits to one file see each other, which is what makes a batch expressible as a
+        // sequence rather than as a set that has to be non-overlapping.
+        let dir = batch_dir();
+        std::fs::write(dir.join("c.txt"), "a b c\n").unwrap();
+        let out = block(execute(
+            &serde_json::json!({"edits": [
+                {"path": "c.txt", "old_text": "a", "new_text": "AA"},
+                {"path": "c.txt", "old_text": "c", "new_text": "CC"},
+            ]}),
+            &dir,
+        ))
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("c.txt")).unwrap(),
+            "AA b CC\n"
+        );
+        // One file in, one file written: the count is files, not items.
+        assert!(out.content.contains("1 个文件"), "{}", out.content);
+        assert!(out.content.contains("2 处"), "{}", out.content);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_batch_keeps_the_uniqueness_check_each_single_edit_has() {
+        // The check a scripted rewrite skipped. Without it an ambiguous `old_text` silently
+        // rewrites the wrong occurrence, and the caller never learns.
+        let dir = batch_dir();
+        std::fs::write(dir.join("d.txt"), "x x\n").unwrap();
+        let error = block(execute(
+            &serde_json::json!({"edits": [
+                {"path": "d.txt", "old_text": "x", "new_text": "y"},
+            ]}),
+            &dir,
+        ))
+        .unwrap_err();
+        assert!(error.contains("出现了 2 次"), "{error}");
+        assert_eq!(std::fs::read_to_string(dir.join("d.txt")).unwrap(), "x x\n");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_empty_or_malformed_batch_is_refused() {
+        let dir = batch_dir();
+        std::fs::write(dir.join("e.txt"), "text\n").unwrap();
+        for (arguments, expected) in [
+            (serde_json::json!({"edits": []}), "edits 是空的"),
+            (
+                serde_json::json!({"edits": [{"path": "e.txt", "new_text": "x"}]}),
+                "缺少 old_text",
+            ),
+            (serde_json::json!({"edits": "nope"}), "edits 必须是数组"),
+        ] {
+            let error = block(execute(&arguments, &dir)).unwrap_err();
+            assert!(error.contains(expected), "{arguments}: {error}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(dir.join("e.txt")).unwrap(),
+            "text\n"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
