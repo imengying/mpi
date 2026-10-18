@@ -138,28 +138,270 @@ async fn apply_one(edit: &Edit<'_>, cwd: &Path) -> Result<ToolOutput, String> {
     })
 }
 
+/// How strictly a located match agrees with what the caller wrote.
+///
+/// The caller's text drifts from the file in a few habitual ways, and refusing all of them
+/// turns a nearly-right edit into a round trip: it re-reads the file and tries again, which is
+/// the most common failure in the recorded sessions. `git apply` has always tolerated exactly
+/// these, which is why a patch written against a lightly drifted file still applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Match {
+    /// Byte for byte.
+    Exact,
+    /// Same text once trailing whitespace is ignored on each line.
+    TrailingWhitespace,
+    /// Same text once leading and trailing whitespace are ignored on each line.
+    Indentation,
+    /// Same text once typographic punctuation is folded to ASCII.
+    Punctuation,
+}
+
+impl Match {
+    /// Whether the file's own text has to be used rather than the caller's.
+    ///
+    /// Anything looser than exact: the caller's text is a *description* of the region, and
+    /// pasting it in would write its drifted indentation or its ASCII dashes into a file that
+    /// has the real thing. The file's own bytes are what belong there.
+    fn uses_file_text(self) -> bool {
+        self != Match::Exact
+    }
+}
+
 /// Apply the replacement to `before`, refusing an ambiguous or absent match.
 fn replace_in(before: &str, edit: &Edit<'_>) -> Result<(String, usize), String> {
-    let occurrences = before.matches(edit.old_text).count();
-    if occurrences == 0 {
+    let located = locate(before, edit.old_text, edit.replace_all)?;
+    let mut after = before.to_string();
+    // Applied back to front so that each replacement's offsets are still valid: working
+    // forwards would shift every later one by the length of the text just inserted.
+    for found in located.iter().rev() {
+        let (from, to) = (found.start, found.end);
+        // Substituting inside the caller's text keeps the lines it did not touch — a rename
+        // buried in an indented block — while the file's own bytes supply everything else.
+        let replacement = if found.strictness.uses_file_text() {
+            retarget(&after[from..to], edit.old_text, edit.new_text)
+        } else {
+            edit.new_text.to_string()
+        };
+        after.replace_range(from..to, &replacement);
+    }
+    Ok((after, located.len()))
+}
+
+/// A stretch of `before` that stands in for the caller's `old_text`.
+#[derive(Clone)]
+struct Found {
+    start: usize,
+    end: usize,
+    strictness: Match,
+}
+
+/// Find every stretch of `before` that `old_text` could mean, loosest match last.
+///
+/// Uniqueness is decided against the *loosest* reading that matches anything. If two places
+/// both match exactly, the caller is ambiguous and has to say which. If two places match only
+/// once indentation is ignored they are still two places, and picking the first would rewrite
+/// code the caller never looked at.
+fn locate(before: &str, old_text: &str, replace_all: bool) -> Result<Vec<Found>, String> {
+    // An exact hit is a byte match, not a line match: substituting the caller's text for the
+    // bytes it named must leave everything around it untouched, including the newline that
+    // follows. Going through the line machinery here would replace a whole line with a string
+    // that carries no terminator, joining it to the next one.
+    let exact: Vec<Found> = before
+        .match_indices(old_text)
+        .map(|(start, found)| Found {
+            start,
+            end: start + found.len(),
+            strictness: Match::Exact,
+        })
+        .collect();
+    if !exact.is_empty() {
+        return balance(exact, replace_all);
+    }
+    // Nothing matched byte for byte, so try the drift levels in order of strictness.
+    for strictness in [
+        Match::TrailingWhitespace,
+        Match::Indentation,
+        Match::Punctuation,
+    ] {
+        let found = find_all(before, old_text, strictness);
+        if !found.is_empty() {
+            return balance(found, replace_all);
+        }
+    }
+    Err(format!(
+        "找不到 old_text：它必须与文件内容逐字一致（含缩进与换行）。{}",
+        nearest_region(before, old_text)
+    ))
+}
+
+/// Apply the uniqueness rule to the matches found at one strictness level.
+fn balance(found: Vec<Found>, replace_all: bool) -> Result<Vec<Found>, String> {
+    if found.len() > 1 && !replace_all {
         return Err(format!(
-            "找不到 old_text：它必须与文件内容逐字一致（含缩进与换行）。{}",
-            nearest_region(before, edit.old_text)
+            "old_text 出现了 {} 次，无法确定要改哪一处（可给更长的上下文，\
+             或设 replace_all=true）。",
+            found.len()
         ));
     }
-    if occurrences > 1 && !edit.replace_all {
-        return Err(format!(
-            "old_text 出现了 {occurrences} 次，无法确定要改哪一处（可给更长的上下文，\
-             或设 replace_all=true）。"
-        ));
-    }
-    let after = if edit.replace_all {
-        before.replace(edit.old_text, edit.new_text)
+    Ok(if replace_all {
+        found
     } else {
-        before.replacen(edit.old_text, edit.new_text, 1)
-    };
-    let replaced = if edit.replace_all { occurrences } else { 1 };
-    Ok((after, replaced))
+        vec![found.into_iter().next().expect("non-empty")]
+    })
+}
+
+/// The lines of `text` with their terminators, so a match can be mapped back to bytes.
+fn lines_with_endings(text: &str) -> Vec<&str> {
+    text.split_inclusive('\n').collect()
+}
+
+/// Every place the lines of `old_text` line up with the lines of `before` under `strictness`.
+///
+/// A match needs the same *number* of lines; what those lines contain is what `strictness`
+/// decides. Line-by-line comparison rather than a substring search is what lets a drifted
+/// indent be seen as the same line instead of a different one.
+fn find_all(before: &str, old_text: &str, strictness: Match) -> Vec<Found> {
+    let have = lines_with_endings(before);
+    // The caller's text is a plain string: its last line usually has no terminator, and
+    // comparing it against a file line that does would never match.
+    let want: Vec<&str> = old_text.split_inclusive('\n').collect();
+    if want.is_empty() || have.len() < want.len() {
+        return Vec::new();
+    }
+    let mut offsets = Vec::with_capacity(have.len());
+    let mut offset = 0usize;
+    for line in &have {
+        offsets.push(offset);
+        offset += line.len();
+    }
+    let mut found = Vec::new();
+    for start in 0..=have.len() - want.len() {
+        let window = &have[start..start + want.len()];
+        if window
+            .iter()
+            .zip(&want)
+            .all(|(have, want)| lines_agree(have, want, strictness))
+        {
+            let begin = offsets[start];
+            let end = begin + window.iter().map(|line| line.len()).sum::<usize>();
+            found.push(Found {
+                start: begin,
+                end,
+                strictness,
+            });
+        }
+    }
+    found
+}
+
+/// Whether one file line stands in for one line of the caller's text.
+fn lines_agree(have: &str, want: &str, strictness: Match) -> bool {
+    // The terminator is not part of the comparison: whether the last line of an edit carries
+    // its newline is an artefact of how the caller wrote the string, not a statement about
+    // the file. The length check above already matched line counts.
+    let have = have.trim_end_matches('\n');
+    let want = want.trim_end_matches('\n');
+    match strictness {
+        Match::Exact => have == want,
+        Match::TrailingWhitespace => have.trim_end() == want.trim_end(),
+        Match::Indentation => have.trim() == want.trim(),
+        Match::Punctuation => fold_punctuation(have.trim()) == fold_punctuation(want.trim()),
+    }
+}
+
+/// Typographic punctuation folded to its ASCII equivalent, for comparing a caller's text
+/// against a file that uses the real characters.
+///
+/// Written text arrives through all sorts of editors: an em dash typed in a chat box, a curly
+/// quote from a word processor, a full-width space from a Chinese input method. None of them
+/// is a different *line* — folding them is how `git apply` treats the same drift.
+fn fold_punctuation(text: &str) -> String {
+    text.chars()
+        .map(|c| match c {
+            '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\u{2014}' | '\u{2015}'
+            | '\u{2212}' => '-',
+            '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' => '\'',
+            '\u{201C}' | '\u{201D}' | '\u{201E}' | '\u{201F}' => '"',
+            '\u{00A0}' | '\u{2002}' | '\u{2003}' | '\u{2004}' | '\u{2005}' | '\u{2006}'
+            | '\u{2007}' | '\u{2008}' | '\u{2009}' | '\u{200A}' | '\u{202F}' | '\u{205F}'
+            | '\u{3000}' => ' ',
+            other => other,
+        })
+        .collect()
+}
+
+/// The caller's `new_text`, re-expressed in the matched region's own bytes.
+///
+/// `found` and `old_text` describe the same lines at one of the looser levels, so working line
+/// by line keeps every part of the caller's intent that did not drift — the words that changed
+/// — while taking indentation and line endings from the file.
+///
+/// **Line endings come from the file, always.** Replacing a region substitutes bytes, and the
+/// caller's `new_text` carries no terminator on its last line (a string literal rarely does).
+/// Using it verbatim would join the replacement to the following line, which is how a fuzzy
+/// match can corrupt a file that a strict match would have refused.
+///
+/// Line counts need not agree: a caller may collapse or expand a block. When they do not, the
+/// replacement stands as written and only the ending of its last line is taken from the file.
+fn retarget(found: &str, old_text: &str, new_text: &str) -> String {
+    let file_lines: Vec<&str> = lines_with_endings(found);
+    let want_lines: Vec<&str> = lines_with_endings(old_text);
+    let new_lines: Vec<&str> = lines_with_endings(new_text);
+    // The file's terminating newline, if the region has one. A region that ends at end-of-file
+    // without a newline must stay that way.
+    let trailing = file_lines
+        .last()
+        .map(|line| line.ends_with('\n'))
+        .unwrap_or(false);
+    let mut out = String::new();
+    for (index, new) in new_lines.iter().enumerate() {
+        let new_body = new.trim_end_matches('\n');
+        let last = index + 1 == new_lines.len();
+        let placed = match (file_lines.get(index), want_lines.get(index)) {
+            (Some(file), Some(want)) => {
+                let want_body = want.trim_end_matches('\n');
+                if lines_agree(file, want, Match::Indentation) && want_body == new_body {
+                    // Unchanged line: the file's own bytes, so nothing drifts.
+                    file.trim_end_matches('\n').to_string()
+                } else {
+                    // Changed line: the caller's words at the file's indentation.
+                    reindent(file, want_body, new_body)
+                }
+            }
+            // The region grew: no file line to follow, so the caller's text stands.
+            _ => new_body.to_string(),
+        };
+        out.push_str(&placed);
+        // Every line but the last keeps a newline, because `new_lines` only had one to keep
+        // where the caller wrote it. The last line follows the region it replaced.
+        if !last || trailing || new.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Place `new_body` at the indentation the file's own line uses.
+///
+/// The caller indented its replacement to match the text it *thought* it was editing. When
+/// that text had the wrong indent, its replacement carries the same error; re-basing it on the
+/// file's line is what keeps a correct edit from landing in the wrong column.
+fn reindent(file_line: &str, want_body: &str, new_body: &str) -> String {
+    let file_indent: String = file_line
+        .chars()
+        .take_while(|c| c.is_whitespace())
+        .collect();
+    let want_indent: String = want_body
+        .chars()
+        .take_while(|c| c.is_whitespace())
+        .collect();
+    let new_indent: String = new_body.chars().take_while(|c| c.is_whitespace()).collect();
+    if want_indent == new_indent {
+        // The caller did not change the indentation, so the file's own is the right one.
+        format!("{file_indent}{}", &new_body[new_indent.len()..])
+    } else {
+        new_body.to_string()
+    }
 }
 
 /// Apply several replacements as one transaction.
@@ -692,5 +934,135 @@ mod tests {
             "text\n"
         );
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The four levels, each on the drift it exists to absorb.
+    ///
+    /// These are the shapes in the recorded sessions' misses: a block re-indented, a trailing
+    /// space the caller could not see, a placeholder that came back from a chat box as curly
+    /// quotes. Refusing them costs a round trip — the caller re-reads the file and tries
+    /// again — which is what made `找不到 old_text` the most common tool failure in the log.
+    #[test]
+    fn a_drifted_match_is_located_and_the_file_keeps_its_own_bytes() {
+        // Indentation: the caller indented to 8 where the file has 4. The words are what it
+        // meant; the columns are the file's, so the edit lands where the line really sits.
+        let before = "fn main() {\n    let a = 1;\n    let b = 2;\n}\n";
+        let edit = Edit {
+            path: "x",
+            old_text: "        let a = 1;\n        let b = 2;",
+            new_text: "        let a = 9;\n        let b = 2;",
+            replace_all: false,
+        };
+        let (after, replaced) = replace_in(before, &edit).expect("indentation drift");
+        assert_eq!(replaced, 1);
+        assert_eq!(after, "fn main() {\n    let a = 9;\n    let b = 2;\n}\n");
+
+        // Trailing whitespace the caller could not see.
+        let before = "value = 1;   \nother = 2;\t\n";
+        let edit = Edit {
+            path: "x",
+            old_text: "value = 1;\nother = 2;",
+            new_text: "value = 9;\nother = 2;",
+            replace_all: false,
+        };
+        let (after, _) = replace_in(before, &edit).expect("trailing whitespace");
+        assert_eq!(after, "value = 9;\nother = 2;\t\n");
+
+        // Typographic punctuation: an em dash where the file has a hyphen.
+        let before = "// 注释—破折号\nlet x = 1;\n";
+        let edit = Edit {
+            path: "x",
+            old_text: "// 注释-破折号",
+            new_text: "// 改过了",
+            replace_all: false,
+        };
+        let (after, _) = replace_in(before, &edit).expect("punctuation");
+        assert_eq!(after, "// 改过了\nlet x = 1;\n");
+    }
+
+    #[test]
+    fn a_fuzzy_match_still_refuses_an_ambiguous_or_absent_one() {
+        // Two places that differ only in indentation are still two places, and picking one
+        // would rewrite code the caller never looked at.
+        let before = "  dup\ndup\n";
+        let edit = Edit {
+            path: "x",
+            old_text: "dup",
+            new_text: "x",
+            replace_all: false,
+        };
+        let error = replace_in(before, &edit).unwrap_err();
+        assert!(error.contains("出现了 2 次"), "{error}");
+
+        // Silence about which one is the whole point of the uniqueness rule, and loosening
+        // the comparison must not loosen it.
+        let before = "alpha\nbeta\n";
+        let edit = Edit {
+            path: "x",
+            old_text: "完全不相干的文本",
+            new_text: "y",
+            replace_all: false,
+        };
+        assert!(replace_in(before, &edit).is_err());
+    }
+
+    #[test]
+    fn only_the_changed_lines_are_rewritten() {
+        // The region matched loosely, so its unchanged lines must come from the file: taking
+        // them from the caller's text would write its drifted indentation into a file that
+        // was already correct.
+        let before = "fn main() {\n        let a = 1;\n        let b = 2;\n        let c = 3;\n}\n";
+        let edit = Edit {
+            path: "x",
+            old_text: "    let a = 1;\n    let b = 2;\n    let c = 3;",
+            new_text: "    let a = 1;\n    let b = 99;\n    let c = 3;",
+            replace_all: false,
+        };
+        let (after, _) = replace_in(before, &edit).unwrap();
+        assert_eq!(
+            after, "fn main() {\n        let a = 1;\n        let b = 99;\n        let c = 3;\n}\n",
+            "the untouched lines must keep the file's own indentation"
+        );
+    }
+
+    #[test]
+    fn a_fuzzy_match_keeps_the_line_ending_it_replaced() {
+        // The caller's `new_text` carries no terminator on its last line. Using it verbatim
+        // joins the replacement to the next line, which is how a loose match corrupts a file
+        // a strict match would have refused.
+        let before = "one\ntwo\nthree\n";
+        let edit = Edit {
+            path: "x",
+            old_text: "  two", // drifted: no file line has these columns
+            new_text: "TWO",
+            replace_all: false,
+        };
+        let (after, _) = replace_in(before, &edit).unwrap();
+        assert_eq!(after, "one\nTWO\nthree\n");
+
+        // A region at end-of-file with no newline stays without one.
+        let before = "a\nb";
+        let edit = Edit {
+            path: "x",
+            old_text: "b",
+            new_text: "B",
+            replace_all: false,
+        };
+        assert_eq!(replace_in(before, &edit).unwrap().0, "a\nB");
+    }
+
+    #[test]
+    fn an_exact_match_is_still_exact() {
+        // The looser paths must not change what an ordinary edit produces: same bytes in,
+        // same bytes out.
+        let before = "alpha\nbeta\ngamma\n";
+        let edit = Edit {
+            path: "x",
+            old_text: "beta",
+            new_text: "BETA",
+            replace_all: false,
+        };
+        let (after, replaced) = replace_in(before, &edit).unwrap();
+        assert_eq!((after.as_str(), replaced), ("alpha\nBETA\ngamma\n", 1));
     }
 }
