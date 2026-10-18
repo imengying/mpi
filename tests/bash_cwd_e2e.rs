@@ -132,3 +132,68 @@ async fn an_unmatched_glob_and_a_run_of_equals_signs_both_reach_the_command() {
     assert!(!equals.is_error, "{}", equals.content);
     assert!(equals.content.contains("==="), "{}", equals.content);
 }
+
+/// The drift levels, through the real tool entry point rather than `replace_in`.
+///
+/// `replace_in` is only half the path: the tool resolves the path, reads the file, writes it
+/// back and builds the diff. A drift that is handled inside `replace_in` but lost on the way
+/// out would pass the unit tests and still refuse a real call.
+#[tokio::test]
+async fn an_edit_survives_the_drifts_the_recorded_sessions_show() {
+    let session = dir("fuzzy-edit");
+    let path = session.join("sample.rs");
+    std::fs::write(&path, "fn main() {\n    let a = 1;\n    let b = 2;\n}\n").unwrap();
+
+    // Indented to 8 where the file has 4, which is the shape of a stale reading.
+    let out = tools::execute(
+        "edit",
+        &serde_json::json!({
+            "path": path.to_string_lossy(),
+            "old_text": "        let a = 1;\n        let b = 2;",
+            "new_text": "        let a = 9;\n        let b = 2;",
+        }),
+        &context(&session),
+    )
+    .await;
+    assert!(!out.is_error, "{}", out.content);
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "fn main() {\n    let a = 9;\n    let b = 2;\n}\n",
+        "the file keeps its own indentation, the caller keeps its change"
+    );
+
+    // Trailing whitespace the caller could not see.
+    let ws = session.join("ws.txt");
+    std::fs::write(&ws, "line one   \nline two\n").unwrap();
+    let out = tools::execute(
+        "edit",
+        &serde_json::json!({
+            "path": ws.to_string_lossy(),
+            "old_text": "line one\nline two",
+            "new_text": "line one\nline two changed",
+        }),
+        &context(&session),
+    )
+    .await;
+    assert!(!out.is_error, "{}", out.content);
+
+    // Typographic punctuation: an em dash where the file has a hyphen.
+    let uni = session.join("uni.rs");
+    std::fs::write(&uni, "// note\u{2014}dash\nlet x = 1;\n").unwrap();
+    let out = tools::execute(
+        "edit",
+        &serde_json::json!({
+            "path": uni.to_string_lossy(),
+            "old_text": "// note-dash",
+            "new_text": "// changed",
+        }),
+        &context(&session),
+    )
+    .await;
+    assert!(!out.is_error, "{}", out.content);
+    assert_eq!(
+        std::fs::read_to_string(&uni).unwrap(),
+        "// changed\nlet x = 1;\n",
+        "the line after the edit must not be joined to it"
+    );
+}
