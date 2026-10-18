@@ -334,13 +334,6 @@ fn lines_are_alike(want: &str, have: &str) -> bool {
 mod tests {
     use super::*;
     use crate::tools::block;
-    use std::path::PathBuf;
-
-    fn temp_dir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("pi-edit-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
 
     fn file(dir: &Path, name: &str, content: &str) -> String {
         let path = dir.join(name);
@@ -350,7 +343,7 @@ mod tests {
 
     #[test]
     fn replaces_a_unique_occurrence() {
-        let dir = temp_dir();
+        let dir = crate::tools::temp_dir("edit");
         let path = file(&dir, "a.txt", "one\ntwo\nthree\n");
         let out = block(execute(
             &serde_json::json!({"path": path, "old_text": "two", "new_text": "TWO"}),
@@ -363,7 +356,7 @@ mod tests {
 
     #[test]
     fn ambiguous_matches_are_refused_unless_replace_all() {
-        let dir = temp_dir();
+        let dir = crate::tools::temp_dir("edit");
         let path = file(&dir, "b.txt", "x\nx\n");
         let error = block(execute(
             &serde_json::json!({"path": path, "old_text": "x", "new_text": "y"}),
@@ -381,7 +374,7 @@ mod tests {
 
     #[test]
     fn a_missing_match_says_what_to_do() {
-        let dir = temp_dir();
+        let dir = crate::tools::temp_dir("edit");
         let path = file(&dir, "c.txt", "hello\n");
         let error = block(execute(
             &serde_json::json!({"path": path, "old_text": "nope", "new_text": "x"}),
@@ -400,7 +393,7 @@ mod tests {
         // The shape of every real miss in the sessions: the caller edited from a stale
         // reading, so its text is real content that has since changed by a line or an
         // indent. Naming the region is the one thing it cannot get from its own arguments.
-        let dir = temp_dir();
+        let dir = crate::tools::temp_dir("edit");
         let path = file(
             &dir,
             "drift.txt",
@@ -425,7 +418,7 @@ mod tests {
     fn an_unrelated_miss_does_not_invent_a_region() {
         // Nothing in the file resembles the request, so there is no "region it meant".
         // A guess here would send the caller to a line that has nothing to do with it.
-        let dir = temp_dir();
+        let dir = crate::tools::temp_dir("edit");
         let path = file(&dir, "other.txt", "alpha\nbeta\ngamma\n");
         let error = block(execute(
             &serde_json::json!({
@@ -442,7 +435,7 @@ mod tests {
 
     #[test]
     fn identical_text_is_rejected_early() {
-        let dir = temp_dir();
+        let dir = crate::tools::temp_dir("edit");
         let path = file(&dir, "d.txt", "same\n");
         let error = block(execute(
             &serde_json::json!({"path": path, "old_text": "same", "new_text": "same"}),

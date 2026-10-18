@@ -311,7 +311,7 @@ mod tests {
     }
 
     fn fixture() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("pi-find-{}", std::process::id()));
+        let dir = crate::tools::temp_dir("find");
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         std::fs::write(dir.join("top.rs"), "").unwrap();
         std::fs::write(dir.join("sub/deep.rs"), "").unwrap();

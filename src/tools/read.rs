@@ -113,7 +113,7 @@ mod tests {
     #[test]
     fn skips_a_huge_line_and_handles_a_limit_that_would_overflow() {
         use std::io::Write;
-        let dir = temp_dir();
+        let dir = crate::tools::temp_dir("read");
         let path = dir.join("huge-line.txt");
         let mut file = std::fs::File::create(&path).unwrap();
         let chunk = [b'a'; 8192];
@@ -129,7 +129,7 @@ mod tests {
     #[test]
     fn a_huge_selected_line_is_bounded_and_saved_in_full() {
         use std::io::Write;
-        let dir = temp_dir();
+        let dir = crate::tools::temp_dir("read");
         let path = dir.join("huge-selected.txt");
         let mut file = std::fs::File::create(&path).unwrap();
         for _ in 0..32 {
@@ -147,12 +147,6 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
-    fn temp_dir() -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("pi-read-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
     #[test]
     fn reads_with_line_numbers_and_no_trailing_note() {
         // The window is described by the tool's own arguments (offset / limit) and by the
@@ -160,7 +154,7 @@ mod tests {
         // on every windowed read to be told something the output already showed. It was also
         // the row that survived collapsing — the block keeps its last rows — so a long read
         // showed nothing *but* the note.
-        let dir = temp_dir();
+        let dir = crate::tools::temp_dir("read");
         let file = dir.join("sample.txt");
         std::fs::write(&file, "a\nb\nc\nd\ne\n").unwrap();
         let out = block(execute(
@@ -187,7 +181,7 @@ mod tests {
 
     #[test]
     fn a_directory_is_rejected_with_a_hint() {
-        let dir = temp_dir();
+        let dir = crate::tools::temp_dir("read");
         let error = block(execute(
             &serde_json::json!({"path": dir.to_string_lossy()}),
             &dir,
@@ -200,7 +194,7 @@ mod tests {
 
     #[test]
     fn binary_files_are_not_dumped_into_the_transcript() {
-        let dir = temp_dir();
+        let dir = crate::tools::temp_dir("read");
         let file = dir.join("bin.dat");
         std::fs::write(&file, [0u8, 1, 2, 3, 4]).unwrap();
         let error = block(execute(
@@ -213,7 +207,7 @@ mod tests {
 
     #[test]
     fn an_offset_past_the_end_is_an_error() {
-        let dir = temp_dir();
+        let dir = crate::tools::temp_dir("read");
         let file = dir.join("short.txt");
         std::fs::write(&file, "only\n").unwrap();
         let error = block(execute(

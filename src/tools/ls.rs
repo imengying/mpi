@@ -140,8 +140,7 @@ mod tests {
     }
 
     fn fixture() -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("pi-ls-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::tools::temp_dir("ls");
         std::fs::write(dir.join("visible.txt"), "").unwrap();
         std::fs::write(dir.join(".hidden"), "").unwrap();
         dir

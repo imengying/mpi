@@ -257,6 +257,24 @@ pub(crate) fn optional_u64(arguments: &serde_json::Value, key: &str) -> Option<u
     arguments.get(key).and_then(|value| value.as_u64())
 }
 
+/// Test-only helper: a fresh directory under the system temp dir, named for the tool using it.
+///
+/// Every tool test needs the same thing — a directory nothing else is writing to. Two things
+/// have to be unique for that to hold: the tool name, so different tools cannot collide, and a
+/// counter, because the tests in one module run **in parallel in the same process** and share
+/// one directory name otherwise. The earlier per-module helpers got away with a name of just
+/// the tool and the pid because nothing ever removed the directory; giving them a shared
+/// helper with a clean-up step deleted files another test was still reading.
+#[cfg(test)]
+pub(crate) fn temp_dir(tool: &str) -> PathBuf {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let serial = NEXT.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("pi-{tool}-{}-{serial}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
 /// Test-only helper: the tools read files and spawn processes, so their futures need a
 /// reactor. A current-thread runtime is all any of them require.
 #[cfg(test)]

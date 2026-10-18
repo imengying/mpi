@@ -52,17 +52,10 @@ pub async fn execute(arguments: &serde_json::Value, cwd: &Path) -> Result<ToolOu
 mod tests {
     use super::*;
     use crate::tools::block;
-    use std::path::PathBuf;
-
-    fn temp_dir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("pi-write-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
 
     #[test]
     fn creates_missing_parent_directories() {
-        let dir = temp_dir();
+        let dir = crate::tools::temp_dir("write");
         let target = dir.join("nested/deeper/out.txt");
         let _ = std::fs::remove_dir_all(dir.join("nested"));
         let out = block(execute(
@@ -76,7 +69,7 @@ mod tests {
 
     #[test]
     fn overwriting_reports_a_diff() {
-        let dir = temp_dir();
+        let dir = crate::tools::temp_dir("write");
         let target = dir.join("rewrite.txt");
         std::fs::write(&target, "old\n").unwrap();
         let out = block(execute(
