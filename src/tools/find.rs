@@ -148,15 +148,14 @@ async fn execute_with_engine(
         content.push('\n');
         content.push_str(&stderr);
     }
-    Ok(ToolOutput {
+    Ok(crate::tools::tool_output(
         content,
-        display: Display::File {
+        Display::File {
             verb: "查找",
             path: target.to_string(),
         },
-        is_error: failed,
-        duration: None,
-    })
+        failed,
+    ))
 }
 
 fn select_paths(

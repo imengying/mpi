@@ -1216,3 +1216,100 @@ fn a_session_file_without_the_permission_field_still_opens_as_ask() {
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// A session recorded before the fix holds empty tool messages, and resuming one fails
+/// identically on every turn: the upstream refuses the request, the empty message is still
+/// in the history next turn, and only starting a new session escapes. The stored record is
+/// left alone — rewriting it would be a silent edit of the user's history — and the message
+/// is repaired as the request is assembled.
+#[test]
+fn an_old_session_with_empty_results_can_be_resumed() {
+    let (mut session, dir) = temp_session("empty-repair");
+    session
+        .push_message(Message::user_text("跑个命令"), None, None)
+        .unwrap();
+    // The shape the old tool layer wrote for `rm`/`mkdir`/`touch`: success, no output.
+    session
+        .push_message(
+            Message::Tool {
+                tool_call_id: "c1".into(),
+                name: "bash".into(),
+                content: String::new(),
+                status: crate::llm::ToolStatus::Success,
+            },
+            None,
+            None,
+        )
+        .unwrap();
+
+    let messages = session.context_messages();
+    assert!(
+        messages
+            .iter()
+            .all(|m| !matches!(m, Message::Tool { content, .. } if content.trim().is_empty())),
+        "no empty result may reach the request: {messages:?}"
+    );
+    assert!(
+        messages.iter().any(
+            |m| matches!(m, Message::Tool { content, .. } if content == crate::tools::NO_OUTPUT)
+        ),
+        "the silent result is given something to say"
+    );
+
+    // The record itself is untouched: reopening it still shows what was written.
+    let raw = std::fs::read_to_string(session.path()).unwrap();
+    assert!(
+        raw.contains("\"content\":\"\""),
+        "the history is not rewritten"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// The real thing: a session file as the old tool layer wrote it, opened from disk.
+///
+/// The other test pushes through the in-memory writer. This one writes the JSON the
+/// recorded sessions actually contain and opens it with `Session::open`, which is the path a
+/// user resuming a broken session takes.
+#[test]
+fn a_recorded_session_with_an_empty_result_reopens_sendable() {
+    let dir = std::env::temp_dir().join(format!("pi-resume-{}", uuid::Uuid::now_v7()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("s.jsonl");
+    let header = serde_json::json!({
+        "type": "session_meta", "id": "01a10000-0000-7000-8000-000000000000",
+        "timestamp": "2026-10-15T00:00:00Z", "cwd": "/tmp/legacy", "model": "p/m"
+    });
+    let user = serde_json::json!({
+        "type": "response_item", "parent_id": null,
+        "id": "01a10000-0000-7000-8000-000000000001",
+        "message": {"role": "user", "content": [{"type": "text", "text": "跑个 rm"}]},
+        "timestamp": "2026-10-15T00:00:01Z"
+    });
+    // The assistant turn that called it: a tool result needs a matching call to load.
+    let call = serde_json::json!({
+        "type": "response_item", "parent_id": "01a10000-0000-7000-8000-000000000001",
+        "id": "01a10000-0000-7000-8000-000000000001a",
+        "message": {"role": "assistant", "content": [
+            {"type": "tool_call", "id": "c1", "name": "bash", "arguments": {"command": "rm -f x"}}
+        ]},
+        "timestamp": "2026-10-15T00:00:01Z"
+    });
+    // Exactly what the old layer wrote for a silent command: an empty string.
+    let tool = serde_json::json!({
+        "type": "response_item", "parent_id": "01a10000-0000-7000-8000-000000000001",
+        "id": "01a10000-0000-7000-8000-000000000002",
+        "message": {"role": "tool", "tool_call_id": "c1", "name": "bash", "content": "", "status": "success"},
+        "timestamp": "2026-10-15T00:00:02Z"
+    });
+    std::fs::write(&path, format!("{header}\n{user}\n{call}\n{tool}\n")).unwrap();
+
+    let session = Session::open(&path).unwrap();
+    let messages = session.context_messages();
+    assert!(
+        messages
+            .iter()
+            .all(|m| !matches!(m, Message::Tool { content, .. } if content.trim().is_empty())),
+        "a resumed session must not keep sending the empty message: {messages:?}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}

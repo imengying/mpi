@@ -224,6 +224,37 @@ impl Message {
         }
     }
 
+    /// Give an empty result something to say, so it can be sent.
+    ///
+    /// Sessions recorded before the tool layer normalised its output already contain empty
+    /// tool messages, and those sessions cannot be resumed: the upstream rejects the request
+    /// and every later turn fails the same way. Rewriting the stored file would be a silent
+    /// edit of the user's history; repairing the message as it is assembled fixes the request
+    /// and leaves the record alone.
+    ///
+    /// The text matches what a silent success gets at the source, so a session behaves the
+    /// same whether it was recorded before or after the fix.
+    pub fn repaired(mut self) -> Self {
+        match &mut self {
+            Message::Tool { content, .. } if content.trim().is_empty() => {
+                *content = crate::tools::NO_OUTPUT.to_string();
+            }
+            Message::Tool { .. } => {}
+            Message::User { content } | Message::Assistant { content, .. } => {
+                // An assistant turn that carried only a tool call has no text, which is a
+                // normal shape and not an empty message: the blocks are what matter. Only a
+                // list with nothing in it is empty.
+                if content.is_empty() {
+                    content.push(Block::Text {
+                        text: crate::tools::NO_OUTPUT.to_string(),
+                    });
+                }
+            }
+            Message::System { .. } => {}
+        }
+        self
+    }
+
     pub fn text(&self) -> String {
         let blocks = match self {
             Message::System { content } => return content.clone(),

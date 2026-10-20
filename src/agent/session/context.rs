@@ -90,7 +90,13 @@ impl Session {
 
     pub fn context_messages(&self) -> Vec<Message> {
         self.context_entries()
-            .map(|(message, _)| message.clone())
+            // Repaired on the way out, not on the way in: sessions recorded before the tool
+            // layer normalised empty results already hold empty messages, and those sessions
+            // cannot be resumed at all — the upstream refuses the whole request and every
+            // later turn fails identically. Rewriting the stored file would be a silent edit
+            // of the user's history; fixing the message as it is assembled leaves the record
+            // alone and makes the request sendable again.
+            .map(|(message, _)| message.clone().repaired())
             .collect()
     }
 

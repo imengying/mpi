@@ -76,15 +76,14 @@ pub async fn execute(arguments: &serde_json::Value, cwd: &Path) -> Result<ToolOu
     }
     let body = stdout.trim_end();
     let content = format!("{body}\n");
-    Ok(ToolOutput {
+    Ok(crate::tools::tool_output(
         content,
-        display: Display::File {
+        Display::File {
             verb: "列出",
             path: target.to_string(),
         },
-        is_error: false,
-        duration: None,
-    })
+        false,
+    ))
 }
 
 #[cfg(test)]

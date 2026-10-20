@@ -181,15 +181,14 @@ async fn execute_with_engine(
         content.push('\n');
         content.push_str(&stderr);
     }
-    Ok(ToolOutput {
+    Ok(crate::tools::tool_output(
         content,
-        display: Display::File {
+        Display::File {
             verb: "搜索",
             path: target.to_string(),
         },
-        is_error: failed,
-        duration: None,
-    })
+        failed,
+    ))
 }
 
 fn select_matches(mut raw: super::output::Capture, max_results: u64) -> std::io::Result<String> {

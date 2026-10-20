@@ -22,6 +22,13 @@ use crate::util;
 #[derive(Debug, Clone)]
 pub struct ToolOutput {
     /// Text for the model, already truncated to the 2000-line / 50KB budget.
+    ///
+    /// Never empty. A command that succeeds and prints nothing (`rm`, `mkdir`, `touch`,
+    /// `true`) has no output to report, and recording an empty string puts an empty tool
+    /// message into the conversation. Some upstreams reject the whole request over it —
+    /// `11151 a message has empty content` — and because the message is part of the history,
+    /// every later turn fails the same way until the session is abandoned. `content` is
+    /// therefore normalised on construction; see [`tool_output`].
     pub content: String,
     /// Presentation-only extras (diffs, exit codes). Never sent to the model.
     pub display: Display,
@@ -118,6 +125,33 @@ pub enum Display {
     },
     /// A plain file header line.
     File { verb: &'static str, path: String },
+}
+
+/// What a tool with nothing to say reports instead of an empty string.
+///
+/// Chosen to read as a fact rather than as filler: the model needs to know the call ran and
+/// produced nothing, which is different from a call that failed and from one that was never
+/// made.
+pub(crate) const NO_OUTPUT: &str = "（无输出）";
+
+/// Build a tool result, giving a silent success something to say.
+///
+/// The empty case is not an error: a command that succeeded silently is a normal outcome.
+/// But an empty `content` travels into the conversation as an empty message, which some
+/// upstreams refuse for the entire request. Filling it in here means no tool can reintroduce
+/// the problem by forgetting to, and an already-stored session that has empty messages is
+/// repaired on the way out by [`crate::llm::Message::without_empty_results`].
+pub(crate) fn tool_output(content: String, display: Display, is_error: bool) -> ToolOutput {
+    ToolOutput {
+        content: if content.trim().is_empty() {
+            NO_OUTPUT.to_string()
+        } else {
+            content
+        },
+        display,
+        is_error,
+        duration: None,
+    }
 }
 
 pub(crate) fn verb_for(name: &str) -> &'static str {
@@ -309,6 +343,28 @@ pub(crate) fn engine_present(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A command that succeeds and prints nothing must still say something.
+    ///
+    /// `rm`, `mkdir`, `touch` and `true` are all silent on success. Recording an empty string
+    /// puts an empty tool message into the conversation, and some upstreams reject the whole
+    /// request over it (`11151 a message has empty content`). Because that message stays in
+    /// the history, every later turn fails the same way and only a new session escapes —
+    /// which is exactly the shape the user hit.
+    #[test]
+    fn a_silent_success_still_produces_a_message() {
+        let out = tool_output(String::new(), Display::None, false);
+        assert_eq!(out.content, NO_OUTPUT);
+        assert!(!out.is_error, "a silent success is not a failure");
+
+        // Whitespace is the same problem: an upstream that trims sees an empty message.
+        let blank = tool_output("  \n\t ".into(), Display::None, false);
+        assert_eq!(blank.content, NO_OUTPUT);
+
+        // Real output is untouched.
+        let real = tool_output("line\n".into(), Display::None, false);
+        assert_eq!(real.content, "line\n");
+    }
 
     #[test]
     fn tool_order_is_pinned_for_cache_stability() {

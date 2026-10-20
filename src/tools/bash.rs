@@ -148,12 +148,11 @@ pub async fn execute_with_shell(
             Some(code) => format!("退出码 {code}"),
         });
     }
-    Ok(ToolOutput {
+    Ok(crate::tools::tool_output(
         content,
-        display: Display::Command { footer },
-        is_error: failed,
-        duration: None,
-    })
+        Display::Command { footer },
+        failed,
+    ))
 }
 
 #[cfg(test)]
