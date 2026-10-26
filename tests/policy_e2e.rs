@@ -299,3 +299,39 @@ async fn a_batch_edit_is_vetted_per_path() {
     );
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+/// A batch that omits per-item paths still has to be vetted for every file it will write.
+///
+/// The top-level path became the default for items that omit one. The policy walks each
+/// item's `path`, so an item without one must fall back to the same default — otherwise the
+/// check sees an empty path and either refuses a legitimate batch or, worse, passes a batch
+/// whose real target was never examined.
+#[tokio::test]
+async fn a_batch_using_the_default_path_is_still_vetted() {
+    use mpi::auth::guard::PermissionGate;
+    let dir = std::env::temp_dir().join(format!("pi-defpath-{}", uuid::Uuid::now_v7()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("inside.txt"), "text\n").unwrap();
+    let gate = PermissionGate::new(false, Dialect::Zsh);
+
+    // Default path inside the project, item without one: allowed.
+    let inside = serde_json::json!({
+        "path": "inside.txt",
+        "edits": [{"old_text": "text", "new_text": "changed"}]
+    });
+    assert!(
+        gate.check("edit", &inside, &dir).is_ok(),
+        "a batch on the default path must be allowed"
+    );
+
+    // Default path outside the project: asks, even though the item names nothing.
+    let outside = serde_json::json!({
+        "path": "/etc/hosts",
+        "edits": [{"old_text": "localhost", "new_text": "x"}]
+    });
+    assert!(
+        gate.check("edit", &outside, &dir).is_err(),
+        "the default path has to be vetted like an explicit one"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}

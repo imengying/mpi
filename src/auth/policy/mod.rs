@@ -165,17 +165,27 @@ pub fn assess_tool(
             // a batch carries its own `path` per item, and vetting a single field would let a
             // second item through unchecked. The first refusal wins, so a batch that reaches
             // outside the project asks however many of its other items stay inside.
+            //
+            // An item without a `path` inherits the top-level one, which is how the tool reads
+            // it too. Falling back to the empty string instead refused every batch that used
+            // the default — a legitimate edit inside the project — while an outside default
+            // was only stopped by accident, because an empty path is refused for its own
+            // reasons. The two sides have to agree on what a missing path means.
+            let default_path = string("path");
             let batch = input.get("edits").and_then(|value| value.as_array());
             match batch {
                 Some(items) => items
                     .iter()
                     .map(|item| {
-                        let path = item.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                        let path = item
+                            .get("path")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(default_path);
                         assess_path(Operation::Write, path, cwd)
                     })
                     .find(|assessment| !assessment.allows())
                     .unwrap_or_else(Assessment::allow),
-                None => assess_path(Operation::Write, string("path"), cwd),
+                None => assess_path(Operation::Write, default_path, cwd),
             }
         }
         "read" | "grep" | "find" | "ls" => {
