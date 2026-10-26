@@ -198,6 +198,11 @@ fn move_to(frame: &mut String, row: usize, column: usize) {
 
 #[cfg(test)]
 mod tests {
+    /// vt100 0.18 takes `NonZeroU16`: a zero size panicked before, so the type now says so.
+    fn nz(value: u16) -> std::num::NonZeroU16 {
+        std::num::NonZeroU16::new(value).expect("test dimensions are never zero")
+    }
+
     use super::*;
 
     fn rows(text: &[&str]) -> Vec<HistoryRow<String>> {
@@ -212,7 +217,7 @@ mod tests {
 
     #[test]
     fn history_reaches_the_bottom_without_drafts_in_scrollback() {
-        let mut terminal = vt100::Parser::new(12, 24, 200);
+        let mut terminal = vt100::Parser::new(nz(12), nz(24), 200);
         terminal.process(b"shell output\r\n");
         let mut view = Viewport::default();
         view.start_at(1, 0);
@@ -249,7 +254,7 @@ mod tests {
 
     #[test]
     fn first_inline_frame_starts_at_the_existing_cursor() {
-        let mut terminal = vt100::Parser::new(12, 24, 100);
+        let mut terminal = vt100::Parser::new(nz(12), nz(24), 100);
         terminal.process(b"shell 0\r\nshell 1\r\nshell 2\r\n");
         let mut view = Viewport::default();
         view.start_at(3, 0);
@@ -267,7 +272,7 @@ mod tests {
 
     #[test]
     fn erasing_inline_frame_returns_cursor_to_the_shell_row() {
-        let mut terminal = vt100::Parser::new(12, 24, 100);
+        let mut terminal = vt100::Parser::new(nz(12), nz(24), 100);
         terminal.process(b"previous shell output\r\n");
         let mut view = Viewport::default();
         view.start_at(1, 0);
@@ -289,7 +294,7 @@ mod tests {
 
     #[test]
     fn a_full_shell_screen_survives_entry_and_exit() {
-        let mut terminal = vt100::Parser::new(12, 24, 100);
+        let mut terminal = vt100::Parser::new(nz(12), nz(24), 100);
         for index in 0..11 {
             terminal.process(format!("shell {index}\r\n").as_bytes());
         }
@@ -322,7 +327,7 @@ mod tests {
     #[test]
     fn partial_shell_lines_survive_even_at_the_bottom() {
         for row in [2, 11] {
-            let mut terminal = vt100::Parser::new(12, 24, 100);
+            let mut terminal = vt100::Parser::new(nz(12), nz(24), 100);
             terminal.process(format!("\x1b[{};1Hpartial shell line", row + 1).as_bytes());
             let mut view = Viewport::default();
             view.start_at(row, 18);
@@ -339,7 +344,7 @@ mod tests {
 
     #[test]
     fn a_shrinking_live_area_does_not_scroll_the_shell_down() {
-        let mut terminal = vt100::Parser::new(12, 24, 100);
+        let mut terminal = vt100::Parser::new(nz(12), nz(24), 100);
         for index in 0..11 {
             terminal.process(format!("shell {index}\r\n").as_bytes());
         }
@@ -370,7 +375,7 @@ mod tests {
 
     #[test]
     fn reflow_preserves_the_shell_prefix_and_inserts_fresh_history_once() {
-        let mut terminal = vt100::Parser::new(12, 24, 100);
+        let mut terminal = vt100::Parser::new(nz(12), nz(24), 100);
         terminal.process(b"shell 0\r\nshell 1\r\n");
         let mut view = Viewport::default();
         view.start_at(2, 0);
@@ -385,7 +390,7 @@ mod tests {
             .as_bytes(),
         );
         for width in [16, 30] {
-            terminal.screen_mut().set_size(12, width);
+            terminal.screen_mut().set_size(nz(12), nz(width));
             terminal.process(
                 view.draw(
                     (width.into(), 12),
@@ -428,7 +433,7 @@ mod tests {
 
     #[test]
     fn growing_and_shrinking_input_preserves_the_visible_transcript() {
-        let mut terminal = vt100::Parser::new(10, 20, 100);
+        let mut terminal = vt100::Parser::new(nz(10), nz(20), 100);
         let mut view = Viewport::default();
         for live in [
             rows(&["draft", "stats"]),
@@ -493,7 +498,7 @@ mod tests {
                     wrapped: row.wrapped,
                 })
                 .collect::<Vec<_>>();
-            let mut terminal = vt100::Parser::new(12, 10, 100);
+            let mut terminal = vt100::Parser::new(nz(12), nz(10), 100);
             let mut view = Viewport::default();
             terminal.process(
                 view.draw(
@@ -520,7 +525,7 @@ mod tests {
 
     #[test]
     fn resize_reflows_visible_history_and_reanchors_the_cursor() {
-        let mut terminal = vt100::Parser::new(12, 24, 100);
+        let mut terminal = vt100::Parser::new(nz(12), nz(24), 100);
         let mut view = Viewport::default();
         terminal.process(
             view.draw(
@@ -533,7 +538,9 @@ mod tests {
             .as_bytes(),
         );
         for (width, height, caret_row) in [(16, 8, 2), (30, 16, 2), (8, 3, 1)] {
-            terminal.screen_mut().set_size(height as u16, width as u16);
+            terminal
+                .screen_mut()
+                .set_size(nz(height as u16), nz(width as u16));
             let frame = view.draw(
                 (width, height),
                 rows(&["draft", "stats"]),

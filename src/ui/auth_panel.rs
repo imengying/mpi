@@ -251,10 +251,11 @@ mod tests {
     #[test]
     fn authorization_remains_bottom_anchored_on_resize_and_in_tiny_windows() {
         let mut panel = state_with_rows(40);
-        let mut terminal = vt100::Parser::new(24, 40, 100);
+        let nz = |value: u16| std::num::NonZeroU16::new(value).expect("never zero here");
+        let mut terminal = vt100::Parser::new(nz(24), nz(40), 100);
         let theme = Theme::default();
         for (width, height) in [(40, 24), (20, 8), (4, 3), (1, 1), (60, 30)] {
-            terminal.screen_mut().set_size(height, width);
+            terminal.screen_mut().set_size(nz(height), nz(width));
             let mut frame = Vec::new();
             panel
                 .draw_at(&mut frame, &theme, width as usize, height as usize)

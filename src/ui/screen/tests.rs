@@ -51,7 +51,7 @@ fn draining_a_command_keeps_older_messages_ahead_of_new_steering() {
 #[test]
 fn an_error_exit_erases_the_composer_before_the_shell_resumes() {
     let captured = CapturedOutput::default();
-    let mut terminal = vt100::Parser::new(24, 40, 100);
+    let mut terminal = vt100::Parser::new(nz(24), nz(40), 100);
     {
         let mut screen = screen();
         screen.out = Box::new(captured.clone());
@@ -69,7 +69,7 @@ fn an_error_exit_erases_the_composer_before_the_shell_resumes() {
 
 #[test]
 fn leaving_places_the_shell_after_queued_output_without_an_empty_block() {
-    let mut terminal = vt100::Parser::new(24, 40, 100);
+    let mut terminal = vt100::Parser::new(nz(24), nz(40), 100);
     terminal.process(b"previous shell output\r\n");
     let captured = CapturedOutput::default();
     let mut screen = screen();
@@ -105,7 +105,7 @@ fn streaming_blocks_enter_scrollback_once_and_keep_the_draft_below_output() {
     screen.working = Some(WORKING_LABEL.into());
     screen.begin_stream();
     screen.push_thinking("thinking");
-    let mut terminal = vt100::Parser::new(24, 40, 500);
+    let mut terminal = vt100::Parser::new(nz(24), nz(40), 500);
     for index in 0..40 {
         screen.push_text(&format!("paragraph {index}\n\n"));
         screen.render();
@@ -198,6 +198,7 @@ impl CapturedOutput {
 
 fn selected_code(terminal: &vt100::Screen) -> String {
     let (height, width) = terminal.size();
+    let (height, width) = (height.get(), width.get());
     let rows = terminal.rows(0, width).collect::<Vec<_>>();
     let first = rows
         .iter()
@@ -229,10 +230,10 @@ fn native_code_selection_keeps_source_newlines_and_indentation_while_streaming_a
     screen.working = Some(WORKING_LABEL.into());
     screen.begin_stream();
     screen.push_text(&format!("```rs\n{body}\n```"));
-    let mut terminal = vt100::Parser::new(48, 16, 500);
+    let mut terminal = vt100::Parser::new(nz(48), nz(16), 500);
     for width in [16, 11, 32] {
         screen.width = width;
-        terminal.screen_mut().set_size(48, width as u16);
+        terminal.screen_mut().set_size(nz(48), nz(width as u16));
         screen.render();
         terminal.process(&captured.take());
         assert_eq!(
@@ -253,7 +254,7 @@ fn native_code_selection_keeps_source_newlines_and_indentation_while_streaming_a
     assert_eq!(selected_code(terminal.screen()), body, "completed");
     for width in [12, 23, 40, 80] {
         screen.width = width;
-        terminal.screen_mut().set_size(48, width as u16);
+        terminal.screen_mut().set_size(nz(48), nz(width as u16));
         screen.render();
         terminal.process(&captured.take());
         assert_eq!(
@@ -279,10 +280,10 @@ fn native_selection_joins_visual_folds_but_keeps_explicit_prose_line_breaks() {
     screen.height = 24;
     set_input(&mut screen, "draft");
     screen.push(Block::markdown(source));
-    let mut terminal = vt100::Parser::new(24, 40, 100);
+    let mut terminal = vt100::Parser::new(nz(24), nz(40), 100);
     for width in [40, 16, 11, 24] {
         screen.width = width;
-        terminal.screen_mut().set_size(24, width as u16);
+        terminal.screen_mut().set_size(nz(24), nz(width as u16));
         screen.render();
         terminal.process(&captured.take());
         let rows = terminal.screen().rows(0, width as u16).collect::<Vec<_>>();
@@ -329,7 +330,7 @@ fn native_code_selection_in_lists_and_quotes_keeps_only_the_code_indentation() {
         screen.interactive = true;
         screen.out = Box::new(std::io::sink());
         screen.push(Block::markdown(source));
-        let mut terminal = vt100::Parser::new(24, 12, 100);
+        let mut terminal = vt100::Parser::new(nz(24), nz(12), 100);
         terminal.process(screen.live_frame().as_bytes());
         assert_eq!(selected_code(terminal.screen()), body);
     }
@@ -635,7 +636,7 @@ fn a_fitting_list_is_not_numbered() {
 #[test]
 fn resizing_and_modal_overlays_restore_history_at_the_current_width() {
     let mut screen = screen();
-    let mut terminal = vt100::Parser::new(24, 40, 100);
+    let mut terminal = vt100::Parser::new(nz(24), nz(40), 100);
     set_input(&mut screen, "draft");
     screen.set_footer(vec![Line::plain("stats")]);
     screen.push_lines(vec![
@@ -650,7 +651,7 @@ fn resizing_and_modal_overlays_restore_history_at_the_current_width() {
     assert!(!terminal.screen().contents().contains("overlay"));
     screen.width = 16;
     screen.height = 10;
-    terminal.screen_mut().set_size(10, 16);
+    terminal.screen_mut().set_size(nz(10), nz(16));
     terminal.process(screen.live_frame().as_bytes());
     assert_eq!(terminal.screen().cursor_position(), (4, 7));
     assert!(
@@ -731,6 +732,12 @@ fn pasting_newlines_does_not_accept_a_command_menu_entry() {
     ))), Some(Action::Line(line)) if line == "/model\n\n"));
 }
 
+/// vt100 0.18 takes `NonZeroU16` for its dimensions: passing 0 panicked before, so the
+/// type now says so. The test dimensions are literals and never zero.
+fn nz(value: u16) -> std::num::NonZeroU16 {
+    std::num::NonZeroU16::new(value).expect("test dimensions are never zero")
+}
+
 fn screen() -> Screen {
     let mut screen = Screen::new();
     screen.out = Box::new(Vec::<u8>::new());
@@ -788,7 +795,7 @@ fn leaving_takes_the_live_region_down() {
 
     // The region is gone, so a later erase has nothing to do — which is exactly the
     // state that keeps the shell's marker off the screen.
-    let mut terminal = vt100::Parser::new(24, 40, 0);
+    let mut terminal = vt100::Parser::new(nz(24), nz(40), 0);
     terminal.process(screen.viewport.erase().as_bytes());
     assert!(terminal.screen().contents().is_empty());
 }
@@ -1709,7 +1716,7 @@ fn appending_a_token_does_not_redraw() {
     );
 
     // And the caller's single redraw picks up everything appended since.
-    let mut terminal = vt100::Parser::new(24, 40, 0);
+    let mut terminal = vt100::Parser::new(nz(24), nz(40), 0);
     terminal.process(screen.live_frame().as_bytes());
     let text: Vec<String> = terminal
         .screen()
