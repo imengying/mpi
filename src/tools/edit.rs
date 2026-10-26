@@ -19,19 +19,19 @@ pub fn spec() -> ToolSpec {
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string", "description": "文件路径（相对当前工作目录或绝对路径）" },
+                "path": { "type": "string", "description": "文件路径（相对当前工作目录或绝对路径）。给出 edits 时，这里是各项的默认路径——改同一个文件的几处时只写这一处即可" },
                 "old_text": { "type": "string", "description": "要被替换的原文，逐字一致" },
                 "new_text": { "type": "string", "description": "替换后的新文本" },
                 "replace_all": { "type": "boolean", "description": "是否替换全部匹配（默认 false）" },
                 "edits": {
                     "type": "array",
-                    "description": "一次改多处（可跨文件）：每项给 path、old_text、new_text，可选 replace_all。\
-                                    给出这个参数时忽略顶层的 path/old_text/new_text。全部成功才写入，\
-                                    任何一处失败则整个调用不产生修改。",
+                    "description": "一次改多处（可跨文件）：每项给 old_text、new_text，可选 path 与 replace_all。\
+                                    项里不给 path 就用顶层的 path，所以改同一个文件的几处只需在顶层写一次。\
+                                    全部成功才写入，任何一处失败则整个调用不产生修改。",
                     "items": {
                         "type": "object",
                         "properties": {
-                            "path": { "type": "string", "description": "文件路径" },
+                            "path": { "type": "string", "description": "文件路径；不给则用顶层的 path" },
                             "old_text": { "type": "string", "description": "要被替换的原文，逐字一致" },
                             "new_text": { "type": "string", "description": "替换后的新文本" },
                             "replace_all": { "type": "boolean", "description": "是否替换全部匹配（默认 false）" }
@@ -61,7 +61,10 @@ struct Edit<'a> {
 
 pub async fn execute(arguments: &serde_json::Value, cwd: &Path) -> Result<ToolOutput, String> {
     let edits = match arguments.get("edits") {
-        Some(serde_json::Value::Array(items)) => parse_batch(items)?,
+        Some(serde_json::Value::Array(items)) => {
+            let default_path = arguments.get("path").and_then(|value| value.as_str());
+            parse_batch(items, default_path)?
+        }
         Some(_) => return Err("edits 必须是数组".into()),
         None => vec![Edit {
             path: crate::tools::required_str(arguments, "path")?,
@@ -97,7 +100,20 @@ fn check_texts(old_text: &str, new_text: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn parse_batch(items: &[serde_json::Value]) -> Result<Vec<Edit<'_>>, String> {
+/// Read a batch, with the top-level `path` standing in for any item that omits one.
+///
+/// Three edits to one file is the ordinary shape — a rename applied throughout, a section
+/// rewritten in a few places — and requiring `path` on every item made the natural way to
+/// write it fail. A recorded session sent exactly that: `path` at the top, three items
+/// without one, and got `第 1 项缺少 path`. It retried with the path repeated four times,
+/// then went back to rewriting files through `python` heredocs (133 times in one session),
+/// which is the path with no uniqueness check at all.
+///
+/// An item that names its own `path` still wins, so a batch across files works unchanged.
+fn parse_batch<'a>(
+    items: &'a [serde_json::Value],
+    default_path: Option<&'a str>,
+) -> Result<Vec<Edit<'a>>, String> {
     if items.is_empty() {
         return Err("edits 是空的，没有需要修改的内容".into());
     }
@@ -110,8 +126,19 @@ fn parse_batch(items: &[serde_json::Value]) -> Result<Vec<Edit<'_>>, String> {
                     .and_then(|value| value.as_str())
                     .ok_or_else(|| format!("第 {} 项缺少 {name}", index + 1))
             };
+            let path = item
+                .get("path")
+                .and_then(|value| value.as_str())
+                .or(default_path)
+                .ok_or_else(|| {
+                    format!(
+                        "第 {} 项没有 path，顶层也没有给出默认 path；\
+                         多处修改同一个文件时把 path 写在顶层即可",
+                        index + 1
+                    )
+                })?;
             Ok(Edit {
-                path: field("path")?,
+                path,
                 old_text: field("old_text")?,
                 new_text: field("new_text")?,
                 replace_all: replace_all_of(item),
@@ -1064,5 +1091,61 @@ mod tests {
         };
         let (after, replaced) = replace_in(before, &edit).unwrap();
         assert_eq!((after.as_str(), replaced), ("alpha\nBETA\ngamma\n", 1));
+    }
+    /// The shape a recorded session actually sent: `path` once at the top, items without it.
+    ///
+    /// Requiring `path` per item made the most natural way to write "three edits to one file"
+    /// fail, and the session gave up on the tool and went back to `python` heredocs — the path
+    /// with no uniqueness check at all.
+    #[test]
+    fn the_top_level_path_stands_in_for_items_without_one() {
+        let dir = crate::tools::temp_dir("edit-default-path");
+        std::fs::write(dir.join("m.rs"), "alpha\nbeta\ngamma\n").unwrap();
+        let out = block(execute(
+            &serde_json::json!({
+                "path": "m.rs",
+                "edits": [
+                    {"old_text": "alpha", "new_text": "ALPHA"},
+                    {"old_text": "gamma", "new_text": "GAMMA"},
+                ]
+            }),
+            &dir,
+        ))
+        .expect("the top-level path is the default");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("m.rs")).unwrap(),
+            "ALPHA\nbeta\nGAMMA\n"
+        );
+        assert!(out.content.contains("1 个文件"), "{}", out.content);
+
+        // An item that names its own path still wins, so a batch across files is unchanged.
+        std::fs::write(dir.join("other.rs"), "one\n").unwrap();
+        block(execute(
+            &serde_json::json!({
+                "path": "m.rs",
+                "edits": [
+                    {"old_text": "beta", "new_text": "BETA"},
+                    {"path": "other.rs", "old_text": "one", "new_text": "ONE"},
+                ]
+            }),
+            &dir,
+        ))
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("m.rs")).unwrap(),
+            "ALPHA\nBETA\nGAMMA\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("other.rs")).unwrap(),
+            "ONE\n"
+        );
+
+        // Neither the item nor the top level names a file: say what to do about it.
+        let error = block(execute(
+            &serde_json::json!({"edits": [{"old_text": "x", "new_text": "y"}]}),
+            &dir,
+        ))
+        .unwrap_err();
+        assert!(error.contains("顶层也没有给出默认 path"), "{error}");
     }
 }
