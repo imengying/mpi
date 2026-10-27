@@ -1658,7 +1658,7 @@ mod tests {
         let (model, provider) = fixtures();
         let tool = Message::Tool {
             tool_call_id: "call-1".into(),
-            name: "view_image".into(),
+            name: "read_image".into(),
             content: "[图片 4×4, 90 B]".into(),
             status: ToolStatus::Success,
             images: vec![crate::llm::Block::Image {

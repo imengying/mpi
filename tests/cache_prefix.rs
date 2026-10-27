@@ -214,7 +214,7 @@ fn the_tool_block_is_stable_and_ordered() {
             "grep",
             "find",
             "ls",
-            "view_image",
+            "read_image",
         ]
     );
     for _ in 0..5 {

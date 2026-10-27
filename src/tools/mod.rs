@@ -11,7 +11,7 @@ pub mod ls;
 mod output;
 mod process;
 pub mod read;
-pub mod view_image;
+pub mod read_image;
 pub mod write;
 
 use std::path::{Path, PathBuf};
@@ -43,7 +43,7 @@ pub struct ToolOutput {
     pub duration: Option<std::time::Duration>,
     /// Images this tool produced, for the model to look at.
     ///
-    /// Empty for every tool that answers in text. `view_image` fills it, because a picture is
+    /// Empty for every tool that answers in text. `read_image` fills it, because a picture is
     /// the whole answer there and no amount of text about it substitutes.
     pub images: Vec<crate::llm::Block>,
 }
@@ -176,7 +176,7 @@ pub(crate) fn verb_for(name: &str) -> &'static str {
         "grep" => "搜索",
         "find" => "查找",
         "ls" => "列出",
-        "view_image" => "查看",
+        "read_image" | "view_image" => "查看",
         _ => "处理",
     }
 }
@@ -190,7 +190,7 @@ pub const TOOL_ORDER: [&str; 8] = [
     "grep",
     "find",
     "ls",
-    "view_image",
+    "read_image",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -207,8 +207,8 @@ pub struct ToolMetadata {
 
 pub fn metadata(name: &str) -> Option<ToolMetadata> {
     let execution = match name {
-        // `view_image` only reads a file, so it runs alongside the other readers.
-        "read" | "grep" | "find" | "ls" | "view_image" => ExecutionMode::Parallel,
+        // `read_image` only reads a file, so it runs alongside the other readers.
+        "read" | "grep" | "find" | "ls" | "read_image" | "view_image" => ExecutionMode::Parallel,
         "write" | "edit" | "bash" => ExecutionMode::Exclusive,
         _ => return None,
     };
@@ -237,7 +237,7 @@ pub fn specs() -> Vec<ToolSpec> {
         grep::spec(),
         find::spec(),
         ls::spec(),
-        view_image::spec(),
+        read_image::spec(),
     ]
 }
 
@@ -269,7 +269,12 @@ pub async fn execute(
         "grep" => grep::execute(arguments, &context.cwd).await,
         "find" => find::execute(arguments, &context.cwd).await,
         "ls" => ls::execute(arguments, &context.cwd).await,
-        "view_image" => view_image::execute(arguments, &context.cwd).await,
+        "read_image" => read_image::execute(arguments, &context.cwd).await,
+        // Sessions recorded before the rename still hold `view_image` calls, and a resumed
+        // session replays them as real tool calls. Accepting the old name keeps a picture the
+        // model already asked for from turning into an error mid-conversation; the tool's
+        // output shape did not change, so replaying it is safe.
+        "view_image" => read_image::execute(arguments, &context.cwd).await,
         other => return ToolOutput::error(format!("未知工具：{other}")),
     };
     let elapsed = started.elapsed();
@@ -370,6 +375,34 @@ pub(crate) fn engine_present(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_advertised_tools_use_the_current_image_name() {
+        // The name is part of the tool definitions, so it is a cache boundary: `view_image`
+        // became `read_image`, and that vocabulary now matches the other harnesses (and the
+        // sentence "read_image reads an image" that the model has to reason from).
+        let names: Vec<String> = specs().into_iter().map(|spec| spec.name).collect();
+        assert!(names.iter().any(|name| name == "read_image"), "{names:?}");
+        assert!(
+            !names.iter().any(|name| name == "view_image"),
+            "the old name must not be advertised: {names:?}"
+        );
+        // The order is what makes the prefix reusable, so the rename must not have shuffled it.
+        assert_eq!(names, TOOL_ORDER);
+    }
+
+    #[test]
+    fn a_recorded_view_image_call_still_runs() {
+        // Sessions written before the rename hold `view_image` calls and replay them as real
+        // tool calls. Failing them would turn an already-answered request into an error in the
+        // middle of a resumed conversation.
+        assert_eq!(verb_for("view_image"), "查看");
+        assert_eq!(execution_mode("view_image"), ExecutionMode::Parallel);
+        assert!(
+            TOOL_ORDER.iter().all(|name| name != &"view_image"),
+            "not advertised"
+        );
+    }
 
     /// A command that succeeds and prints nothing must still say something.
     ///

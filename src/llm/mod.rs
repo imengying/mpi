@@ -158,7 +158,7 @@ pub enum Message {
         status: ToolStatus,
         /// Images the tool produced, sent alongside `content` in the same result.
         ///
-        /// A tool that reads a picture (`view_image`) has to hand the model the pixels, and a
+        /// A tool that reads a picture (`read_image`) has to hand the model the pixels, and a
         /// text result cannot carry them. Both provider APIs let a tool result hold content
         /// items, so the image travels as one; `content` stays the text that describes it, and
         /// stays non-empty, because an empty result is a shape some upstreams refuse outright.

@@ -11,7 +11,7 @@ pub fn spec() -> ToolSpec {
         name: "read".into(),
         description:
             "读取文本文件内容。可选 offset（起始行号，从 1 开始）与 limit（最多读取行数）。\
-                      输出带行号，便于后续 edit 引用。图片用 view_image 读，不要用 read。"
+                      输出带行号，便于后续 edit 引用。图片用 read_image 读，不要用 read。"
                 .into(),
         parameters: serde_json::json!({
             "type": "object",
@@ -60,12 +60,12 @@ fn read_window(path: &Path, offset: u64, limit: u64) -> Result<String, String> {
         let mut probe = [0; 4096];
         let count = file.read(&mut probe)?;
         // An image is not unreadable, it is the wrong tool: the model wants the pixels, and
-        // `read` would only ever hand back mojibake. Naming `view_image` here is what stops
+        // `read` would only ever hand back mojibake. Naming `read_image` here is what stops
         // the retry — sessions show models falling back to `bash` + PIL or `base64` when the
         // error merely said "binary", which is both blind to the picture and expensive.
         if let Some(media_type) = crate::image_input::sniff(&probe[..count]) {
             return Err(std::io::Error::other(format!(
-                "这是一个 {media_type} 图片；要看见画面请改用 view_image，read 只读文本。"
+                "这是一个 {media_type} 图片；要看见画面请改用 read_image，read 只读文本。"
             )));
         }
         if probe[..count].contains(&0) {
@@ -208,7 +208,7 @@ mod tests {
         // A real PNG header, because the point is that `read` recognises the format rather
         // than falling into the generic binary branch. Sessions show what the plain "binary"
         // error costs: models retried with `bash` and PIL, or base64'd the file, instead of
-        // switching to `view_image` — blind to the picture and expensive in tokens.
+        // switching to `read_image` — blind to the picture and expensive in tokens.
         let dir = crate::tools::temp_dir("read");
         let file = dir.join("shot.png");
         std::fs::write(&file, b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x10\0\0\0\x10").unwrap();
@@ -217,7 +217,7 @@ mod tests {
             &dir,
         ))
         .unwrap_err();
-        assert!(error.contains("view_image"), "{error}");
+        assert!(error.contains("read_image"), "{error}");
         assert!(
             error.contains("image/png"),
             "the format is worth naming: {error}"

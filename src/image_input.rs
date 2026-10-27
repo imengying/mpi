@@ -159,7 +159,7 @@ impl From<PathError> for ImageError {
 /// is common, and the provider reads the type from the request rather than from the name.
 ///
 /// `pub(crate)` because `read` uses it too: hitting an image there is a wrong-tool mistake,
-/// and naming the format is what lets that error point at `view_image`.
+/// and naming the format is what lets that error point at `read_image`.
 pub(crate) fn sniff(bytes: &[u8]) -> Option<&'static str> {
     const PNG: &[u8] = b"\x89PNG\r\n\x1a\n";
     if bytes.starts_with(PNG) {

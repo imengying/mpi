@@ -1,4 +1,4 @@
-//! `view_image`: give the model a picture from disk.
+//! `read_image`: give the model a picture from disk.
 //!
 //! The other tools answer in text, and text about an image is not the image. A screenshot,
 //! a rendered chart, a UI mock — the model has to see it to say anything useful, so this
@@ -14,11 +14,13 @@ use crate::tools::ToolOutput;
 
 pub fn spec() -> ToolSpec {
     ToolSpec {
-        name: "view_image".into(),
-        description: "查看磁盘上的图片（PNG / JPEG / GIF / WebP）。用在需要真正看见画面的时候：\
-                      截图、渲染结果、界面设计。返回图片本身，不是对图片的描述。\
-                      读图一律用这个工具；read 只读文本，遇到图片会拒绝。"
-            .into(),
+        name: "read_image".into(),
+        description:
+            "查看磁盘上的图片（PNG / JPEG / GIF / WebP），返回图片本身，不是对图片的描述。\
+                      需要真正看见画面时用它：截图、渲染结果、界面设计。读图一律用这个工具。\
+                      不要用 read（它只读文本，遇到图片会拒绝），也不要装图像库、写脚本\
+                      分析像素或生成缩略图来代替——那样看不到画面。"
+                .into(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
@@ -38,7 +40,7 @@ pub async fn execute(arguments: &serde_json::Value, cwd: &Path) -> Result<ToolOu
     Ok(ToolOutput {
         content: image.label(),
         display: crate::tools::Display::File {
-            verb: crate::tools::verb_for("view_image"),
+            verb: crate::tools::verb_for("read_image"),
             path: resolved.display().to_string(),
         },
         is_error: false,

@@ -198,7 +198,7 @@ async fn an_edit_survives_the_drifts_the_recorded_sessions_show() {
     );
 }
 
-/// `view_image` through the real entry point: the picture must arrive as a block.
+/// `read_image` through the real entry point: the picture must arrive as a block.
 ///
 /// The unit test covers the tool; this covers the dispatch, the policy vetted path and the
 /// output budget, all of which sit between the tool and the model.
@@ -218,7 +218,7 @@ async fn viewing_an_image_returns_the_picture_itself() {
     }
 
     let out = tools::execute(
-        "view_image",
+        "read_image",
         &serde_json::json!({"path": path.to_string_lossy()}),
         &context(&session),
     )

@@ -336,7 +336,7 @@ async fn a_batch_using_the_default_path_is_still_vetted() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
-/// `view_image` reads a file, so it is vetted like `read`: outside the project it asks.
+/// `read_image` reads a file, so it is vetted like `read`: outside the project it asks.
 #[tokio::test]
 async fn viewing_an_image_outside_the_project_asks() {
     use mpi::auth::guard::PermissionGate;
@@ -347,14 +347,14 @@ async fn viewing_an_image_outside_the_project_asks() {
 
     let inside = serde_json::json!({"path": "inside.png"});
     assert!(
-        gate.check("view_image", &inside, &dir).is_ok(),
+        gate.check("read_image", &inside, &dir).is_ok(),
         "a picture inside the project is allowed"
     );
 
     let outside = serde_json::json!({"path": "/etc/shadow"});
     assert!(
-        gate.check("view_image", &outside, &dir).is_err(),
-        "reading outside the project through view_image must ask"
+        gate.check("read_image", &outside, &dir).is_err(),
+        "reading outside the project through read_image must ask"
     );
     std::fs::remove_dir_all(dir).unwrap();
 }
