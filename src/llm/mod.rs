@@ -207,6 +207,16 @@ pub enum Message {
         name: String,
         content: String,
         status: ToolStatus,
+        /// Images the tool produced, sent alongside `content` in the same result.
+        ///
+        /// A tool that reads a picture (`view_image`) has to hand the model the pixels, and a
+        /// text result cannot carry them. Both provider APIs let a tool result hold content
+        /// items, so the image travels as one; `content` stays the text that describes it, and
+        /// stays non-empty, because an empty result is a shape some upstreams refuse outright.
+        ///
+        /// Empty for every tool that returns only text — which is all of them but one.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<Block>,
     },
 }
 
@@ -699,6 +709,7 @@ mod tests {
         };
         let result = |id: &str| Message::Tool {
             status: crate::llm::ToolStatus::Success,
+            images: Vec::new(),
             tool_call_id: id.into(),
             name: "read".into(),
             content: String::new(),
@@ -722,6 +733,7 @@ mod tests {
                 assistant(vec![call("a")]),
                 Message::Tool {
                     status: crate::llm::ToolStatus::Success,
+                    images: Vec::new(),
                     tool_call_id: "a".into(),
                     name: "write".into(),
                     content: String::new(),

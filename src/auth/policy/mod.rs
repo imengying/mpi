@@ -188,7 +188,9 @@ pub fn assess_tool(
                 None => assess_path(Operation::Write, default_path, cwd),
             }
         }
-        "read" | "grep" | "find" | "ls" => {
+        // `view_image` reads a file like `read` does, so it is vetted the same way: a path
+        // outside the project has to ask, and a secret is refused whichever tool names it.
+        "read" | "grep" | "find" | "ls" | "view_image" => {
             let path = {
                 let explicit = string("path");
                 if explicit.is_empty() {

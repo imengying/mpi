@@ -472,6 +472,7 @@ fn call(id: &str, name: &str, path: &str) -> Message {
 fn result(id: &str, content: &str) -> Message {
     Message::Tool {
         status: crate::llm::ToolStatus::Success,
+        images: Vec::new(),
         tool_call_id: id.into(),
         name: "read".into(),
         content: content.into(),
@@ -651,6 +652,7 @@ fn file_blocks_separate_read_files_from_modified_ones() {
             name: "edit".into(),
             content: "done".into(),
             status: crate::llm::ToolStatus::Success,
+            images: Vec::new(),
         },
         call("4", "write", "src/c.rs"),
         Message::Tool {
@@ -658,6 +660,7 @@ fn file_blocks_separate_read_files_from_modified_ones() {
             name: "write".into(),
             content: "done".into(),
             status: crate::llm::ToolStatus::Success,
+            images: Vec::new(),
         },
     ];
     let ops = FileOps::collect(&messages);
@@ -980,6 +983,7 @@ fn failed_cancelled_skipped_and_unknown_operations_are_not_completed_files() {
             name: "edit".into(),
             content: "result".into(),
             status,
+            images: Vec::new(),
         });
     }
     messages.push(call("pending", "write", "never-executed.rs"));

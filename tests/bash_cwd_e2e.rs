@@ -197,3 +197,42 @@ async fn an_edit_survives_the_drifts_the_recorded_sessions_show() {
         "the line after the edit must not be joined to it"
     );
 }
+
+/// `view_image` through the real entry point: the picture must arrive as a block.
+///
+/// The unit test covers the tool; this covers the dispatch, the policy vetted path and the
+/// output budget, all of which sit between the tool and the model.
+#[tokio::test]
+async fn viewing_an_image_returns_the_picture_itself() {
+    let session = dir("view-image");
+    let path = session.join("shot.png");
+    {
+        let mut bytes = Vec::new();
+        let mut encoder = png::Encoder::new(&mut bytes, 9, 5);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().unwrap();
+        writer.write_image_data(&[0u8; 9 * 5 * 4]).unwrap();
+        writer.finish().unwrap();
+        std::fs::write(&path, bytes).unwrap();
+    }
+
+    let out = tools::execute(
+        "view_image",
+        &serde_json::json!({"path": path.to_string_lossy()}),
+        &context(&session),
+    )
+    .await;
+    assert!(!out.is_error, "{}", out.content);
+    assert_eq!(out.images.len(), 1, "the picture is the result");
+    assert!(
+        matches!(out.images[0], mpi::llm::Block::Image { .. }),
+        "{:?}",
+        out.images
+    );
+    assert!(out.content.contains("9×5"), "{}", out.content);
+
+    // The output budget must not drop it: text is truncated, images are not.
+    let budgeted = out.budget();
+    assert_eq!(budgeted.images.len(), 1, "budgeting must keep the picture");
+}

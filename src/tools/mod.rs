@@ -11,6 +11,7 @@ pub mod ls;
 mod output;
 mod process;
 pub mod read;
+pub mod view_image;
 pub mod write;
 
 use std::path::{Path, PathBuf};
@@ -40,6 +41,11 @@ pub struct ToolOutput {
     /// before the authorization panel asks, so a number taken from the render would
     /// include however long the user spent reading the dialog.
     pub duration: Option<std::time::Duration>,
+    /// Images this tool produced, for the model to look at.
+    ///
+    /// Empty for every tool that answers in text. `view_image` fills it, because a picture is
+    /// the whole answer there and no amount of text about it substitutes.
+    pub images: Vec<crate::llm::Block>,
 }
 
 impl ToolOutput {
@@ -49,6 +55,7 @@ impl ToolOutput {
             display: Display::None,
             is_error: false,
             duration: None,
+            images: Vec::new(),
         }
     }
 
@@ -58,6 +65,7 @@ impl ToolOutput {
             display: Display::None,
             is_error: true,
             duration: None,
+            images: Vec::new(),
         }
     }
 
@@ -82,6 +90,7 @@ impl ToolOutput {
             display,
             is_error: true,
             duration: None,
+            images: Vec::new(),
         }
     }
 
@@ -106,6 +115,10 @@ impl ToolOutput {
             display,
             is_error: self.is_error,
             duration: self.duration,
+            // The budget applies to text. Images are not text and are not truncated — but
+            // they must survive here, or a tool that answered with a picture would have it
+            // silently dropped on the way out.
+            images: self.images,
         }
     }
 }
@@ -151,6 +164,7 @@ pub(crate) fn tool_output(content: String, display: Display, is_error: bool) -> 
         display,
         is_error,
         duration: None,
+        images: Vec::new(),
     }
 }
 
@@ -162,12 +176,22 @@ pub(crate) fn verb_for(name: &str) -> &'static str {
         "grep" => "搜索",
         "find" => "查找",
         "ls" => "列出",
+        "view_image" => "查看",
         _ => "处理",
     }
 }
 
 /// Tool names in the order they are advertised. **Do not reorder.**
-pub const TOOL_ORDER: [&str; 7] = ["read", "write", "edit", "bash", "grep", "find", "ls"];
+pub const TOOL_ORDER: [&str; 8] = [
+    "read",
+    "write",
+    "edit",
+    "bash",
+    "grep",
+    "find",
+    "ls",
+    "view_image",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionMode {
@@ -183,7 +207,8 @@ pub struct ToolMetadata {
 
 pub fn metadata(name: &str) -> Option<ToolMetadata> {
     let execution = match name {
-        "read" | "grep" | "find" | "ls" => ExecutionMode::Parallel,
+        // `view_image` only reads a file, so it runs alongside the other readers.
+        "read" | "grep" | "find" | "ls" | "view_image" => ExecutionMode::Parallel,
         "write" | "edit" | "bash" => ExecutionMode::Exclusive,
         _ => return None,
     };
@@ -212,6 +237,7 @@ pub fn specs() -> Vec<ToolSpec> {
         grep::spec(),
         find::spec(),
         ls::spec(),
+        view_image::spec(),
     ]
 }
 
@@ -243,6 +269,7 @@ pub async fn execute(
         "grep" => grep::execute(arguments, &context.cwd).await,
         "find" => find::execute(arguments, &context.cwd).await,
         "ls" => ls::execute(arguments, &context.cwd).await,
+        "view_image" => view_image::execute(arguments, &context.cwd).await,
         other => return ToolOutput::error(format!("未知工具：{other}")),
     };
     let elapsed = started.elapsed();

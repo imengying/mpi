@@ -40,6 +40,7 @@ fn pruning_and_repeated_checkpoints_preserve_original_execution_facts() {
                 name: "edit".into(),
                 content: original.clone(),
                 status: ToolStatus::Error,
+                images: Vec::new(),
             },
             None,
             None,
@@ -216,6 +217,7 @@ fn unfinished_tool_results_are_marked_unknown_once() {
         .push_message(
             Message::Tool {
                 status: ToolStatus::Success,
+                images: Vec::new(),
                 tool_call_id: "first".into(),
                 name: "write".into(),
                 content: "写入成功".into(),
@@ -441,6 +443,7 @@ fn user_history_holds_what_the_user_typed_and_nothing_else() {
         .push_message(
             Message::Tool {
                 status: ToolStatus::Success,
+                images: Vec::new(),
                 tool_call_id: "c1".into(),
                 name: "bash".into(),
                 content: "输出".into(),
@@ -1236,6 +1239,7 @@ fn an_old_session_with_empty_results_can_be_resumed() {
                 name: "bash".into(),
                 content: String::new(),
                 status: crate::llm::ToolStatus::Success,
+                images: Vec::new(),
             },
             None,
             None,

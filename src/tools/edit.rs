@@ -162,6 +162,7 @@ async fn apply_one(edit: &Edit<'_>, cwd: &Path) -> Result<ToolOutput, String> {
         display: diff::for_edit(&before, &after),
         is_error: false,
         duration: None,
+        images: Vec::new(),
     })
 }
 
@@ -502,6 +503,7 @@ async fn apply_batch(edits: &[Edit<'_>], cwd: &Path) -> Result<ToolOutput, Strin
         },
         is_error: false,
         duration: None,
+        images: Vec::new(),
     })
 }
 

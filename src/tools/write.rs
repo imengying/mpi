@@ -45,6 +45,7 @@ pub async fn execute(arguments: &serde_json::Value, cwd: &Path) -> Result<ToolOu
         display,
         is_error: false,
         duration: None,
+        images: Vec::new(),
     })
 }
 

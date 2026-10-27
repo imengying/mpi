@@ -133,6 +133,7 @@ fn message_serialisation_order_is_fixed() {
             tool_call_id: "c1".into(),
             name: "read".into(),
             content: "data".into(),
+            images: Vec::new(),
         },
     ];
     let first = serde_json::to_string(&body_of(&messages, &model, &provider)).unwrap();
@@ -170,6 +171,7 @@ fn tool_outcomes_reach_all_protocols_without_rewriting_success_content() {
                 name: "read".into(),
                 content: original.into(),
                 status,
+                images: Vec::new(),
             },
         ];
         let request = Request {
@@ -208,7 +210,18 @@ fn the_tool_block_is_stable_and_ordered() {
     let names: Vec<String> = tools().iter().map(|tool| tool.name.clone()).collect();
     assert_eq!(
         names,
-        vec!["read", "write", "edit", "bash", "grep", "find", "ls"]
+        // New tools are appended, never inserted: the order is a cache boundary, and
+        // reordering an existing tool would invalidate every session's prefix.
+        vec![
+            "read",
+            "write",
+            "edit",
+            "bash",
+            "grep",
+            "find",
+            "ls",
+            "view_image",
+        ]
     );
     for _ in 0..5 {
         let again: Vec<String> = tools().iter().map(|tool| tool.name.clone()).collect();
@@ -340,6 +353,7 @@ fn summary_requests_keep_the_prefix_without_reusing_the_main_cache_key() {
             tool_call_id: "c1".into(),
             name: "read".into(),
             content: "原始文件内容".into(),
+            images: Vec::new(),
         },
     ];
     let original = prefix.clone();

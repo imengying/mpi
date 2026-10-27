@@ -104,6 +104,7 @@ impl Session {
                 tool_call_id,
                 name,
                 status: crate::llm::ToolStatus::Unknown,
+                images: Vec::new(),
                 content: "上次会话意外中断，此工具调用的执行结果未知。请先检查文件或实际状态，再决定是否重试。".into(),
             }, None, None)?;
         }

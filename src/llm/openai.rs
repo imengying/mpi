@@ -339,11 +339,34 @@ pub fn build_request(req: &Request<'_>, stream: bool) -> ChatRequest {
                 message.reasoning_content = reasoning_content;
                 messages.push(message);
             }
-            Message::Tool { tool_call_id, .. } => {
+            Message::Tool {
+                tool_call_id,
+                images,
+                ..
+            } => {
+                // Chat Completions defines a tool message's content as a string. It has no
+                // content-item form, so an image cannot ride inside the result.
                 let mut result = ChatMessage::new("tool");
                 result.content = Some(ChatContent::Text(message.text()));
                 result.tool_call_id = Some(tool_call_id.clone());
                 messages.push(result);
+                // The pictures follow as a user turn. That is the only place this API accepts
+                // an image, and keeping them next to the result means the model sees them in
+                // the same position in the conversation. Dropping them would leave it
+                // answering about an image it never received.
+                if !images.is_empty() {
+                    let mut parts = Vec::new();
+                    for block in images {
+                        if let Block::Image { media_type, data } = block {
+                            parts.push(ContentBlock::image(media_type, data));
+                        }
+                    }
+                    if !parts.is_empty() {
+                        let mut picture = ChatMessage::new("user");
+                        picture.content = Some(ChatContent::Blocks(parts));
+                        messages.push(picture);
+                    }
+                }
             }
         }
     }
@@ -972,6 +995,7 @@ impl FullResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm::ToolStatus;
 
     #[test]
     fn deepseek_gateway_replays_thinking_across_tools_and_user_turns_without_invented_budgets() {
@@ -1002,6 +1026,7 @@ mod tests {
             },
             Message::Tool {
                 status: crate::llm::ToolStatus::Success,
+                images: Vec::new(),
                 tool_call_id: "c1".into(),
                 name: "read".into(),
                 content: "文件内容".into(),
@@ -1355,5 +1380,62 @@ mod tests {
             vec!["https://news.example/a", "https://news.example/b"]
         );
         assert!(matches!(&content[1], Block::Citation { title, .. } if title == "财报"));
+    }
+    /// A tool result carrying a picture must still reach the model.
+    ///
+    /// Chat Completions defines a tool message's content as a string, so the image cannot ride
+    /// inside it. It follows as a user turn instead; dropping it would leave the model
+    /// answering about a picture it never received.
+    #[test]
+    fn a_tool_result_with_an_image_sends_the_image_as_a_following_turn() {
+        let (model, provider) = anthropic_style_model();
+        let tool = Message::Tool {
+            tool_call_id: "c1".into(),
+            name: "view_image".into(),
+            content: "[图片 4×4, 90 B]".into(),
+            status: ToolStatus::Success,
+            images: vec![crate::llm::Block::Image {
+                media_type: "image/png".into(),
+                data: "AAAA".into(),
+            }],
+        };
+        let body = serde_json::to_value(build_request(
+            &request(&model, &provider, std::slice::from_ref(&tool)),
+            true,
+        ))
+        .unwrap();
+        let messages = body["messages"].as_array().expect("messages");
+        let kinds: Vec<&str> = messages
+            .iter()
+            .map(|m| m["role"].as_str().unwrap_or("?"))
+            .collect();
+        assert_eq!(kinds, vec!["tool", "user"], "{body}");
+        assert!(
+            messages[0]["content"].is_string(),
+            "a tool result's content stays a string"
+        );
+        let image = &messages[1]["content"][0];
+        assert_eq!(image["type"], "image_url", "{body}");
+        assert!(
+            image["image_url"]["url"]
+                .as_str()
+                .is_some_and(|url| url.starts_with("data:image/png;base64,")),
+            "{body}"
+        );
+
+        // Without an image the result is one message, as before.
+        let plain = Message::Tool {
+            tool_call_id: "c2".into(),
+            name: "read".into(),
+            content: "contents".into(),
+            status: ToolStatus::Success,
+            images: Vec::new(),
+        };
+        let body = serde_json::to_value(build_request(
+            &request(&model, &provider, std::slice::from_ref(&plain)),
+            true,
+        ))
+        .unwrap();
+        assert_eq!(body["messages"].as_array().unwrap().len(), 1, "{body}");
     }
 }

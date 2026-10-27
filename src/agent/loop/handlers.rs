@@ -115,6 +115,10 @@ impl Agent {
                         name: name.clone(),
                         content: output.content.clone(),
                         status,
+                        // The pictures the tool produced, carried into the conversation. A
+                        // tool that answers with an image has nothing else to give: without
+                        // this the model would be told a picture exists and never see it.
+                        images: output.images.clone(),
                     },
                     None,
                     None,
@@ -148,6 +152,7 @@ impl Agent {
                     name: name.clone(),
                     content: content.into(),
                     status: ToolStatus::Skipped,
+                    images: Vec::new(),
                 },
                 None,
                 None,
@@ -786,6 +791,7 @@ mod tests {
                     name: "read".into(),
                     content: original.clone(),
                     status: ToolStatus::Success,
+                    images: Vec::new(),
                 },
                 None,
                 None,

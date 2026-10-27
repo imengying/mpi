@@ -88,13 +88,45 @@ struct InputItem {
     #[serde(skip_serializing_if = "Option::is_none")]
     arguments: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    output: Option<String>,
+    output: Option<Box<OutputBody>>,
     /// A replayed reasoning item: the summary is the text the UI showed, and the encrypted
     /// payload is what lets the server pick the thought back up.
     #[serde(skip_serializing_if = "Option::is_none")]
     summary: Option<Vec<SummaryPart>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     encrypted_content: Option<String>,
+}
+
+/// What a `function_call_output` carries: plain text, or text plus images.
+///
+/// The API takes either a string or an array of content items for this field. A tool that
+/// reads a picture has to hand over the pixels, and a string cannot hold them, so those
+/// results go out as the array form. Everything else stays a plain string: it is the shape
+/// every tool returned before images existed, and it is the smaller payload.
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+enum OutputBody {
+    Text(String),
+    Items(Vec<ContentPart>),
+}
+
+impl OutputBody {
+    /// Text alone stays a string; anything with an image becomes the item array.
+    fn from(message: &Message) -> Self {
+        let Message::Tool { images, .. } = message else {
+            return OutputBody::Text(message.text());
+        };
+        if images.is_empty() {
+            return OutputBody::Text(message.text());
+        }
+        let mut parts = vec![ContentPart::text(message.text())];
+        for block in images {
+            if let Block::Image { media_type, data } = block {
+                parts.push(ContentPart::image(media_type, data));
+            }
+        }
+        OutputBody::Items(parts)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -286,7 +318,7 @@ pub fn build_request(req: &Request<'_>, stream: bool) -> ResponsesRequest {
                 input.push(InputEntry::Item(InputItem {
                     kind: Some("function_call_output"),
                     call_id: Some(tool_call_id.clone()),
-                    output: Some(message.text()),
+                    output: Some(Box::new(OutputBody::from(message))),
                     ..InputItem::empty()
                 }));
             }
@@ -1181,6 +1213,7 @@ mod tests {
             },
             Message::Tool {
                 status: crate::llm::ToolStatus::Success,
+                images: Vec::new(),
                 tool_call_id: "call_1".into(),
                 name: "read".into(),
                 content: "data".into(),
@@ -1616,5 +1649,57 @@ mod tests {
         assert!(
             matches!(&content[2], Block::Citation { url, title } if url == "https://example.com" && title == "docs")
         );
+    }
+    /// The Responses API takes a tool output as a string *or* a content-item array; an image
+    /// has to go out as the array, because a string cannot hold pixels.
+    #[test]
+    fn a_tool_result_with_an_image_uses_the_item_array_form() {
+        use crate::llm::ToolStatus;
+        let (model, provider) = fixtures();
+        let tool = Message::Tool {
+            tool_call_id: "call-1".into(),
+            name: "view_image".into(),
+            content: "[图片 4×4, 90 B]".into(),
+            status: ToolStatus::Success,
+            images: vec![crate::llm::Block::Image {
+                media_type: "image/png".into(),
+                data: "AAAA".into(),
+            }],
+        };
+        let req = Request {
+            model: &model,
+            provider: &provider,
+            messages: std::slice::from_ref(&tool),
+            tools: &[],
+            level: "high",
+            session_id: "s",
+            cache_hints: false,
+        };
+        let body = serde_json::to_value(build_request(&req, false)).unwrap();
+        let output = &body["input"][0]["output"];
+        assert!(output.is_array(), "an image forces the item array: {body}");
+        assert_eq!(output[0]["type"], "input_text", "{body}");
+        assert_eq!(output[1]["type"], "input_image", "{body}");
+
+        // Text alone stays a plain string: the smaller payload, and the shape every tool
+        // returned before images existed.
+        let plain = Message::Tool {
+            tool_call_id: "call-2".into(),
+            name: "read".into(),
+            content: "contents".into(),
+            status: ToolStatus::Success,
+            images: Vec::new(),
+        };
+        let req = Request {
+            model: &model,
+            provider: &provider,
+            messages: std::slice::from_ref(&plain),
+            tools: &[],
+            level: "high",
+            session_id: "s",
+            cache_hints: false,
+        };
+        let body = serde_json::to_value(build_request(&req, false)).unwrap();
+        assert!(body["input"][0]["output"].is_string(), "{body}");
     }
 }

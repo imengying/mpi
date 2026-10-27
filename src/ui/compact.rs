@@ -611,6 +611,7 @@ mod tests {
                 name: "read".into(),
                 content: "original data".into(),
                 status: ToolStatus::Success,
+                images: Vec::new(),
             },
             Message::user_text("再读一次"),
             call(),
@@ -619,6 +620,7 @@ mod tests {
                 name: "read".into(),
                 content: "read failed".into(),
                 status: ToolStatus::Error,
+                images: Vec::new(),
             },
         ];
         crate::llm::validate_tool_history(&messages).unwrap();
@@ -695,6 +697,7 @@ mod tests {
             },
             Message::Tool {
                 status: crate::llm::ToolStatus::Success,
+                images: Vec::new(),
                 tool_call_id: "c1".into(),
                 name: "bash".into(),
                 content: "hi\n".into(),
@@ -778,6 +781,7 @@ mod tests {
             },
             Message::Tool {
                 status: ToolStatus::Cancelled,
+                images: Vec::new(),
                 tool_call_id: "c1".into(),
                 name: "bash".into(),
                 content: model_facing.into(),
@@ -887,6 +891,7 @@ mod tests {
                         tool_call_id: "c1".into(),
                         name: name.into(),
                         content: output.content.clone(),
+                        images: Vec::new(),
                     },
                 ])
                 .iter()
@@ -953,6 +958,7 @@ mod tests {
             },
             is_error: false,
             duration: None,
+            images: Vec::new(),
         };
         let block = tool_block(
             "bash",
@@ -1052,6 +1058,7 @@ mod tests {
             },
             is_error: true,
             duration: None,
+            images: Vec::new(),
         };
         let text = plain(
             &tool_block(
@@ -1078,6 +1085,7 @@ mod tests {
             display: Display::Command { footer: Vec::new() },
             is_error: false,
             duration: None,
+            images: Vec::new(),
         }
         .budget();
         let text = plain(
@@ -1103,6 +1111,7 @@ mod tests {
             },
             is_error: true,
             duration: None,
+            images: Vec::new(),
         };
         let text = plain(
             &tool_block(
@@ -1159,6 +1168,7 @@ mod tests {
             display: Display::Command { footer: Vec::new() },
             is_error: false,
             duration: None,
+            images: Vec::new(),
         };
         let block = tool_block(
             "bash",
@@ -1203,6 +1213,7 @@ mod tests {
             },
             is_error: true,
             duration: None,
+            images: Vec::new(),
         };
         let text = plain(
             &tool_block(
@@ -1304,6 +1315,7 @@ mod tests {
             display: crate::ui::diff::for_edit("one\ntwo\n", "one\nTWO\n"),
             is_error: false,
             duration: None,
+            images: Vec::new(),
         };
         let block = tool_block(
             "edit",
@@ -1348,6 +1360,7 @@ mod tests {
             display: crate::ui::diff::for_edit(&before, &after),
             is_error: false,
             duration: None,
+            images: Vec::new(),
         };
         let text = plain(
             &tool_block(
@@ -1386,6 +1399,7 @@ mod tests {
             },
             is_error: false,
             duration: None,
+            images: Vec::new(),
         };
         let text = plain(
             &tool_block("ls", &serde_json::json!({}), &output, ToolStatus::Success).render(120),
@@ -1418,6 +1432,7 @@ mod tests {
             display: Display::None,
             is_error: false,
             duration: None,
+            images: Vec::new(),
         };
         let text = plain(
             &tool_block("read", &serde_json::json!({}), &output, ToolStatus::Success).render(80),
@@ -1437,6 +1452,7 @@ mod tests {
             },
             is_error: true,
             duration: None,
+            images: Vec::new(),
         };
         for line in tool_block(
             "bash",

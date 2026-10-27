@@ -73,7 +73,12 @@ enum OutBlock {
     },
     ToolResult {
         tool_use_id: String,
-        content: String,
+        /// A string, or an array of blocks when the result carries images.
+        ///
+        /// Anthropic accepts both shapes for this field. A tool that reads a picture has to
+        /// hand over the pixels, and a string cannot hold them; everything else stays a plain
+        /// string, which is the shape every tool returned before images existed.
+        content: ToolResultBody,
         is_error: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
@@ -88,6 +93,38 @@ enum OutBlock {
         tool_use_id: String,
         content: serde_json::Value,
     },
+}
+
+/// The `content` of a tool result: text alone, or text plus images.
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+enum ToolResultBody {
+    Text(String),
+    Blocks(Vec<OutBlock>),
+}
+
+impl ToolResultBody {
+    /// Text alone stays a string; anything with an image becomes the block array.
+    fn from(message: &Message) -> Self {
+        let Message::Tool { images, .. } = message else {
+            return ToolResultBody::Text(message.text());
+        };
+        if images.is_empty() {
+            return ToolResultBody::Text(message.text());
+        }
+        let mut blocks = vec![OutBlock::Text {
+            text: message.text(),
+            cache_control: None,
+        }];
+        for block in images {
+            if let crate::llm::Block::Image { media_type, data } = block {
+                blocks.push(OutBlock::Image {
+                    source: ImageSource::base64(media_type, data),
+                });
+            }
+        }
+        ToolResultBody::Blocks(blocks)
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -278,7 +315,7 @@ pub fn build_request(req: &Request<'_>) -> MessagesRequest {
                 // them for one turn have to arrive together.
                 pending_results.push(OutBlock::ToolResult {
                     tool_use_id: tool_call_id.clone(),
-                    content: message.text(),
+                    content: ToolResultBody::from(message),
                     is_error: *status != super::ToolStatus::Success,
                     cache_control: None,
                 });
@@ -1101,12 +1138,14 @@ mod tests {
             },
             Message::Tool {
                 status: crate::llm::ToolStatus::Success,
+                images: Vec::new(),
                 tool_call_id: "a".into(),
                 name: "read".into(),
                 content: "A".into(),
             },
             Message::Tool {
                 status: crate::llm::ToolStatus::Error,
+                images: Vec::new(),
                 tool_call_id: "b".into(),
                 name: "read".into(),
                 content: "B".into(),
@@ -1314,5 +1353,59 @@ mod tests {
         );
         assert!(matches!(&content[2], Block::Text { text } if text == "yes"));
         assert!(matches!(&content[3], Block::Citation { url, .. } if url == "https://example.com"));
+    }
+    /// An Anthropic tool result accepts a block array, so the image rides inside the result.
+    #[test]
+    fn a_tool_result_with_an_image_becomes_content_blocks() {
+        use crate::llm::ToolStatus;
+        let (model, provider) = fixtures();
+        let tool = Message::Tool {
+            tool_call_id: "tu-1".into(),
+            name: "view_image".into(),
+            content: "[图片 4×4, 90 B]".into(),
+            status: ToolStatus::Success,
+            images: vec![crate::llm::Block::Image {
+                media_type: "image/png".into(),
+                data: "AAAA".into(),
+            }],
+        };
+        let req = Request {
+            model: &model,
+            provider: &provider,
+            messages: std::slice::from_ref(&tool),
+            tools: &[],
+            level: "high",
+            session_id: "s",
+            cache_hints: false,
+        };
+        let body = serde_json::to_value(build_request(&req)).unwrap();
+        let content = &body["messages"][0]["content"][0]["content"];
+        assert_eq!(content[0]["type"], "text", "{body}");
+        assert_eq!(content[1]["type"], "image", "{body}");
+        assert_eq!(content[1]["source"]["media_type"], "image/png");
+        assert_eq!(content[1]["source"]["data"], "AAAA");
+
+        // A text-only result keeps the plain string shape.
+        let plain = Message::Tool {
+            tool_call_id: "tu-2".into(),
+            name: "read".into(),
+            content: "contents".into(),
+            status: ToolStatus::Success,
+            images: Vec::new(),
+        };
+        let req = Request {
+            model: &model,
+            provider: &provider,
+            messages: std::slice::from_ref(&plain),
+            tools: &[],
+            level: "high",
+            session_id: "s",
+            cache_hints: false,
+        };
+        let body = serde_json::to_value(build_request(&req)).unwrap();
+        assert!(
+            body["messages"][0]["content"][0]["content"].is_string(),
+            "{body}"
+        );
     }
 }
