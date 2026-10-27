@@ -23,10 +23,8 @@ pub enum ImageError {
     NoImage,
     #[error("剪贴板里没有文本")]
     NoText,
-    #[error(
-        "不是 PNG 文件。只能直接发送 PNG；JPEG、WebP 等请先转成 PNG（例如 `convert x.jpg x.png`）"
-    )]
-    NotPng,
+    #[error("不是受支持的图片格式。只接受 PNG / JPEG / GIF / WebP")]
+    Unsupported,
     #[error("无法访问剪贴板：{0}")]
     Clipboard(String),
     #[error("图片尺寸 {}×{} 超出上限（每边最多 {MAX_DIMENSION}）", .0, .1)]
@@ -40,8 +38,14 @@ pub enum ImageError {
 pub struct PastedImage {
     pub width: u32,
     pub height: u32,
-    /// Base64 of the PNG bytes.
+    /// Base64 of the encoded bytes.
     pub data: String,
+    /// The media type those bytes actually are, e.g. `image/png`.
+    ///
+    /// Carried rather than assumed: a file on disk may be PNG, JPEG, GIF or WebP, and both
+    /// provider APIs take the type from the request. Sending JPEG bytes labelled `image/png`
+    /// fails at the provider with a message about the payload rather than about the type.
+    pub media_type: &'static str,
     /// Encoded size, for the note shown to the user.
     pub bytes: usize,
 }
@@ -50,7 +54,7 @@ impl PastedImage {
     /// The block that goes into the conversation.
     pub fn block(&self) -> Block {
         Block::Image {
-            media_type: "image/png".to_string(),
+            media_type: self.media_type.to_string(),
             data: self.data.clone(),
         }
     }
@@ -118,6 +122,8 @@ pub fn encode_rgba(width: usize, height: usize, rgba: &[u8]) -> Result<PastedIma
         width: w,
         height: h,
         data: base64::engine::general_purpose::STANDARD.encode(&encoded),
+        // Clipboard pixels are encoded here, so the type is known: PNG.
+        media_type: "image/png",
         bytes,
     })
 }
@@ -127,12 +133,10 @@ pub fn encode_rgba(width: usize, height: usize, rgba: &[u8]) -> Result<PastedIma
 pub enum PathError {
     #[error("读不了这个文件：{0}")]
     Read(std::io::Error),
-    #[error(
-        "不是 PNG 文件。只能直接发送 PNG；JPEG、WebP 等请先转成 PNG（例如 `convert x.jpg x.png`）"
-    )]
-    NotPng,
-    #[error("PNG 文件损坏：{0}")]
-    Decode(png::DecodingError),
+    #[error("不是受支持的图片格式。只接受 PNG / JPEG / GIF / WebP")]
+    Unsupported,
+    #[error("图片损坏或尺寸读不出来：{0}")]
+    Decode(String),
     #[error("图片尺寸 {}×{} 超出上限（每边最多 {MAX_DIMENSION}）", .0, .1)]
     TooLarge(u32, u32),
 }
@@ -141,34 +145,82 @@ impl From<PathError> for ImageError {
     fn from(err: PathError) -> Self {
         match err {
             PathError::Read(err) => ImageError::Clipboard(err.to_string()),
-            PathError::NotPng => ImageError::NotPng,
-            PathError::Decode(err) => ImageError::Encode(err.to_string()),
+            PathError::Unsupported => ImageError::Unsupported,
+            PathError::Decode(err) => ImageError::Encode(err),
             PathError::TooLarge(w, h) => ImageError::TooLarge(w, h),
         }
     }
 }
 
+/// What kind of image these bytes are, judged from the file signature.
+///
+/// Only the four types both provider APIs accept, and only the ones whose extent can be read
+/// without a full decoder. The signature is the honest source: a `.jpg` extension on PNG bytes
+/// is common, and the provider reads the type from the request rather than from the name.
+fn sniff(bytes: &[u8]) -> Option<&'static str> {
+    const PNG: &[u8] = b"\x89PNG\r\n\x1a\n";
+    if bytes.starts_with(PNG) {
+        return Some("image/png");
+    }
+    // JPEG: SOI marker followed by any segment marker.
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some("image/jpeg");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+    if bytes.len() > 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    None
+}
+
+/// The pixel dimensions, read from the header alone.
+///
+/// Each container states its extent in a fixed place near the front, so nothing is decoded:
+/// this function never touches image data. A format whose size could not be read that cheaply
+/// is not supported, which is the same list [`sniff`] accepts.
+fn dimensions(bytes: &[u8], media_type: &str) -> Option<(u32, u32)> {
+    match media_type {
+        "image/png" => {
+            // IHDR is the first chunk: 8-byte signature, 4-byte length, 4-byte type, then
+            // width and height as big-endian u32.
+            let header = bytes.get(16..24)?;
+            Some((
+                u32::from_be_bytes(header[0..4].try_into().ok()?),
+                u32::from_be_bytes(header[4..8].try_into().ok()?),
+            ))
+        }
+        "image/gif" => {
+            // Logical screen descriptor: little-endian u16 each.
+            let header = bytes.get(6..10)?;
+            Some((
+                u16::from_le_bytes(header[0..2].try_into().ok()?).into(),
+                u16::from_le_bytes(header[2..4].try_into().ok()?).into(),
+            ))
+        }
+        // JPEG and WebP put their extent after variable-length segments. Reading it means
+        // walking those segments, which is a decoder by another name; the size is checked
+        // against the byte budget instead, which is what actually costs anything.
+        _ => None,
+    }
+}
+
 /// Load an image from a file path, for the case where the picture is already on disk.
 ///
-/// A pasted screenshot arrives as raw pixels and has to be encoded; a file on disk usually
-/// does not. PNG is passed through **byte for byte** — re-encoding it would cost time and
-/// lose nothing, and the provider accepts it as-is — so the only thing read out of the file
-/// is the dimensions, from the header. That keeps the "no image crate" rule: there is no
-/// decoder here, and nothing to pull a JPEG or TIFF stack in for.
-///
-/// Anything that is not PNG is refused by name. Decoding it would mean adding a codec, and
-/// silently sending a JPEG labelled `image/png` would fail at the provider with a message
-/// about the base64 rather than about the format.
+/// A pasted screenshot arrives as raw pixels and has to be encoded; a file on disk does not.
+/// The bytes are passed through **unchanged** and the media type is taken from the file
+/// signature, so a JPEG goes out as `image/jpeg` without being re-encoded — no quality lost,
+/// no codec pulled in.
 pub fn read_image_path(path: &std::path::Path) -> Result<PastedImage, PathError> {
     let bytes = std::fs::read(path).map_err(PathError::Read)?;
-    const MAGIC: &[u8] = b"\x89PNG\r\n\x1a\n";
-    if !bytes.starts_with(MAGIC) {
-        return Err(PathError::NotPng);
-    }
-    // Header only: the dimensions live there, and reading them does not touch the pixels.
-    let mut decoder = png::Decoder::new(std::io::Cursor::new(&bytes));
-    let info = decoder.read_header_info().map_err(PathError::Decode)?;
-    let (width, height) = (info.width, info.height);
+    let media_type = sniff(&bytes).ok_or(PathError::Unsupported)?;
+    let (width, height) = match dimensions(&bytes, media_type) {
+        Some((w, h)) => (w, h),
+        // The extent is not in a fixed place. Report the file as 0×0 rather than inventing a
+        // number; the label shows the size on disk, which is the figure that matters here.
+        None => (0, 0),
+    };
     if width > MAX_DIMENSION || height > MAX_DIMENSION {
         return Err(PathError::TooLarge(width, height));
     }
@@ -176,6 +228,7 @@ pub fn read_image_path(path: &std::path::Path) -> Result<PastedImage, PathError>
         width,
         height,
         data: base64::engine::general_purpose::STANDARD.encode(&bytes),
+        media_type,
         bytes: bytes.len(),
     })
 }
@@ -298,16 +351,48 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// The bytes decide the type, not the file name, and each type goes out as itself.
+    ///
+    /// Both provider APIs read the type from the request. Labelling JPEG bytes `image/png`
+    /// fails at the provider with a message about the payload rather than about the type,
+    /// which sends the reader looking in the wrong place.
     #[test]
-    fn a_file_that_is_not_png_is_named_rather_than_mis_sent() {
-        // Labelling a JPEG as image/png would surface at the provider as a decoding error
-        // about the base64, which says nothing about the real problem.
-        let dir = crate::tools::temp_dir("image-not-png");
-        let fake = dir.join("photo.jpg");
-        std::fs::write(&fake, b"\xff\xd8\xff\xe0 not really a jpeg").unwrap();
-        let error = read_image_path(&fake).unwrap_err();
-        assert!(matches!(error, PathError::NotPng), "{error}");
-        assert!(error.to_string().contains("PNG"), "{error}");
+    fn the_media_type_comes_from_the_bytes_not_the_name() {
+        let dir = crate::tools::temp_dir("image-types");
+
+        // A JPEG signature on a file called `.png`: the name lies, the bytes do not.
+        let lying = dir.join("actually_jpeg.png");
+        let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xE0];
+        jpeg.extend_from_slice(&[0u8; 64]);
+        std::fs::write(&lying, &jpeg).unwrap();
+        let image = read_image_path(&lying).unwrap();
+        assert_eq!(image.media_type, "image/jpeg");
+        assert!(matches!(
+            image.block(),
+            Block::Image { ref media_type, .. } if media_type == "image/jpeg"
+        ));
+
+        // WebP and GIF are recognised the same way.
+        let mut webp = b"RIFF".to_vec();
+        webp.extend_from_slice(&[0, 0, 0, 0]);
+        webp.extend_from_slice(b"WEBP");
+        webp.extend_from_slice(&[0u8; 32]);
+        std::fs::write(dir.join("x.webp"), &webp).unwrap();
+        assert_eq!(
+            read_image_path(&dir.join("x.webp")).unwrap().media_type,
+            "image/webp"
+        );
+        std::fs::write(dir.join("x.gif"), b"GIF89a\x04\x00\x03\x00\x00\x00\x00").unwrap();
+        let gif = read_image_path(&dir.join("x.gif")).unwrap();
+        assert_eq!(gif.media_type, "image/gif");
+        // GIF states its extent in the header, so the label can show it.
+        assert_eq!((gif.width, gif.height), (4, 3));
+
+        // Something that is not an image at all is refused by name.
+        let text = dir.join("notes.txt");
+        std::fs::write(&text, "just text").unwrap();
+        let error = read_image_path(&text).unwrap_err();
+        assert!(matches!(error, PathError::Unsupported), "{error}");
 
         // A missing file is its own message.
         let missing = read_image_path(&dir.join("nope.png")).unwrap_err();

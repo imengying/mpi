@@ -490,7 +490,7 @@ impl Screen {
                 }
                 // A real file that is not a PNG: say why rather than pasting its path as
                 // text, which would leave the user wondering why nothing was attached.
-                Err(err @ image_input::PathError::NotPng) => {
+                Err(err @ image_input::PathError::Unsupported) => {
                     self.notice = Some(format!("没有附加图片：{err}"));
                     true
                 }
@@ -537,7 +537,7 @@ fn standalone_image_path(line: &str) -> Result<Option<crate::image_input::Pasted
         Ok(image) => Ok(Some(image)),
         // A file that exists but cannot be sent: say so. Falling back to text would send the
         // path as a message, and the user would be left thinking the picture went with it.
-        Err(err @ crate::image_input::PathError::NotPng) => Err(err.to_string()),
+        Err(err @ crate::image_input::PathError::Unsupported) => Err(err.to_string()),
         Err(_) => Ok(None),
     }
 }

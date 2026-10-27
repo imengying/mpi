@@ -385,6 +385,7 @@ fn large_pastes_queues_images_and_menus_fit_even_small_terminals() {
                     width: 1,
                     height: 1,
                     data: "AA==".into(),
+                    media_type: "image/png",
                     bytes: 3,
                 })
                 .collect();
@@ -1333,6 +1334,7 @@ fn a_paste_that_was_never_submitted_stays_with_the_draft() {
         width: 4,
         height: 4,
         data: "AAAA".into(),
+        media_type: "image/png",
         bytes: 3,
     });
     crate::agent::r#loop::queue_mid_turn(&mut screen, "queued message".to_string(), Vec::new());
@@ -1563,6 +1565,7 @@ fn the_erase_step_lands_on_the_first_live_row() {
         width: 1,
         height: 1,
         data: "AA==".into(),
+        media_type: "image/png",
         bytes: 3,
     });
     let (lines, cursor) = screen.compose_live();
@@ -2172,6 +2175,7 @@ fn every_clipboard_outcome_lands_somewhere_useful() {
                 width: 2,
                 height: 2,
                 data: "AA==".into(),
+                media_type: "image/png",
                 bytes: 3,
             })
         },
@@ -2271,10 +2275,11 @@ fn submitting_a_path_sends_the_image_instead_of_the_text() {
         "a sentence is not a path: {action:?}"
     );
 
-    // A file that exists but is not a PNG is refused with a reason, and the line stays put:
-    // sending the path as text would leave the user thinking the picture went with it.
-    let jpeg = dir.join("photo.jpg");
-    std::fs::write(&jpeg, b"\xff\xd8\xff\xe0 not really a jpeg").unwrap();
+    // A file that exists but is not an image at all is refused with a reason, and the line
+    // stays put: sending the path as text would leave the user thinking the picture went
+    // with it.
+    let jpeg = dir.join("notes.txt");
+    std::fs::write(&jpeg, b"just text, not an image").unwrap();
     let mut s4 = screen();
     s4.begin_line();
     set_input(&mut s4, &jpeg.to_string_lossy());
@@ -2284,7 +2289,7 @@ fn submitting_a_path_sends_the_image_instead_of_the_text() {
     )));
     assert!(refused.is_none(), "nothing is sent: {refused:?}");
     assert!(
-        s4.notice.as_deref().is_some_and(|n| n.contains("PNG")),
+        s4.notice.as_deref().is_some_and(|n| n.contains("图片格式")),
         "{:?}",
         s4.notice
     );
