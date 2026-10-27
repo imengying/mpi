@@ -16,7 +16,8 @@ pub fn spec() -> ToolSpec {
     ToolSpec {
         name: "view_image".into(),
         description: "查看磁盘上的图片（PNG / JPEG / GIF / WebP）。用在需要真正看见画面的时候：\
-                      截图、渲染结果、界面设计。返回图片本身，不是对图片的描述。"
+                      截图、渲染结果、界面设计。返回图片本身，不是对图片的描述。\
+                      读图一律用这个工具；read 只读文本，遇到图片会拒绝。"
             .into(),
         parameters: serde_json::json!({
             "type": "object",

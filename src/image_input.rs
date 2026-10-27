@@ -157,7 +157,10 @@ impl From<PathError> for ImageError {
 /// Only the four types both provider APIs accept, and only the ones whose extent can be read
 /// without a full decoder. The signature is the honest source: a `.jpg` extension on PNG bytes
 /// is common, and the provider reads the type from the request rather than from the name.
-fn sniff(bytes: &[u8]) -> Option<&'static str> {
+///
+/// `pub(crate)` because `read` uses it too: hitting an image there is a wrong-tool mistake,
+/// and naming the format is what lets that error point at `view_image`.
+pub(crate) fn sniff(bytes: &[u8]) -> Option<&'static str> {
     const PNG: &[u8] = b"\x89PNG\r\n\x1a\n";
     if bytes.starts_with(PNG) {
         return Some("image/png");
