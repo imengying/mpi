@@ -242,6 +242,28 @@ impl Screen {
                     }
                 }
                 self.remember(&line);
+                // Typing or pasting a path to an image and pressing Enter sends the picture.
+                //
+                // This is the route that works with no display server at all: `Ctrl+V` reads a
+                // clipboard through X11 or a Wayland compositor, and a headless session has
+                // neither. Acting on Enter also covers the ordinary case — the file is on disk
+                // already, so there is nothing to paste.
+                //
+                // Only when the line *is* a path: a message that merely mentions one still
+                // sends what was written.
+                if self.pending_images.is_empty() {
+                    match standalone_image_path(&line) {
+                        Ok(Some(image)) => return Some(Action::LineWithImages(line, vec![image])),
+                        Err(why) => {
+                            // Not sent: the line stays on screen with the reason, so the user
+                            // can fix the file instead of wondering where the picture went.
+                            self.notice = Some(why);
+                            self.editing = Some(Editor::from_text(&line));
+                            return None;
+                        }
+                        Ok(None) => {}
+                    }
+                }
                 // Images travel with the line, and an image with no text at all is a
                 // valid message: the user may only want to show a screenshot.
                 if !self.pending_images.is_empty() {
@@ -488,5 +510,34 @@ impl Screen {
         if self.history.len() > HISTORY_LIMIT {
             self.history.remove(0);
         }
+    }
+}
+
+/// The image a submitted line names, when the line is nothing but a path to one.
+///
+/// "Nothing but" is the whole rule: `看看 /tmp/shot.png 这个报错` mentions a file, and
+/// sending that as only a picture would drop what the user wrote. A line that is exactly a
+/// path — the shape you get from typing, pasting, or dragging a file into the terminal — is
+/// a request for the picture itself.
+///
+/// Returns `None` for text that is not a path, for a path that does not exist, and for a file
+/// that is not a PNG: those all mean "send this as text", except the last, which the caller
+/// reports so the user is not left wondering why nothing happened.
+fn standalone_image_path(line: &str) -> Result<Option<crate::image_input::PastedImage>, String> {
+    let candidate = line.trim();
+    // A path is one line and short. Anything longer is prose that happens to end in `.png`.
+    if candidate.is_empty() || candidate.contains('\n') || candidate.len() > 4096 {
+        return Ok(None);
+    }
+    let path = std::path::Path::new(candidate);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    match crate::image_input::read_image_path(path) {
+        Ok(image) => Ok(Some(image)),
+        // A file that exists but cannot be sent: say so. Falling back to text would send the
+        // path as a message, and the user would be left thinking the picture went with it.
+        Err(err @ crate::image_input::PathError::NotPng) => Err(err.to_string()),
+        Err(_) => Ok(None),
     }
 }

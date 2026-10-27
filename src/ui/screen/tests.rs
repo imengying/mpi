@@ -2221,3 +2221,88 @@ fn every_clipboard_outcome_lands_somewhere_useful() {
 
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+/// Typing a path to a PNG and pressing Enter sends the picture.
+///
+/// This is the route that needs no clipboard at all, which is what makes it the only one
+/// available on a machine with no display server.
+#[test]
+fn submitting_a_path_sends_the_image_instead_of_the_text() {
+    let dir = std::env::temp_dir().join(format!("pi-enterpath-{}", uuid::Uuid::now_v7()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let png = dir.join("shot.png");
+    {
+        let mut bytes = Vec::new();
+        let mut encoder = png::Encoder::new(&mut bytes, 6, 3);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().unwrap();
+        writer.write_image_data(&[0u8; 6 * 3 * 4]).unwrap();
+        writer.finish().unwrap();
+        std::fs::write(&png, bytes).unwrap();
+    }
+    let path_text = png.to_string_lossy().to_string();
+
+    // A bare path becomes an image, and the text goes along as the message.
+    let mut s1 = screen();
+    s1.begin_line();
+    set_input(&mut s1, &path_text);
+    let action = s1.absorb_event(Event::Key(KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::NONE,
+    )));
+    let Some(Action::LineWithImages(line, images)) = action else {
+        panic!("expected the picture to travel with the line: {action:?}");
+    };
+    assert_eq!(line, path_text, "the path still reads as the message");
+    assert_eq!(images.len(), 1, "the file is attached");
+    assert_eq!((images[0].width, images[0].height), (6, 3));
+
+    // Prose that merely mentions the path is sent as written, with nothing attached.
+    let mut s2 = screen();
+    s2.begin_line();
+    set_input(&mut s2, &format!("看看 {path_text} 这个报错"));
+    let action = s2.absorb_event(Event::Key(KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::NONE,
+    )));
+    assert!(
+        matches!(action, Some(Action::Line(ref line)) if line.contains("这个报错")),
+        "a sentence is not a path: {action:?}"
+    );
+
+    // A file that exists but is not a PNG is refused with a reason, and the line stays put:
+    // sending the path as text would leave the user thinking the picture went with it.
+    let jpeg = dir.join("photo.jpg");
+    std::fs::write(&jpeg, b"\xff\xd8\xff\xe0 not really a jpeg").unwrap();
+    let mut s4 = screen();
+    s4.begin_line();
+    set_input(&mut s4, &jpeg.to_string_lossy());
+    let refused = s4.absorb_event(Event::Key(KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::NONE,
+    )));
+    assert!(refused.is_none(), "nothing is sent: {refused:?}");
+    assert!(
+        s4.notice.as_deref().is_some_and(|n| n.contains("PNG")),
+        "{:?}",
+        s4.notice
+    );
+    assert_eq!(
+        input(&s4),
+        jpeg.to_string_lossy(),
+        "the line is kept so it can be corrected"
+    );
+
+    // A path that does not exist is just text.
+    let mut s3 = screen();
+    s3.begin_line();
+    set_input(&mut s3, "/no/such/shot.png");
+    let action = s3.absorb_event(Event::Key(KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::NONE,
+    )));
+    assert!(matches!(action, Some(Action::Line(_))), "{action:?}");
+
+    std::fs::remove_dir_all(dir).unwrap();
+}
