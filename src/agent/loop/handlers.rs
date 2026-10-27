@@ -321,7 +321,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pi-boundaries-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir(&dir).unwrap();
         let config: Config = serde_json::from_value(serde_json::json!({
-            "providers":[{"name":"test","api":"completions","base_url":"http://127.0.0.1:9/v1","api_key":"local-test",
+            "providers":[{"name":"test","api":"responses","base_url":"http://127.0.0.1:9/v1","api_key":"local-test",
                 "models":[{"id":"m","context_window":6000,"max_tokens":1000,"compaction":{"reserve_tokens":2000,"keep_recent_tokens":1000}}]}],
             "default_model":"test/m"
         })).unwrap();
@@ -675,9 +675,11 @@ mod tests {
             // Split around the first token, so both readings have a window: the wait before
             // it (prefill) and the time after it (decode). Sent as one body, the delay would
             // land entirely on the prefill side.
-            let event = serde_json::json!({"choices":[{"delta":{"content":"答案"},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":30}});
+            let event = serde_json::json!({"type":"response.output_text.delta","output_index":0,"delta":"答案"});
             let first = format!("data: {event}\n\n");
-            let rest = "data: [DONE]\n\n";
+            let done = serde_json::json!({"type":"response.completed","response":{
+                "status":"completed","usage":{"input_tokens":100,"output_tokens":30}}});
+            let rest = format!("data: {done}\n\n");
             let response = format!("{first}{rest}");
             write!(
                 socket,
@@ -765,8 +767,10 @@ mod tests {
             let mut bytes = vec![0; length];
             reader.read_exact(&mut bytes).unwrap();
             let request: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-            let event = serde_json::json!({"choices":[{"delta":{"content":"已分析"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1700,"completion_tokens":3}});
-            let response = format!("data: {event}\n\ndata: [DONE]\n\n");
+            let text = serde_json::json!({"type":"response.output_text.delta","output_index":0,"delta":"已分析"});
+            let done = serde_json::json!({"type":"response.completed","response":{
+                "status":"completed","usage":{"input_tokens":1700,"output_tokens":3}}});
+            let response = format!("data: {text}\n\ndata: {done}\n\n");
             write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).unwrap();
             request
         });
@@ -810,7 +814,8 @@ mod tests {
             request["tool_choice"], "none",
             "pressure was relieved without summarization"
         );
-        assert!(request["messages"].to_string().contains("中间已裁剪"));
+        // The Responses shape puts the turns in `input`, not `messages`.
+        assert!(request["input"].to_string().contains("中间已裁剪"));
         assert_eq!(agent.session.totals.input, 1700);
         assert!(agent.session.records().iter().any(|r| matches!(
             r,

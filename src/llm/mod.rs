@@ -28,7 +28,7 @@
 pub mod anthropic;
 pub mod client;
 pub mod compat;
-pub mod openai;
+
 pub mod responses;
 
 use serde::{Deserialize, Serialize};
@@ -41,27 +41,21 @@ use crate::util;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Api {
     AnthropicMessages,
-    OpenAiCompletions,
     OpenAiResponses,
 }
 
 impl Api {
     /// Every protocol, in the order the config's docs list them.
-    pub const ALL: [Api; 3] = [
-        Api::AnthropicMessages,
-        Api::OpenAiCompletions,
-        Api::OpenAiResponses,
-    ];
+    pub const ALL: [Api; 2] = [Api::AnthropicMessages, Api::OpenAiResponses];
 
     /// The name the config writes, which is also what the error message quotes.
     ///
-    /// One word, because it is a value the user types: `completions` names the protocol as
+    /// One word, because it is a value the user types: `responses` names the protocol as
     /// precisely as a longer `openai-` prefix would, next to a `base_url` that already says
     /// whose API it is.
     pub fn name(self) -> &'static str {
         match self {
             Api::AnthropicMessages => "messages",
-            Api::OpenAiCompletions => "completions",
             Api::OpenAiResponses => "responses",
         }
     }
@@ -74,26 +68,23 @@ impl Api {
     pub fn default_base_url(self) -> &'static str {
         match self {
             Api::AnthropicMessages => "https://api.anthropic.com",
-            Api::OpenAiCompletions | Api::OpenAiResponses => "https://api.openai.com/v1",
+            Api::OpenAiResponses => "https://api.openai.com/v1",
         }
     }
 
     /// Whether this protocol sends a thinking block back on the next request.
     ///
     /// Anthropic replays the block it signed, and Responses replays the reasoning item with
-    /// its encrypted payload, so there the draft occupies prompt space and has to be
-    /// counted. Chat completions drops it — `openai::join_text` keeps only text — and what
-    /// the DeepSeek-shaped hosts ask for instead is an empty `reasoning_content` field,
-    /// which carries no content and is not billed: measured against the local gateway, a
-    /// 40k-character echo moved `prompt_tokens` by exactly 0.
+    /// its encrypted payload, so in both the draft occupies prompt space and has to be
+    /// counted.
     ///
-    /// The first two count as replayed even when a particular block would be dropped (a
-    /// signature from another provider, a reasoning item whose envelope does not match).
-    /// Over-counting a handful of blocks is the cheap side of this estimate; the expensive
-    /// side was treating 77% of everything ever produced as prompt space on a protocol that
-    /// never sends it.
+    /// Either counts as replayed even when a particular block would be dropped (a signature
+    /// from another provider, a reasoning item whose envelope does not match). Over-counting
+    /// a handful of blocks is the cheap side of this estimate; the expensive side was
+    /// treating 77% of everything ever produced as prompt space on a protocol that never
+    /// sends it.
     pub fn replays_thinking(self) -> bool {
-        !matches!(self, Api::OpenAiCompletions)
+        true
     }
 }
 
@@ -321,11 +312,9 @@ impl Message {
 
     /// chars/4 estimate of what this message costs the request it is part of.
     ///
-    /// `replay` decides whether thinking counts, because the three protocols do not agree
-    /// on it. Anthropic sends back the block it signed and Responses sends back the
-    /// encrypted reasoning item, so there the draft is prompt space. Plain chat
-    /// completions sends nothing back — [`crate::llm::openai`]'s `join_text` drops the
-    /// block — so counting it there reads the request several times its real size.
+    /// `replay` decides whether thinking counts, and on both protocols it does. Anthropic
+    /// sends back the block it signed and Responses sends back the encrypted reasoning
+    /// item, so in either the draft occupies prompt space.
     ///
     /// An image is charged a fixed cost rather than its byte length: providers bill by
     /// tiles or by a visual-token formula, not by how well a PNG compressed, so measuring
@@ -588,7 +577,7 @@ pub fn hosted_search(model: &ModelConfig, provider: &Provider) -> Option<compat:
         return None;
     }
     let format = provider.compat(model).search_format?;
-    let api = provider.api().unwrap_or(Api::OpenAiCompletions);
+    let api = provider.api().unwrap_or(Api::OpenAiResponses);
     format.fits(api).then_some(format)
 }
 
@@ -671,9 +660,8 @@ pub fn clamp_level(model: &ModelConfig, level: &str) -> (String, bool) {
 /// Estimate the complete model-visible request, including stable tool definitions.
 ///
 /// `replay` comes from the protocol this request is going to; see
-/// [`Api::replays_thinking`]. Pass it rather than guessing: the same history costs
-/// different amounts on `messages` and on `completions`, and every threshold in the agent
-/// is built on this number.
+/// [`Api::replays_thinking`]. Pass it rather than guessing, because every threshold in the
+/// agent is built on this number.
 pub fn estimate_request_context(
     messages: &[Message],
     system: &str,
@@ -766,11 +754,9 @@ mod tests {
 
     #[test]
     fn thinking_is_counted_only_where_the_protocol_sends_it_back() {
-        // A session that produced a long draft next to a short answer. The draft is the
-        // whole difference between the two readings, and on `completions` it never reaches
-        // the upstream — measured against the local gateway, a 40k-character
-        // `reasoning_content` echo moved `prompt_tokens` by exactly 0. Counting it made
-        // real sessions estimate 3-6x over the prompt the upstream reported.
+        // A session that produced a long draft next to a short answer. Both remaining
+        // protocols replay the draft, so it is prompt space and has to be counted; skipping
+        // it made real sessions estimate 3-6x under the prompt the upstream reported.
         let message = Message::Assistant {
             content: vec![
                 Block::Thinking {
@@ -796,10 +782,11 @@ mod tests {
     }
 
     #[test]
-    fn only_chat_completions_drops_thinking_from_the_request() {
+    fn both_remaining_protocols_replay_thinking() {
+        // The one protocol that did not — Chat Completions — is gone, so this now pins the
+        // rule for what is left: a draft occupies prompt space on every protocol pi speaks.
         assert!(Api::AnthropicMessages.replays_thinking());
         assert!(Api::OpenAiResponses.replays_thinking());
-        assert!(!Api::OpenAiCompletions.replays_thinking());
     }
 
     #[test]

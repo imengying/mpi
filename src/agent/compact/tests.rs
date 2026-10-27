@@ -49,13 +49,16 @@ async fn compaction_has_separate_session_headers_and_no_main_cache_key() {
         let mut bytes = vec![0; headers["content-length"].parse::<usize>().unwrap()];
         reader.read_exact(&mut bytes).unwrap();
         let request: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        let response = serde_json::json!({"choices":[{"message":{"content":"## Goal\n完成第一项任务"},"finish_reason":"stop"}],
-                "usage":{"prompt_tokens":10000,"prompt_cache_hit_tokens":9000,"prompt_cache_miss_tokens":1000,"completion_tokens":30}}).to_string();
+        let response = serde_json::json!({
+            "status":"completed",
+            "output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"## Goal\n完成第一项任务"}]}],
+            "usage":{"input_tokens":10000,"output_tokens":30,
+                     "input_tokens_details":{"cached_tokens":9000}}}).to_string();
         write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).unwrap();
         (request, headers)
     });
     let provider: Provider = serde_json::from_value(serde_json::json!({
-        "api":"completions","base_url":format!("http://{address}/v1"),"api_key":"local-test",
+        "api":"responses","base_url":format!("http://{address}/v1"),"api_key":"local-test",
         "compat":{"send_session_affinity":true}
     }))
     .unwrap();
@@ -105,12 +108,14 @@ async fn compaction_has_separate_session_headers_and_no_main_cache_key() {
     assert_eq!(headers["x-session-id"], "summary-session");
     assert_eq!(headers["x-session-affinity"], "summary-session");
     assert!(request.get("prompt_cache_key").is_none());
+    // The summary request keeps the tools but forbids calling one.
     assert_eq!(request["tool_choice"], "none");
     assert_eq!(request["tools"].as_array().unwrap().len(), tools.len());
-    assert_eq!(request["messages"][0]["content"], "固定系统提示");
-    assert_eq!(request["messages"][1]["content"], "第一项任务");
-    assert_eq!(request["messages"][2]["content"], source[1].text());
-    assert_eq!(request["reasoning_effort"], "max");
+    // The Responses shape carries the system prompt in `instructions` and the turns in
+    // `input`, not the `messages` array Chat Completions used.
+    assert_eq!(request["instructions"], "固定系统提示");
+    assert_eq!(request["input"][0]["content"][0]["text"], "第一项任务");
+    assert_eq!(request["reasoning"]["effort"], "max");
     assert_eq!(outcome.usage.cache_read, 9000);
     assert_eq!(outcome.replacement.last(), source.last());
     assert_eq!(source, original);
@@ -159,12 +164,14 @@ async fn a_compaction_carries_the_environment_block_through_the_real_path() {
         }
         let mut bytes = vec![0; headers["content-length"].parse::<usize>().unwrap()];
         reader.read_exact(&mut bytes).unwrap();
-        let response = serde_json::json!({"choices":[{"message":{"content":"## Goal\n继续"},"finish_reason":"stop"}],
+        let response = serde_json::json!({
+            "status":"completed",
+            "output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"## Goal\n继续"}]}],
                 "usage":{"prompt_tokens":10000,"completion_tokens":30}}).to_string();
         write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).unwrap();
     });
     let provider: Provider = serde_json::from_value(
-        serde_json::json!({"api":"completions","base_url":format!("http://{address}/v1"),"api_key":"k"}),
+        serde_json::json!({"api":"responses","base_url":format!("http://{address}/v1"),"api_key":"k"}),
     )
     .unwrap();
     let model = ModelConfig {
@@ -234,7 +241,9 @@ async fn a_block_that_opens_a_split_turn_is_still_pushed_only_once() {
         let (mut socket, _) = listener.accept().unwrap();
         let mut buf = [0u8; 8192];
         let _ = std::io::Read::read(&mut socket, &mut buf);
-        let response = serde_json::json!({"choices":[{"message":{"content":"## Goal\n继续"},"finish_reason":"stop"}],
+        let response = serde_json::json!({
+            "status":"completed",
+            "output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"## Goal\n继续"}]}],
                 "usage":{"prompt_tokens":10,"completion_tokens":3}}).to_string();
         let _ = write!(
             socket,
@@ -243,7 +252,7 @@ async fn a_block_that_opens_a_split_turn_is_still_pushed_only_once() {
         );
     });
     let provider: Provider = serde_json::from_value(
-        serde_json::json!({"api":"completions","base_url":format!("http://{address}/v1"),"api_key":"k"}),
+        serde_json::json!({"api":"responses","base_url":format!("http://{address}/v1"),"api_key":"k"}),
     )
     .unwrap();
     let model = ModelConfig {
@@ -323,7 +332,7 @@ async fn a_block_that_opens_a_split_turn_is_still_pushed_only_once() {
 #[test]
 fn oversized_history_falls_back_without_changing_system_tools_or_recent_request() {
     let provider = Provider {
-        api: "completions".into(),
+        api: "responses".into(),
         ..Default::default()
     };
     let model = ModelConfig {
@@ -387,7 +396,7 @@ fn oversized_history_falls_back_without_changing_system_tools_or_recent_request(
 #[test]
 fn summary_preserves_absent_system_and_rejects_an_unfit_fixed_prefix() {
     let provider = Provider {
-        api: "completions".into(),
+        api: "responses".into(),
         ..Default::default()
     };
     let model = ModelConfig {

@@ -444,10 +444,12 @@ mod tests {
                     }
                 }
                 reader.read_exact(&mut vec![0; length]).unwrap();
-                let event = serde_json::json!({"choices":[{"delta":{"content":"保留正文", "reasoning_content":"保留思考", "tool_calls":[{
-                    "index":0,"id":"unconfirmed","function":{"name":"write","arguments":"{\"path\":\"must-not-exist\",\"content\":\"bad\"}"}
-                }]}}]});
-                let mut body = format!("data: {event}\n\n");
+                let thinking = serde_json::json!({"type":"response.reasoning_summary_text.delta","output_index":0,"delta":"保留思考"});
+                let text = serde_json::json!({"type":"response.output_text.delta","output_index":1,"delta":"保留正文"});
+                let item = serde_json::json!({"type":"response.output_item.added","output_index":2,"item":{
+                    "type":"function_call","id":"fc1","call_id":"unconfirmed","name":"write",
+                    "arguments":"{\"path\":\"must-not-exist\",\"content\":\"bad\"}"}});
+                let mut body = format!("data: {thinking}\n\ndata: {text}\n\ndata: {item}\n\n");
                 if failure == "in-band" {
                     body.push_str("data: {\"error\":{\"message\":\"upstream failed\"}}\n\n");
                 }
@@ -459,7 +461,7 @@ mod tests {
                 socket.flush().unwrap();
             });
             let config: Config = serde_json::from_value(serde_json::json!({
-                "providers":[{"name":"test","api":"completions","base_url":format!("http://{address}/v1"), "api_key":"local-test", "models":[{"id":"m","context_window":128000}]}],
+                "providers":[{"name":"test","api":"responses","base_url":format!("http://{address}/v1"), "api_key":"local-test", "models":[{"id":"m","context_window":128000}]}],
                 "default_model":"test/m"
             })).unwrap();
             let dir = std::env::temp_dir().join(format!("pi-unconfirmed-{}", uuid::Uuid::now_v7()));
@@ -539,19 +541,22 @@ mod tests {
                 let mut body = vec![0; length];
                 reader.read_exact(&mut body).unwrap();
                 requests.push(serde_json::from_slice::<serde_json::Value>(&body).unwrap());
-                let delta = serde_json::json!({"content":"第一部分", "tool_calls":[{
-                    "index":0,"id":"cut-call","function":{"name":"write",
-                    "arguments":"{\"path\":\"must-not-exist\",\"content\":\"bad\"}"}
-                }]});
-                let event = serde_json::json!({"choices":[{"delta":delta,"finish_reason":"length"}],
-                    "usage":{"prompt_tokens":100,"completion_tokens":128}});
-                let body = format!("data: {event}\n\ndata: [DONE]\n\n");
+                let text = serde_json::json!({"type":"response.output_text.delta","output_index":0,"delta":"第一部分"});
+                let call = serde_json::json!({"type":"response.output_item.added","output_index":1,"item":{
+                    "type":"function_call","id":"fc1","call_id":"cut-call","name":"write",
+                    "arguments":"{\"path\":\"must-not-exist\",\"content\":\"bad\"}"}});
+                // `incomplete` with `max_output_tokens` is how this API reports a cut-off
+                // answer, where Chat Completions said `finish_reason: "length"`.
+                let done = serde_json::json!({"type":"response.incomplete","response":{
+                    "status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},
+                    "usage":{"input_tokens":100,"output_tokens":128}}});
+                let body = format!("data: {text}\n\ndata: {call}\n\ndata: {done}\n\n");
                 write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
             }
             (requests, listener)
         });
         let config: Config = serde_json::from_value(serde_json::json!({
-            "providers":[{"name":"test","api":"completions","base_url":format!("http://{address}/v1"),
+            "providers":[{"name":"test","api":"responses","base_url":format!("http://{address}/v1"),
                 "api_key":"local-test","models":[{"id":"m","max_tokens":128,"context_window":128000}]}],
             "default_model":"test/m"
         })).unwrap();

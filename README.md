@@ -67,7 +67,7 @@ install -m755 target/release/pi ~/.local/bin/pi
   "providers": [
     {
       "name": "name",
-      "api": "completions",
+      "api": "responses",
       "base_url": "url",
       "api_key_env": "NAME_API_KEY",
       "models": [
@@ -91,7 +91,7 @@ pi 没有内置模型目录，也不会去猜。没配置 providers 会直接报
 
 | 字段 | 说明 |
 |---|---|
-| `api` | `messages`、`completions` 或 `responses` |
+| `api` | `messages` 或 `responses` |
 | `base_url` | 缺省按 `api` 取官方地址；任意 OpenAI 兼容网关直接写它即可 |
 | `api_key_env` | 读哪个环境变量取 key，缺省为 `<PROVIDER>_API_KEY` |
 | `api_key` | 直接写 key（不推荐）；两者都缺时请求会报错 |
@@ -115,8 +115,8 @@ pi 没有内置模型目录，也不会去猜。没配置 providers 会直接报
 `xhigh` 紫、`max` 黄。整体采用 Codex 风格的简洁配色：正文、标题沿用终端前景色，
 辅助信息灰色，链接和行内代码用青色；警告与错误仍分别用黄、红色。
 
-`api` 同样只有 `messages`、`completions`、`responses` 三个取值，**没有别名**：
-协议名只有一种写法，长名字（`openai-completions` 这类）不会因为是旧写法而被接受。
+`api` 同样只有 `messages`、`responses` 两个取值，**没有别名**：
+协议名只有一种写法，长名字（`openai-responses` 这类）不会因为是旧写法而被接受。
 少一种写法就少一件要记住的事，而写错时那句报错会把该写什么直接说出来。
 
 **写错的字段名同样会在启动时报错。** 配置字段一律 snake_case，写成 `baseUrl`
@@ -124,12 +124,11 @@ pi 没有内置模型目录，也不会去猜。没配置 providers 会直接报
 主机（比如 `api.openai.com`），带着你的 key 和整段对话。所以这类拼写错误会被点名
 拦下，并提示正确写法，而不是让请求发到别处。
 
-### 三个协议怎么选
+### 两个协议怎么选
 
 | `api` | 什么时候用 |
 |---|---|
-| `completions` | 绝大多数网关与中转（DeepSeek、GLM、Kimi…）；先试这个 |
-| `responses` | 只会说 Responses 的模型（GPT-5 系、Codex），或网关只对这个端点开通了某模型 |
+| `responses` | 绝大多数网关与中转，以及只会说 Responses 的模型（GPT-5 系、Codex） |
 | `messages` | Anthropic 官方或兼容 Messages 的服务 |
 
 `responses` 会以 `store: false` 发送，会话只在本地存一份，服务端不留档；
@@ -142,9 +141,6 @@ pi 没有内置模型目录，也不会去猜。没配置 providers 会直接报
 
 不同网关对「OpenAI 兼容」的理解不一样。pi 按 `base_url` 自动探测一组开关，
 配置里只写例外（`compat` 可以是 provider 级或 model 级，model 级优先）。
-对 `completions` 协议，`deepseek-*` 模型（也支持 `deepseek-ai/DeepSeek-*`）会按模型名补充
-DeepSeek 的推理参数与历史回传规则，避免通用中转地址漏发 `reasoning_content`。
-显式配置的 `compat` 仍然优先；同一中转里的其他模型不受此规则影响。
 `responses` 只用到其中的 `supports_strict_mode`（工具定义上的 `strict`）
 与 `send_session_affinity`（会话粘性头），其余开关对它没有意义——
 它的思考参数、请求形状与缓存键都是这个协议固定的写法。

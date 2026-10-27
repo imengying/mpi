@@ -38,7 +38,7 @@ impl Default for ShellConfig {
 #[serde(default)]
 pub struct Provider {
     pub name: String,
-    /// `messages`, `completions` or `responses`.
+    /// `messages` or `responses`.
     pub api: String,
     pub base_url: String,
     pub api_key_env: Option<String>,
@@ -64,7 +64,7 @@ pub struct ModelConfig {
     /// a tool that appears and disappears between turns breaks the cache prefix.
     pub search: bool,
     /// Sampling overrides keyed by the effective thinking level. These are sent on
-    /// OpenAI-compatible chat-completions routes; other protocols keep their defaults.
+    /// OpenAI-compatible Responses routes; other protocols keep their defaults.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub sampling_params_by_thinking_level: BTreeMap<String, SamplingParams>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -127,15 +127,6 @@ pub fn level_index(level: &str) -> Option<usize> {
 }
 
 impl ModelConfig {
-    fn is_deepseek(&self) -> bool {
-        self.id
-            .rsplit('/')
-            .next()
-            .unwrap_or(&self.id)
-            .to_ascii_lowercase()
-            .starts_with("deepseek-")
-    }
-
     pub fn display_name(&self) -> &str {
         self.name.as_deref().unwrap_or(&self.id)
     }
@@ -251,7 +242,7 @@ pub enum ConfigError {
         model: String,
         level: String,
     },
-    #[error("provider「{0}」的 api 必须是 messages、completions 或 responses")]
+    #[error("provider「{0}」的 api 必须是 messages 或 responses")]
     BadApi(String),
     #[error("{0}")]
     UnknownField(String),
@@ -271,7 +262,7 @@ pub enum ConfigError {
         reason: String,
     },
     #[error(
-        "provider「{provider}」的模型「{model}」打开了 search，但这个接口没有可用的原生搜索写法。在 compat.search_format 里指定：responses 用 web_search 或 web_and_x，messages 用 anthropic，completions 用 xai、qwen 或 zhipu。DeepSeek 官方接口不能原生搜索，请把 search 设为 false"
+        "provider「{provider}」的模型「{model}」打开了 search，但这个接口没有可用的原生搜索写法。在 compat.search_format 里指定：responses 用 web_search 或 web_and_x，messages 用 anthropic。DeepSeek 官方接口不能原生搜索，请把 search 设为 false"
     )]
     NoNativeSearch { provider: String, model: String },
 }
@@ -488,7 +479,7 @@ pub const TEMPLATE: &str = r#"{
   "providers": [
     {
       "name": "provider-name",
-      "api": "completions",
+      "api": "responses",
       "base_url": "http://127.0.0.1:8000/v1",
       "api_key_env": "PROVIDER_NAME_API_KEY",
       "models": [
@@ -622,7 +613,7 @@ impl Config {
                 }
                 if model.search {
                     let format = provider.compat(model).search_format;
-                    let api = provider.api().unwrap_or(crate::llm::Api::OpenAiCompletions);
+                    let api = provider.api().unwrap_or(crate::llm::Api::OpenAiResponses);
                     if format.is_none_or(|format| !format.fits(api)) {
                         return Err(ConfigError::NoNativeSearch {
                             provider: provider.name.clone(),
@@ -727,15 +718,11 @@ impl Provider {
 
     pub fn compat(&self, model: &ModelConfig) -> Compat {
         // An unrecognised api has already been rejected at start-up; falling back to the
-        // completions shape here keeps this total without inventing a protocol.
-        let api = self.api().unwrap_or(crate::llm::Api::OpenAiCompletions);
+        // Responses shape here keeps this total without inventing a protocol.
+        let api = self.api().unwrap_or(crate::llm::Api::OpenAiResponses);
         let mut compat = Compat::from_base_url(&self.base_url, api);
         // Gateways host several model families on one URL. DeepSeek's reasoning protocol
         // belongs to the model, so a neutral gateway must not drop its reasoning history.
-        if api == crate::llm::Api::OpenAiCompletions && model.is_deepseek() {
-            compat.thinking_format = crate::llm::compat::ThinkingFormat::Deepseek;
-            compat.requires_reasoning_content_on_assistant = true;
-        }
         if let Some(overrides) = &self.compat {
             compat.apply(overrides);
         }
@@ -910,61 +897,9 @@ mod tests {
     }
 
     #[test]
-    fn gateway_models_select_their_own_reasoning_protocol_and_keep_overrides() {
-        use crate::llm::compat::ThinkingFormat;
-        let provider: Provider = serde_json::from_value(serde_json::json!({
-            "name":"gateway", "api":"completions", "base_url":"https://gateway.example/v1"
-        }))
-        .unwrap();
-        for id in ["deepseek-v4.1-flash", "deepseek-ai/DeepSeek-V4.1-Flash"] {
-            let model = ModelConfig {
-                id: id.into(),
-                ..Default::default()
-            };
-            let compat = provider.compat(&model);
-            assert_eq!(compat.thinking_format, ThinkingFormat::Deepseek);
-            assert!(compat.requires_reasoning_content_on_assistant);
-        }
-        let mut model = ModelConfig {
-            id: "deepseek-v4.1-flash".into(),
-            ..Default::default()
-        };
-        model.compat = Some(
-            serde_json::from_value(serde_json::json!({
-                "thinking_format":"none", "requires_reasoning_content_on_assistant":false
-            }))
-            .unwrap(),
-        );
-        let compat = provider.compat(&model);
-        assert_eq!(compat.thinking_format, ThinkingFormat::None);
-        assert!(!compat.requires_reasoning_content_on_assistant);
-        assert_eq!(
-            provider
-                .compat(&ModelConfig {
-                    id: "another-model".into(),
-                    ..Default::default()
-                })
-                .thinking_format,
-            ThinkingFormat::Openai
-        );
-        let provider = Provider {
-            api: "responses".into(),
-            ..provider
-        };
-        assert!(
-            !provider
-                .compat(&ModelConfig {
-                    id: "deepseek-v4.1-flash".into(),
-                    ..Default::default()
-                })
-                .requires_reasoning_content_on_assistant
-        );
-    }
-
-    #[test]
     fn sampling_params_follow_the_effective_level_and_validate_ranges() {
         let raw = serde_json::json!({
-            "providers": [{"name":"p", "api":"completions", "models": [{
+            "providers": [{"name":"p", "api":"responses", "models": [{
                 "id":"m",
                 "sampling_params_by_thinking_level": {
                     "off": {"temperature": 0.2},
@@ -978,7 +913,7 @@ mod tests {
         assert_eq!(model.sampling_params("high").unwrap().top_p, Some(0.9));
 
         let invalid = serde_json::json!({
-            "providers": [{"name":"p", "api":"completions", "models": [{
+            "providers": [{"name":"p", "api":"responses", "models": [{
                 "id":"m", "sampling_params_by_thinking_level": {"high": {"top_p": 2.0}}
             }]}]
         });
@@ -989,7 +924,7 @@ mod tests {
     fn sample() -> Config {
         let raw = r#"{
           "providers": [
-            {"name":"work","api":"completions","base_url":"http://x/v1",
+            {"name":"work","api":"responses","base_url":"http://x/v1",
              "models":[{"id":"m1","reasoning":true,"thinking_levels":["low","high","max"]},
                        {"id":"m2"}]}
           ]
@@ -1048,7 +983,7 @@ mod tests {
 
     #[test]
     fn unknown_level_is_rejected() {
-        let raw = r#"{"providers":[{"name":"p","api":"completions","models":[{"id":"m","thinking_levels":["off"]}]}]}"#;
+        let raw = r#"{"providers":[{"name":"p","api":"responses","models":[{"id":"m","thinking_levels":["off"]}]}]}"#;
         let cfg: Config = serde_json::from_str(raw).unwrap();
         assert!(matches!(
             cfg.validate(&PathBuf::from("x")),
@@ -1081,13 +1016,15 @@ mod tests {
         // accepted as a second spelling: two ways to write the same thing means the next
         // reader has to know both, and the error says the same thing the docs do.
         for raw in [
-            r#"{"providers":[{"name":"p","api":"openai-completions","models":[{"id":"m"}]}]}"#,
-            r#"{"providers":[{"name":"p","api":"anthropic-messages","models":[{"id":"m"}]}]}"#,
             r#"{"providers":[{"name":"p","api":"openai-responses","models":[{"id":"m"}]}]}"#,
+            r#"{"providers":[{"name":"p","api":"anthropic-messages","models":[{"id":"m"}]}]}"#,
+            // A protocol pi no longer speaks is rejected by name rather than quietly sent to
+            // an endpoint that takes a different body.
+            r#"{"providers":[{"name":"p","api":"completions","models":[{"id":"m"}]}]}"#,
         ] {
             let cfg: Config = serde_json::from_str(raw).unwrap();
             let err = cfg.validate(&PathBuf::from("x")).unwrap_err().to_string();
-            assert!(err.contains("messages、completions 或 responses"), "{err}");
+            assert!(err.contains("messages 或 responses"), "{raw}: {err}");
         }
     }
 
@@ -1099,7 +1036,7 @@ mod tests {
         let raw = serde_json::json!({
             "providers": [{
                 "name": "grok",
-                "api": "completions",
+                "api": "responses",
                 "baseUrl": "https://api.example.org/v1",
                 "models": [{"id": "grok-4.7"}]
             }]
@@ -1118,20 +1055,20 @@ mod tests {
     fn misspellings_are_caught_at_every_level() {
         let cases = [
             // A provider field.
-            serde_json::json!({"providers":[{"name":"p","api":"completions",
+            serde_json::json!({"providers":[{"name":"p","api":"responses",
                 "key":"x","models":[{"id":"m"}]}]}),
             // A model field.
-            serde_json::json!({"providers":[{"name":"p","api":"completions",
+            serde_json::json!({"providers":[{"name":"p","api":"responses",
                 "models":[{"id":"m","maxTokens":100}]}]}),
             // A compat switch.
-            serde_json::json!({"providers":[{"name":"p","api":"completions",
+            serde_json::json!({"providers":[{"name":"p","api":"responses",
                 "compat":{"sendSessionAffinityHeaders":true},"models":[{"id":"m"}]}]}),
             // The shell block.
             serde_json::json!({"shell":{"shell":"/bin/zsh"},"providers":[{"name":"p",
-                "api":"completions","models":[{"id":"m"}]}]}),
+                "api":"responses","models":[{"id":"m"}]}]}),
             // The root itself.
             serde_json::json!({"provider":[],"providers":[{"name":"p",
-                "api":"completions","models":[{"id":"m"}]}]}),
+                "api":"responses","models":[{"id":"m"}]}]}),
         ];
         for case in cases {
             let err =
@@ -1185,7 +1122,7 @@ mod tests {
 
     #[test]
     fn a_key_with_no_obvious_snake_case_form_is_still_reported() {
-        let raw = serde_json::json!({"providers":[{"name":"p","api":"completions",
+        let raw = serde_json::json!({"providers":[{"name":"p","api":"responses",
             "models":[{"id":"m","contextwindo":1}]}]});
         let text = check_unknown_fields(&raw).unwrap_err().to_string();
         assert!(text.contains("contextwindo"), "{text}");

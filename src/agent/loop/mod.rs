@@ -668,7 +668,7 @@ mod tests {
     #[test]
     fn switching_sessions_restores_the_target_model_and_level() {
         let config: Config = serde_json::from_value(serde_json::json!({
-            "providers":[{"name":"test", "api":"completions", "base_url":"http://127.0.0.1", "api_key":"unused", "models":[
+            "providers":[{"name":"test", "api":"responses", "base_url":"http://127.0.0.1", "api_key":"unused", "models":[
                 {"id":"first", "reasoning":true}, {"id":"second", "reasoning":true}
             ]}], "default_model":"test/first"
         })).unwrap();
@@ -803,7 +803,7 @@ mod tests {
         // The rate describes the responses in one conversation, or from one provider. Carried
         // across a switch it would be read as the new session's speed.
         let config: Config = serde_json::from_value(serde_json::json!({
-            "providers":[{"name":"test", "api":"completions", "base_url":"http://127.0.0.1", "api_key":"unused",
+            "providers":[{"name":"test", "api":"responses", "base_url":"http://127.0.0.1", "api_key":"unused",
                 "models":[{"id":"m","reasoning":true}]}],
             "default_model":"test/m"
         }))

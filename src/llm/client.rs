@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use super::{Api, Delta, LlmError, Request, anthropic, openai, responses};
+use super::{Api, Delta, LlmError, Request, anthropic, responses};
 use crate::config::Provider;
 
 pub struct Client {
@@ -99,7 +99,6 @@ fn parse_retry_after(value: &str) -> Option<Duration> {
 /// One decoded SSE frame, ready to be handed to the matching assembler.
 enum Frame {
     Anthropic(Box<anthropic::StreamEvent>),
-    OpenAi(Box<openai::StreamChunk>),
     Responses(Box<responses::StreamEvent>),
 }
 
@@ -115,7 +114,6 @@ enum Frame {
 /// They are not merged into one type despite the resemblance: see the note in `llm/mod.rs`.
 struct Assemblers {
     anthropic: anthropic::Assembler,
-    openai: openai::Assembler,
     responses: responses::Assembler,
 }
 
@@ -123,7 +121,6 @@ impl Assemblers {
     fn finish(self, api: Api) -> super::Completion {
         match api {
             Api::AnthropicMessages => self.anthropic.finish_stream(),
-            Api::OpenAiCompletions => self.openai.finish_stream(),
             Api::OpenAiResponses => self.responses.finish_stream(),
         }
     }
@@ -242,16 +239,10 @@ impl Client {
             }
             request
         } else {
-            let mut request = match api {
-                Api::OpenAiResponses => self
-                    .http
-                    .post(responses::endpoint(&provider.base_url))
-                    .json(&responses::build_request(req, true)),
-                _ => self
-                    .http
-                    .post(openai::endpoint(&provider.base_url))
-                    .json(&openai::build_request(req, true)),
-            };
+            let mut request = self
+                .http
+                .post(responses::endpoint(&provider.base_url))
+                .json(&responses::build_request(req, true));
             request = request.bearer_auth(api_key);
             request
         };
@@ -364,7 +355,6 @@ impl Client {
         let body = summary_request_body(req)?;
         let endpoint = match api {
             Api::AnthropicMessages => anthropic::endpoint(&provider.base_url),
-            Api::OpenAiCompletions => openai::endpoint(&provider.base_url),
             Api::OpenAiResponses => responses::endpoint(&provider.base_url),
         };
         let mut request = self.http.post(endpoint).json(&body);
@@ -403,9 +393,6 @@ impl Client {
         match api {
             Api::AnthropicMessages => serde_json::from_str::<anthropic::FullResponse>(&text)
                 .map(|full| full.assemble(&provider.base_url, &req.model.id))
-                .map_err(decode),
-            Api::OpenAiCompletions => serde_json::from_str::<openai::FullResponse>(&text)
-                .map(openai::FullResponse::assemble)
                 .map_err(decode),
             Api::OpenAiResponses => {
                 let mut assembler = responses::Assembler::default();
@@ -464,7 +451,6 @@ fn dispatch(
 ) -> Result<(), LlmError> {
     match parse_sse_frame(frame, api)? {
         Some(Frame::Anthropic(event)) => assemblers.anthropic.feed(*event, on_delta),
-        Some(Frame::OpenAi(chunk)) => chunk.feed(&mut assemblers.openai, on_delta),
         Some(Frame::Responses(event)) => event.feed(&mut assemblers.responses, on_delta),
         None => {}
     }
@@ -508,7 +494,6 @@ fn parse_sse_frame(frame: &str, api: Api) -> Result<Option<Frame>, LlmError> {
     Ok(match api {
         Api::AnthropicMessages => anthropic::parse_event(event_name.as_deref(), &data)?
             .map(|e| Frame::Anthropic(Box::new(e))),
-        Api::OpenAiCompletions => openai::parse_frame(&data)?.map(|c| Frame::OpenAi(Box::new(c))),
         Api::OpenAiResponses => {
             responses::parse_frame(&data)?.map(|e| Frame::Responses(Box::new(e)))
         }
@@ -520,7 +505,6 @@ fn parse_sse_frame(frame: &str, api: Api) -> Result<Option<Frame>, LlmError> {
 #[serde(untagged)]
 pub enum SummaryBody {
     Messages(anthropic::MessagesRequest),
-    Completions(openai::ChatRequest),
     Responses(responses::ResponsesRequest),
 }
 
@@ -532,11 +516,6 @@ pub fn summary_request_body(req: &Request<'_>) -> Result<SummaryBody, LlmError> 
             body.stream = false;
             body.prohibit_tools();
             SummaryBody::Messages(body)
-        }
-        Api::OpenAiCompletions => {
-            let mut body = openai::build_request(req, false);
-            body.prohibit_tools();
-            SummaryBody::Completions(body)
         }
         Api::OpenAiResponses => {
             let mut body = responses::build_request(req, false);
@@ -585,10 +564,6 @@ mod tests {
     fn tool_prefix(api: Api) -> Vec<serde_json::Value> {
         let args = r#"{"path":"must-not-exist","content":"bad"}"#;
         match api {
-            Api::OpenAiCompletions => vec![serde_json::json!({"choices":[{"delta":{
-                "content":"已生成的正文", "reasoning_content":"已有思考",
-                "tool_calls":[{"index":0,"id":"c1","function":{"name":"write","arguments":args}}]
-            }}]})],
             Api::OpenAiResponses => vec![
                 serde_json::json!({"type":"response.output_text.delta", "output_index":0, "delta":"已生成的正文"}),
                 serde_json::json!({"type":"response.output_item.added", "output_index":1, "item":{"type":"function_call", "id":"fc1", "call_id":"c1", "name":"write", "arguments":args}}),
@@ -605,11 +580,7 @@ mod tests {
 
     #[test]
     fn every_protocol_requires_a_terminal_event_before_releasing_tools() {
-        for api in [
-            Api::OpenAiCompletions,
-            Api::OpenAiResponses,
-            Api::AnthropicMessages,
-        ] {
+        for api in [Api::OpenAiResponses, Api::AnthropicMessages] {
             for terminal in [false, true] {
                 let mut assemblers = Assemblers::default();
                 let mut sink = |_: Delta| {};
@@ -624,9 +595,6 @@ mod tests {
                 }
                 if terminal {
                     let events = match api {
-                        Api::OpenAiCompletions => vec![
-                            serde_json::json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
-                        ],
                         Api::OpenAiResponses => vec![
                             serde_json::json!({"type":"response.completed","response":{"status":"completed"}}),
                         ],
@@ -664,11 +632,7 @@ mod tests {
 
     #[test]
     fn in_band_errors_discard_tools_and_preserve_partial_text() {
-        for api in [
-            Api::OpenAiCompletions,
-            Api::OpenAiResponses,
-            Api::AnthropicMessages,
-        ] {
+        for api in [Api::OpenAiResponses, Api::AnthropicMessages] {
             let mut assemblers = Assemblers::default();
             let mut sink = |_: Delta| {};
             for event in tool_prefix(api) {
@@ -681,9 +645,6 @@ mod tests {
                 .unwrap();
             }
             let error = match api {
-                Api::OpenAiCompletions => {
-                    serde_json::json!({"error":{"message":"upstream failed"}})
-                }
                 Api::OpenAiResponses => {
                     serde_json::json!({"type":"error","message":"upstream failed"})
                 }
@@ -742,9 +703,8 @@ mod tests {
 
     #[test]
     fn utf8_and_crlf_frames_survive_every_transport_boundary() {
-        let bytes =
-            "data: {\"choices\":[{\"delta\":{\"content\":\"中文🙂\"}}]}\r\n\r\ndata: [DONE]\n\n"
-                .as_bytes();
+        let bytes = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"中文🙂\"}\r\n\r\n"
+            .as_bytes();
         for split in 0..=bytes.len() {
             let mut buffer = Vec::new();
             let mut assemblers = Assemblers::default();
@@ -758,7 +718,7 @@ mod tests {
                 buffer.extend_from_slice(part);
                 drain_sse(
                     &mut buffer,
-                    Api::OpenAiCompletions,
+                    Api::OpenAiResponses,
                     &mut assemblers,
                     &mut sink,
                 )
@@ -787,11 +747,6 @@ mod tests {
             Some(Frame::Anthropic(event)) => assert_eq!(event.kind, "content_block_delta"),
             _ => panic!("expected an anthropic event"),
         }
-        let frame = "data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n";
-        match parse_sse_frame(frame, Api::OpenAiCompletions).unwrap() {
-            Some(Frame::OpenAi(_)) => {}
-            _ => panic!("expected an openai chunk"),
-        }
         // The Responses API names the event twice — once as an SSE `event:` line and once
         // inside the payload — and the payload is the copy that is trusted.
         let frame = "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"x\"}\n\n";
@@ -799,11 +754,6 @@ mod tests {
             Some(Frame::Responses(event)) => assert_eq!(event.kind, "response.output_text.delta"),
             _ => panic!("expected a responses event"),
         }
-        assert!(
-            parse_sse_frame("data: [DONE]\n\n", Api::OpenAiCompletions)
-                .unwrap()
-                .is_none()
-        );
         assert!(
             parse_sse_frame("\n", Api::OpenAiResponses)
                 .unwrap()
@@ -994,7 +944,7 @@ mod tests {
                     respond(
                         &mut socket,
                         200,
-                        "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+                        "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"hello\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
                         0,
                     );
                 } else {
@@ -1033,7 +983,7 @@ mod tests {
         // 503, not 429: the retried statuses are the ones that describe a failed *attempt*.
         let (base_url, server) = scripted_server(vec![503, 503, 200]);
         let config: crate::config::Config = serde_json::from_value(serde_json::json!({
-            "providers":[{"name":"test","api":"completions","base_url":base_url,"api_key":"k",
+            "providers":[{"name":"test","api":"responses","base_url":base_url,"api_key":"k",
                 "models":[{"id":"m"}]}],
             "default_model":"test/m"
         }))
@@ -1067,7 +1017,7 @@ mod tests {
         // Six responses for one request: the original and the five retries.
         let (base_url, server) = scripted_server(vec![503, 503, 503, 503, 503, 503]);
         let config: crate::config::Config = serde_json::from_value(serde_json::json!({
-            "providers":[{"name":"test","api":"completions","base_url":base_url,"api_key":"k",
+            "providers":[{"name":"test","api":"responses","base_url":base_url,"api_key":"k",
                 "models":[{"id":"m"}]}],
             "default_model":"test/m"
         }))
@@ -1096,7 +1046,7 @@ mod tests {
         // times. One connection is all the server should see.
         let (base_url, server) = scripted_server(vec![400]);
         let config: crate::config::Config = serde_json::from_value(serde_json::json!({
-            "providers":[{"name":"test","api":"completions","base_url":base_url,"api_key":"k",
+            "providers":[{"name":"test","api":"responses","base_url":base_url,"api_key":"k",
                 "models":[{"id":"m"}]}],
             "default_model":"test/m"
         }))
@@ -1151,10 +1101,10 @@ mod tests {
         // The half-answer is real output the user can read, and the caller records it as the
         // assistant's message. A retry would print a second copy of it.
         let preamble =
-            r#"{"choices":[{"delta":{"content":"已经写出来的正文"},"finish_reason":null}]}"#;
+            r#"{"type":"response.output_text.delta","output_index":0,"delta":"已经写出来的正文"}"#;
         let (base_url, server) = truncated_server(preamble);
         let config: crate::config::Config = serde_json::from_value(serde_json::json!({
-            "providers":[{"name":"test","api":"completions","base_url":base_url,"api_key":"k",
+            "providers":[{"name":"test","api":"responses","base_url":base_url,"api_key":"k",
                 "models":[{"id":"m"}]}],
             "default_model":"test/m"
         }))

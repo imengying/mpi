@@ -5,14 +5,14 @@
 //! compare them, because a comment claiming the prefix is stable proves nothing.
 
 use mpi::config::{Config, ModelConfig, Provider};
-use mpi::llm::{Block, Message, Request, ToolSpec, ToolStatus, anthropic, openai};
+use mpi::llm::{Block, Message, Request, ToolSpec, ToolStatus, anthropic, responses};
 
 fn fixtures() -> (ModelConfig, Provider) {
     let config: Config = serde_json::from_str(
         r#"{
           "providers": [{
             "name": "name",
-            "api": "completions",
+            "api": "responses",
             "base_url": "url",
             "models": [{
               "id": "deepseek-v4.1-flash",
@@ -51,18 +51,15 @@ fn body_of(messages: &[Message], model: &ModelConfig, provider: &Provider) -> se
         session_id: "session-id",
         cache_hints: true,
     };
-    serde_json::to_value(openai::build_request(&request, true)).unwrap()
+    serde_json::to_value(responses::build_request(&request, true)).unwrap()
 }
 
-/// The JSON prefix a gateway would reuse: the system message and the tool definitions.
+/// The JSON prefix a gateway would reuse: the instructions and the tool definitions.
+///
+/// In the Responses shape the system prompt travels as `instructions` and the turns as
+/// `input`, so the reusable prefix is those two fields in that order.
 fn prefix(body: &serde_json::Value) -> String {
-    let messages = body["messages"].as_array().unwrap();
-    let system = messages
-        .iter()
-        .find(|message| message["role"] == "system" || message["role"] == "developer")
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
-    format!("{system}\n{}", body["tools"])
+    format!("{}\n{}", body["instructions"], body["tools"])
 }
 
 #[test]
@@ -94,7 +91,7 @@ fn the_system_message_and_tools_are_identical_between_turns() {
             session_id: "session-id",
             cache_hints: true,
         };
-        serde_json::to_value(openai::build_request(&request, true)).unwrap()
+        serde_json::to_value(responses::build_request(&request, true)).unwrap()
     };
     assert_eq!(
         prefix(&body(&first)),
@@ -183,16 +180,13 @@ fn tool_outcomes_reach_all_protocols_without_rewriting_success_content() {
             session_id: "s",
             cache_hints: false,
         };
-        let chat = serde_json::to_value(openai::build_request(&request, true)).unwrap();
-        let responses =
-            serde_json::to_value(mpi::llm::responses::build_request(&request, true)).unwrap();
+        let responses = serde_json::to_value(responses::build_request(&request, true)).unwrap();
         let anthropic = serde_json::to_value(anthropic::build_request(&request)).unwrap();
         let expected = if status == ToolStatus::Success {
             original.to_string()
         } else {
             format!("[工具状态：{}]\n{original}", status.label())
         };
-        assert_eq!(chat["messages"][1]["content"], expected);
         assert_eq!(responses["input"][1]["output"], expected);
         assert_eq!(anthropic["messages"][1]["content"][0]["content"], expected);
         assert_eq!(
@@ -271,18 +265,18 @@ fn the_environment_block_is_a_message_not_the_system_prompt() {
     ];
     let (model, provider) = fixtures();
     let body = body_of(&messages, &model, &provider);
-    let array = body["messages"].as_array().unwrap();
-    assert_eq!(array[0]["role"], "system");
-    assert!(array[0]["content"].as_str().unwrap() == SYSTEM);
+    // The system prompt is `instructions`; the environment block is the first input item.
+    assert_eq!(body["instructions"], SYSTEM);
+    let array = body["input"].as_array().unwrap();
     assert!(
-        array[1]["content"]
+        array[0]["content"][0]["text"]
             .as_str()
             .unwrap()
             .contains("/tmp/some-project"),
         "the cwd must travel in the conversation, not the system prompt"
     );
     // And the environment block is present exactly once, as the first user turn.
-    assert_eq!(array.len(), 2);
+    assert_eq!(array.len(), 1);
 }
 
 #[test]
@@ -312,7 +306,7 @@ fn history_is_never_rewritten_by_a_later_turn() {
 }
 
 #[test]
-fn openai_requests_carry_the_prompt_cache_key() {
+fn responses_requests_carry_the_prompt_cache_key() {
     let (model, provider) = fixtures();
     let messages = vec![
         Message::System {
@@ -363,7 +357,7 @@ fn summary_requests_keep_the_prefix_without_reusing_the_main_cache_key() {
     full_history.extend(prefix.clone());
     full_history.push(Message::assistant_text("已完成"));
     full_history.push(Message::user_text("最近任务"));
-    for api in ["completions", "messages", "responses"] {
+    for api in ["messages", "responses"] {
         let provider = Provider {
             api: api.into(),
             ..provider.clone()
@@ -396,11 +390,6 @@ fn summary_requests_keep_the_prefix_without_reusing_the_main_cache_key() {
             ..request
         };
         let (normal, messages_key, system_key) = match api {
-            "completions" => (
-                serde_json::to_value(openai::build_request(&normal, true)).unwrap(),
-                "messages",
-                "unused",
-            ),
             "messages" => (
                 serde_json::to_value(anthropic::build_request(&normal)).unwrap(),
                 "messages",
@@ -433,10 +422,6 @@ fn summary_requests_keep_the_prefix_without_reusing_the_main_cache_key() {
                 serde_json::json!("none")
             }
         );
-        if api == "completions" {
-            assert_eq!(normal["thinking"], summary["thinking"]);
-            assert_eq!(normal["reasoning_effort"], summary["reasoning_effort"]);
-        }
         assert_eq!(summary["stream"], false);
     }
     assert_eq!(
@@ -476,7 +461,6 @@ fn a_summary_budget_counts_replayed_thinking_on_the_protocols_that_send_it() {
     };
 
     for (api, expected) in [
-        ("completions", ThinkingReplay::Dropped),
         ("messages", ThinkingReplay::Replayed),
         ("responses", ThinkingReplay::Replayed),
     ] {
