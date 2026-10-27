@@ -176,7 +176,7 @@ pub(crate) fn verb_for(name: &str) -> &'static str {
         "grep" => "搜索",
         "find" => "查找",
         "ls" => "列出",
-        "read_image" | "view_image" => "查看",
+        "read_image" => "查看",
         _ => "处理",
     }
 }
@@ -208,7 +208,7 @@ pub struct ToolMetadata {
 pub fn metadata(name: &str) -> Option<ToolMetadata> {
     let execution = match name {
         // `read_image` only reads a file, so it runs alongside the other readers.
-        "read" | "grep" | "find" | "ls" | "read_image" | "view_image" => ExecutionMode::Parallel,
+        "read" | "grep" | "find" | "ls" | "read_image" => ExecutionMode::Parallel,
         "write" | "edit" | "bash" => ExecutionMode::Exclusive,
         _ => return None,
     };
@@ -270,11 +270,6 @@ pub async fn execute(
         "find" => find::execute(arguments, &context.cwd).await,
         "ls" => ls::execute(arguments, &context.cwd).await,
         "read_image" => read_image::execute(arguments, &context.cwd).await,
-        // Sessions recorded before the rename still hold `view_image` calls, and a resumed
-        // session replays them as real tool calls. Accepting the old name keeps a picture the
-        // model already asked for from turning into an error mid-conversation; the tool's
-        // output shape did not change, so replaying it is safe.
-        "view_image" => read_image::execute(arguments, &context.cwd).await,
         other => return ToolOutput::error(format!("未知工具：{other}")),
     };
     let elapsed = started.elapsed();
@@ -377,30 +372,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_advertised_tools_use_the_current_image_name() {
-        // The name is part of the tool definitions, so it is a cache boundary: `view_image`
-        // became `read_image`, and that vocabulary now matches the other harnesses (and the
-        // sentence "read_image reads an image" that the model has to reason from).
+    fn the_advertised_tools_are_exactly_the_declared_order() {
+        // The tool definitions are part of the request prefix, and their order is what makes
+        // that prefix reusable across turns: a name missing here, or shuffled, silently costs
+        // the cache on every request. `read_image` also has to be spelled the way the other
+        // harnesses spell it — the model reasons from "read_image reads an image", and a
+        // second name for the same job is something it has to guess about.
         let names: Vec<String> = specs().into_iter().map(|spec| spec.name).collect();
+        assert_eq!(names, TOOL_ORDER);
         assert!(names.iter().any(|name| name == "read_image"), "{names:?}");
         assert!(
             !names.iter().any(|name| name == "view_image"),
-            "the old name must not be advertised: {names:?}"
-        );
-        // The order is what makes the prefix reusable, so the rename must not have shuffled it.
-        assert_eq!(names, TOOL_ORDER);
-    }
-
-    #[test]
-    fn a_recorded_view_image_call_still_runs() {
-        // Sessions written before the rename hold `view_image` calls and replay them as real
-        // tool calls. Failing them would turn an already-answered request into an error in the
-        // middle of a resumed conversation.
-        assert_eq!(verb_for("view_image"), "查看");
-        assert_eq!(execution_mode("view_image"), ExecutionMode::Parallel);
-        assert!(
-            TOOL_ORDER.iter().all(|name| name != &"view_image"),
-            "not advertised"
+            "the old name must not come back: {names:?}"
         );
     }
 
