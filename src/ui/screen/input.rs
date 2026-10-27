@@ -275,11 +275,12 @@ impl Screen {
                     Ok(image) => {
                         self.pending_images.push(image);
                     }
+                    // No picture on the clipboard. The text might be the path to one — a
+                    // screenshot saved to disk, or a file dragged into the terminal — and
+                    // attaching it is what the user meant by pasting it.
                     Err(image_input::ImageError::NoImage) => {
-                        if let Ok(text) = image_input::read_clipboard_text()
-                            && let Some(editor) = &mut self.editing
-                        {
-                            editor.paste(&text);
+                        if let Ok(text) = image_input::read_clipboard_text() {
+                            self.attach_text_or_image(&text);
                         }
                     }
                     Err(err) => {
@@ -429,6 +430,36 @@ impl Screen {
             _ => {}
         }
         None
+    }
+
+    /// Take pasted text as an image path when it names one, and as text otherwise.
+    ///
+    /// A path is checked first because that is the only way to send a picture without a
+    /// clipboard: a headless session has no display server, so `Ctrl+V` reading the clipboard
+    /// fails outright, and the file is already on disk anyway. Text that is not a path takes
+    /// the ordinary route, so this costs a `stat` and nothing else.
+    pub(super) fn attach_text_or_image(&mut self, text: &str) {
+        let candidate = text.trim();
+        let attached = !candidate.is_empty()
+            && candidate.len() <= 4096
+            && !candidate.contains('\n')
+            && std::path::Path::new(candidate).is_file()
+            && match image_input::read_image_path(std::path::Path::new(candidate)) {
+                Ok(image) => {
+                    self.pending_images.push(image);
+                    true
+                }
+                // A real file that is not a PNG: say why rather than pasting its path as
+                // text, which would leave the user wondering why nothing was attached.
+                Err(err @ image_input::PathError::NotPng) => {
+                    self.notice = Some(format!("没有附加图片：{err}"));
+                    true
+                }
+                Err(_) => false,
+            };
+        if !attached {
+            self.editing.get_or_insert_with(Editor::new).paste(text);
+        }
     }
 
     /// Add a submitted line to the history, so Up recalls it later.

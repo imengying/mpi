@@ -2080,3 +2080,61 @@ fn recalling_a_folded_line_shows_the_label_again_and_still_sends_the_text() {
         "a recalled line must send what it sent before"
     );
 }
+
+/// A path pasted at the prompt attaches the image instead of inserting its text.
+///
+/// This is the only way to send a picture when there is no display server: `Ctrl+V` reads
+/// the clipboard through X11 or Wayland, and a headless session has neither.
+#[test]
+fn pasting_an_image_path_attaches_it_and_pasting_text_still_inserts_text() {
+    let dir = std::env::temp_dir().join(format!("pi-imgpaste-{}", uuid::Uuid::now_v7()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let png = dir.join("shot.png");
+    {
+        let mut bytes = Vec::new();
+        let mut encoder = png::Encoder::new(&mut bytes, 8, 4);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().unwrap();
+        writer.write_image_data(&[0u8; 8 * 4 * 4]).unwrap();
+        writer.finish().unwrap();
+        std::fs::write(&png, bytes).unwrap();
+    }
+
+    let mut s1 = screen();
+    s1.begin_line();
+    s1.attach_text_or_image(&png.to_string_lossy());
+    assert_eq!(s1.pending_images.len(), 1, "the file is attached");
+    assert_eq!(input(&s1), "", "the path is not inserted as text");
+
+    // Ordinary text still goes into the buffer, and the earlier image stays attached.
+    s1.attach_text_or_image("照着这张图改");
+    assert_eq!(input(&s1), "照着这张图改");
+    assert_eq!(s1.pending_images.len(), 1);
+
+    // A real file that is not a PNG says so instead of pasting the path as text.
+    let txt = dir.join("note.txt");
+    std::fs::write(&txt, "hello").unwrap();
+    let mut s2 = screen();
+    s2.begin_line();
+    s2.attach_text_or_image(&txt.to_string_lossy());
+    assert_eq!(
+        input(&s2),
+        "",
+        "a non-PNG file is not pasted as text either"
+    );
+    assert!(
+        s2.notice
+            .as_deref()
+            .is_some_and(|n| n.contains("没有附加图片")),
+        "{:?}",
+        s2.notice
+    );
+
+    // A path that does not exist is just text.
+    let mut s3 = screen();
+    s3.begin_line();
+    s3.attach_text_or_image("/no/such/file.png");
+    assert_eq!(input(&s3), "/no/such/file.png");
+    std::fs::remove_dir_all(dir).unwrap();
+}

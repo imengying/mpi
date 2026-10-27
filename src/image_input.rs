@@ -23,6 +23,10 @@ pub enum ImageError {
     NoImage,
     #[error("剪贴板里没有文本")]
     NoText,
+    #[error(
+        "不是 PNG 文件。只能直接发送 PNG；JPEG、WebP 等请先转成 PNG（例如 `convert x.jpg x.png`）"
+    )]
+    NotPng,
     #[error("无法访问剪贴板：{0}")]
     Clipboard(String),
     #[error("图片尺寸 {}×{} 超出上限（每边最多 {MAX_DIMENSION}）", .0, .1)]
@@ -118,6 +122,64 @@ pub fn encode_rgba(width: usize, height: usize, rgba: &[u8]) -> Result<PastedIma
     })
 }
 
+/// Why a path did not yield an image.
+#[derive(thiserror::Error, Debug)]
+pub enum PathError {
+    #[error("读不了这个文件：{0}")]
+    Read(std::io::Error),
+    #[error(
+        "不是 PNG 文件。只能直接发送 PNG；JPEG、WebP 等请先转成 PNG（例如 `convert x.jpg x.png`）"
+    )]
+    NotPng,
+    #[error("PNG 文件损坏：{0}")]
+    Decode(png::DecodingError),
+    #[error("图片尺寸 {}×{} 超出上限（每边最多 {MAX_DIMENSION}）", .0, .1)]
+    TooLarge(u32, u32),
+}
+
+impl From<PathError> for ImageError {
+    fn from(err: PathError) -> Self {
+        match err {
+            PathError::Read(err) => ImageError::Clipboard(err.to_string()),
+            PathError::NotPng => ImageError::NotPng,
+            PathError::Decode(err) => ImageError::Encode(err.to_string()),
+            PathError::TooLarge(w, h) => ImageError::TooLarge(w, h),
+        }
+    }
+}
+
+/// Load an image from a file path, for the case where the picture is already on disk.
+///
+/// A pasted screenshot arrives as raw pixels and has to be encoded; a file on disk usually
+/// does not. PNG is passed through **byte for byte** — re-encoding it would cost time and
+/// lose nothing, and the provider accepts it as-is — so the only thing read out of the file
+/// is the dimensions, from the header. That keeps the "no image crate" rule: there is no
+/// decoder here, and nothing to pull a JPEG or TIFF stack in for.
+///
+/// Anything that is not PNG is refused by name. Decoding it would mean adding a codec, and
+/// silently sending a JPEG labelled `image/png` would fail at the provider with a message
+/// about the base64 rather than about the format.
+pub fn read_image_path(path: &std::path::Path) -> Result<PastedImage, PathError> {
+    let bytes = std::fs::read(path).map_err(PathError::Read)?;
+    const MAGIC: &[u8] = b"\x89PNG\r\n\x1a\n";
+    if !bytes.starts_with(MAGIC) {
+        return Err(PathError::NotPng);
+    }
+    // Header only: the dimensions live there, and reading them does not touch the pixels.
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(&bytes));
+    let info = decoder.read_header_info().map_err(PathError::Decode)?;
+    let (width, height) = (info.width, info.height);
+    if width > MAX_DIMENSION || height > MAX_DIMENSION {
+        return Err(PathError::TooLarge(width, height));
+    }
+    Ok(PastedImage {
+        width,
+        height,
+        data: base64::engine::general_purpose::STANDARD.encode(&bytes),
+        bytes: bytes.len(),
+    })
+}
+
 /// Read the clipboard's image, if it has one.
 pub fn read_clipboard_image() -> Result<PastedImage, ImageError> {
     let mut clipboard =
@@ -192,5 +254,74 @@ mod tests {
         assert_eq!(human_size(512), "512 B");
         assert_eq!(human_size(2048), "2 KB");
         assert_eq!(human_size(3 * 1024 * 1024), "3.0 MB");
+    }
+
+    /// Build a real PNG of the given size without pulling in an encoder helper.
+    fn png_bytes(width: u32, height: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut encoder = png::Encoder::new(&mut out, width, height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().unwrap();
+        let pixels = vec![0u8; (width * height * 4) as usize];
+        writer.write_image_data(&pixels).unwrap();
+        writer.finish().unwrap();
+        out
+    }
+
+    /// The file is already an image; sending it must not require a display server.
+    ///
+    /// A headless session cannot read the clipboard at all, so a path is the only way to
+    /// attach a picture there. The bytes go out unchanged: re-encoding a PNG costs time and
+    /// buys nothing, and the provider takes it as it is.
+    #[test]
+    fn a_png_on_disk_is_sent_byte_for_byte() {
+        let dir = crate::tools::temp_dir("image-path");
+        let path = dir.join("shot.png");
+        let original = png_bytes(64, 32);
+        std::fs::write(&path, &original).unwrap();
+
+        let image = read_image_path(&path).unwrap();
+        assert_eq!((image.width, image.height), (64, 32));
+        assert_eq!(image.bytes, original.len());
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&image.data)
+            .unwrap();
+        assert_eq!(
+            decoded, original,
+            "the file must be passed through untouched"
+        );
+        assert!(matches!(
+            image.block(),
+            Block::Image { ref media_type, .. } if media_type == "image/png"
+        ));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_file_that_is_not_png_is_named_rather_than_mis_sent() {
+        // Labelling a JPEG as image/png would surface at the provider as a decoding error
+        // about the base64, which says nothing about the real problem.
+        let dir = crate::tools::temp_dir("image-not-png");
+        let fake = dir.join("photo.jpg");
+        std::fs::write(&fake, b"\xff\xd8\xff\xe0 not really a jpeg").unwrap();
+        let error = read_image_path(&fake).unwrap_err();
+        assert!(matches!(error, PathError::NotPng), "{error}");
+        assert!(error.to_string().contains("PNG"), "{error}");
+
+        // A missing file is its own message.
+        let missing = read_image_path(&dir.join("nope.png")).unwrap_err();
+        assert!(matches!(missing, PathError::Read(_)), "{missing}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_oversized_png_on_disk_is_refused_before_anything_is_sent() {
+        let dir = crate::tools::temp_dir("image-too-big");
+        let path = dir.join("huge.png");
+        std::fs::write(&path, png_bytes(MAX_DIMENSION + 1, 8)).unwrap();
+        let error = read_image_path(&path).unwrap_err();
+        assert!(matches!(error, PathError::TooLarge(..)), "{error}");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
