@@ -268,25 +268,10 @@ impl Screen {
                 // the stream", and the buffer is not part of that.
             }
             KeyCode::Char('v') if ctrl => {
-                // An image on the clipboard wins over text: a screenshot tool usually
-                // leaves both, and the user pressing Ctrl+V after a screenshot means
-                // the picture. Text paste is the consolation path.
-                match image_input::read_clipboard_image() {
-                    Ok(image) => {
-                        self.pending_images.push(image);
-                    }
-                    // No picture on the clipboard. The text might be the path to one — a
-                    // screenshot saved to disk, or a file dragged into the terminal — and
-                    // attaching it is what the user meant by pasting it.
-                    Err(image_input::ImageError::NoImage) => {
-                        if let Ok(text) = image_input::read_clipboard_text() {
-                            self.attach_text_or_image(&text);
-                        }
-                    }
-                    Err(err) => {
-                        self.notice = Some(format!("粘贴失败：{err}"));
-                    }
-                }
+                self.paste_from_clipboard(
+                    image_input::read_clipboard_image,
+                    image_input::read_clipboard_text,
+                );
             }
             KeyCode::Char('u') if ctrl => {
                 if let Some(editor) = &mut self.editing {
@@ -430,6 +415,38 @@ impl Screen {
             _ => {}
         }
         None
+    }
+
+    /// Paste the clipboard: the image if it has one, then text, then a path it names.
+    ///
+    /// The order is deliberate. A screenshot tool usually leaves both an image and its file
+    /// name, and a user pressing `Ctrl+V` after a screenshot means the picture. Text comes
+    /// next, and if it names a file on disk that file is attached as an image — which is how
+    /// a picture gets sent from a machine with no display server at all.
+    ///
+    /// **Every** image-read failure falls through to the text path, not just `NoImage`. When
+    /// the clipboard cannot be opened the error is `Clipboard`, and treating that as fatal
+    /// made the path route unreachable on exactly the machines with no other way to send a
+    /// picture. The two readers are parameters so the decision can be tested without a
+    /// display server.
+    pub(super) fn paste_from_clipboard(
+        &mut self,
+        read_image: impl FnOnce() -> Result<image_input::PastedImage, image_input::ImageError>,
+        read_text: impl FnOnce() -> Result<String, image_input::ImageError>,
+    ) {
+        let failure = match read_image() {
+            Ok(image) => {
+                self.pending_images.push(image);
+                return;
+            }
+            Err(err) => err,
+        };
+        match read_text() {
+            Ok(text) => self.attach_text_or_image(&text),
+            // Neither an image nor text. The clipboard error is the useful one: it says why
+            // nothing happened, where "no text" would only say what was not there.
+            Err(_) => self.notice = Some(format!("粘贴失败：{failure}")),
+        }
     }
 
     /// Take pasted text as an image path when it names one, and as text otherwise.

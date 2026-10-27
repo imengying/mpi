@@ -2138,3 +2138,86 @@ fn pasting_an_image_path_attaches_it_and_pasting_text_still_inserts_text() {
     assert_eq!(input(&s3), "/no/such/file.png");
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+/// The clipboard route, with each branch driven directly.
+///
+/// The readers are injected precisely so this is testable: `arboard` cannot succeed without a
+/// display server, so a test that called the real ones would only ever exercise the failure
+/// path — and the bug being guarded against was a failure path that did *not* fall through.
+#[test]
+fn every_clipboard_outcome_lands_somewhere_useful() {
+    use crate::image_input::{ImageError, PastedImage};
+
+    let dir = std::env::temp_dir().join(format!("pi-clip-{}", uuid::Uuid::now_v7()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let png = dir.join("shot.png");
+    {
+        let mut bytes = Vec::new();
+        let mut encoder = png::Encoder::new(&mut bytes, 4, 4);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().unwrap();
+        writer.write_image_data(&[0u8; 4 * 4 * 4]).unwrap();
+        writer.finish().unwrap();
+        std::fs::write(&png, bytes).unwrap();
+    }
+    let path_text = png.to_string_lossy().to_string();
+
+    // 1. An image on the clipboard wins.
+    let mut a = screen();
+    a.begin_line();
+    a.paste_from_clipboard(
+        || {
+            Ok(PastedImage {
+                width: 2,
+                height: 2,
+                data: "AA==".into(),
+                bytes: 3,
+            })
+        },
+        || Ok("ignored text".into()),
+    );
+    assert_eq!(a.pending_images.len(), 1);
+    assert_eq!(input(&a), "", "text must not be inserted when an image won");
+
+    // 2. The clipboard cannot be opened at all — the headless case, and the one that was
+    // broken. It must still reach the path route.
+    let mut b = screen();
+    b.begin_line();
+    b.paste_from_clipboard(
+        || Err(ImageError::Clipboard("no display server".into())),
+        || Ok(path_text.clone()),
+    );
+    assert_eq!(
+        b.pending_images.len(),
+        1,
+        "a clipboard that will not open must still reach the path route: {:?}",
+        b.notice
+    );
+    assert_eq!(input(&b), "", "the path is not inserted as text");
+
+    // 3. Text that is not a path is pasted as text.
+    let mut c = screen();
+    c.begin_line();
+    c.paste_from_clipboard(|| Err(ImageError::NoImage), || Ok("普通的文字".into()));
+    assert_eq!(input(&c), "普通的文字");
+    assert!(c.pending_images.is_empty());
+
+    // 4. Neither an image nor text: report why, rather than doing nothing silently.
+    let mut d = screen();
+    d.begin_line();
+    d.paste_from_clipboard(
+        || Err(ImageError::Clipboard("no display server".into())),
+        || Err(ImageError::NoText),
+    );
+    assert_eq!(input(&d), "");
+    assert!(
+        d.notice.as_deref().is_some_and(|n| n.contains("没有显示")
+            || n.contains("no display")
+            || n.contains("粘贴失败")),
+        "{:?}",
+        d.notice
+    );
+
+    std::fs::remove_dir_all(dir).unwrap();
+}
