@@ -3,27 +3,24 @@
 //! Message serialisation is done with structs (never hand-built `Value`s) so field
 //! order is stable and prompt-cache prefixes stay byte-identical between turns.
 //!
-//! # The three protocols do not share an assembler, on purpose
+//! # The two protocols do not share an assembler, on purpose
 //!
-//! `anthropic`, `openai` and `responses` each own a request builder, a stream-event parser
-//! and an `Assembler` that turns a stream of decoded frames into one [`Completion`]. The
-//! three assemblers look alike at the edges — they all record usage, a stop reason and an
-//! error, and two of them record where a hosted search was issued — and that resemblance is
-//! not an invitation to merge them. What they accumulate is shaped by the wire format, which
-//! is different in each case:
+//! `anthropic` and `responses` each own a request builder, a stream-event parser and an
+//! `Assembler` that turns a stream of decoded frames into one [`Completion`]. The two
+//! assemblers look alike at the edges — they all record usage, a stop reason and an error —
+//! and that resemblance is not an invitation to merge them. What they accumulate is shaped by
+//! the wire format, which is different in each case:
 //!
 //! * `anthropic`: content blocks indexed by position, each a text/thinking/tool-use variant
 //!   that may be opened, delta'd into and closed across separate events.
-//! * `openai`: flat deltas (`content`, `reasoning_content`, `tool_calls` by index) with
-//!   arguments arriving as a string that only parses once the call is complete.
 //! * `responses`: whole items keyed by `output_index`, with reasoning carried as an
 //!   encrypted signature that has to be attributed to the provider and model that issued it.
 //!
-//! A shared abstraction would have to model all three of those, which is a superset of any
-//! one of them, and every protocol detail would then be expressed as a configuration of that
+//! A shared abstraction would have to model both of those, which is a superset of either
+//! one, and every protocol detail would then be expressed as a configuration of that
 //! superset. The similarity that remains — three fields' worth of bookkeeping — is cheaper to
-//! repeat than to abstract. `client.rs` is the one place that knows all three: it owns the
-//! SSE framing and the dispatch, and its `client::Assemblers` holds one of each.
+//! repeat than to abstract. `client.rs` is the one place that knows both: it owns the SSE
+//! framing and the dispatch, and its `client::Assemblers` holds one of each.
 
 pub mod anthropic;
 pub mod client;
@@ -69,45 +66,6 @@ impl Api {
         match self {
             Api::AnthropicMessages => "https://api.anthropic.com",
             Api::OpenAiResponses => "https://api.openai.com/v1",
-        }
-    }
-
-    /// Whether this protocol sends a thinking block back on the next request.
-    ///
-    /// Anthropic replays the block it signed, and Responses replays the reasoning item with
-    /// its encrypted payload, so in both the draft occupies prompt space and has to be
-    /// counted.
-    ///
-    /// Either counts as replayed even when a particular block would be dropped (a signature
-    /// from another provider, a reasoning item whose envelope does not match). Over-counting
-    /// a handful of blocks is the cheap side of this estimate; the expensive side was
-    /// treating 77% of everything ever produced as prompt space on a protocol that never
-    /// sends it.
-    pub fn replays_thinking(self) -> bool {
-        true
-    }
-}
-
-/// Whether the request being measured sends thinking blocks back to the model.
-///
-/// Not a per-block property: it is the protocol that decides, once per request. See
-/// [`Api::replays_thinking`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ThinkingReplay {
-    Replayed,
-    Dropped,
-}
-
-impl ThinkingReplay {
-    /// The reading that applies to a request about to be sent to `provider`.
-    ///
-    /// A provider whose `api` does not parse cannot be reached with a live request — the
-    /// value is rejected at start-up — so this falls back to `Dropped`, which is both the
-    /// common case and the reading that never overstates the prompt.
-    pub fn for_provider(provider: &Provider) -> Self {
-        match provider.api() {
-            Some(api) if api.replays_thinking() => Self::Replayed,
-            _ => Self::Dropped,
         }
     }
 }
@@ -312,15 +270,15 @@ impl Message {
 
     /// chars/4 estimate of what this message costs the request it is part of.
     ///
-    /// `replay` decides whether thinking counts, and on both protocols it does. Anthropic
-    /// sends back the block it signed and Responses sends back the encrypted reasoning
-    /// item, so in either the draft occupies prompt space.
+    /// Thinking counts. Both protocols send the block back — Anthropic the text it signed,
+    /// Responses the encrypted reasoning item — so a draft occupies prompt space and has to
+    /// be measured.
     ///
     /// An image is charged a fixed cost rather than its byte length: providers bill by
     /// tiles or by a visual-token formula, not by how well a PNG compressed, so measuring
     /// the encoded bytes would be wildly wrong in both directions. The constant comes from
     /// the observed cost of a typical screenshot.
-    pub fn estimate_tokens(&self, replay: ThinkingReplay) -> u64 {
+    pub fn estimate_tokens(&self) -> u64 {
         const IMAGE_TOKENS: u64 = 1_200;
         let mut tokens = 0u64;
         let mut images = 0u64;
@@ -332,9 +290,7 @@ impl Message {
                     match block {
                         Block::Text { text } => tokens += util::estimate_tokens(text),
                         Block::Thinking { thinking, .. } => {
-                            if replay == ThinkingReplay::Replayed {
-                                tokens += util::estimate_tokens(thinking)
-                            }
+                            tokens += util::estimate_tokens(thinking)
                         }
                         Block::ToolCall {
                             name, arguments, ..
@@ -659,19 +615,13 @@ pub fn clamp_level(model: &ModelConfig, level: &str) -> (String, bool) {
 
 /// Estimate the complete model-visible request, including stable tool definitions.
 ///
-/// `replay` comes from the protocol this request is going to; see
-/// [`Api::replays_thinking`]. Pass it rather than guessing, because every threshold in the
-/// agent is built on this number.
-pub fn estimate_request_context(
-    messages: &[Message],
-    system: &str,
-    tools: &[ToolSpec],
-    replay: ThinkingReplay,
-) -> u64 {
+/// Every threshold in the agent is built on this number, so it has to be the complete
+/// model-visible request: system prompt, every message, and the tool definitions.
+pub fn estimate_request_context(messages: &[Message], system: &str, tools: &[ToolSpec]) -> u64 {
     let system = util::estimate_tokens(system);
     let messages = messages
         .iter()
-        .map(|message| message.estimate_tokens(replay))
+        .map(|message| message.estimate_tokens())
         .sum::<u64>();
     let tools = tools
         .iter()
@@ -753,10 +703,10 @@ mod tests {
     }
 
     #[test]
-    fn thinking_is_counted_only_where_the_protocol_sends_it_back() {
-        // A session that produced a long draft next to a short answer. Both remaining
-        // protocols replay the draft, so it is prompt space and has to be counted; skipping
-        // it made real sessions estimate 3-6x under the prompt the upstream reported.
+    fn thinking_counts_toward_the_estimate() {
+        // A session that produced a long draft next to a short answer. Both protocols send
+        // the draft back, so it is prompt space and has to be counted; skipping it made real
+        // sessions estimate 3-6x under the prompt the upstream reported.
         let message = Message::Assistant {
             content: vec![
                 Block::Thinking {
@@ -769,24 +719,11 @@ mod tests {
             ],
             stop_reason: Some(StopReason::Stop),
         };
-        let dropped = message.estimate_tokens(ThinkingReplay::Dropped);
-        let replayed = message.estimate_tokens(ThinkingReplay::Replayed);
+        let tokens = message.estimate_tokens();
         assert!(
-            dropped < 100,
-            "a draft nobody replays must not dominate the estimate: {dropped}"
+            tokens > 8_000,
+            "the draft is prompt space and must be counted: {tokens}"
         );
-        assert!(
-            replayed > 8_000,
-            "anthropic and responses do send the block back: {replayed}"
-        );
-    }
-
-    #[test]
-    fn both_remaining_protocols_replay_thinking() {
-        // The one protocol that did not — Chat Completions — is gone, so this now pins the
-        // rule for what is left: a draft occupies prompt space on every protocol pi speaks.
-        assert!(Api::AnthropicMessages.replays_thinking());
-        assert!(Api::OpenAiResponses.replays_thinking());
     }
 
     #[test]

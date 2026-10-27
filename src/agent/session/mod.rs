@@ -367,7 +367,6 @@ impl Session {
                 request.messages,
                 "",
                 request.tools,
-                crate::llm::ThinkingReplay::for_provider(request.provider),
             ),
             system_prompt_hash,
             tools_hash,

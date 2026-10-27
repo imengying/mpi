@@ -437,9 +437,9 @@ fn summary_requests_keep_the_prefix_without_reusing_the_main_cache_key() {
 /// as absent would let a request that does not fit be assembled anyway, which is the one
 /// failure the bound exists to prevent.
 #[test]
-fn a_summary_budget_counts_replayed_thinking_on_the_protocols_that_send_it() {
+fn a_summary_budget_counts_replayed_thinking_on_every_protocol() {
     use mpi::agent::compact::{SummaryRequest, prepare_summary};
-    use mpi::llm::{StopReason, ThinkingReplay};
+    use mpi::llm::StopReason;
 
     let draft = "推理".repeat(4_000);
     let history = vec![
@@ -460,10 +460,7 @@ fn a_summary_budget_counts_replayed_thinking_on_the_protocols_that_send_it() {
         p
     };
 
-    for (api, expected) in [
-        ("messages", ThinkingReplay::Replayed),
-        ("responses", ThinkingReplay::Replayed),
-    ] {
+    for api in ["messages", "responses"] {
         let provider = with_api(api);
         let settings = SummaryRequest {
             provider: &provider,
@@ -474,12 +471,8 @@ fn a_summary_budget_counts_replayed_thinking_on_the_protocols_that_send_it() {
             system_prompt: Some(SYSTEM),
             custom_instructions: None,
         };
-        assert_eq!(
-            ThinkingReplay::for_provider(&provider),
-            expected,
-            "{api}: the summary budget would be measured the wrong way"
-        );
-        // Whatever the reading, planning must still succeed and must not rewrite the source.
+        // Both protocols send the draft back, so the budget has to count it; either way
+        // planning must still succeed and must not rewrite the source.
         let before = history.clone();
         let prepared = prepare_summary(&settings, &history, false).unwrap();
         assert!(!prepared.messages.is_empty(), "{api}");

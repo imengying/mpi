@@ -88,9 +88,9 @@ impl Compat {
             compat.supports_long_cache = true;
         } else if host.contains("deepseek") {
             // The official API does not run a search. Responses accepts `web_search` and
-            // then ignores it, which would look like a search that never happened. Chat
-            // The Responses API would ignore it. Leave the format unset so `search:
-            // true` fails at startup instead of sending a no-op.
+            // then ignores it, which would look like a search that never happened. Leave
+            // the format unset so `search: true` fails at startup instead of sending a
+            // no-op.
             compat.search_format = None;
         } else if host.contains("bigmodel") || host.contains("z.ai") || host.contains("zhipu") {
             // No hosted search on the Responses API for this host: `search: true` fails at
@@ -100,7 +100,6 @@ impl Compat {
             compat.search_format = None;
         } else if host == "x.ai" || host.ends_with(".x.ai") {
             compat.search_format = Some(SearchFormat::WebAndX);
-        } else if host.contains("moonshot") {
         } else if host.contains("openrouter") {
             // OpenRouter normalises caching itself; the markers are not accepted.
             compat.send_session_affinity = false;

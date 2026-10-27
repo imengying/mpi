@@ -413,10 +413,9 @@ impl Agent {
             Err(_) => (None, self.level.clone()),
         };
         let cache_hit = self.session.totals.hit_rate();
-        let replay = self.thinking_replay();
         let context_usage = footer::context_usage(
             self.compaction.running,
-            self.session.measured_context_tokens(replay),
+            self.session.measured_context_tokens(),
             self.session.context_holds_only_environment(),
             || {
                 // Only reached once there is a conversation: the session's own reading is
@@ -428,7 +427,6 @@ impl Agent {
                     &messages,
                     self.system_prompt.as_deref().unwrap_or_default(),
                     &tools,
-                    replay,
                 )
             },
         );

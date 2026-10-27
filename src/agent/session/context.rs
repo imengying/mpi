@@ -9,7 +9,7 @@
 //! is arithmetic over records (no IO, no locks), while the parent is about appending,
 //! locking and recovering bytes.
 
-use crate::llm::{Message, ThinkingReplay};
+use crate::llm::Message;
 
 use super::{ContextSnapshot, Record, Session};
 
@@ -101,7 +101,7 @@ impl Session {
     }
 
     /// Latest observed prompt+answer plus messages appended since that observation.
-    pub fn measured_context_tokens(&self, replay: ThinkingReplay) -> Option<u64> {
+    pub fn measured_context_tokens(&self) -> Option<u64> {
         let usage = self.last_usage?;
         if usage
             .input
@@ -115,7 +115,7 @@ impl Session {
         let appended = self.records[index + 1..]
             .iter()
             .filter_map(Record::message)
-            .map(|message| message.estimate_tokens(replay))
+            .map(|message| message.estimate_tokens())
             .sum::<u64>();
         Some(
             usage

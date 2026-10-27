@@ -300,17 +300,12 @@ mod fields {
     ];
     pub const COMPACTION: [&str; 2] = ["reserve_tokens", "keep_recent_tokens"];
     pub const SAMPLING: [&str; 2] = ["temperature", "top_p"];
-    pub const COMPAT: [&str; 13] = [
-        "max_tokens_field",
-        "supports_developer_role",
-        "supports_reasoning_effort",
-        "thinking_format",
-        "requires_thinking_as_text",
-        "requires_reasoning_content_on_assistant",
+    /// Only the keys `compat::CompatPatch` still has. The rest named Chat Completions
+    /// switches, which no longer exist: leaving them here would let a config set one and
+    /// hear nothing back, which is exactly the silent no-op this check exists to prevent.
+    pub const COMPAT: [&str; 5] = [
         "requires_assistant_after_tool_result",
-        "supports_usage_in_streaming",
         "supports_strict_mode",
-        "supports_cache_control",
         "send_session_affinity",
         "supports_long_cache",
         "search_format",
@@ -1029,6 +1024,35 @@ mod tests {
     }
 
     #[test]
+    fn a_compat_key_from_the_deleted_protocol_is_rejected() {
+        // These switches only ever steered Chat Completions. Now that the protocol is gone
+        // they do nothing, and a config that still sets one has to hear that rather than
+        // run with a setting everybody silently ignores.
+        for key in [
+            "max_tokens_field",
+            "supports_developer_role",
+            "supports_reasoning_effort",
+            "thinking_format",
+            "requires_thinking_as_text",
+            "requires_reasoning_content_on_assistant",
+            "supports_usage_in_streaming",
+            "supports_cache_control",
+        ] {
+            let raw = serde_json::json!({
+                "providers": [{
+                    "name": "relay",
+                    "api": "responses",
+                    "compat": {key: true},
+                    "models": [{"id": "m"}]
+                }]
+            });
+            let err = check_unknown_fields(&raw).unwrap_err().to_string();
+            assert!(err.contains(key), "{key} must be named in the error: {err}");
+            assert!(err.contains("compat"), "{key}: {err}");
+        }
+    }
+
+    #[test]
     fn a_misspelled_key_is_an_error_not_a_silent_default() {
         // The bug this guards: `baseUrl` parses, is dropped, and the request goes to the
         // protocol's default host with the user's key attached — which is how a working
@@ -1092,18 +1116,11 @@ mod tests {
                 "api_key_env": "P_API_KEY",
                 "api_key": "sk-x",
                 "compat": {
-                    "max_tokens_field": "max_completion_tokens",
-                    "supports_developer_role": false,
-                    "supports_reasoning_effort": true,
-                    "thinking_format": "none",
-                    "requires_thinking_as_text": false,
-                    "requires_reasoning_content_on_assistant": false,
                     "requires_assistant_after_tool_result": false,
-                    "supports_usage_in_streaming": true,
                     "supports_strict_mode": false,
-                    "supports_cache_control": false,
                     "send_session_affinity": true,
-                    "supports_long_cache": false
+                    "supports_long_cache": false,
+                    "search_format": "off"
                 },
                 "models": [{
                     "id": "m",
@@ -1118,6 +1135,27 @@ mod tests {
             "default_model": "p/m"
         });
         check_unknown_fields(&raw).expect("the documented shape must be accepted");
+    }
+
+    #[test]
+    fn the_compat_key_list_matches_the_struct_that_parses_it() {
+        // The list above is what the typo check accepts; `CompatPatch` is what actually
+        // parses. If they drift apart, a key is either accepted and ignored (silent no-op)
+        // or rejected although it is real. Deleting the Chat Completions protocol left eight
+        // keys in the list that no struct field backed any more, so this compares the two
+        // rather than trusting a hand-written sample to notice.
+        let patch: serde_json::Value =
+            serde_json::to_value(crate::llm::compat::CompatPatch::default()).unwrap();
+        let mut declared: Vec<&str> = patch
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        declared.sort_unstable();
+        let mut listed = fields::COMPAT.to_vec();
+        listed.sort_unstable();
+        assert_eq!(listed, declared);
     }
 
     #[test]
