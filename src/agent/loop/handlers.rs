@@ -159,6 +159,9 @@ impl Agent {
         let context = tools::ToolContext {
             cwd: self.cwd.clone(),
             shell: self.config.shell.path.clone(),
+            // Fresh per batch: what matters is "did the file change since *this* turn read
+            // it", which is exactly the window an edit guesses into.
+            observed: tools::observed::Observed::default(),
         };
         for (index, approval) in approved.into_iter().enumerate() {
             match approval {

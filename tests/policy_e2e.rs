@@ -173,6 +173,7 @@ async fn a_single_file_search_carries_no_exclusions_but_still_cannot_leak() {
     let context = mpi::tools::ToolContext {
         cwd: dir.clone(),
         shell: "/usr/bin/zsh".into(),
+        observed: Default::default(),
     };
     for command in [
         "grep -n ordinary-sentinel ordinary.txt",
@@ -216,6 +217,7 @@ async fn broad_and_explicit_glob_searches_cannot_read_secrets() {
     let context = mpi::tools::ToolContext {
         cwd: dir.clone(),
         shell: "/usr/bin/zsh".into(),
+        observed: Default::default(),
     };
     for command in [
         "rg --hidden --no-ignore policy-secret-sentinel .",

@@ -916,6 +916,7 @@ mod tests {
         let context = crate::tools::ToolContext {
             cwd: dir.clone(),
             shell: "/usr/bin/zsh".into(),
+            observed: Default::default(),
         };
         let cases: Vec<(&str, serde_json::Value)> = vec![
             ("read", serde_json::json!({"path": "nope.rs"})),

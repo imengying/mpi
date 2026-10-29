@@ -8,6 +8,7 @@ pub mod edit;
 pub mod find;
 pub mod grep;
 pub mod ls;
+pub mod observed;
 mod output;
 mod process;
 pub mod read;
@@ -253,9 +254,9 @@ pub async fn execute(
     // asks, so a render-based number would include the time spent reading the dialog.
     let started = std::time::Instant::now();
     let result = match name {
-        "read" => read::execute(arguments, &context.cwd).await,
+        "read" => read::execute(arguments, &context.cwd, &context.observed).await,
         "write" => write::execute(arguments, &context.cwd).await,
-        "edit" => edit::execute(arguments, &context.cwd).await,
+        "edit" => edit::execute(arguments, &context.cwd, &context.observed).await,
         "bash" => match required_str(arguments, "command") {
             Ok(command) => {
                 let cwd = bash::resolve_cwd(arguments, &context.cwd);
@@ -283,11 +284,13 @@ pub async fn execute(
         .timed(elapsed)
 }
 
-/// Immutable execution inputs shared by every tool in a batch.
+/// Execution inputs shared by every tool in a batch.
 #[derive(Debug, Clone)]
 pub struct ToolContext {
     pub cwd: PathBuf,
     pub shell: String,
+    /// What this batch has read, so an edit can tell a typo from a file that moved.
+    pub observed: observed::Observed,
 }
 
 /// Locate a command at the first of `candidates` that exists, as an absolute path.

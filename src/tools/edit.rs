@@ -19,7 +19,7 @@ pub fn spec() -> ToolSpec {
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string", "description": "文件路径（相对当前工作目录或绝对路径）。给出 edits 时，这里是各项的默认路径——改同一个文件的几处时只写这一处即可" },
+                "path": { "type": "string", "description": "文件路径（相对当前工作目录或绝对路径）。给出 edits 时，这里是各项的默认路径——改同一个文件的几处时只写这一处即可。先在参数里给出 path，再给 old_text 和 new_text" },
                 "old_text": { "type": "string", "description": "要被替换的原文，逐字一致" },
                 "new_text": { "type": "string", "description": "替换后的新文本" },
                 "replace_all": { "type": "boolean", "description": "是否替换全部匹配（默认 false）" },
@@ -31,7 +31,7 @@ pub fn spec() -> ToolSpec {
                     "items": {
                         "type": "object",
                         "properties": {
-                            "path": { "type": "string", "description": "文件路径；不给则用顶层的 path" },
+                            "path": { "type": "string", "description": "文件路径；不给则用顶层的 path。先在参数里给出 path，再给 old_text 和 new_text" },
                             "old_text": { "type": "string", "description": "要被替换的原文，逐字一致" },
                             "new_text": { "type": "string", "description": "替换后的新文本" },
                             "replace_all": { "type": "boolean", "description": "是否替换全部匹配（默认 false）" }
@@ -59,7 +59,11 @@ struct Edit<'a> {
     replace_all: bool,
 }
 
-pub async fn execute(arguments: &serde_json::Value, cwd: &Path) -> Result<ToolOutput, String> {
+pub async fn execute(
+    arguments: &serde_json::Value,
+    cwd: &Path,
+    observed: &crate::tools::observed::Observed,
+) -> Result<ToolOutput, String> {
     let edits = match arguments.get("edits") {
         Some(serde_json::Value::Array(items)) => {
             let default_path = arguments.get("path").and_then(|value| value.as_str());
@@ -77,9 +81,9 @@ pub async fn execute(arguments: &serde_json::Value, cwd: &Path) -> Result<ToolOu
         check_texts(edit.old_text, edit.new_text)?;
     }
     if edits.len() == 1 {
-        return apply_one(&edits[0], cwd).await;
+        return apply_one(&edits[0], cwd, observed).await;
     }
-    apply_batch(&edits, cwd).await
+    apply_batch(&edits, cwd, observed).await
 }
 
 fn replace_all_of(value: &serde_json::Value) -> bool {
@@ -148,8 +152,16 @@ fn parse_batch<'a>(
 }
 
 /// Replace one occurrence (or all of them) in one file and report the diff.
-async fn apply_one(edit: &Edit<'_>, cwd: &Path) -> Result<ToolOutput, String> {
+async fn apply_one(
+    edit: &Edit<'_>,
+    cwd: &Path,
+    observed: &crate::tools::observed::Observed,
+) -> Result<ToolOutput, String> {
     let resolved = crate::auth::policy::resolve_tool_path(edit.path, cwd);
+    // Before matching, deliberately. A stale file makes `old_text` miss, and "not found" would
+    // read as a typo — sending the model to guess at other spellings of text that is no longer
+    // there. Naming the real cause is the whole point of tracking it.
+    observed.stale(&resolved, edit.path)?;
     let before = tokio::fs::read_to_string(&resolved)
         .await
         .map_err(|err| format!("无法读取：{err}"))?;
@@ -157,6 +169,9 @@ async fn apply_one(edit: &Edit<'_>, cwd: &Path) -> Result<ToolOutput, String> {
     tokio::fs::write(&resolved, &after)
         .await
         .map_err(|err| format!("无法写入：{err}"))?;
+    // This batch made the change, so a later edit of the same file must not read as
+    // someone else's.
+    observed.forget(&resolved);
     Ok(ToolOutput {
         content: format!("已修改（替换 {replaced} 处）"),
         display: diff::for_edit(&before, &after),
@@ -444,7 +459,11 @@ fn reindent(file_line: &str, want_body: &str, new_body: &str) -> String {
 /// a `python` heredoc replacing a table of `(path, old, new)` entries — and it carried none of
 /// the checks here: no uniqueness requirement, no all-or-nothing, and a mistake rewrote the
 /// file silently.
-async fn apply_batch(edits: &[Edit<'_>], cwd: &Path) -> Result<ToolOutput, String> {
+async fn apply_batch(
+    edits: &[Edit<'_>],
+    cwd: &Path,
+    observed: &crate::tools::observed::Observed,
+) -> Result<ToolOutput, String> {
     // Group by file so each is read once and written once, keeping the caller's order.
     let mut order: Vec<std::path::PathBuf> = Vec::new();
     let mut pending: std::collections::HashMap<std::path::PathBuf, (String, String)> =
@@ -453,6 +472,7 @@ async fn apply_batch(edits: &[Edit<'_>], cwd: &Path) -> Result<ToolOutput, Strin
     for (index, edit) in edits.iter().enumerate() {
         let resolved = crate::auth::policy::resolve_tool_path(edit.path, cwd);
         if !pending.contains_key(&resolved) {
+            observed.stale(&resolved, edit.path)?;
             let text = tokio::fs::read_to_string(&resolved)
                 .await
                 .map_err(|err| format!("第 {} 项无法读取 {}：{err}", index + 1, edit.path))?;
@@ -478,6 +498,7 @@ async fn apply_batch(edits: &[Edit<'_>], cwd: &Path) -> Result<ToolOutput, Strin
         tokio::fs::write(path, after)
             .await
             .map_err(|err| format!("无法写入 {}：{err}", path.display()))?;
+        observed.forget(path);
         let crate::tools::Display::Diff {
             diff,
             added: a,
@@ -606,17 +627,65 @@ mod tests {
     use super::*;
     use crate::tools::block;
 
+    /// Every test here edits a file it just wrote, so the staleness record is not the subject
+    /// unless the test says so; the ones that do use `Observed` directly.
+    async fn run(
+        arguments: &serde_json::Value,
+        cwd: &Path,
+    ) -> Result<crate::tools::ToolOutput, String> {
+        execute(arguments, cwd, &crate::tools::observed::Observed::default()).await
+    }
+
     fn file(dir: &Path, name: &str, content: &str) -> String {
         let path = dir.join(name);
         std::fs::write(&path, content).unwrap();
         path.to_string_lossy().to_string()
     }
 
+    #[tokio::test]
+    async fn a_file_changed_after_the_read_reports_staleness_not_a_miss() {
+        // The reader and the editor share one `Observed` per batch, exactly as the loop wires
+        // them. Without that, a model editing from a stale read retries with other spellings
+        // of text that is gone, because "not found" reads as its own mistake.
+        let dir = crate::tools::temp_dir("edit");
+        let path = file(&dir, "a.txt", "alpha\nbeta\n");
+        let observed = crate::tools::observed::Observed::default();
+        super::super::read::execute(&serde_json::json!({"path": path.clone()}), &dir, &observed)
+            .await
+            .unwrap();
+        std::fs::write(&path, "alpha\nBETA CHANGED\n").unwrap();
+        let error = execute(
+            &serde_json::json!({"path": path, "old_text": "beta", "new_text": "BETA"}),
+            &dir,
+            &observed,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("被改过"), "{error}");
+        assert!(error.contains("重新读"), "{error}");
+        assert!(!error.contains("找不到"), "not a miss: {error}");
+    }
+
+    #[tokio::test]
+    async fn an_edit_that_was_not_preceded_by_a_read_still_works() {
+        // Resumed sessions and long turns edit files read many turns ago, where the record no
+        // longer exists. Refusing those would break the common case to catch a rarer one.
+        let dir = crate::tools::temp_dir("edit");
+        let path = file(&dir, "a.txt", "one\n");
+        let out = run(
+            &serde_json::json!({"path": path, "old_text": "one", "new_text": "two"}),
+            &dir,
+        )
+        .await
+        .unwrap();
+        assert!(out.content.contains("替换 1 处"));
+    }
+
     #[test]
     fn replaces_a_unique_occurrence() {
         let dir = crate::tools::temp_dir("edit");
         let path = file(&dir, "a.txt", "one\ntwo\nthree\n");
-        let out = block(execute(
+        let out = block(run(
             &serde_json::json!({"path": path, "old_text": "two", "new_text": "TWO"}),
             &dir,
         ))
@@ -629,13 +698,13 @@ mod tests {
     fn ambiguous_matches_are_refused_unless_replace_all() {
         let dir = crate::tools::temp_dir("edit");
         let path = file(&dir, "b.txt", "x\nx\n");
-        let error = block(execute(
+        let error = block(run(
             &serde_json::json!({"path": path, "old_text": "x", "new_text": "y"}),
             &dir,
         ))
         .unwrap_err();
         assert!(error.contains("出现了 2 次"));
-        block(execute(
+        block(run(
             &serde_json::json!({"path": path, "old_text": "x", "new_text": "y", "replace_all": true}),
             &dir,
         ))
@@ -647,7 +716,7 @@ mod tests {
     fn a_missing_match_says_what_to_do() {
         let dir = crate::tools::temp_dir("edit");
         let path = file(&dir, "c.txt", "hello\n");
-        let error = block(execute(
+        let error = block(run(
             &serde_json::json!({"path": path, "old_text": "nope", "new_text": "x"}),
             &dir,
         ))
@@ -670,7 +739,7 @@ mod tests {
             "drift.txt",
             "fn main() {\n    let a = 1;\n    let b = 2;\n    let c = 3;\n}\n",
         );
-        let error = block(execute(
+        let error = block(run(
             &serde_json::json!({
                 "path": path,
                 "old_text": "    let a = 1;\n    let b = 2;\n    let bb = 2;",
@@ -691,7 +760,7 @@ mod tests {
         // A guess here would send the caller to a line that has nothing to do with it.
         let dir = crate::tools::temp_dir("edit");
         let path = file(&dir, "other.txt", "alpha\nbeta\ngamma\n");
-        let error = block(execute(
+        let error = block(run(
             &serde_json::json!({
                 "path": path,
                 "old_text": "完全不相干的一段文本，与文件内容没有任何重叠部分",
@@ -708,7 +777,7 @@ mod tests {
     fn identical_text_is_rejected_early() {
         let dir = crate::tools::temp_dir("edit");
         let path = file(&dir, "d.txt", "same\n");
-        let error = block(execute(
+        let error = block(run(
             &serde_json::json!({"path": path, "old_text": "same", "new_text": "same"}),
             &dir,
         ))
@@ -839,7 +908,7 @@ mod tests {
         let dir = batch_dir();
         std::fs::write(dir.join("a.txt"), "one\ntwo\nthree\n").unwrap();
         std::fs::write(dir.join("b.txt"), "alpha\nbeta\n").unwrap();
-        let out = block(execute(
+        let out = block(run(
             &serde_json::json!({"edits": [
                 {"path": "a.txt", "old_text": "two", "new_text": "TWO"},
                 {"path": "b.txt", "old_text": "beta", "new_text": "BETA"},
@@ -879,7 +948,7 @@ mod tests {
         let dir = batch_dir();
         std::fs::write(dir.join("a.txt"), "one\n").unwrap();
         std::fs::write(dir.join("b.txt"), "alpha\n").unwrap();
-        let error = block(execute(
+        let error = block(run(
             &serde_json::json!({"edits": [
                 {"path": "a.txt", "old_text": "one", "new_text": "ONE"},
                 {"path": "b.txt", "old_text": "not-here", "new_text": "X"},
@@ -907,7 +976,7 @@ mod tests {
         // sequence rather than as a set that has to be non-overlapping.
         let dir = batch_dir();
         std::fs::write(dir.join("c.txt"), "a b c\n").unwrap();
-        let out = block(execute(
+        let out = block(run(
             &serde_json::json!({"edits": [
                 {"path": "c.txt", "old_text": "a", "new_text": "AA"},
                 {"path": "c.txt", "old_text": "c", "new_text": "CC"},
@@ -931,7 +1000,7 @@ mod tests {
         // rewrites the wrong occurrence, and the caller never learns.
         let dir = batch_dir();
         std::fs::write(dir.join("d.txt"), "x x\n").unwrap();
-        let error = block(execute(
+        let error = block(run(
             &serde_json::json!({"edits": [
                 {"path": "d.txt", "old_text": "x", "new_text": "y"},
             ]}),
@@ -955,7 +1024,7 @@ mod tests {
             ),
             (serde_json::json!({"edits": "nope"}), "edits 必须是数组"),
         ] {
-            let error = block(execute(&arguments, &dir)).unwrap_err();
+            let error = block(run(&arguments, &dir)).unwrap_err();
             assert!(error.contains(expected), "{arguments}: {error}");
         }
         assert_eq!(
@@ -1103,7 +1172,7 @@ mod tests {
     fn the_top_level_path_stands_in_for_items_without_one() {
         let dir = crate::tools::temp_dir("edit-default-path");
         std::fs::write(dir.join("m.rs"), "alpha\nbeta\ngamma\n").unwrap();
-        let out = block(execute(
+        let out = block(run(
             &serde_json::json!({
                 "path": "m.rs",
                 "edits": [
@@ -1122,7 +1191,7 @@ mod tests {
 
         // An item that names its own path still wins, so a batch across files is unchanged.
         std::fs::write(dir.join("other.rs"), "one\n").unwrap();
-        block(execute(
+        block(run(
             &serde_json::json!({
                 "path": "m.rs",
                 "edits": [
@@ -1143,7 +1212,7 @@ mod tests {
         );
 
         // Neither the item nor the top level names a file: say what to do about it.
-        let error = block(execute(
+        let error = block(run(
             &serde_json::json!({"edits": [{"old_text": "x", "new_text": "y"}]}),
             &dir,
         ))

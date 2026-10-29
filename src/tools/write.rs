@@ -14,7 +14,7 @@ pub fn spec() -> ToolSpec {
             "type": "object",
             "properties": {
                 "path": { "type": "string", "description": "文件路径（相对当前工作目录或绝对路径）" },
-                "content": { "type": "string", "description": "完整文件内容" }
+                "content": { "type": "string", "description": "完整文件内容。先在参数里给出 path，再给 content" }
             },
             "required": ["path", "content"]
         }),

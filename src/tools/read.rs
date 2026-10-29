@@ -25,7 +25,11 @@ pub fn spec() -> ToolSpec {
     }
 }
 
-pub async fn execute(arguments: &serde_json::Value, cwd: &Path) -> Result<ToolOutput, String> {
+pub async fn execute(
+    arguments: &serde_json::Value,
+    cwd: &Path,
+    observed: &crate::tools::observed::Observed,
+) -> Result<ToolOutput, String> {
     let path = crate::tools::required_str(arguments, "path")?;
     let resolved = crate::auth::policy::resolve_tool_path(path, cwd);
     let meta = std::fs::metadata(&resolved).map_err(|err| format!("无法读取：{err}"))?;
@@ -36,6 +40,10 @@ pub async fn execute(arguments: &serde_json::Value, cwd: &Path) -> Result<ToolOu
         .unwrap_or(1)
         .max(1);
     let limit = crate::tools::optional_u64(arguments, "limit").unwrap_or(2000);
+    // Recorded before the read: an edit in the same batch compares against the bytes the model
+    // was shown, and noting the state first means a write landing mid-read still reads as a
+    // change rather than being papered over.
+    observed.note(&resolved);
     let out = tokio::task::spawn_blocking(move || read_window(&resolved, offset, limit))
         .await
         .map_err(|err| format!("读取任务失败：{err}"))??;
@@ -121,6 +129,15 @@ mod tests {
     use super::*;
     use crate::tools::block;
 
+    /// These tests are about what `read` returns; the staleness record is exercised in
+    /// `observed` itself and in `edit`.
+    async fn run(
+        arguments: &serde_json::Value,
+        cwd: &Path,
+    ) -> Result<crate::tools::ToolOutput, String> {
+        execute(arguments, cwd, &crate::tools::observed::Observed::default()).await
+    }
+
     #[test]
     fn skips_a_huge_line_and_handles_a_limit_that_would_overflow() {
         use std::io::Write;
@@ -168,7 +185,7 @@ mod tests {
         let dir = crate::tools::temp_dir("read");
         let file = dir.join("sample.txt");
         std::fs::write(&file, "a\nb\nc\nd\ne\n").unwrap();
-        let out = block(execute(
+        let out = block(run(
             &serde_json::json!({"path": file.to_string_lossy(), "offset": 2, "limit": 2}),
             &dir,
         ))
@@ -193,7 +210,7 @@ mod tests {
     #[test]
     fn a_directory_is_rejected_with_a_hint() {
         let dir = crate::tools::temp_dir("read");
-        let error = block(execute(
+        let error = block(run(
             &serde_json::json!({"path": dir.to_string_lossy()}),
             &dir,
         ))
@@ -212,7 +229,7 @@ mod tests {
         let dir = crate::tools::temp_dir("read");
         let file = dir.join("shot.png");
         std::fs::write(&file, b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x10\0\0\0\x10").unwrap();
-        let error = block(execute(
+        let error = block(run(
             &serde_json::json!({"path": file.to_string_lossy()}),
             &dir,
         ))
@@ -233,7 +250,7 @@ mod tests {
         let dir = crate::tools::temp_dir("read");
         let file = dir.join("bin.dat");
         std::fs::write(&file, [0u8, 1, 2, 3, 4]).unwrap();
-        let error = block(execute(
+        let error = block(run(
             &serde_json::json!({"path": file.to_string_lossy()}),
             &dir,
         ))
@@ -246,7 +263,7 @@ mod tests {
         let dir = crate::tools::temp_dir("read");
         let file = dir.join("short.txt");
         std::fs::write(&file, "only\n").unwrap();
-        let error = block(execute(
+        let error = block(run(
             &serde_json::json!({"path": file.to_string_lossy(), "offset": 9}),
             &dir,
         ))

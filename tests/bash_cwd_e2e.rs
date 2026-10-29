@@ -19,6 +19,7 @@ fn context(cwd: &std::path::Path) -> ToolContext {
     ToolContext {
         cwd: cwd.to_path_buf(),
         shell: "/usr/bin/zsh".to_string(),
+        observed: Default::default(),
     }
 }
 
