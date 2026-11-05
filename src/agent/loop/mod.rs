@@ -439,7 +439,6 @@ impl Agent {
             context_window,
             model: model.cloned(),
             level,
-            auto_approve: self.gate.mode() == crate::auth::guard::PermissionMode::Allow,
             busy: busy.map(str::to_owned),
         };
         self.screen.set_footer_state(state);

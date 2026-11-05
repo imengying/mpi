@@ -771,7 +771,6 @@ fn the_status_reflows_without_new_model_output_after_a_resize() {
         model: Some(model),
         level: String::new(),
         busy: None,
-        auto_approve: false,
     });
     screen.width = 80;
     let wide = screen.compose_live().0.last().unwrap().line.text();
@@ -1914,7 +1913,6 @@ fn no_live_row_is_wider_than_the_terminal() {
         model: None,
         level: "high".into(),
         busy: None,
-        auto_approve: false,
     };
     screen.set_footer(crate::ui::footer::render(
         &state,
