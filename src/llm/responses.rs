@@ -10,9 +10,7 @@
 //!   `store: false` means the server keeps nothing: the item has to be replayed by the
 //!   client on the next turn or the model loses its own train of thought.
 //!
-//! Fields are serialised from structs with a fixed order for the same reason as the other
-//! two providers: the request prefix has to be byte-identical between turns to keep the
-//! server-side prompt cache hitting.
+//! Struct field order keeps the request prefix stable between turns for prompt caching.
 
 use serde::{Deserialize, Serialize};
 
@@ -205,6 +203,10 @@ pub struct ResponsesRequest {
     max_output_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning: Option<Reasoning>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_p: Option<f64>,
     /// Keeps the request stateless, which is what makes the session file the only copy of
     /// the conversation — there is no server-side thread to lose or to leak.
     store: bool,
@@ -232,6 +234,7 @@ pub fn build_request(req: &Request<'_>, stream: bool) -> ResponsesRequest {
     let compat: Compat = provider.compat(model);
     let max_tokens = model.max_tokens();
     let plan = plan_thinking(model, req.level, max_tokens);
+    let sampling = model.sampling_params(plan.effort.as_deref().unwrap_or("off"));
 
     let mut instructions = None;
     let mut input: Vec<InputEntry> = Vec::new();
@@ -323,6 +326,15 @@ pub fn build_request(req: &Request<'_>, stream: bool) -> ResponsesRequest {
                 }));
             }
         }
+        if let Some(notice) = message.output_limit_notice() {
+            input.push(InputEntry::Item(InputItem::message(
+                "assistant",
+                vec![ContentPart::Text {
+                    kind: "output_text",
+                    text: notice.into(),
+                }],
+            )));
+        }
     }
 
     let mut tools: Vec<ToolDef> = req
@@ -362,6 +374,8 @@ pub fn build_request(req: &Request<'_>, stream: bool) -> ResponsesRequest {
             .then_some("auto"),
         max_output_tokens: Some(max_tokens.max(MIN_OUTPUT_TOKENS)),
         reasoning: reasoning.clone(),
+        temperature: sampling.and_then(|params| params.temperature),
+        top_p: sampling.and_then(|params| params.top_p),
         store: false,
         prompt_cache_key: req.cache_hints.then(|| req.session_id.to_string()),
         include: (reasoning.is_some() || model.reasoning)
@@ -462,7 +476,7 @@ pub struct StreamEvent {
     #[serde(default)]
     output_index: Option<usize>,
     #[serde(default)]
-    response: Option<ResponseBody>,
+    response: Option<FullResponse>,
     #[serde(default)]
     code: Option<String>,
     #[serde(default)]
@@ -544,7 +558,7 @@ impl ItemContent {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct ResponseBody {
+pub struct FullResponse {
     #[serde(default)]
     status: Option<String>,
     #[serde(default)]
@@ -569,6 +583,17 @@ struct ProviderError {
     code: Option<String>,
     #[serde(default)]
     message: Option<String>,
+}
+
+impl ProviderError {
+    fn describe(&self) -> String {
+        match (&self.code, &self.message) {
+            (Some(code), Some(message)) => format!("{code}: {message}"),
+            (None, Some(message)) => message.clone(),
+            (Some(code), None) => code.clone(),
+            (None, None) => "上游未给出原因".into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -596,7 +621,6 @@ struct InputDetails {
 pub struct Assembler {
     items: Vec<Slot>,
     usage: Usage,
-    output_tokens: u64,
     stop_reason: Option<String>,
     incomplete: Option<String>,
     error: Option<String>,
@@ -646,11 +670,7 @@ impl Assembler {
         &mut self.items[index]
     }
 
-    fn apply(
-        &mut self,
-        event: StreamEvent,
-        on_delta: &mut dyn FnMut(Delta),
-    ) -> Result<(), LlmError> {
+    fn apply(&mut self, event: StreamEvent, on_delta: &mut dyn FnMut(Delta)) {
         match event.kind.as_str() {
             "response.output_item.added" => {
                 let index = event.output_index.unwrap_or(self.items.len());
@@ -781,7 +801,6 @@ impl Assembler {
                         }
                     }
                     let announce = slot.kind.as_deref().is_some_and(is_search_call);
-                    let _ = item.role;
                     if announce {
                         self.note_search(on_delta);
                     }
@@ -807,12 +826,7 @@ impl Assembler {
                 let message = body
                     .as_ref()
                     .and_then(|body| body.error.as_ref())
-                    .map(|error| match (&error.code, &error.message) {
-                        (Some(code), Some(message)) => format!("{code}: {message}"),
-                        (None, Some(message)) => message.clone(),
-                        (Some(code), None) => code.clone(),
-                        (None, None) => "上游未给出原因".into(),
-                    })
+                    .map(ProviderError::describe)
                     .or_else(|| {
                         body.as_ref()
                             .and_then(|body| body.incomplete_details.as_ref())
@@ -823,20 +837,19 @@ impl Assembler {
             }
             "error" => {
                 self.saw_terminal = true;
-                let message = match (event.code, event.message) {
-                    (Some(code), Some(message)) => format!("{code}: {message}"),
-                    (None, Some(message)) => message,
-                    (Some(code), None) => code,
-                    (None, None) => "上游未给出原因".into(),
-                };
-                self.error = Some(message);
+                self.error = Some(
+                    ProviderError {
+                        code: event.code,
+                        message: event.message,
+                    }
+                    .describe(),
+                );
             }
             _ => {}
         }
-        Ok(())
     }
 
-    fn finish_body(&mut self, body: ResponseBody) {
+    fn finish_body(&mut self, body: FullResponse) {
         if let Some(usage) = &body.usage {
             self.set_usage(usage);
         }
@@ -883,7 +896,6 @@ impl Assembler {
             cache_read: cached,
             cache_write: 0,
         };
-        self.output_tokens = usage.output_tokens;
     }
 
     pub fn finish(mut self) -> Completion {
@@ -978,7 +990,6 @@ impl Assembler {
                 }
             },
         };
-        let _ = (self.stop_reason, self.output_tokens, self.saw_terminal);
         Completion {
             message: Message::Assistant {
                 content,
@@ -1061,23 +1072,8 @@ pub fn parse_frame(payload: &str) -> Result<Option<StreamEvent>, LlmError> {
 
 impl StreamEvent {
     pub(crate) fn feed(self, assembler: &mut Assembler, on_delta: &mut dyn FnMut(Delta)) {
-        let _ = assembler.apply(self, on_delta);
+        assembler.apply(self, on_delta);
     }
-}
-
-/// Non-streaming response shape: the `response` object itself.
-#[derive(Debug, Deserialize)]
-pub struct FullResponse {
-    #[serde(default)]
-    status: Option<String>,
-    #[serde(default)]
-    incomplete_details: Option<IncompleteDetails>,
-    #[serde(default)]
-    error: Option<ProviderError>,
-    #[serde(default)]
-    usage: Option<WireUsage>,
-    #[serde(default)]
-    output: Vec<Item>,
 }
 
 impl FullResponse {
@@ -1086,14 +1082,14 @@ impl FullResponse {
     ///
     /// The caller supplies the accumulator so the identity a signature is stamped with
     /// (`issued_by`) is set in one place for both paths.
-    pub fn assemble(self, mut assembler: Assembler) -> Completion {
+    pub fn assemble(mut self, mut assembler: Assembler) -> Completion {
         let mut sink = |_: Delta| {};
         // The items are fed through the same events the stream would have sent, which keeps
         // one implementation of "what an item means".
-        for (index, item) in self.output.iter().enumerate() {
+        for (index, item) in std::mem::take(&mut self.output).into_iter().enumerate() {
             let event = StreamEvent {
                 kind: "response.output_item.done".into(),
-                item: Some(item.clone()),
+                item: Some(item),
                 delta: None,
                 arguments: None,
                 output_index: Some(index),
@@ -1101,27 +1097,14 @@ impl FullResponse {
                 code: None,
                 message: None,
             };
-            let _ = assembler.apply(event, &mut sink);
+            assembler.apply(event, &mut sink);
         }
-        let body = ResponseBody {
-            status: self.status,
-            incomplete_details: self.incomplete_details,
-            error: self.error,
-            usage: self.usage,
-            output: Vec::new(),
-        };
         // A failed non-streaming response has to be reported the same way the stream reports
         // `response.failed`; the failure is not an HTTP status, it is a body.
-        if let Some(error) = body.error.as_ref() {
-            let message = match (&error.code, &error.message) {
-                (Some(code), Some(message)) => format!("{code}: {message}"),
-                (None, Some(message)) => message.clone(),
-                (Some(code), None) => code.clone(),
-                (None, None) => "上游未给出原因".into(),
-            };
-            assembler.error = Some(message);
+        if let Some(error) = self.error.as_ref() {
+            assembler.error = Some(error.describe());
         }
-        assembler.finish_body(body);
+        assembler.finish_body(self);
         assembler.finish()
     }
 }
@@ -1182,6 +1165,43 @@ mod tests {
             cache_hints: true,
         };
         serde_json::to_value(build_request(&request, true)).unwrap()
+    }
+
+    #[test]
+    fn sampling_overrides_follow_the_effective_effort_and_omit_unset_fields() {
+        let (mut model, provider) = fixtures();
+        model.sampling_params_by_thinking_level = serde_json::from_value(serde_json::json!({
+            "off": {"temperature": 0.0},
+            "high": {"temperature": 0.7, "top_p": 0.9}
+        }))
+        .unwrap();
+        for (reasoning, level, temperature, top_p) in [
+            (true, "high", Some(0.7), Some(0.9)),
+            (true, "low", None, None),
+            (true, "", Some(0.0), None),
+            (false, "high", Some(0.0), None),
+        ] {
+            model.reasoning = reasoning;
+            for stream in [false, true] {
+                let request = Request {
+                    model: &model,
+                    provider: &provider,
+                    messages: &[],
+                    tools: &[],
+                    level,
+                    session_id: "sampling",
+                    cache_hints: true,
+                };
+                let body = serde_json::to_value(build_request(&request, stream)).unwrap();
+                assert_eq!(
+                    body.get("temperature").and_then(|value| value.as_f64()),
+                    temperature
+                );
+                assert_eq!(body.get("top_p").and_then(|value| value.as_f64()), top_p);
+                assert_eq!(body.get("temperature").is_some(), temperature.is_some());
+                assert_eq!(body.get("top_p").is_some(), top_p.is_some());
+            }
+        }
     }
 
     #[test]

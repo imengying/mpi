@@ -77,6 +77,7 @@ pub struct FooterState {
     pub context_window: Option<u64>,
     pub model: Option<ModelConfig>,
     pub level: String,
+    pub auto_approve: bool,
     /// Shown while a turn is in flight.
     pub busy: Option<String>,
 }
@@ -97,8 +98,7 @@ fn location_line(state: &FooterState, width: usize) -> Line {
     // terminal wraps on its own would throw the region's row count off by one — which shows up
     // as the whole footer creeping down the screen, a row per redraw.
     //
-    // The directory is what the user needs to see, so it is what survives: the branch loses
-    // its tail first, then the session name, then the directory itself.
+    // Reserve the permission indicator first, then fit the directory, branch and name.
     let name = state
         .session_name
         .as_ref()
@@ -106,12 +106,24 @@ fn location_line(state: &FooterState, width: usize) -> Line {
         .filter(|name| !name.is_empty());
     let branch = state.branch.as_ref().map(|branch| util::one_line(branch));
     let mut budget = width;
+    let mut spans = Vec::new();
+    if state.auto_approve {
+        let label = util::truncate("自动放行", budget, "…");
+        budget = budget.saturating_sub(util::width(&label));
+        spans.push(Span::new(label, Style::new(Color::Yellow)));
+        if budget > 3 {
+            spans.push(Span::new(" · ", Style::new(Color::Dim)));
+            budget -= 3;
+        } else {
+            budget = 0;
+        }
+    }
     let cwd = {
         let shown = util::truncate(&util::one_line(&cwd), budget, "…");
         budget = budget.saturating_sub(util::width(&shown));
         shown
     };
-    let mut spans = vec![Span::new(cwd, Style::new(Color::Green))];
+    spans.push(Span::new(cwd, Style::new(Color::Green)));
     if let Some(branch) = branch {
         // " (" + branch + ")", and at least one column so an empty branch cannot produce "()".
         let room = budget.saturating_sub(3);
@@ -395,7 +407,22 @@ mod tests {
             context_window: Some(1_000_000),
             model: None,
             level: "high".into(),
+            auto_approve: false,
             busy: None,
+        }
+    }
+
+    #[test]
+    fn automatic_approval_is_visible_even_when_the_directory_is_long() {
+        let mut state = state("/a/long/project/directory");
+        assert!(!location_line(&state, 80).text().contains("自动放行"));
+        state.auto_approve = true;
+        for width in [1, 8, 16, 40, 80] {
+            let line = location_line(&state, width);
+            assert!(line.width() <= width);
+            if width >= 8 {
+                assert!(line.text().starts_with("自动放行"));
+            }
         }
     }
 

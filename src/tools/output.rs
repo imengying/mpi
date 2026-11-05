@@ -29,7 +29,7 @@ impl Capture {
         })
     }
 
-    pub fn finish(mut self, sanitize: bool) -> std::io::Result<(String, Option<PathBuf>)> {
+    pub fn finish(mut self, sanitize: bool) -> std::io::Result<String> {
         let size = self.file.metadata()?.len();
         let start = size.saturating_sub(MAX_OUTPUT_BYTES as u64);
         self.file.seek(SeekFrom::Start(start))?;
@@ -53,7 +53,7 @@ impl Capture {
         let truncated =
             start > 0 || text.len() > MAX_OUTPUT_BYTES || text.lines().count() > MAX_OUTPUT_LINES;
         if !truncated {
-            return Ok((text.to_string(), None));
+            return Ok(text.to_string());
         }
         // Leave room for the path and exit status so the shared budget does not truncate again.
         let mut cut = text.len().saturating_sub(MAX_OUTPUT_BYTES - 1024);
@@ -72,12 +72,9 @@ impl Capture {
         let lines: Vec<_> = tail.lines().collect();
         let kept = lines[lines.len().saturating_sub(MAX_OUTPUT_LINES - 4)..].join("\n");
         self.retained = true;
-        Ok((
-            format!(
-                "{kept}\n\n[输出过长，已截断。完整输出：{}]",
-                self.path.display()
-            ),
-            Some(self.path.clone()),
+        Ok(format!(
+            "{kept}\n\n[输出过长，已截断。完整输出：{}]",
+            self.path.display()
         ))
     }
 }

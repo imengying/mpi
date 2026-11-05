@@ -3,13 +3,14 @@
 //! Three shapes, all collapsible with Ctrl+O and all re-collapsed when a new task starts
 //! (see [`crate::ui::screen::Screen::collapse_all`]):
 //!
-//! * command output — the last 5 lines, with the `✓ $ command` header and any footer note
-//!   (exit code, temp-file path) always visible,
+//! * successful calls — one summary line, with full output available on expansion,
 //! * a file diff — red and green with line numbers, previewed at 14 rows,
-//! * a plain file note — one header line plus the tail of the result.
+//! * failures — a header and an excerpt from both ends of the error.
 //!
 //! Text is sanitized before it becomes a block, so nothing a command printed can move the
 //! cursor or recolour the UI, and styling is expressed as spans rather than escape codes.
+
+use std::borrow::Cow;
 
 use crate::config::Defaults;
 use crate::tools::{Display, ToolOutput};
@@ -17,6 +18,9 @@ use crate::ui::diff;
 use crate::ui::screen::{Block, Line, Span, Style};
 use crate::ui::theme::Color;
 use crate::util;
+
+#[cfg(test)]
+mod output_tests;
 
 /// The mark for a call that is still running: not a verdict, just "not finished".
 ///
@@ -50,12 +54,57 @@ pub fn status_mark(status: crate::llm::ToolStatus) -> (Style, &'static str) {
 /// stored message keeps it; the transcript does not. `Unknown` was the one status left out of
 /// this list, so an interrupted call printed `请先检查文件或实际状态，再决定是否重试。`
 /// under a `×` — advice for the model, in the user's transcript.
-fn result_text(status: crate::llm::ToolStatus, content: &str) -> &str {
+fn result_text(status: crate::llm::ToolStatus, content: &str) -> Cow<'_, str> {
     use crate::llm::ToolStatus;
     match status {
-        ToolStatus::Success | ToolStatus::Error => content,
-        ToolStatus::Cancelled | ToolStatus::Skipped | ToolStatus::Unknown => "",
+        ToolStatus::Success | ToolStatus::Error => {
+            if content.trim() == crate::tools::NO_OUTPUT {
+                return Cow::Borrowed("");
+            }
+            if !content.lines().any(model_output_note) {
+                return Cow::Borrowed(content);
+            }
+            Cow::Owned(
+                content
+                    .lines()
+                    .filter(|line| !model_output_note(line))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+                    .trim_end()
+                    .to_string(),
+            )
+        }
+        ToolStatus::Cancelled | ToolStatus::Skipped | ToolStatus::Unknown => Cow::Borrowed(""),
     }
+}
+
+/// Recognize only pi's framed output annotations, never an arbitrary mention of truncation.
+/// The original result stays in the session and model request. Both live and restored
+/// transcripts use this projection, including sessions written before the UI changed.
+fn model_output_note(line: &str) -> bool {
+    let Some(note) = line
+        .strip_prefix('[')
+        .and_then(|line| line.strip_suffix(']'))
+    else {
+        return false;
+    };
+    if note.starts_with("输出过长，已截断。完整输出：")
+        || note.starts_with("完整输出写入临时文件失败：")
+        || (note.starts_with("工具结果中间已裁剪；原始内容保存在 ")
+            && note.contains("，tool_call_id="))
+    {
+        return true;
+    }
+    [
+        ("已截断，仅返回前 ", " 条匹配"),
+        ("已截断，仅列出前 ", " 个"),
+    ]
+    .iter()
+    .any(|(prefix, suffix)| {
+        note.strip_prefix(prefix)
+            .and_then(|value| value.strip_suffix(suffix))
+            .is_some_and(|count| count.parse::<u64>().is_ok())
+    })
 }
 
 /// The display a call would have, derived from its arguments alone.
@@ -78,12 +127,12 @@ pub(crate) fn arguments_display(name: &str, arguments: &serde_json::Value) -> Di
             .unwrap_or_else(|| fallback.to_string())
     };
     match name {
-        "bash" => Display::Command { footer: Vec::new() },
+        "bash" => Display::Command,
         "grep" | "find" | "ls" => Display::File {
             verb: crate::tools::verb_for(name),
             path: path("."),
         },
-        "read" | "write" | "edit" => Display::File {
+        "read" | "read_image" | "write" | "edit" => Display::File {
             verb: crate::tools::verb_for(name),
             path: path("…"),
         },
@@ -100,13 +149,13 @@ pub fn tool_block(
 ) -> Block {
     let mut lines: Vec<Line> = Vec::new();
     let mut head = 1usize;
-    let mut tail = 0usize;
+    let tail = 0usize;
     let (mark_style, mark) = status_mark(status);
     let mark_span = Span::new(mark, mark_style);
     let body = result_text(status, &output.content);
 
     match &output.display {
-        Display::Command { footer, .. } => {
+        Display::Command => {
             let command = arguments
                 .get("command")
                 .and_then(|v| v.as_str())
@@ -124,33 +173,20 @@ pub fn tool_block(
                     Style::new(Color::Dim),
                 ));
             }
+            if let Some(duration) = output.duration
+                && let Some(line) = header.last_mut()
+            {
+                line.spans.push(Span::new(
+                    format!(" · {}", format_duration(duration)),
+                    Style::new(Color::Dim),
+                ));
+            }
             lines.extend(header);
             // A header with no result under it is a complete statement — "this command, no
             // output" — so the blank separator only appears when something follows.
             if !body.is_empty() {
                 lines.push(Line::blank());
-                lines.extend(plain_text_lines(body, Style::plain()));
-            }
-            // The duration leads the footer: it is the one thing the user compares between
-            // runs, and an exit code only appears when something went wrong.
-            if let Some(duration) = output.duration {
-                lines.push(Line::new(
-                    format!("耗时 {}", format_duration(duration)),
-                    Style::new(Color::Dim),
-                ));
-                tail += 1;
-            }
-            for note in footer {
-                // The exit code and the temp-file path are written into the output as well as
-                // into the footer, and both copies are right where they are: the model reads
-                // the text, and the footer survives collapsing. The transcript is where the
-                // two meet, and printing them twice puts the same path on two adjacent rows.
-                // The output's copy wins — it is the one a replayed session still has.
-                if output_states_note(&output.content, note) {
-                    continue;
-                }
-                lines.push(Line::new(note.clone(), Style::new(Color::Dim)));
-                tail += 1;
+                lines.extend(plain_text_lines(&body, Style::plain()));
             }
         }
         Display::Diff { .. } => {
@@ -171,54 +207,56 @@ pub fn tool_block(
                 head = 2;
             }
             lines.extend(rows);
-            // A change is read from both ends: what was taken away at the top, what replaced
-            // it at the bottom. Command output is read from its tail only, which is why this
-            // is a different block shape rather than a different preview length.
+            // Keep both ends of the change visible, including removed and added lines.
             let budget = Defaults::DIFF_PREVIEW_LINES;
             let half = budget / 2;
             return Block::collapsible_excerpted(lines, head, tail, half, budget - half);
         }
         Display::File { verb, path } => {
-            lines.push(Line::spans(vec![
+            let mut header = vec![
                 mark_span.clone(),
                 Span::plain(" "),
                 Span::plain(*verb),
                 Span::plain(" "),
                 Span::new(util::one_line(path), Style::new(Color::Cyan)),
-            ]));
-            lines.extend(plain_text_lines(body, Style::new(Color::Output)));
+            ];
+            if status == crate::llm::ToolStatus::Success {
+                let summary = match body.trim() {
+                    "没有找到匹配。" | "没有找到匹配的文件。" => {
+                        "无匹配".to_string()
+                    }
+                    "" => String::new(),
+                    _ if name == "read" && !output.content.lines().any(model_output_note) => {
+                        format!("{} 行", body.lines().count())
+                    }
+                    _ => String::new(),
+                };
+                if !summary.is_empty() {
+                    header.push(Span::new(format!(" · {summary}"), Style::new(Color::Dim)));
+                }
+            }
+            lines.push(Line::spans(header));
+            lines.extend(plain_text_lines(&body, Style::new(Color::Output)));
         }
         Display::None => {
             lines.push(Line::spans(vec![
                 mark_span.clone(),
                 Span::plain(format!(" {name}")),
             ]));
-            lines.extend(plain_text_lines(body, Style::plain()));
+            lines.extend(plain_text_lines(&body, Style::plain()));
         }
     }
-    Block::collapsible(lines, head, tail, Defaults::COMMAND_PREVIEW_LINES)
-}
-
-/// Whether the command's own output already states this footer note.
-///
-/// The tools write the exit code and the location of a cut-off output into the result text
-/// as well as into the footer. Comparing is done on the text without the surrounding
-/// brackets the tools wrap it in (`[退出码 3]` against `退出码 3`), and a note the output
-/// states in full — the truncation note carries the temp path the footer also names — counts
-/// as stated. The output is the copy that keeps working after a resume, so it is the one
-/// the transcript keeps.
-fn output_states_note(output: &str, note: &str) -> bool {
-    if note.is_empty() {
-        return false;
+    if status == crate::llm::ToolStatus::Error {
+        // Keep the cause at the start and the exit status at the end of long errors.
+        if matches!(output.display, Display::Command) && lines.get(head).is_some_and(Line::is_empty)
+        {
+            lines.remove(head);
+        }
+        let budget = Defaults::ERROR_PREVIEW_LINES;
+        Block::collapsible_excerpted(lines, head, tail, budget / 2, budget - budget / 2)
+    } else {
+        Block::collapsible(lines, head, tail, 0)
     }
-    output.lines().any(|line| {
-        let line = line
-            .trim()
-            .trim_start_matches('[')
-            .trim_end_matches(']')
-            .trim();
-        line.contains(note)
-    })
 }
 
 /// A duration in the shortest form that still says how long it was.
@@ -352,12 +390,6 @@ pub fn replay_blocks(messages: &[crate::llm::Message]) -> Vec<crate::ui::screen:
                     })
                     .collect();
                 let mut lines: Vec<Line> = Vec::new();
-                let had_thinking = content
-                    .iter()
-                    .any(|b| matches!(b, MsgBlock::Thinking { .. }));
-                if had_thinking {
-                    push_lines(&mut out, thinking_done_lines());
-                }
                 let stopped = *stop_reason == Some(crate::llm::StopReason::Aborted);
                 // Said once, on the first hosted call or citation, not once per result.
                 let mut announced_search = false;
@@ -430,8 +462,7 @@ pub fn replay_blocks(messages: &[crate::llm::Message]) -> Vec<crate::ui::screen:
 
 /// Append `lines` to the previous block, or start a new one with a blank separator.
 ///
-/// One message's text and thinking belong together: emitting them as separate blocks would
-/// put a collapse note between two halves of the same reply.
+/// Adjacent notes share a block so replay does not add extra separators.
 fn push_lines(out: &mut Vec<crate::ui::screen::Block>, lines: Vec<Line>) {
     if lines.is_empty() {
         return;
@@ -453,15 +484,6 @@ fn stored_output(name: &str, arguments: &serde_json::Value, content: &str) -> To
     output
 }
 
-/// The one-line marker that replaces the live thinking preview once a turn ends.
-///
-/// It carries **no** trailing blank row: the answer follows immediately underneath, and an
-/// empty row between them reads as a paragraph break the model did not write. Blocks are
-/// separated by the transcript itself wherever that is wanted.
-pub fn thinking_done_lines() -> Vec<Line> {
-    vec![Line::new("思考完成", Style::new(Color::Dim))]
-}
-
 /// The single line for a call in flight: `● $ sleep 30`.
 ///
 /// Only the first line of a multi-line command, matching the collapsed transcript row, so
@@ -471,7 +493,7 @@ pub fn running_line(name: &str, arguments: &serde_json::Value) -> Vec<Span> {
     let (style, mark) = running_mark();
     let header = Span::new(mark, style);
     match &display {
-        Display::Command { .. } => {
+        Display::Command => {
             let command = arguments
                 .get("command")
                 .and_then(|v| v.as_str())
@@ -625,8 +647,13 @@ mod tests {
         ];
         crate::llm::validate_tool_history(&messages).unwrap();
         let rendered: Vec<_> = replay_blocks(&messages)
-            .iter()
-            .map(|block| plain(&block.render(80)).join("\n"))
+            .into_iter()
+            .map(|mut block| {
+                if let Block::Collapsible(inner) = &mut block {
+                    inner.expanded = true;
+                }
+                plain(&block.render(80)).join("\n")
+            })
             .collect();
         assert!(rendered[0].contains("✓ 读取 a.rs"), "{}", rendered[0]);
         assert!(rendered[0].contains("original data"));
@@ -729,8 +756,8 @@ mod tests {
             "the answer must come back: {text}"
         );
         assert!(
-            text.contains("思考完成"),
-            "thinking stays collapsed: {text}"
+            !text.contains("思考完成"),
+            "thinking leaves no permanent marker: {text}"
         );
         // The environment block is bookkeeping, not something the user said.
         assert!(!text.contains("<environment>"), "{text}");
@@ -802,19 +829,6 @@ mod tests {
         assert!(!text.contains("可能已有部分效果"), "{text}");
         // The one line that does belong to the user: the turn did not finish.
         assert!(text.contains("已停止"), "{text}");
-    }
-
-    #[test]
-    fn the_thinking_marker_is_not_followed_by_a_blank_row() {
-        // The marker sits directly above the answer it precedes. A blank row between them
-        // reads as a paragraph break the model never wrote — and it appeared on every single
-        // turn that involved thinking, which is most of them.
-        let lines = thinking_done_lines();
-        assert_eq!(lines.len(), 1, "the marker is one row: {lines:?}");
-        assert!(
-            !lines.last().unwrap().is_empty(),
-            "and that row has text in it"
-        );
     }
 
     #[test]
@@ -951,14 +965,12 @@ mod tests {
     }
 
     #[test]
-    fn a_command_result_collapses_to_its_tail() {
+    fn a_successful_command_collapses_to_its_header() {
         let output = ToolOutput {
             content: (0..20).map(|i| format!("row {i}\n")).collect(),
-            display: Display::Command {
-                footer: vec!["耗时 0.4s".into()],
-            },
+            display: Display::Command,
             is_error: false,
-            duration: None,
+            duration: Some(std::time::Duration::from_millis(400)),
             images: Vec::new(),
         };
         let block = tool_block(
@@ -971,12 +983,14 @@ mod tests {
         let text = plain(&block.render(80));
         assert!(text[0].starts_with("✓ "), "{text:?}");
         assert!(text[0].contains("$ ls -l"), "{text:?}");
-        // No row says "collapsed": the excerpt is the tail of the output, and the reader
-        // does not need to be told that an excerpt is an excerpt on every tool call.
-        assert!(!text.iter().any(|line| line.contains("收起")), "{text:?}");
-        assert!(text.iter().any(|line| line.contains("row 19")), "{text:?}");
-        // The footer note is the last row, visible even when collapsed.
-        assert!(text.last().unwrap().contains("耗时 0.4s"), "{text:?}");
+        assert_eq!(text, ["✓ $ ls -l · 0.4s"]);
+        let Block::Collapsible(mut expanded) = block else {
+            unreachable!()
+        };
+        expanded.expanded = true;
+        let full = plain(&Block::Collapsible(expanded).render(80));
+        assert!(full.contains(&"row 0".into()));
+        assert!(full.contains(&"row 19".into()));
     }
 
     #[test]
@@ -1048,15 +1062,11 @@ mod tests {
     }
 
     #[test]
-    fn a_note_the_output_already_states_is_not_printed_twice() {
-        // A failed command used to read: `× $ false`, `[退出码 3]`, and then `退出码 3` again
-        // on the next row — the same fact from the output text and from the footer. Both
-        // copies belong where they are; the transcript is where they meet, so it shows one.
+    fn command_status_is_shown_once_and_truncation_is_model_only() {
+        // Exit status stays in the result text, which both live display and replay use.
         let output = ToolOutput {
             content: "boom\n[退出码 3]\n".into(),
-            display: Display::Command {
-                footer: vec!["退出码 3".into()],
-            },
+            display: Display::Command,
             is_error: true,
             duration: None,
             images: Vec::new(),
@@ -1078,12 +1088,11 @@ mod tests {
         assert!(text[0].starts_with("× $ false"), "{text:?}");
         assert_eq!(text.last().unwrap(), "[退出码 3]", "{text:?}");
 
-        // Same for the temp file a cut-off output is parked in: the truncation note at the
-        // end of the output names it, and the footer used to name it again underneath.
+        // Truncation and the full-log path belong only in the model's result.
         let huge: String = (0..40_000).map(|i| format!("row {i}\n")).collect();
         let output = ToolOutput {
             content: huge,
-            display: Display::Command { footer: Vec::new() },
+            display: Display::Command,
             is_error: false,
             duration: None,
             images: Vec::new(),
@@ -1100,30 +1109,10 @@ mod tests {
         );
         assert_eq!(
             text.iter().filter(|line| line.contains("完整输出")).count(),
-            1,
+            0,
             "{text:?}"
         );
-
-        // A note the output never mentions is the only copy there is, so it stays.
-        let output = ToolOutput {
-            content: "done\n".into(),
-            display: Display::Command {
-                footer: vec!["退出码 3".into()],
-            },
-            is_error: true,
-            duration: None,
-            images: Vec::new(),
-        };
-        let text = plain(
-            &tool_block(
-                "bash",
-                &serde_json::json!({"command": "false"}),
-                &output,
-                ToolStatus::Error,
-            )
-            .render(80),
-        );
-        assert!(text.iter().any(|line| line == "退出码 3"), "{text:?}");
+        assert!(output.content.contains("输出过长，已截断。完整输出："));
     }
 
     #[test]
@@ -1166,7 +1155,7 @@ mod tests {
         // compares between runs, so it has to survive collapsing.
         let mut output = ToolOutput {
             content: "done\n".into(),
-            display: Display::Command { footer: Vec::new() },
+            display: Display::Command,
             is_error: false,
             duration: None,
             images: Vec::new(),
@@ -1191,7 +1180,7 @@ mod tests {
             ToolStatus::Success,
         );
         let text = plain(&block.render(80));
-        assert!(text.iter().any(|line| line == "耗时 3.4s"), "{text:?}");
+        assert_eq!(text, ["✓ $ sleep 1 · 3.4s"]);
     }
 
     #[test]
@@ -1209,9 +1198,7 @@ mod tests {
     fn a_failed_command_is_marked_and_reports_the_exit_code() {
         let output = ToolOutput {
             content: "boom\n[退出码 3]\n".into(),
-            display: Display::Command {
-                footer: vec!["退出码 3".into()],
-            },
+            display: Display::Command,
             is_error: true,
             duration: None,
             images: Vec::new(),
@@ -1391,7 +1378,7 @@ mod tests {
     }
 
     #[test]
-    fn a_file_result_shows_a_header_and_a_short_preview() {
+    fn a_successful_listing_only_shows_its_header() {
         let output = ToolOutput {
             content: (0..20).map(|i| format!("entry {i}\n")).collect(),
             display: Display::File {
@@ -1409,12 +1396,7 @@ mod tests {
             text.iter().any(|line| line.contains("列出 src")),
             "{text:?}"
         );
-        // The tail of the listing is what survives, with nothing announcing the cut.
-        assert!(
-            text.iter().any(|line| line.contains("entry 19")),
-            "{text:?}"
-        );
-        assert!(!text.iter().any(|line| line.contains("收起")), "{text:?}");
+        assert_eq!(text, ["✓ 列出 src"]);
     }
 
     #[test]
@@ -1448,9 +1430,7 @@ mod tests {
     fn every_line_contains_no_escape_sequences() {
         let output = ToolOutput {
             content: "ok\n".into(),
-            display: Display::Command {
-                footer: vec!["退出码 1".into()],
-            },
+            display: Display::Command,
             is_error: true,
             duration: None,
             images: Vec::new(),

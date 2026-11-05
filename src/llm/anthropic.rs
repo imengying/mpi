@@ -216,7 +216,7 @@ pub fn build_request(req: &Request<'_>) -> MessagesRequest {
     let mut system = None;
     let mut messages: Vec<OutMessage> = Vec::new();
     let mut pending_results: Vec<OutBlock> = Vec::new();
-    let mut cache = CacheControl::ephemeral(compat.supports_long_cache);
+    let cache = CacheControl::ephemeral(compat.supports_long_cache);
 
     for message in req.messages {
         match message {
@@ -299,6 +299,12 @@ pub fn build_request(req: &Request<'_>) -> MessagesRequest {
                         Block::Citation { .. } | Block::Image { .. } => {}
                     }
                 }
+                if let Some(notice) = message.output_limit_notice() {
+                    out.push(OutBlock::Text {
+                        text: notice.into(),
+                        cache_control: None,
+                    });
+                }
                 if !out.is_empty() {
                     messages.push(OutMessage {
                         role: "assistant",
@@ -336,7 +342,6 @@ pub fn build_request(req: &Request<'_>) -> MessagesRequest {
             _ => {}
         }
     }
-    let _ = &mut cache;
 
     let mut tools: Vec<ToolEntry> = req
         .tools

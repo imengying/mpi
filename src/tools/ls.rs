@@ -65,9 +65,9 @@ pub async fn execute(arguments: &serde_json::Value, cwd: &Path) -> Result<ToolOu
     let output = super::process::capture(command.current_dir(cwd))
         .await
         .map_err(|err| format!("列目录失败：{err}"))?;
-    let (stdout, _) = output.stdout.finish(true).map_err(|err| err.to_string())?;
+    let stdout = output.stdout.finish(true).map_err(|err| err.to_string())?;
     if !output.status.success() {
-        let (stderr, _) = output.stderr.finish(true).map_err(|err| err.to_string())?;
+        let stderr = output.stderr.finish(true).map_err(|err| err.to_string())?;
         return Err(if stderr.trim().is_empty() {
             format!("列目录失败（退出码 {:?}）", output.status.code())
         } else {

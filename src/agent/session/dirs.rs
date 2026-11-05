@@ -23,12 +23,7 @@ pub fn sessions_root() -> PathBuf {
     home_dir().join(Defaults::SESSIONS_DIR)
 }
 
-/// The file mapping a short directory id back to the path it stands for.
-pub fn dirs_index_path() -> PathBuf {
-    dirs_index_path_in(&sessions_root())
-}
-
-/// [`dirs_index_path`] under a given store, so tests do not touch the real table.
+/// The file mapping directory ids to paths under the given session store.
 fn dirs_index_path_in(root: &Path) -> PathBuf {
     root.join("dirs.json")
 }
@@ -70,13 +65,7 @@ fn provisional_dir_id() -> String {
 
 /// Register `cwd` and return the id its sessions go under, minting one if it is new.
 ///
-/// Called when a session is created, so the table only ever gains directories that produced
-/// something.
-pub fn register_dir(cwd: &Path) -> String {
-    register_dir_in(&sessions_root(), cwd)
-}
-
-/// [`register_dir`] under a given store, so tests do not touch the real one.
+/// Called on the first persisted message, so empty sessions do not create entries.
 pub fn register_dir_in(root: &Path, cwd: &Path) -> String {
     if let Some(id) = dir_id_in(root, cwd) {
         return id;
@@ -293,7 +282,10 @@ mod tests {
         // user's store.
         let home = home_dir();
         assert_eq!(sessions_root(), home.join("sessions"));
-        assert_eq!(dirs_index_path(), home.join("sessions/dirs.json"));
+        assert_eq!(
+            dirs_index_path_in(&sessions_root()),
+            home.join("sessions/dirs.json")
+        );
 
         // Under a store of its own, the grouping still holds.
         let root = std::env::temp_dir().join(format!("pipaths{}", std::process::id()));

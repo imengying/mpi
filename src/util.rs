@@ -255,7 +255,7 @@ pub fn shorten_home(path: &Path, home: Option<&Path>) -> String {
 }
 
 /// Where the full (untruncated) tool output is parked.
-pub fn temp_output_path() -> PathBuf {
+fn temp_output_path() -> PathBuf {
     let mut counter = TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let pid = std::process::id();
     let stamp = std::time::SystemTime::now()
@@ -272,55 +272,30 @@ static TEMP_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicU
 pub const MAX_OUTPUT_LINES: usize = 2000;
 pub const MAX_OUTPUT_BYTES: usize = 50 * 1024;
 
-/// Result of applying the tool-output budget.
-pub struct Truncated {
-    pub text: String,
-    pub truncated: bool,
-    pub dropped_lines: usize,
-    pub full_path: Option<PathBuf>,
-}
-
 /// Keep the **tail** of an oversized result and park the whole thing in a temp file,
 /// whose path is appended for the model to follow up on.
-pub fn truncate_output(raw: &str) -> Truncated {
+pub fn truncate_output(raw: &str) -> String {
     let lines: Vec<&str> = raw.split('\n').collect();
     let over_lines = lines.len().saturating_sub(MAX_OUTPUT_LINES);
     let over_bytes = raw.len().saturating_sub(MAX_OUTPUT_BYTES);
     if over_lines == 0 && over_bytes == 0 {
-        return Truncated {
-            text: raw.to_string(),
-            truncated: false,
-            dropped_lines: 0,
-            full_path: None,
-        };
+        return raw.to_string();
     }
     let full_path = temp_output_path();
     if let Err(err) = std::fs::write(&full_path, raw) {
         // Losing the temp copy is better than losing the answer: report it inline.
-        let kept = tail(raw, &lines);
-        return Truncated {
-            text: format!("{}\n\n[完整输出写入临时文件失败：{err}]", kept.trim_end()),
-            truncated: true,
-            dropped_lines: over_lines,
-            full_path: None,
-        };
+        let kept = tail(&lines);
+        return format!("{}\n\n[完整输出写入临时文件失败：{err}]", kept.trim_end());
     }
-    let kept = tail(raw, &lines);
+    let kept = tail(&lines);
     // What the reader cannot work out for themselves: that this is a tail, and where the
     // whole thing is. How many lines and bytes were kept is countable from the content, so
     // it is left out — the same rule that keeps `read` from appending "仅显示第 X–Y 行".
     let note = format!("\n\n[输出过长，已截断。完整输出：{}]", full_path.display());
-    Truncated {
-        // The kept tail ends with the newline the last line had, and the note opens with a
-        // blank row of its own: without this the note sits two rows under the output.
-        text: format!("{}{note}", kept.trim_end()),
-        truncated: true,
-        dropped_lines: over_lines,
-        full_path: Some(full_path),
-    }
+    format!("{}{note}", kept.trim_end())
 }
 
-fn tail(raw: &str, lines: &[&str]) -> String {
+fn tail(lines: &[&str]) -> String {
     let start_line = lines.len().saturating_sub(MAX_OUTPUT_LINES);
     let candidate = lines[start_line..].join("\n");
     if candidate.len() <= MAX_OUTPUT_BYTES {
@@ -333,7 +308,6 @@ fn tail(raw: &str, lines: &[&str]) -> String {
         offset += 1;
     }
     let body = &candidate[offset..];
-    let _ = raw;
     match body.find('\n') {
         Some(idx) if idx + 1 < body.len() => body[idx + 1..].to_string(),
         _ => body.to_string(),
@@ -400,9 +374,7 @@ mod tests {
 
     #[test]
     fn tiny_output_is_not_truncated() {
-        let out = truncate_output("hello");
-        assert!(!out.truncated);
-        assert_eq!(out.text, "hello");
+        assert_eq!(truncate_output("hello"), "hello");
     }
 
     #[test]
@@ -411,9 +383,14 @@ mod tests {
             .map(|i| format!("line{i}\n"))
             .collect();
         let out = truncate_output(&raw);
-        assert!(out.truncated);
-        assert!(out.text.contains("line2009"));
-        assert!(!out.text.contains("line0\n"));
-        assert!(out.full_path.is_some());
+        assert!(out.contains("line2009"));
+        assert!(!out.contains("line0\n"));
+        let path = out
+            .split("完整输出：")
+            .last()
+            .unwrap()
+            .trim_end_matches(']');
+        assert_eq!(std::fs::read_to_string(path).unwrap(), raw);
+        std::fs::remove_file(path).unwrap();
     }
 }

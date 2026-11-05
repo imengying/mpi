@@ -72,40 +72,36 @@ impl Compat {
         let mut compat = Compat::default();
         let url = base_url.to_lowercase();
         if api == crate::llm::Api::AnthropicMessages {
-            compat.send_session_affinity = true;
             compat.search_format = Some(SearchFormat::Anthropic);
             return compat;
         }
-        if api == crate::llm::Api::OpenAiResponses {
-            // The Responses tool is the same shape on every host. xAI's extra `x_search`
-            // is layered on below, where the host is known.
-            compat.search_format = Some(SearchFormat::WebSearch);
-        }
+        compat.search_format = Some(SearchFormat::WebSearch);
         let host = url.split("//").nth(1).unwrap_or(&url);
         let host = host.split('/').next().unwrap_or(host);
         if host.ends_with("api.openai.com") {
             compat.supports_strict_mode = true;
             compat.supports_long_cache = true;
-        } else if host.contains("deepseek") {
-            // The official API does not run a search. Responses accepts `web_search` and
-            // then ignores it, which would look like a search that never happened. Leave
-            // the format unset so `search: true` fails at startup instead of sending a
-            // no-op.
-            compat.search_format = None;
-        } else if host.contains("bigmodel") || host.contains("z.ai") || host.contains("zhipu") {
-            // No hosted search on the Responses API for this host: `search: true` fails at
-            // startup rather than sending a flag the endpoint ignores.
-            compat.search_format = None;
-        } else if host.contains("dashscope") || host.contains("aliyuncs") || host.contains("qwen") {
+        } else if [
+            "deepseek",
+            "bigmodel",
+            "z.ai",
+            "zhipu",
+            "dashscope",
+            "aliyuncs",
+            "qwen",
+        ]
+        .iter()
+        .any(|name| host.contains(name))
+        {
+            // These Responses routes do not run hosted search. Reject it at startup.
             compat.search_format = None;
         } else if host == "x.ai" || host.ends_with(".x.ai") {
             compat.search_format = Some(SearchFormat::WebAndX);
-        } else if host.contains("openrouter") {
-            // OpenRouter normalises caching itself; the markers are not accepted.
-            compat.send_session_affinity = false;
-        } else if host.contains("localhost") || host.contains("127.0.0.1") {
-            // A local gateway (vLLM, llama.cpp, LM Studio, one-api…). Keep the most
-            // permissive shape: unknown options are usually ignored there.
+        } else if host.contains("openrouter")
+            || host.contains("localhost")
+            || host.contains("127.0.0.1")
+        {
+            // OpenRouter handles affinity itself; local gateways need no affinity headers.
             compat.send_session_affinity = false;
         }
         compat

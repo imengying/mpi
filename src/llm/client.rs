@@ -73,8 +73,7 @@ fn retry_delay(base: Duration, attempt: u32) -> Duration {
 /// Every other 4xx is a statement about the request itself, and resending it would spend the
 /// budget to produce the same refusal.
 fn retry_for_status(status: u16, retry_after: Option<Duration>) -> Retry {
-    let transient = status == 529 || (500..600).contains(&status);
-    if !transient {
+    if !(500..600).contains(&status) {
         return Retry::Never;
     }
     Retry::After(retry_after.unwrap_or(Duration::ZERO).min(RETRY_MAX_DELAY))
@@ -107,9 +106,7 @@ enum Frame {
 ///
 /// Held together rather than selected by `Api` because a frame is decoded before it is
 /// attributed: `Frame` carries the protocol it was parsed as, and the matching field is the
-/// one that consumes it. Keeping all three here is also what lets every request share one
-/// code path — the alternative is three copies of the read loop, each with its own framing
-/// and its own timeout handling.
+/// one that consumes it. Both protocols share the read loop, framing and timeout handling.
 ///
 /// They are not merged into one type despite the resemblance: see the note in `llm/mod.rs`.
 struct Assemblers {
@@ -205,9 +202,7 @@ impl Client {
             if delay < scheduled {
                 delay = scheduled;
             }
-            on_delta(Delta::Notice(format!(
-                "请求失败，重试 {attempts}/{RETRY_LIMIT}：{error}"
-            )));
+            on_delta(Delta::Notice(format!("请求重试 {attempts}/{RETRY_LIMIT}")));
             tokio::time::sleep(delay).await;
         }
     }

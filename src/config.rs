@@ -64,7 +64,7 @@ pub struct ModelConfig {
     /// a tool that appears and disappears between turns breaks the cache prefix.
     pub search: bool,
     /// Sampling overrides keyed by the effective thinking level. These are sent on
-    /// OpenAI-compatible Responses routes; other protocols keep their defaults.
+    /// OpenAI-compatible Responses routes; other protocols reject these overrides.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub sampling_params_by_thinking_level: BTreeMap<String, SamplingParams>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -586,6 +586,14 @@ impl Config {
                 }
                 let supported_levels = model.levels();
                 for (level, sampling) in &model.sampling_params_by_thinking_level {
+                    if provider.api() != Some(crate::llm::Api::OpenAiResponses) {
+                        return Err(ConfigError::BadSampling {
+                            provider: provider.name.clone(),
+                            model: model.id.clone(),
+                            level: level.clone(),
+                            reason: "sampling_params_by_thinking_level 仅支持 responses".into(),
+                        });
+                    }
                     if level != "off"
                         && (level_index(level).is_none()
                             || !supported_levels.iter().any(|supported| supported == level))
@@ -801,7 +809,7 @@ pub const SUMMARY_SECTIONS: &str = "## Goal
 pub struct Defaults;
 
 impl Defaults {
-    pub const COMMAND_PREVIEW_LINES: usize = 5;
+    pub const ERROR_PREVIEW_LINES: usize = 5;
     pub const DIFF_PREVIEW_LINES: usize = 14;
     pub const THINKING_PREVIEW_LINES: usize = 2;
     pub const AUTH_PANEL_MAX_HEIGHT: u16 = 22;
@@ -889,6 +897,23 @@ mod tests {
         assert_eq!(unknown.compaction_budget().unwrap().keep_recent, 20_000);
         let raw = serde_json::json!({"providers":[{"name":"p","models":[{"id":"m","compaction":{"keepRecentTokens":100}}]}]});
         assert!(check_unknown_fields(&raw).is_err());
+    }
+
+    #[test]
+    fn messages_rejects_sampling_overrides_instead_of_ignoring_them() {
+        let mut config = sample();
+        config.providers[0].api = "messages".into();
+        config.providers[0].models[0]
+            .sampling_params_by_thinking_level
+            .insert(
+                "high".into(),
+                SamplingParams {
+                    temperature: Some(0.5),
+                    top_p: None,
+                },
+            );
+        let error = config.validate(Path::new("config.json")).unwrap_err();
+        assert!(error.to_string().contains("仅支持 responses"), "{error}");
     }
 
     #[test]

@@ -95,21 +95,30 @@ impl Screen {
         if queue_cap > 0 && !self.pending.is_empty() {
             let first = self.pending.len().saturating_sub(queue_cap);
             for (index, queued) in self.pending[first..].iter().enumerate() {
-                let marker = if index == 0 && first > 0 {
-                    format!("… +{first} · ")
+                let mut marker = if index == 0 && first > 0 {
+                    format!("待处理（另 {first} 条）")
                 } else {
-                    "… ".into()
+                    "待处理".into()
                 };
-                above.push(Line::dim(format!(
-                    "{marker}{}",
-                    util::one_line(queued.text())
-                )));
+                if first + index + 1 == self.pending.len() {
+                    marker.push_str(" · Alt+↑ 编辑");
+                }
+                let mut text = util::one_line(queued.text());
+                if let Queued::Message(_, images) = queued
+                    && !images.is_empty()
+                {
+                    text.push_str(&format!(" [{} 张图片]", images.len()));
+                }
+                above.push(Line::dim(format!("{marker}：{text}")));
             }
             room = room.saturating_sub(above.len());
         }
         let mut preview = Vec::new();
         if let Some(thinking) = &self.streaming_thinking
-            && !self.thinking_committed
+            && self
+                .streaming_answer
+                .as_ref()
+                .is_none_or(|answer| answer.trim().is_empty())
         {
             let wrapped = util::wrap(&util::one_line(thinking), self.width);
             let first = wrapped
@@ -267,16 +276,6 @@ impl Screen {
         if prefix.trim().is_empty() {
             self.streaming_committed = end;
             return;
-        }
-        if !self.thinking_committed
-            && self
-                .streaming_thinking
-                .as_ref()
-                .is_some_and(|text| !text.trim().is_empty())
-        {
-            self.blocks
-                .push(Block::lines(crate::ui::compact::thinking_done_lines()));
-            self.thinking_committed = true;
         }
         self.blocks.push(Block::markdown(prefix));
         self.streaming_committed = end;

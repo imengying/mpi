@@ -8,6 +8,93 @@ fn drain_queued(screen: &mut Screen) -> Vec<Queued> {
 }
 
 #[test]
+fn editing_a_queued_message_withdraws_it_and_restores_text_and_images() {
+    let mut screen = screen_with_commands();
+    screen.interactive = false;
+    set_input(&mut screen, "");
+    let image = PastedImage {
+        width: 1,
+        height: 1,
+        data: "png".into(),
+        media_type: "image/png",
+        bytes: 3,
+    };
+    let text = "long pasted line\n".repeat(50);
+    screen.queue(Queued::Message("older".into(), Vec::new()));
+    screen.queue(Queued::Message(text.clone(), vec![image.clone()]));
+    let live: String = screen
+        .compose_live()
+        .0
+        .iter()
+        .map(|row| row.line.text())
+        .collect();
+    assert!(live.contains("待处理") && live.contains("Alt+↑"));
+    screen.absorb_event(Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT)));
+    assert_eq!(screen.editing.as_ref().unwrap().expanded(), text);
+    assert_eq!(
+        screen.pending_images.as_slice(),
+        std::slice::from_ref(&image)
+    );
+    assert_eq!(
+        screen.take_steering(),
+        [Queued::Message("older".into(), Vec::new())]
+    );
+    assert!(screen.take_steering().is_empty());
+    assert_eq!(
+        screen.absorb_event(Event::Key(KeyCode::Enter.into())),
+        Some(Action::LineWithImages(text, vec![image]))
+    );
+    assert!(screen.pending_images.is_empty());
+}
+
+#[test]
+fn queued_recall_preserves_an_existing_draft_and_its_images() {
+    let mut screen = screen_with_commands();
+    screen.interactive = false;
+    screen.queue(Queued::Message("pending".into(), Vec::new()));
+    set_input(&mut screen, "draft");
+    let recall = Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT));
+    screen.absorb_event(recall.clone());
+    assert_eq!(screen.editing.as_ref().unwrap().expanded(), "draft");
+    assert_eq!(screen.pending.len(), 1);
+    assert!(screen.notice.is_some());
+    set_input(&mut screen, "");
+    screen.pending_images.push(PastedImage {
+        width: 1,
+        height: 1,
+        data: "draft".into(),
+        media_type: "image/png",
+        bytes: 5,
+    });
+    screen.absorb_event(recall);
+    assert_eq!(screen.pending_images[0].data, "draft");
+    assert_eq!(screen.pending.len(), 1);
+}
+
+#[test]
+fn a_recalled_command_can_be_edited_or_discarded_without_being_dispatched() {
+    let mut screen = screen_with_commands();
+    screen.interactive = false;
+    set_input(&mut screen, "");
+    screen.queue(Queued::Command("/model".into()));
+    screen.absorb_event(Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT)));
+    assert!(screen.menu.is_empty());
+    assert!(screen.pop_queued().is_none());
+    assert_eq!(
+        screen.absorb_event(Event::Key(KeyCode::Enter.into())),
+        Some(Action::Line("/model".into()))
+    );
+    screen.queue(Queued::Command("/new".into()));
+    screen.absorb_event(Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT)));
+    screen.absorb_event(Event::Key(KeyEvent::new(
+        KeyCode::Char('c'),
+        KeyModifiers::CONTROL,
+    )));
+    assert!(screen.editing.as_ref().unwrap().is_empty());
+    assert!(screen.pop_queued().is_none());
+}
+
+#[test]
 fn steering_preserves_submission_order_and_waits_behind_commands() {
     let mut screen = screen_with_commands();
     screen.interactive = false;
@@ -110,7 +197,7 @@ fn streaming_blocks_enter_scrollback_once_and_keep_the_draft_below_output() {
         screen.push_text(&format!("paragraph {index}\n\n"));
         screen.render();
         terminal.process(&captured.take());
-        let expected_row = (4 + index * 2).min(21) as u16;
+        let expected_row = (3 + index * 2).min(21) as u16;
         assert_eq!(terminal.screen().cursor_position(), (expected_row, 7));
         assert!(
             terminal
@@ -141,7 +228,8 @@ fn streaming_blocks_enter_scrollback_once_and_keep_the_draft_below_output() {
             1
         );
     }
-    assert_eq!(transcript.matches("思考完成").count(), 1);
+    assert!(!transcript.contains("思考完成"));
+    assert!(!transcript.contains("thinking"));
     terminal.screen_mut().set_scrollback(500);
     let scrollback = terminal.screen().contents();
     assert!(scrollback.contains("paragraph 0"));
@@ -683,6 +771,7 @@ fn the_status_reflows_without_new_model_output_after_a_resize() {
         model: Some(model),
         level: String::new(),
         busy: None,
+        auto_approve: false,
     });
     screen.width = 80;
     let wide = screen.compose_live().0.last().unwrap().line.text();
@@ -1727,7 +1816,8 @@ fn appending_a_token_does_not_redraw() {
         .lines()
         .map(str::to_owned)
         .collect();
-    assert!(text.iter().any(|row| row.contains("think")), "{text:?}");
+    assert!(!text.iter().any(|row| row.contains("think")), "{text:?}");
+    assert_eq!(screen.streaming_thinking.as_deref(), Some("think"));
     let drawn = text.concat();
     assert!(
         drawn.contains(&"x".repeat(40)),
@@ -1824,6 +1914,7 @@ fn no_live_row_is_wider_than_the_terminal() {
         model: None,
         level: "high".into(),
         busy: None,
+        auto_approve: false,
     };
     screen.set_footer(crate::ui::footer::render(
         &state,

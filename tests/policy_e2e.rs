@@ -321,9 +321,31 @@ async fn a_batch_using_the_default_path_is_still_vetted() {
         "path": "inside.txt",
         "edits": [{"old_text": "text", "new_text": "changed"}]
     });
+    // The advertised item requirements must accept the same inherited path as execution.
+    let schema = mpi::tools::edit::spec().parameters;
+    for key in schema["properties"]["edits"]["items"]["required"]
+        .as_array()
+        .unwrap()
+    {
+        assert!(
+            inside["edits"][0].get(key.as_str().unwrap()).is_some(),
+            "schema requires {key}, but path is inherited from the call"
+        );
+    }
     assert!(
         gate.check("edit", &inside, &dir).is_ok(),
         "a batch on the default path must be allowed"
+    );
+    let context = mpi::tools::ToolContext {
+        cwd: dir.clone(),
+        shell: mpi::config::DEFAULT_SHELL.into(),
+        observed: Default::default(),
+    };
+    let result = mpi::tools::execute("edit", &inside, &context).await;
+    assert!(!result.is_error, "{}", result.content);
+    assert_eq!(
+        std::fs::read_to_string(dir.join("inside.txt")).unwrap(),
+        "changed\n"
     );
 
     // Default path outside the project: asks, even though the item names nothing.

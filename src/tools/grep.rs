@@ -167,7 +167,7 @@ async fn execute_with_engine(
         .await
         .map_err(|err| err.to_string())?
         .map_err(|err| format!("读取搜索输出失败：{err}"))?;
-    let (stderr, _) = output.stderr.finish(true).map_err(|err| err.to_string())?;
+    let stderr = output.stderr.finish(true).map_err(|err| err.to_string())?;
     let mut content = if body.is_empty() {
         if failed {
             format!("搜索失败（退出码 {:?}）", output.status.code())
@@ -224,7 +224,7 @@ fn select_matches(mut raw: super::output::Capture, max_results: u64) -> std::io:
         selected.file.write_all(&[separator])?;
         super::output::copy_line(&mut reader, &mut selected.file)?;
     }
-    selected.finish(true).map(|(text, _)| text)
+    selected.finish(true)
 }
 
 #[cfg(test)]

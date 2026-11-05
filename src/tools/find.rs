@@ -133,7 +133,7 @@ async fn execute_with_engine(
         tokio::task::spawn_blocking(move || select_paths(output.stdout, &target_path, max_results))
             .await
             .map_err(|err| err.to_string())??;
-    let (stderr, _) = output.stderr.finish(true).map_err(|err| err.to_string())?;
+    let stderr = output.stderr.finish(true).map_err(|err| err.to_string())?;
     let failed = !output.status.success();
     let mut content = if body.is_empty() {
         if failed {
@@ -192,10 +192,7 @@ fn select_paths(
         .map_err(|err| err.to_string())?;
         count += 1;
     }
-    selected
-        .finish(true)
-        .map(|(body, _)| body)
-        .map_err(|err| err.to_string())
+    selected.finish(true).map_err(|err| err.to_string())
 }
 
 #[cfg(test)]

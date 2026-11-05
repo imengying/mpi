@@ -123,7 +123,7 @@ pub async fn execute_with_shell(
         .map_err(|err| format!("等待命令结束失败：{err}"))?;
     let code = status.code();
 
-    let (body, full_path) = capture
+    let body = capture
         .finish(true)
         .map_err(|err| format!("读取命令输出失败：{err}"))?;
 
@@ -138,21 +138,7 @@ pub async fn execute_with_shell(
         Some(code) => content.push_str(&format!("[退出码 {code}]\n")),
         None => content.push_str("[命令被信号终止]\n"),
     }
-    let mut footer: Vec<String> = Vec::new();
-    if let Some(path) = full_path {
-        footer.push(format!("完整输出：{}", path.display()));
-    }
-    if failed {
-        footer.push(match code {
-            Some(0) | None => "命令被信号终止".to_string(),
-            Some(code) => format!("退出码 {code}"),
-        });
-    }
-    Ok(crate::tools::tool_output(
-        content,
-        Display::Command { footer },
-        failed,
-    ))
+    Ok(crate::tools::tool_output(content, Display::Command, failed))
 }
 
 #[cfg(test)]
@@ -221,13 +207,13 @@ mod tests {
         });
         assert!(out.content.contains("last-output"));
         assert!(out.content.len() <= crate::util::MAX_OUTPUT_BYTES);
-        let Display::Command { footer, .. } = out.display else {
-            panic!("command display")
-        };
-        let path = footer
-            .iter()
-            .find_map(|line| line.strip_prefix("完整输出："))
-            .unwrap();
+        let path = out
+            .content
+            .split("完整输出：")
+            .last()
+            .unwrap()
+            .trim()
+            .trim_end_matches(']');
         assert!(std::fs::metadata(path).unwrap().len() > 262144);
         std::fs::remove_file(path).unwrap();
     }

@@ -30,13 +30,14 @@ pub struct PanelRequest {
 
 const TITLE: &str = "需要授权";
 const ALLOW_LABEL: &str = "1. 允许本次操作";
-const DENY_LABEL: &str = "2. 拒绝并停止";
+const DENY_LABEL: &str = "2. 拒绝本次";
 
 /// What the user chose.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decision {
     Allow,
     Deny,
+    Stop,
 }
 
 /// Show the panel and block until the user decides. Returns `Deny` if there is no
@@ -105,7 +106,7 @@ impl PanelState {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Esc => return Some(Decision::Deny),
-            KeyCode::Char('c') if ctrl => return Some(Decision::Deny),
+            KeyCode::Char('c') if ctrl => return Some(Decision::Stop),
             KeyCode::Enter => {
                 return Some(if self.allow_selected {
                     Decision::Allow
@@ -182,7 +183,11 @@ impl PanelState {
             lines.push(rule.clone());
         }
         if height >= 3 {
-            lines.push(row(TITLE, false, &|text| theme.fg(Color::Cyan, text)));
+            lines.push(row(
+                &format!("{TITLE} · Ctrl+C 停止本轮"),
+                false,
+                &|text| theme.fg(Color::Cyan, text),
+            ));
         }
         for line in visible {
             lines.push(row(line, false, &|text| theme.fg(Color::Text, text)));
@@ -333,7 +338,7 @@ mod tests {
             Some(Decision::Deny)
         );
         let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
-        assert_eq!(state("x").handle_key(ctrl_c), Some(Decision::Deny));
+        assert_eq!(state("x").handle_key(ctrl_c), Some(Decision::Stop));
     }
 
     #[test]
@@ -477,7 +482,7 @@ mod tests {
         let lines = frame(&mut panel);
         // Docked strip: a rule, the fixed title, the body, a rule, then the two choices.
         assert!(lines[0].starts_with('─'), "{lines:?}");
-        assert_eq!(lines[1], TITLE, "{lines:?}");
+        assert_eq!(lines[1], "需要授权 · Ctrl+C 停止本轮", "{lines:?}");
         assert_eq!(
             TITLE, "需要授权",
             "the title is short and fixed: the choices say the rest"
@@ -492,7 +497,7 @@ mod tests {
             lines.contains(&"› 1. 允许本次操作".to_string()),
             "{lines:?}"
         );
-        assert!(lines.contains(&"2. 拒绝并停止".to_string()), "{lines:?}");
+        assert!(lines.contains(&"2. 拒绝本次".to_string()), "{lines:?}");
         // The choices are the last two rows.
         assert!(lines[lines.len() - 2].starts_with("› 1."), "{lines:?}");
         assert!(lines[lines.len() - 1].starts_with("2."), "{lines:?}");
@@ -509,7 +514,7 @@ mod tests {
             "{lines:?}"
         );
         assert!(
-            lines.iter().any(|line| line == "› 2. 拒绝并停止"),
+            lines.iter().any(|line| line == "› 2. 拒绝本次"),
             "{lines:?}"
         );
     }

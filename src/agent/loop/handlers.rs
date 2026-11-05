@@ -63,16 +63,19 @@ impl Agent {
             self.screen.set_running(running.clone());
             self.screen.suspend_live();
             // Every call keeps its own authorization decision; no batch-wide grant.
-            let approved: Vec<_> = batch
-                .iter()
-                .map(|(_, name, arguments)| {
-                    self.gate
-                        .check(name, arguments, &self.cwd)
-                        .map_err(|refusal| {
-                            ToolOutput::error_for(name, arguments, refusal.message())
-                        })
-                })
-                .collect();
+            let mut approved = Vec::with_capacity(batch.len());
+            for (_, name, arguments) in batch {
+                match self.gate.check(name, arguments, &self.cwd) {
+                    Err(refusal) if refusal.stopped => {
+                        self.screen.clear_running();
+                        self.skip_tools(&calls[next..], true)?;
+                        return Ok(true);
+                    }
+                    approval => approved.push(approval.map_err(|refusal| {
+                        ToolOutput::error_for(name, arguments, refusal.message())
+                    })),
+                }
+            }
             let started: Vec<_> = approved.iter().map(Result::is_ok).collect();
             self.screen.set_running(running);
             for ((id, name, _), approval) in batch.iter().zip(approved.iter()) {
@@ -159,9 +162,7 @@ impl Agent {
         let context = tools::ToolContext {
             cwd: self.cwd.clone(),
             shell: self.config.shell.path.clone(),
-            // Fresh per batch: what matters is "did the file change since *this* turn read
-            // it", which is exactly the window an edit guesses into.
-            observed: tools::observed::Observed::default(),
+            observed: self.observed.clone(),
         };
         for (index, approval) in approved.into_iter().enumerate() {
             match approval {
@@ -340,6 +341,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn file_versions_survive_batches_until_reread_or_own_write() {
+        let (mut agent, dir) = test_agent();
+        let file = dir.join("shared");
+        std::fs::write(&file, "alpha\nbeta\n").unwrap();
+        agent
+            .session
+            .push_message(Message::user_text("修改文件"), None, None)
+            .unwrap();
+        let read = vec![(
+            "read-1".into(),
+            "read".into(),
+            serde_json::json!({"path":"shared"}),
+        )];
+        append_calls(&mut agent, &read);
+        agent.execute_tools(&read).await.unwrap();
+
+        // Even a still-matching old_text must not hide an external change elsewhere.
+        std::fs::write(&file, "alpha\nexternally changed\n").unwrap();
+        let edit = vec![(
+            "edit-1".into(),
+            "edit".into(),
+            serde_json::json!({
+                "path":"shared", "old_text":"alpha", "new_text":"ALPHA"
+            }),
+        )];
+        append_calls(&mut agent, &edit);
+        agent.execute_tools(&edit).await.unwrap();
+        assert!(matches!(agent.session.context_messages().last(),
+            Some(Message::Tool { status: ToolStatus::Error, content, .. }) if content.contains("被改过")));
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "alpha\nexternally changed\n"
+        );
+
+        // A re-read and edit in one model response still cross two scheduler batches.
+        let calls = vec![
+            (
+                "read-2".into(),
+                "read".into(),
+                serde_json::json!({"path":"shared"}),
+            ),
+            (
+                "edit-2".into(),
+                "edit".into(),
+                serde_json::json!({"path":"shared", "old_text":"alpha", "new_text":"ALPHA"}),
+            ),
+            (
+                "edit-3".into(),
+                "edit".into(),
+                serde_json::json!({"path":"shared", "old_text":"ALPHA", "new_text":"done"}),
+            ),
+            (
+                "read-3".into(),
+                "read".into(),
+                serde_json::json!({"path":"shared"}),
+            ),
+            (
+                "write-1".into(),
+                "write".into(),
+                serde_json::json!({"path":"shared", "content":"rewritten"}),
+            ),
+            (
+                "edit-4".into(),
+                "edit".into(),
+                serde_json::json!({"path":"shared", "old_text":"rewritten", "new_text":"finished"}),
+            ),
+        ];
+        append_calls(&mut agent, &calls);
+        agent.execute_tools(&calls).await.unwrap();
+        let messages = agent.session.context_messages();
+        assert!(
+            messages
+                .iter()
+                .rev()
+                .take(calls.len())
+                .all(|message| matches!(
+                    message,
+                    Message::Tool {
+                        status: ToolStatus::Success,
+                        ..
+                    }
+                ))
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "finished");
+        drop(agent);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn switching_sessions_clears_observed_file_versions() {
+        let (mut agent, dir) = test_agent();
+        let file = dir.join("shared");
+        for restore in [false, true] {
+            std::fs::write(&file, "before").unwrap();
+            agent.observed.note(&file);
+            std::fs::write(&file, "changed outside the agent").unwrap();
+            assert!(agent.observed.stale(&file, "shared").is_err());
+            if restore {
+                let session = Session::create_in(&dir, &dir, "test/m").unwrap();
+                agent.restore_session(session).unwrap();
+            } else {
+                agent.start_new_session().unwrap();
+            }
+            assert!(agent.observed.stale(&file, "shared").is_ok());
+        }
+        drop(agent);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn cancelled_and_crashed_workers_keep_completed_results_and_report_uncertainty() {
         let mut workers = tokio::task::JoinSet::new();
         let mut indices = std::collections::HashMap::new();
@@ -400,7 +511,7 @@ mod tests {
         // block would say `⊘ bash` here and `⊘ $ sleep 30` on the next resume.
         assert!(matches!(
             results[1].0.display,
-            crate::tools::Display::Command { .. }
+            crate::tools::Display::Command
         ));
         assert!(matches!(
             results[2].0.display,

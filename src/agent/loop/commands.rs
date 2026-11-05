@@ -18,17 +18,12 @@ impl Agent {
             "name" => self.command_name(argument)?,
             "permissions" => self.command_permissions()?,
             "compact" => self.command_compact(argument).await?,
-            "new" => self.command_new()?,
+            "new" => self.start_new_session()?,
             "resume" => self.command_resume().await?,
             "delete" => return self.command_delete(),
             other => {
-                let available = COMMANDS
-                    .iter()
-                    .map(|(name, _)| format!("/{name}"))
-                    .collect::<Vec<_>>()
-                    .join(" ");
                 self.screen.push_lines(ui_compact::note_lines(
-                    &format!("未知命令：/{other}（可用：{available}）"),
+                    &format!("未知命令：/{other}。输入 / 查看命令"),
                     crate::ui::screen::Style::new(Color::Yellow),
                 ));
             }
@@ -70,7 +65,7 @@ impl Agent {
         if !self.session.is_saved() {
             self.deleted = true;
             self.screen.push_lines(ui_compact::note_lines(
-                "没有内容，未生成文件。",
+                "会话为空",
                 crate::ui::screen::Style::new(Color::Dim),
             ));
             return Ok(false);
@@ -97,9 +92,7 @@ impl Agent {
         if choice != Some(1) {
             return Ok(true);
         }
-        // The early return above proved there is a file, so the deletion is a fact and not a
-        // question: report the path that is gone, which is the one thing the user cannot see
-        // from the screen.
+        // The early return above proved there is a file; confirm removal before leaving.
         let removed = self.session.delete()?;
         debug_assert!(removed, "a saved session always has a file to unlink");
         self.deleted = true;
@@ -108,16 +101,10 @@ impl Agent {
         // where history *is* — which is the whole reason for grouping by directory.
         crate::agent::session::dirs::forget_dir_if_empty(&self.cwd);
         self.screen.push_lines(ui_compact::note_lines(
-            &format!("已删除会话文件：{path}"),
+            "已删除会话",
             crate::ui::screen::Style::new(Color::Dim),
         ));
         Ok(false)
-    }
-
-    pub(super) fn command_new(&mut self) -> anyhow::Result<()> {
-        // The id is not announced: it is printed on the way out, with the command that
-        // resumes it, which is the only place it is useful.
-        self.start_new_session()
     }
 
     /// Replace the current session with a fresh one, keeping the working directory.
@@ -130,6 +117,7 @@ impl Agent {
     pub(super) fn start_new_session(&mut self) -> anyhow::Result<()> {
         let model_spec = self.model_spec.clone();
         self.session = Session::create(&self.cwd, &model_spec)?;
+        self.observed = tools::observed::Observed::default();
         // Nothing has been timed in the new session yet.
         self.output_rate = None;
         self.system_prompt = system_prompt_from(&self.cwd);
@@ -185,16 +173,6 @@ impl Agent {
         // part of how the session runs, like the model and the thinking level beside it.
         self.session
             .push_turn_context(&self.cwd, &self.model_spec, &self.level, chosen)?;
-        // Turning the questions off is the one direction the user cannot see from the footer:
-        // the next command simply runs. Saying it once is the whole reason this is not
-        // silent. Turning them back on needs no line — the panel appearing again is itself
-        // the answer, and a note would land in a transcript the panel is about to cover.
-        if chosen == PermissionMode::Allow {
-            self.screen.push_lines(ui_compact::note_lines(
-                "已关闭命令审核：策略标注的命令将直接执行。",
-                crate::ui::screen::Style::new(Color::Yellow),
-            ));
-        }
         Ok(())
     }
 
@@ -202,7 +180,7 @@ impl Agent {
         let summaries = crate::agent::session::list(&self.cwd);
         if summaries.is_empty() {
             self.screen.push_lines(ui_compact::note_lines(
-                "没有可恢复的会话。",
+                "暂无历史会话",
                 crate::ui::screen::Style::new(Color::Dim),
             ));
             return Ok(());
@@ -218,18 +196,7 @@ impl Agent {
                 )
             })
             .collect();
-        // Esc cancels, and cancelling a "go somewhere else" prompt leaves the user at a
-        // blank line with no way to start over — the current session is still the one they
-        // were trying to leave. So cancelling *is* the new session here. When the current
-        // session has already said something it is kept (it stays in `/resume`), so nothing
-        // is lost; the menu's own hint says what the key will do, and the wiped screen says
-        // it happened, so no note follows.
-        let Some(index) = self.screen.pick_with_hint(
-            "恢复历史会话",
-            "↑↓ 选择 · Enter 确认 · Esc 开始新会话",
-            &items,
-        ) else {
-            self.start_new_session()?;
+        let Some(index) = self.screen.pick("恢复历史会话", &items) else {
             return Ok(());
         };
         let target = summaries[index].path.clone();
@@ -289,38 +256,24 @@ impl Agent {
             return Ok(());
         };
         let spec = catalogue[index].1.clone();
-        self.model_spec = spec.clone();
         let (_, model) = self.config.find(&spec).expect("chosen from the catalogue");
         let levels = model.levels();
-        // The footer is redrawn with every change, so the model and level that are now in
-        // force need no note. The one thing it cannot show is a level the user asked for and
-        // did not get, because that was silently replaced.
-        let mut clamped_from: Option<String> = None;
-
-        if levels.is_empty() {
-            self.level.clear();
+        let level = if levels.is_empty() {
+            String::new()
         } else {
             let current = levels
                 .iter()
                 .position(|level| *level == self.level)
                 .unwrap_or(0);
             let level_items: Vec<String> = levels.iter().map(|level| level.to_string()).collect();
-            if let Some(chosen) = self.screen.pick_at("思考级别", &level_items, current) {
-                self.level = levels[chosen].clone();
-            }
-            // A level that came from another model may not exist here.
-            let (clamped, moved) = llm::clamp_level(model, &self.level);
-            if moved {
-                clamped_from = Some(self.level.clone());
-            }
-            self.level = clamped;
-        }
-        if let Some(asked) = clamped_from {
-            self.screen.push_lines(ui_compact::note_lines(
-                &format!("思考级别 {asked} 不受支持，已调整为 {}", self.level),
-                crate::ui::screen::Style::new(Color::Dim),
-            ));
-        }
+            let Some(chosen) = self.screen.pick_at("思考级别", &level_items, current) else {
+                return Ok(());
+            };
+            levels[chosen].clone()
+        };
+        // Both choices must be confirmed before changing the current model.
+        self.model_spec = spec;
+        self.level = level;
         // The rate measured the previous provider. Keeping it under a new model name would
         // attribute one vendor's speed to another.
         self.output_rate = None;
@@ -452,11 +405,12 @@ impl Agent {
         // The token counts are not restated: the footer carries the context gauge, and that is
         // the number the user is already reading. A compaction that shrank nothing is not a
         // quietly-worded success either — it fails as `NotSmaller` and never reaches here.
-        let note = "已压缩";
-        self.screen.push_lines(ui_compact::note_lines(
-            note,
-            crate::ui::screen::Style::new(Color::Dim),
-        ));
+        if reason == Reason::Manual {
+            self.screen.push_lines(ui_compact::note_lines(
+                "已压缩",
+                crate::ui::screen::Style::new(Color::Dim),
+            ));
+        }
         Ok(())
     }
 }

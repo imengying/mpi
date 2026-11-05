@@ -51,15 +51,6 @@ impl Screen {
         self.pick_at(title, items, 0)
     }
 
-    /// Like [`Screen::pick`], but the hint row says what Esc will do.
-    ///
-    /// The default hint promises "cancel", which is wrong where cancel *is* an action —
-    /// `/resume` starts a new session on Esc, and a menu that said "cancel" while doing that
-    /// would be lying about its own key.
-    pub fn pick_with_hint(&mut self, title: &str, hint: &str, items: &[String]) -> Option<usize> {
-        self.pick_hinted(title, items, 0, hint)
-    }
-
     /// Like [`Screen::pick`], with the initial highlight on `initial` (clamped into range).
     /// The menu for `/model` uses this so the current choice starts highlighted and Enter
     /// keeps it.

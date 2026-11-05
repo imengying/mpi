@@ -40,7 +40,7 @@ pub async fn execute(
         .unwrap_or(1)
         .max(1);
     let limit = crate::tools::optional_u64(arguments, "limit").unwrap_or(2000);
-    // Recorded before the read: an edit in the same batch compares against the bytes the model
+    // Recorded before the read: a later edit compares against the bytes the model
     // was shown, and noting the state first means a write landing mid-read still reads as a
     // change rather than being papered over.
     observed.note(&resolved);
@@ -119,7 +119,7 @@ fn read_window(path: &Path, offset: u64, limit: u64) -> Result<String, String> {
                 prefixed = false;
             }
         }
-        output.finish(false).map(|(text, _)| text)
+        output.finish(false)
     };
     read().map_err(|err| format!("无法读取：{err}"))
 }

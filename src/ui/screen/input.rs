@@ -6,6 +6,30 @@
 use super::*;
 
 impl Screen {
+    /// Withdraw the newest queued submission before it reaches the model or dispatcher.
+    fn edit_queued(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        if self
+            .editing
+            .as_ref()
+            .is_some_and(|editor| !editor.is_empty())
+            || !self.pending_images.is_empty()
+        {
+            self.notice = Some("先清空输入，再取回待处理消息".into());
+            return;
+        }
+        let queued = self.pending.pop().expect("queue is not empty");
+        self.editing = Some(Editor::from_history(queued.text()));
+        if let Queued::Message(_, images) = queued {
+            self.pending_images = images;
+        }
+        self.history_index = None;
+        self.history_draft = None;
+        self.menu_dismissed = self.editing.as_ref().map(Editor::text);
+    }
+
     /// Up: one entry further back, or the oldest entry when the walk begins.
     ///
     /// The first press stashes the buffer, so whatever was half-typed comes back when the
@@ -204,6 +228,7 @@ impl Screen {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         match key.code {
+            KeyCode::Up if alt => self.edit_queued(),
             KeyCode::Enter
                 if key
                     .modifiers

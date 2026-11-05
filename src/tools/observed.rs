@@ -58,8 +58,8 @@ impl Version {
     }
 }
 
-/// Per-batch record of what has been read. Shared by every tool call in the batch, so the
-/// `read` of one call is visible to the `edit` of the next.
+/// Session record of what has been read. Readers and editors run in separate batches;
+/// their contexts must share this map. A new or restored session starts empty.
 #[derive(Debug, Clone, Default)]
 pub struct Observed {
     seen: Arc<Mutex<HashMap<PathBuf, Version>>>,
@@ -78,7 +78,7 @@ impl Observed {
         }
     }
 
-    /// What this batch last saw at `path`, if it was read at all.
+    /// What this session last saw at `path`, if it was read at all.
     fn get(&self, path: &Path) -> Option<Version> {
         self.seen.lock().ok()?.get(path).copied()
     }
@@ -90,11 +90,11 @@ impl Observed {
         }
     }
 
-    /// Whether `path` is stale relative to the last read in this batch.
+    /// Whether `path` is stale relative to the last read in this session.
     ///
     /// Returns `Err` with the sentence the model should see when the file changed. A path
-    /// never read in this batch is not stale: the model is allowed to edit what it has not
-    /// read (long sessions, resumed sessions), and refusing that would break the common case
+    /// never read in this session is not stale: the model is allowed to edit what it has not
+    /// read (including resumed sessions), and refusing that would break the common case
     /// to catch a rarer one.
     pub fn stale(&self, path: &Path, display: &str) -> Result<(), String> {
         let Some(was) = self.get(path) else {
@@ -153,7 +153,7 @@ mod tests {
     }
 
     #[test]
-    fn a_file_never_read_in_this_batch_is_editable() {
+    fn a_file_never_read_in_this_session_is_editable() {
         // Long and resumed sessions edit files they read many turns ago, and the record does
         // not survive that far. Refusing these would break the common case.
         let dir = crate::tools::temp_dir("observed");

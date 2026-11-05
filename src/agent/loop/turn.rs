@@ -377,22 +377,7 @@ impl Agent {
         // A max-token finish is terminal, as in harness: preserve the partial output,
         // but do not invent another user turn or execute a potentially cut tool call.
         if completion.stop_reason == StopReason::Length {
-            // Each note states what happened plus the one thing that is not guessable
-            // from the message: a cut to the thinking budget is pi's own coupling of
-            // thinking to `max_tokens`, so naming `/model` is worth a sentence. Asking
-            // the user to "continue if you want more" is not: the prompt is right there
-            // under the note.
-            let note = if completion.text().trim().is_empty()
-                && !completion.message.thinking().trim().is_empty()
-            {
-                "思考达到输出上限，未产生正文或完整工具调用。可在 /model 调低思考级别后重试。"
-            } else {
-                "输出达到上限，已保留生成内容。"
-            };
-            self.screen.push_lines(ui_compact::note_lines(
-                note,
-                crate::ui::screen::Style::new(Color::Yellow),
-            ));
+            // The persisted stop reason becomes a model-only notice on the next request.
             return Ok(TurnEnd::Done);
         }
         let calls = completion.tool_calls();

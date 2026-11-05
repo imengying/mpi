@@ -1,4 +1,4 @@
-//! The seven tools. Each is a small module exposing a spec plus an `execute`.
+//! Built-in tools, each exposing a spec and an `execute` function.
 //!
 //! Tool order is fixed in [`specs`] and must not change between turns: the tool block is
 //! part of the prompt-cache prefix.
@@ -62,11 +62,8 @@ impl ToolOutput {
 
     pub fn error(content: impl Into<String>) -> Self {
         ToolOutput {
-            content: content.into(),
-            display: Display::None,
             is_error: true,
-            duration: None,
-            images: Vec::new(),
+            ..Self::text(content)
         }
     }
 
@@ -87,40 +84,16 @@ impl ToolOutput {
         // see `ui::compact::arguments_display`.
         let display = crate::ui::compact::arguments_display(name, arguments);
         ToolOutput {
-            content: content.into(),
             display,
-            is_error: true,
-            duration: None,
-            images: Vec::new(),
+            ..Self::error(content)
         }
     }
 
     /// Apply the shared output budget, parking the full text in a temp file when it
     /// does not fit.
-    pub fn budget(self) -> Self {
-        let truncated = util::truncate_output(&self.content);
-        let display = match (self.display, truncated.full_path.clone()) {
-            (Display::Command { footer }, path) => Display::Command {
-                footer: {
-                    let mut parts = footer;
-                    if let Some(path) = path {
-                        parts.push(format!("完整输出：{}", path.display()));
-                    }
-                    parts
-                },
-            },
-            (other, _) => other,
-        };
-        ToolOutput {
-            content: truncated.text,
-            display,
-            is_error: self.is_error,
-            duration: self.duration,
-            // The budget applies to text. Images are not text and are not truncated — but
-            // they must survive here, or a tool that answered with a picture would have it
-            // silently dropped on the way out.
-            images: self.images,
-        }
+    pub fn budget(mut self) -> Self {
+        self.content = util::truncate_output(&self.content);
+        self
     }
 }
 
@@ -129,8 +102,8 @@ impl ToolOutput {
 pub enum Display {
     #[default]
     None,
-    /// A bash result: exit status plus the note lines shown under the output.
-    Command { footer: Vec<String> },
+    /// A bash result. Its text already contains the exit status.
+    Command,
     /// A diff for `edit` / `write`, as the rows to show and the change counts.
     Diff {
         diff: String,
@@ -154,7 +127,7 @@ pub(crate) const NO_OUTPUT: &str = "（无输出）";
 /// But an empty `content` travels into the conversation as an empty message, which some
 /// upstreams refuse for the entire request. Filling it in here means no tool can reintroduce
 /// the problem by forgetting to, and an already-stored session that has empty messages is
-/// repaired on the way out by [`crate::llm::Message::without_empty_results`].
+/// repaired on the way out by [`crate::llm::Message::repaired`].
 pub(crate) fn tool_output(content: String, display: Display, is_error: bool) -> ToolOutput {
     ToolOutput {
         content: if content.trim().is_empty() {
@@ -183,7 +156,8 @@ pub(crate) fn verb_for(name: &str) -> &'static str {
 }
 
 /// Tool names in the order they are advertised. **Do not reorder.**
-pub const TOOL_ORDER: [&str; 8] = [
+#[cfg(test)]
+const TOOL_ORDER: [&str; 8] = [
     "read",
     "write",
     "edit",
@@ -200,33 +174,16 @@ pub enum ExecutionMode {
     Exclusive,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ToolMetadata {
-    pub execution: ExecutionMode,
-    pub replay_safe: bool,
-}
-
-pub fn metadata(name: &str) -> Option<ToolMetadata> {
-    let execution = match name {
+pub fn execution_mode(name: &str) -> ExecutionMode {
+    match name {
         // `read_image` only reads a file, so it runs alongside the other readers.
         "read" | "grep" | "find" | "ls" | "read_image" => ExecutionMode::Parallel,
-        "write" | "edit" | "bash" => ExecutionMode::Exclusive,
-        _ => return None,
-    };
-    Some(ToolMetadata {
-        execution,
-        replay_safe: execution == ExecutionMode::Parallel,
-    })
-}
-
-pub fn execution_mode(name: &str) -> ExecutionMode {
-    metadata(name)
-        .map(|meta| meta.execution)
-        .unwrap_or(ExecutionMode::Exclusive)
+        _ => ExecutionMode::Exclusive,
+    }
 }
 
 pub fn replay_safe(name: &str) -> bool {
-    metadata(name).is_some_and(|meta| meta.replay_safe)
+    execution_mode(name) == ExecutionMode::Parallel
 }
 
 pub fn specs() -> Vec<ToolSpec> {
@@ -255,7 +212,17 @@ pub async fn execute(
     let started = std::time::Instant::now();
     let result = match name {
         "read" => read::execute(arguments, &context.cwd, &context.observed).await,
-        "write" => write::execute(arguments, &context.cwd).await,
+        "write" => {
+            let result = write::execute(arguments, &context.cwd).await;
+            if result.is_ok()
+                && let Some(path) = arguments.get("path").and_then(|value| value.as_str())
+            {
+                context
+                    .observed
+                    .forget(&crate::auth::policy::resolve_tool_path(path, &context.cwd));
+            }
+            result
+        }
         "edit" => edit::execute(arguments, &context.cwd, &context.observed).await,
         "bash" => match required_str(arguments, "command") {
             Ok(command) => {
@@ -289,7 +256,7 @@ pub async fn execute(
 pub struct ToolContext {
     pub cwd: PathBuf,
     pub shell: String,
-    /// What this batch has read, so an edit can tell a typo from a file that moved.
+    /// What this session has read, shared across tool batches.
     pub observed: observed::Observed,
 }
 
@@ -446,6 +413,7 @@ mod tests {
         assert!(replay_safe("grep"));
         assert_eq!(execution_mode("write"), ExecutionMode::Exclusive);
         assert!(!replay_safe("bash"));
-        assert!(metadata("unknown").is_none());
+        assert_eq!(execution_mode("unknown"), ExecutionMode::Exclusive);
+        assert!(!replay_safe("unknown"));
     }
 }

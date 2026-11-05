@@ -119,7 +119,6 @@ pub struct Screen {
     streaming_answer: Option<String>,
     /// Bytes already emitted as complete Markdown blocks during this stream.
     streaming_committed: usize,
-    thinking_committed: bool,
     /// The spinner's label while a turn is in flight, and which frame of the animation it
     /// is on.
     ///
@@ -242,7 +241,6 @@ impl Screen {
             running_call: None,
             streaming_answer: None,
             streaming_committed: 0,
-            thinking_committed: false,
             interactive,
             title: None,
             notice: None,
@@ -278,10 +276,6 @@ impl Screen {
         let _ = write!(self.out, "\u{1b}]0;{title}\u{7}");
         let _ = self.out.flush();
         self.title = Some(title);
-    }
-
-    pub fn width(&self) -> usize {
-        self.width
     }
 
     pub fn refresh_size(&mut self) {
@@ -376,7 +370,6 @@ impl Screen {
         self.streaming_answer = None;
         self.streaming_thinking = None;
         self.streaming_committed = 0;
-        self.thinking_committed = false;
         self.running_call = None;
         self.working = None;
         self.editing = None;
@@ -454,7 +447,6 @@ impl Screen {
         self.streaming_thinking = None;
         self.streaming_answer = Some(String::new());
         self.streaming_committed = 0;
-        self.thinking_committed = false;
     }
 
     /// Append to the thinking preview. No redraw: the caller drains a burst of deltas and
@@ -477,32 +469,27 @@ impl Screen {
         self.streaming_answer = None;
         self.streaming_thinking = None;
         self.streaming_committed = 0;
-        self.thinking_committed = false;
         self.erase_live();
         let _ = self.out.flush();
     }
 
-    /// Finish the stream and commit the answer. The thinking block itself is not printed:
-    /// it collapses to the single "思考完成" marker, matching the compact-display rule.
+    /// Finish the stream and commit the answer. Thinking stays in the live preview only.
     pub fn end_stream(&mut self) -> (String, String) {
         let answer = self.streaming_answer.take().unwrap_or_default();
         let thinking = self.streaming_thinking.take().unwrap_or_default();
-        if !thinking.trim().is_empty() && !self.thinking_committed {
-            self.push_lines(crate::ui::compact::thinking_done_lines());
-        }
         let tail = &answer[self.streaming_committed..];
         if !tail.trim().is_empty() {
             self.blocks.push(Block::markdown(tail));
         }
         self.streaming_committed = 0;
-        self.thinking_committed = false;
         self.flush();
         (answer, thinking)
     }
 
     // -- history ------------------------------------------------------------
 
-    pub fn set_footer(&mut self, lines: Vec<Line>) {
+    #[cfg(test)]
+    fn set_footer(&mut self, lines: Vec<Line>) {
         self.footer = lines;
         self.footer_state = None;
     }

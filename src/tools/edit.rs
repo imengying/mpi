@@ -36,7 +36,7 @@ pub fn spec() -> ToolSpec {
                             "new_text": { "type": "string", "description": "替换后的新文本" },
                             "replace_all": { "type": "boolean", "description": "是否替换全部匹配（默认 false）" }
                         },
-                        "required": ["path", "old_text", "new_text"]
+                        "required": ["old_text", "new_text"]
                     }
                 }
             },
@@ -169,7 +169,7 @@ async fn apply_one(
     tokio::fs::write(&resolved, &after)
         .await
         .map_err(|err| format!("无法写入：{err}"))?;
-    // This batch made the change, so a later edit of the same file must not read as
+    // This tool made the change, so a later edit of the same file must not read as
     // someone else's.
     observed.forget(&resolved);
     Ok(ToolOutput {
@@ -644,8 +644,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_file_changed_after_the_read_reports_staleness_not_a_miss() {
-        // The reader and the editor share one `Observed` per batch, exactly as the loop wires
-        // them. Without that, a model editing from a stale read retries with other spellings
+        // The reader and the editor share the session's `Observed`. Without that,
+        // a model editing from a stale read retries with other spellings
         // of text that is gone, because "not found" reads as its own mistake.
         let dir = crate::tools::temp_dir("edit");
         let path = file(&dir, "a.txt", "alpha\nbeta\n");
@@ -668,8 +668,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_edit_that_was_not_preceded_by_a_read_still_works() {
-        // Resumed sessions and long turns edit files read many turns ago, where the record no
-        // longer exists. Refusing those would break the common case to catch a rarer one.
+        // Resumed sessions have no in-memory read record. They may still edit files.
         let dir = crate::tools::temp_dir("edit");
         let path = file(&dir, "a.txt", "one\n");
         let out = run(

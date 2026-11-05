@@ -170,6 +170,18 @@ pub enum Message {
 }
 
 impl Message {
+    /// Explain a cut response to the model without adding a UI message or a synthetic user turn.
+    pub(crate) fn output_limit_notice(&self) -> Option<&'static str> {
+        matches!(
+            self,
+            Message::Assistant {
+                stop_reason: Some(StopReason::Length),
+                ..
+            }
+        )
+        .then_some("[上次回复达到输出上限，内容可能不完整；其中的工具调用未执行。]")
+    }
+
     pub fn user_text(text: impl Into<String>) -> Self {
         Message::User {
             content: vec![Block::Text { text: text.into() }],

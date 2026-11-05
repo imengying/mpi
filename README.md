@@ -100,7 +100,7 @@ pi 没有内置模型目录，也不会去猜。没配置 providers 会直接报
 | `models[].reasoning` | 是否支持推理，决定 `/model` 选完要不要问级别 |
 | `models[].search` | 是否使用该接口的原生搜索，缺省 `false`。整段会话要么一直开要么一直关 |
 | `models[].thinking_levels` | 该模型支持的级别；`reasoning` 为真但缺失时表示五档全支持 |
-| `models[].sampling_params_by_thinking_level` | 按级别设置 `temperature` / `top_p`；非推理模型用 `off`，只在 Completions 请求发送 |
+| `models[].sampling_params_by_thinking_level` | 按级别设置 `temperature` / `top_p`；非推理模型用 `off`，仅支持 `responses`，未配置的字段不发送 |
 | `models[].compat` | 覆盖兼容开关，见下 |
 | `models[].compaction.reserve_tokens` | 压缩的安全余量；缺省为 16384 与窗口四分之一中的较小值 |
 | `models[].compaction.keep_recent_tokens` | 摘要后保留的最近历史预算；缺省最多 20000，小窗口自动缩小 |
@@ -141,35 +141,29 @@ pi 没有内置模型目录，也不会去猜。没配置 providers 会直接报
 
 不同网关对「OpenAI 兼容」的理解不一样。pi 按 `base_url` 自动探测一组开关，
 配置里只写例外（`compat` 可以是 provider 级或 model 级，model 级优先）。
-`responses` 只用到其中的 `supports_strict_mode`（工具定义上的 `strict`）
-与 `send_session_affinity`（会话粘性头），其余开关对它没有意义——
-它的思考参数、请求形状与缓存键都是这个协议固定的写法。
 
 ```json
 "compat": {
-  "thinking_format": "deepseek",
-  "requires_reasoning_content_on_assistant": true,
-  "max_tokens_field": "max_completion_tokens",
-  "supports_developer_role": false,
+  "supports_strict_mode": false,
   "send_session_affinity": true
 }
 ```
 
-可用开关：`max_tokens_field`、`supports_developer_role`、`supports_reasoning_effort`、
-`thinking_format`（`openai` / `deepseek` / `zai` / `qwen` / `llamacpp` / `anthropic` / `none`）、
-`requires_thinking_as_text`、`requires_reasoning_content_on_assistant`、
-`requires_assistant_after_tool_result`、`supports_usage_in_streaming`、`supports_strict_mode`、
-`supports_cache_control`、`send_session_affinity`、`supports_long_cache`、
-`search_format`（`web_search` / `web_and_x` / `anthropic` / `xai` / `qwen` / `zhipu` / `off`）。
+可用开关：
+
+- `supports_strict_mode`：Responses 工具定义是否发送 `strict`。
+- `send_session_affinity`：是否发送会话粘性头。
+- `supports_long_cache`：Messages 是否发送长缓存提示。
+- `requires_assistant_after_tool_result`：工具结果后是否补一条助手消息。
+- `search_format`：`web_search` / `web_and_x` / `anthropic` / `off`。
 
 `search: true` 时按 `base_url` 选写法：Responses 追加 `web_search`（x.ai 再加 `x_search`），
-Messages 追加 `web_search_20250305`，Chat Completions 用 `search_parameters`（x.ai）、
-`enable_search`（通义）或智谱的 `web_search` 工具（`open.bigmodel.cn`、`z.ai`，并要回搜索结果）。
-探测不到、又没有 `search_format` 时启动失败，而不是发一个上游不认识的字段。
+Messages 追加 `web_search_20250305`。未检测到支持的格式，或格式与协议不符时，启动会报错。
 
-**DeepSeek 官方接口不能原生搜索。** 对话补全没有搜索参数；Responses 接受 `web_search` 然后直接忽略，
-所以对 `api.deepseek.com` 打开 `search` 会在启动时报错，而不是假装搜过。GLM 可以：模型上
-`"search": true`，`base_url` 指向智谱或 Z.ai。
+当前实现对 DeepSeek、智谱 / Z.ai、通义的 Responses 路由不启用原生搜索，
+在这些路由配置 `search: true` 会在启动时报错。
+
+采样参数只在 `responses` 下发送，并由上游模型决定是否支持；`messages` 配置这些参数会报错。
 
 搜索默认关闭，未开启时请求前缀与以前一致。摘要请求会强制关掉搜索。引用只出现在界面上，
 不写进发给模型的历史。
@@ -242,14 +236,16 @@ Linux 二进制依赖 runner 自带的 glibc（当前 2.39），构建摘要里�
 | 命令 | 作用 |
 |---|---|
 | `/model` | 选择模型；选完若该模型支持推理，紧接着问思考级别 |
+| `/permissions` | 切换命令审核：需要审核 / 自动放行 |
 | `/name <文字>` | 设置会话名；不带参数则清空 |
 | `/compact [指示]` | 手动压缩上下文，可带一段自定义关注点 |
 | `/new` | 新会话 |
-| `/resume` | 恢复历史会话（Esc 开始新会话） |
+| `/resume` | 恢复历史会话（Esc 取消） |
 | `/delete` | 删除本会话文件并退出（需确认） |
 | `/exit` | 退出 |
 
 `/delete` 会先问一次（默认高亮在「不删」），确认后删掉会话文件并退出。
+选择列表按 `Esc` 取消，保留当前会话和设置；`/model` 的模型与思考级别全部确认后才生效。
 非交互时（管道输入）不执行删除，只提示手动删除的命令——被删除的文件无法恢复，
 不能靠默认选择拿主意。
 
@@ -288,11 +284,14 @@ Linux 二进制依赖 runner 自带的 glibc（当前 2.39），构建摘要里�
 代码块保留换行和空格缩进，HTML 按文本展示。流式输出按完整块提交，恢复会话时仍从 Markdown 原文排版。
 完整 Markdown 段落陆续进入终端滚动历史，未完成的段落留在预览区，结束时只补齐剩余部分。
 每帧只重画变化的逻辑行；缩放窗口会重新排版可见历史、输入和底栏。
-回合中按 `Enter` 提交的补充显示在输入行上方（`… <内容>`），连同图片在下一次模型请求前生效。
+回合中按 `Enter` 提交的补充显示在输入行上方（`待处理`），连同图片在下一次模型请求前生效。
+输入框为空时按 `Alt+↑`，取回最近一条待处理消息或命令，文字和图片一起恢复到输入框。
+取回后不再排队，修改后按 `Enter` 重新提交，或按 `Ctrl+C` 清空丢弃；已有草稿或图片时不会覆盖。
 模型正在生成或工具已经开始执行时，先保留它的结果；尚未开始的工具调用标记为未执行，
 让模型结合新要求重新决定。需要立即停止当前操作时按 `Esc`。
 以 `/` 开头的命令等当前回合结束后执行；消息和命令始终按提交顺序处理，命令后的消息不会提前越过它。
-等待授权时面板上不显示光标。
+授权面板中「拒绝本次」和 `Esc` 只拒绝当前操作，`Ctrl+C` 停止本轮。
+开启自动放行后，底栏持续显示「自动放行」。等待授权时面板上不显示光标。
 
 `Ctrl+V` 粘贴剪贴板里的图片（截图直接可用），图片显示为 `[图片 1280×720, 84 KB]`
 挂在输入行下方，多张图片显示数量；也可以只粘图片不带文字。图片随该条消息一起发出去，存在会话文件里，
@@ -313,31 +312,38 @@ Linux 二进制依赖 runner 自带的 glibc（当前 2.39），构建摘要里�
 
 ## 工具
 
-`read`、`write`、`edit`、`bash`、`grep`、`find`、`ls`。
+`read`、`write`、`edit`、`bash`、`grep`、`find`、`ls`、`read_image`。
+
+`read_image` 把本地图片交给模型查看。`edit` 支持单次替换或 `edits` 批量替换，
+批量项可继承顶层 `path`。文件自上次读取后发生变化时，会提示模型重新读取；
+读取记录跨工具批次保留，开启或恢复另一会话时清空。
 
 `bash` 通过 zsh 执行。`grep` / `find` / `ls` 优先用系统的 `rg` / `fd` / `eza`，
 没有就回退 `grep` / `find` / `ls`。
 
-相邻的 `read` / `grep` / `find` / `ls` 最多四项同时执行，每项独立检查授权，结果按模型请求的顺序记录。
+相邻的 `read` / `grep` / `find` / `ls` / `read_image` 最多四项同时执行，每项独立检查授权，结果按模型请求的顺序记录。
 `write` / `edit` / `bash` 逐项执行，并等待前面的只读调用完成；修改后的读取因此能看到最新内容。
 工具结果区分成功、失败、已中止、未执行和结果未知。中止可能已有部分效果，继续任务前需要检查实际状态。
 
 工具输出最多保留 2000 行或 50KB，超出时**保留末尾**并把完整输出写进临时文件，
-在结果里给出路径。
+在发给模型的结果里给出路径。截断说明、结果裁剪说明和完整日志路径只提供给模型，
+实时界面和恢复会话时都不显示；工具失败原因和退出状态仍然保留。
 
 `bash` 的 stdout / stderr 直接写入同一临时文件，避免管道堵塞，结束后只读取有界的末尾内容；
 小输出的临时文件自动清理，截断时保留完整原始日志。`read` 按固定大小缓冲区扫描指定行范围，
 跳过的内容不留在内存中，单行很长时也不会整行载入。
 
-长输出折叠时**直接显示摘录，不提示「已收起 N 行」**——那一行每次工具调用都要占一行位置，
-而截断本身从内容就看得出来。文件修改同理：过大的改动不会只留一句「预览已省略」，
-而是先把两侧相同的首尾行剪掉、只对改动区域做 diff，所以「大文件里改一行」照样看得见那一行。
+成功的读取、搜索和命令默认显示一行摘要，`Ctrl+O` 展开最近一块的详细结果。
+读取摘要显示本次返回行数；结果已裁剪时不显示行数，搜索无结果时显示「无匹配」。
+命令耗时放在标题同行，失败自动展示错误首尾最多 5 行，退出状态保留。
+文件修改保留最多 14 行 diff 预览；先去掉两侧相同内容，再对改动区域做 diff。
+思考内容只在生成时临时预览，答案出现后隐藏，不留下重复的「思考完成」记录。
 
-**输出里不加总结性的注记**：`read` 不再追加「仅显示第 X–Y 行，共 Z 行；继续读取请用 offset=…」，
-`ls` / `grep` / `find` 也不再追加「共 N 项 / N 行匹配 / N 个结果」。这些数字都能从内容自己数出来，
-而注记总落在最后一行——折叠时块只保留末尾几行，于是**注记成了唯一一定看得见的那一行**，
-长结果反而只剩一句统计。真正无法从内容推断的提醒会保留：`find` 被 `max_results` 截断时
-仍然报告「已截断」，否则一个前缀列表会被当成完整答案。
+摘要仅用于界面，模型收到的工具正文不变。`grep` / `find` 被 `max_results` 截断时，
+模型仍会收到截断说明，避免把部分结果当成完整答案。
+
+成功且无输出的工具只显示完成状态。模型回复达到输出上限时保留已生成内容，
+停止本轮且不执行被截断的工具调用；长度说明随后续请求交给模型，不在界面提示。
 
 同一条规矩适用于转录里的所有旁白：**只写用户无从得知的那件事**。
 底栏已经画着的（模型、级别、会话名、上下文用量）不重复；
@@ -377,6 +383,9 @@ Linux 二进制依赖 runner 自带的 glibc（当前 2.39），构建摘要里�
 `↑↓`/`Tab` 切换，「Enter」确认，`a`/`1` 允许本次，`Esc`/`Ctrl+C`/`q`/`n`/`2` 拒绝。
 等待没有超时，授权只对当次有效。
 
+`/permissions` 可切换为「自动放行」，让策略标记为需确认的操作直接执行；选择会随会话保存。
+默认「需要审核」。非交互模式始终拒绝需要确认的操作。
+
 **自动放行**：白名单里的简单只读命令（`pwd ls cat head tail wc stat readlink realpath
 printf echo true false cut tr du df uname rg grep find sort file sed git`），
 其中 `git` 只放行 `status diff log show rev-parse ls-files ls-tree`，
@@ -399,7 +408,7 @@ column lscpu seq` 这类探查命令也放行——它们改不了任何东西�
 
 路径检查逐参数进行，覆盖 `--file=/path`、`-f/path` 与 `-nf/path`（按 `-n -f /path` 理解）
 三种写法，`git show <rev>:<path>` 冒号后的路径也检查。搜索表达式按数据处理，
-`rg/grep` 的 `-f`、`--file` 等参数仍按实际文件路径检查。授权面板显示判定原因。
+`rg/grep` 的 `-f`、`--file` 等参数仍按实际文件路径检查。
 自动放行后执行的是校验过的绝对程序路径和参数；Git 禁用外部 diff、textconv 与 hooks。
 
 授权面板只显示要执行的东西：`bash` 是命令本身，文件工具是它的参数。策略判定原因

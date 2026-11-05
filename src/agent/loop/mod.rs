@@ -129,6 +129,8 @@ pub struct Agent {
     pub screen: Screen,
     pub session: Session,
     gate: PermissionGate,
+    /// File versions read in this session, shared across requests and tool batches.
+    observed: tools::observed::Observed,
     pub cwd: PathBuf,
     model_spec: String,
     level: String,
@@ -230,6 +232,7 @@ impl Agent {
             screen,
             session,
             gate,
+            observed: tools::observed::Observed::default(),
             cwd,
             model_spec,
             level,
@@ -327,6 +330,7 @@ impl Agent {
             screen,
             session,
             gate,
+            observed: tools::observed::Observed::default(),
             cwd,
             model_spec,
             level,
@@ -351,6 +355,7 @@ impl Agent {
         // `/resume` path taken mid-session, so nothing else would put it back.
         self.gate.set_mode(session.current_permission_mode());
         self.session = session;
+        self.observed = tools::observed::Observed::default();
         self.model_spec = model_spec;
         self.level = level;
         self.compaction = CompactionState::default();
@@ -372,14 +377,6 @@ impl Agent {
             ));
         }
         Ok(())
-    }
-
-    pub fn model_spec(&self) -> &str {
-        &self.model_spec
-    }
-
-    pub fn level(&self) -> &str {
-        &self.level
     }
 
     fn model(&self) -> anyhow::Result<(&Provider, &ModelConfig)> {
@@ -442,6 +439,7 @@ impl Agent {
             context_window,
             model: model.cloned(),
             level,
+            auto_approve: self.gate.mode() == crate::auth::guard::PermissionMode::Allow,
             busy: busy.map(str::to_owned),
         };
         self.screen.set_footer_state(state);

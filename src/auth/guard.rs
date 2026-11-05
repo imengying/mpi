@@ -18,6 +18,8 @@ use crate::ui::auth_panel::{self, PanelRequest};
 #[derive(Debug)]
 pub struct Refusal {
     pub reason: String,
+    /// The user asked to stop the turn, rather than deny this one call.
+    pub stopped: bool,
 }
 
 impl Refusal {
@@ -122,7 +124,10 @@ impl PermissionGate {
                 // mode. This is the invariant the gate exists for, so the mode cannot
                 // weaken it.
                 if !self.interactive {
-                    return Err(Refusal { reason });
+                    return Err(Refusal {
+                        reason,
+                        stopped: false,
+                    });
                 }
                 // The mode only decides whether to ask. Note the rewritten arguments are not
                 // produced on this path — the policy asked *about* the call rather than
@@ -131,13 +136,16 @@ impl PermissionGate {
                 if self.mode == PermissionMode::Allow {
                     return Ok(input.clone());
                 }
-                if auth_panel::ask(PanelRequest {
+                let decision = auth_panel::ask(PanelRequest {
                     body: panel_body(tool, input),
-                }) == auth_panel::Decision::Allow
-                {
+                });
+                if decision == auth_panel::Decision::Allow {
                     Ok(input.clone())
                 } else {
-                    Err(Refusal { reason })
+                    Err(Refusal {
+                        reason,
+                        stopped: decision == auth_panel::Decision::Stop,
+                    })
                 }
             }
         }

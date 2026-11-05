@@ -34,14 +34,7 @@ pub enum Bg {
 
 impl Style {
     pub const fn plain() -> Self {
-        Style {
-            fg: Color::Text,
-            bold: false,
-            italic: false,
-            underline: false,
-            crossed_out: false,
-            bg: Bg::None,
-        }
+        Self::new(Color::Text)
     }
 
     pub const fn new(fg: Color) -> Self {
@@ -57,34 +50,22 @@ impl Style {
 
     pub const fn bold(fg: Color) -> Self {
         Style {
-            fg,
             bold: true,
-            italic: false,
-            underline: false,
-            crossed_out: false,
-            bg: Bg::None,
+            ..Self::new(fg)
         }
     }
 
     pub const fn italic(fg: Color) -> Self {
         Style {
-            fg,
-            bold: false,
             italic: true,
-            underline: false,
-            crossed_out: false,
-            bg: Bg::None,
+            ..Self::new(fg)
         }
     }
 
     pub const fn with_bg(fg: Color, bg: Bg) -> Self {
         Style {
-            fg,
-            bold: false,
-            italic: false,
-            underline: false,
-            crossed_out: false,
             bg,
+            ..Self::new(fg)
         }
     }
 }
@@ -193,11 +174,10 @@ impl Line {
 #[derive(Debug, Clone)]
 pub struct Collapsible {
     pub lines: Vec<Line>,
-    /// Rows that stay visible in both states: a tool result's header belongs here, so
+    /// Logical lines that stay visible in both states: a tool result's header belongs here, so
     /// collapsing never hides which command produced the output.
     pub head: usize,
-    /// Rows that stay visible at the end in both states: an exit code or a
-    /// "full output: …" note. Losing those while collapsed would hide the outcome.
+    /// Logical lines that stay visible at the end in both states.
     pub tail: usize,
     /// How many rows from the *start* of the middle are shown while collapsed.
     ///
@@ -220,9 +200,12 @@ pub enum Block {
 
 impl Collapsible {
     /// The retained prefix and suffix, with no overlap even for short blocks.
-    fn excerpt(&self, total: usize) -> (std::ops::Range<usize>, std::ops::Range<usize>) {
-        let head = self.head.min(total);
-        let tail = self.tail.min(total - head);
+    fn excerpt(
+        &self,
+        total: usize,
+        head: usize,
+        tail: usize,
+    ) -> (std::ops::Range<usize>, std::ops::Range<usize>) {
         if self.expanded || total <= head + tail + self.middle_head + self.preview {
             (0..total, total..total)
         } else {
@@ -244,7 +227,7 @@ impl Block {
     }
 
     /// A block whose tail is shown by default and which Ctrl+O expands. The first `head`
-    /// and last `tail` rows are always visible.
+    /// and last `tail` logical lines are always visible, including wrapped continuations.
     pub fn collapsible(lines: Vec<Line>, head: usize, tail: usize, preview: usize) -> Self {
         Block::Collapsible(Collapsible {
             lines,
@@ -298,7 +281,11 @@ impl Block {
             }
             Block::Collapsible(block) => {
                 let rows = history_rows(&block.lines, width);
-                let (prefix, suffix) = block.excerpt(rows.len());
+                let head = block.head.min(block.lines.len());
+                let tail = block.tail.min(block.lines.len() - head);
+                let head_rows = history_rows(&block.lines[..head], width).len();
+                let tail_rows = history_rows(&block.lines[block.lines.len() - tail..], width).len();
+                let (prefix, suffix) = block.excerpt(rows.len(), head_rows, tail_rows);
                 let gap = prefix.end < suffix.start;
                 let mut out = rows[prefix].to_vec();
                 if gap && let Some(last) = out.last_mut() {

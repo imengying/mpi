@@ -485,7 +485,7 @@ mod tests {
     fn native_selection_keeps_a_hard_boundary_across_a_collapsed_gap() {
         use crate::ui::text::{Block, Line};
         let source = "0123456789abcdefghijABCDEFGHIJ";
-        let mut block = Block::collapsible(vec![Line::plain(source)], 1, 0, 1);
+        let mut block = Block::collapsible_excerpted(vec![Line::plain(source)], 0, 0, 1, 1);
         for expanded in [false, true] {
             if let Block::Collapsible(inner) = &mut block {
                 inner.expanded = expanded;
