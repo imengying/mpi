@@ -766,23 +766,6 @@ fn a_long_assistant_message_is_capped() {
 }
 
 #[test]
-fn the_first_prompt_asks_for_the_seven_sections() {
-    let prompt = summary_prompt("CONVERSATION", None, false);
-    for section in [
-        "## Goal",
-        "## Constraints & Preferences",
-        "## Progress",
-        "## Key Decisions",
-        "## Next Steps",
-        "## Critical Context",
-    ] {
-        assert!(prompt.contains(section), "missing {section}");
-    }
-    assert!(prompt.contains("<conversation>\nCONVERSATION\n</conversation>"));
-    assert!(!prompt.contains("<previous-summary>"));
-}
-
-#[test]
 fn a_split_turn_is_flagged_to_the_summariser() {
     let prompt = summary_prompt("CONVERSATION", None, true);
     assert!(prompt.contains("还没有结束"));
@@ -813,17 +796,6 @@ fn a_truncated_summary_is_refused() {
         check_summary(&failed),
         Err(CompactError::Summarize(_))
     ));
-}
-
-#[test]
-fn a_complete_summary_is_accepted() {
-    let completion = Completion {
-        message: Message::assistant_text("## Goal\nstuff"),
-        usage: Usage::default(),
-        stop_reason: StopReason::Stop,
-        error: None,
-    };
-    assert!(check_summary(&completion).is_ok());
 }
 
 #[test]

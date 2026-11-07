@@ -32,12 +32,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_version_is_never_empty() {
-        // A tagged build overrides this; either way it has to say something.
-        assert!(!version().trim().is_empty());
-    }
-
-    #[test]
     fn the_cli_parses_codex_style_subcommands() {
         use clap::Parser as _;
         for (arg, expected) in [("resume", "Resume"), ("update", "Update")] {

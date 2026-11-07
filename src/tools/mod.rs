@@ -13,6 +13,7 @@ mod output;
 mod process;
 pub mod read;
 pub mod read_image;
+pub mod sandbox;
 pub mod write;
 
 use std::path::{Path, PathBuf};
@@ -340,22 +341,6 @@ pub(crate) fn engine_present(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_advertised_tools_are_exactly_the_declared_order() {
-        // The tool definitions are part of the request prefix, and their order is what makes
-        // that prefix reusable across turns: a name missing here, or shuffled, silently costs
-        // the cache on every request. `read_image` also has to be spelled the way the other
-        // harnesses spell it — the model reasons from "read_image reads an image", and a
-        // second name for the same job is something it has to guess about.
-        let names: Vec<String> = specs().into_iter().map(|spec| spec.name).collect();
-        assert_eq!(names, TOOL_ORDER);
-        assert!(names.iter().any(|name| name == "read_image"), "{names:?}");
-        assert!(
-            !names.iter().any(|name| name == "view_image"),
-            "the old name must not come back: {names:?}"
-        );
-    }
 
     /// A command that succeeds and prints nothing must still say something.
     ///

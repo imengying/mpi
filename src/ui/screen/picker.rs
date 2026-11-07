@@ -99,6 +99,9 @@ impl Screen {
             // No terminal to choose on: fall back to the highlighted entry.
             return Some(initial.min(choices.len() - 1));
         }
+        if self.detail.is_some() {
+            self.close_detail();
+        }
         let mut cursor = initial.min(choices.len() - 1);
         if crate::ui::terminal::ensure_raw_mode().is_err() {
             return None;

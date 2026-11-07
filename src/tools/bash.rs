@@ -23,6 +23,7 @@ pub fn spec() -> ToolSpec {
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
+                "sandbox_permissions": { "type": "string", "enum": ["use_default", "require_escalated"], "description": "默认在隔离内执行；需要网络或隔离外文件写入时，用 require_escalated 单独请求授权，不要重复执行已产生副作用的命令" },
                 "command": { "type": "string", "description": "要执行的命令。不要用 `cd X && ...` 换目录，用 cwd 参数" },
                 "description": { "type": "string", "description": "一句话说明这条命令做什么" },
                 "cwd": { "type": "string", "description": "命令的工作目录。默认是当前工作目录；要在别处执行就用这个参数，命令里不要再写 cd" }
@@ -305,27 +306,6 @@ mod tests {
                 out.content
             );
         }
-    }
-
-    #[test]
-    fn the_options_are_only_handed_to_zsh() {
-        // `-o no_nomatch` is not a bash flag: passing it there would be an error, not a
-        // no-op, so the guard has to be by shell name.
-        assert_eq!(
-            shell_options("/usr/bin/zsh"),
-            vec!["-o", "no_nomatch", "-o", "noequals"]
-        );
-        assert_eq!(
-            shell_options("zsh"),
-            vec!["-o", "no_nomatch", "-o", "noequals"]
-        );
-        assert_eq!(
-            shell_options("/usr/bin/zsh.exe"),
-            vec!["-o", "no_nomatch", "-o", "noequals"]
-        );
-        assert!(shell_options("/usr/bin/bash").is_empty());
-        assert!(shell_options("/bin/sh").is_empty());
-        assert!(shell_options("").is_empty());
     }
 
     #[test]

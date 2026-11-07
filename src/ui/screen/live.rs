@@ -192,26 +192,46 @@ impl Screen {
     }
 
     fn fresh_history(&mut self) -> Vec<HistoryRow<Line>> {
-        let mut lines: Vec<_> = self.blocks[self.printed..]
-            .iter()
-            .flat_map(|block| block.history_rows(self.width))
-            .collect();
-        lines.append(&mut self.updates);
+        let mut lines = Vec::new();
+        for index in self.printed..self.blocks.len() {
+            let rows = self.layout.rows(index, self.width, &self.blocks[index]);
+            lines.extend(rows.iter().cloned());
+        }
         self.printed = self.blocks.len();
         lines
     }
 
     pub(super) fn erase_live(&mut self) {
-        if self.interactive {
+        if self.interactive && self.detail.is_none() {
             let _ = write!(self.out, "{}", self.viewport.erase());
         }
     }
 
     pub fn render(&mut self) {
-        self.draw_live();
+        self.redraw.request();
+        self.flush_pending_frame();
+    }
+
+    pub(super) fn flush_pending_frame(&mut self) {
+        if self.redraw.ready(std::time::Instant::now()) {
+            self.draw_live();
+        }
     }
 
     pub(super) fn draw_live(&mut self) {
+        self.redraw.drawn(std::time::Instant::now());
+        if self.detail.is_some() {
+            self.draw_detail();
+            return;
+        }
+        if let Some((panel, _)) = self.approval.as_mut() {
+            if panel.draw(&mut self.out, &self.theme).is_err()
+                && let Some((_, sender)) = self.approval.take()
+            {
+                let _ = sender.send(crate::auth::guard::Decision::Deny);
+            }
+            return;
+        }
         if !self.interactive {
             self.commit();
             return;
@@ -233,9 +253,20 @@ impl Screen {
         self.commit_stream_prefix();
         let (lines, cursor) = self.compose_live();
         let reflow = if self.viewport.needs_reflow(self.width, self.height) {
-            self.blocks[..self.printed]
-                .iter()
-                .flat_map(|block| block.history_rows(self.width))
+            // The viewport only repaints its visible tail. Stop once that tail is filled.
+            let mut tail = std::collections::VecDeque::new();
+            let mut count = 0;
+            for index in (0..self.printed).rev() {
+                let rows = self.layout.rows(index, self.width, &self.blocks[index]);
+                count += rows.len();
+                tail.push_front(rows);
+                if count >= self.height {
+                    break;
+                }
+            }
+            tail.iter()
+                .flat_map(|rows| rows.iter())
+                .skip(count.saturating_sub(self.height))
                 .map(|row| HistoryRow {
                     line: self.paint(&row.line),
                     wrapped: row.wrapped,

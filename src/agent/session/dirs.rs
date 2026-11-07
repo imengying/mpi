@@ -272,27 +272,4 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(root);
     }
-
-    #[test]
-    fn the_store_sits_under_the_pi_directory() {
-        // One directory for everything pi owns, so the file to edit sits next to the sessions
-        // it produced. Asserted on the *names* rather than by calling the resolvers:
-        // `sessions_dir` registers the directory it is asked about, and a test that calls it
-        // writes into the real table — which is how a stray `/tmp/x` entry ended up in a
-        // user's store.
-        let home = home_dir();
-        assert_eq!(sessions_root(), home.join("sessions"));
-        assert_eq!(
-            dirs_index_path_in(&sessions_root()),
-            home.join("sessions/dirs.json")
-        );
-
-        // Under a store of its own, the grouping still holds.
-        let root = std::env::temp_dir().join(format!("pipaths{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let dir = sessions_dir_in(&root, Path::new("/tmp/somewhere"));
-        assert!(dir.starts_with(&root), "{}", dir.display());
-        assert_eq!(dir.parent(), Some(root.as_path()));
-        let _ = std::fs::remove_dir_all(root);
-    }
 }

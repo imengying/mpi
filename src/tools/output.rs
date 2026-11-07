@@ -13,7 +13,7 @@ pub(super) struct Capture {
 
 impl Capture {
     pub fn new() -> std::io::Result<Self> {
-        let path = std::env::temp_dir().join(format!("pi-{}.log", uuid::Uuid::now_v7()));
+        let path = super::sandbox::output_dir().join(format!("pi-{}.log", uuid::Uuid::now_v7()));
         let mut options = std::fs::OpenOptions::new();
         options.read(true).write(true).create_new(true);
         #[cfg(unix)]

@@ -46,7 +46,7 @@ pub enum Action {
     /// A line with one or more pasted images attached. The caller sends them as a single
     /// user message so the text and the pictures stay together.
     LineWithImages(String, Vec<PastedImage>),
-    ToggleExpand,
+    ToolDetails,
     /// Ctrl+C on an empty line: exit at the prompt, interrupt a running turn.
     Interrupt,
     /// Esc while a turn is in flight: stop it.
@@ -93,14 +93,20 @@ pub struct Screen {
     width: usize,
     height: usize,
     blocks: Vec<Block>,
+    layout: layout::LayoutCache,
+    redraw: redraw::Redraw,
     /// How many blocks have already been written to the terminal. Blocks are kept — so an
     /// expand/collapse can re-render one — but each is printed exactly once.
     printed: usize,
     /// An expanded/collapsed presentation waiting to be inserted into history.
-    updates: Vec<HistoryRow<Line>>,
+    detail: Option<detail::Detail>,
     footer: Vec<Line>,
     footer_state: Option<crate::ui::footer::FooterState>,
     viewport: Viewport,
+    approval: Option<(
+        crate::ui::auth_panel::PanelState,
+        tokio::sync::oneshot::Sender<crate::auth::guard::Decision>,
+    )>,
     /// The line editor's current text, echoed in the live region.
     editing: Option<Editor>,
     history: Vec<String>,
@@ -226,11 +232,14 @@ impl Screen {
             width: 80,
             height: 24,
             blocks: Vec::new(),
+            layout: layout::LayoutCache::default(),
+            redraw: redraw::Redraw::default(),
             printed: 0,
-            updates: Vec::new(),
+            detail: None,
             footer: Vec::new(),
             footer_state: None,
             viewport: Viewport::default(),
+            approval: None,
             editing: None,
             history: Vec::new(),
             history_index: None,
@@ -303,41 +312,9 @@ impl Screen {
         self.draw_live();
     }
 
-    /// New work starts collapsed, as pi-custom does.
-    pub fn collapse_all(&mut self) {
-        for block in &mut self.blocks {
-            if let Block::Collapsible(collapsible) = block {
-                collapsible.expanded = false;
-            }
-        }
-    }
-
-    /// Flip the most recent collapsible block.
-    ///
-    /// Output that has already scrolled into the terminal's scrollback cannot be rewritten
-    /// in place, so the block is printed again below, in its new state. Re-printing rather
-    /// than repainting keeps the history honest: what the user read stays where they read
-    /// it, and the fresh copy is the one that is now current.
-    ///
-    /// Nothing to flip is still an answer: the note is pushed here rather than at each call
-    /// site, so a caller cannot forget it and leave the key looking broken.
-    pub fn toggle_last_collapsible(&mut self) -> bool {
-        let Some(index) = self.blocks.iter().rposition(Block::is_collapsible) else {
-            self.push_lines(crate::ui::compact::note_lines(
-                "没有可展开的内容",
-                Style::new(Color::Dim),
-            ));
-            self.draw_live();
-            return false;
-        };
-        if let Block::Collapsible(collapsible) = &mut self.blocks[index] {
-            collapsible.expanded = !collapsible.expanded;
-        }
-        let lines = self.blocks[index].history_rows(self.width);
-        // Queue the new presentation so history insertion and the live frame stay atomic.
-        self.updates.extend(lines);
-        self.draw_live();
-        true
+    /// Open the temporary browser at the latest tool result.
+    pub fn show_tool_details(&mut self) -> bool {
+        self.open_detail()
     }
 
     /// Take the live region down for good, on the way out of the program.
@@ -354,6 +331,9 @@ impl Screen {
         // note naming the command that resumes this session, for one — and erasing without
         // committing would silently throw it away. The note is written *after* the turn loop
         // ends, which is why this cannot be left to a later draw that never comes.
+        if self.detail.take().is_some() {
+            let _ = crossterm::execute!(self.out, terminal::LeaveAlternateScreen);
+        }
         self.commit();
         self.erase_live();
         if self.interactive {
@@ -364,9 +344,13 @@ impl Screen {
     /// Forget the transcript and wipe the screen. Used by `/new` and `/resume`, where the
     /// previous conversation is no longer relevant.
     pub fn clear_transcript(&mut self) {
+        if self.detail.is_some() {
+            self.close_detail();
+        }
         self.blocks.clear();
+        self.layout = layout::LayoutCache::default();
         self.printed = 0;
-        self.updates.clear();
+        self.detail = None;
         self.streaming_answer = None;
         self.streaming_thinking = None;
         self.streaming_committed = 0;
@@ -546,10 +530,14 @@ impl Screen {
     }
 }
 
+mod approval;
+mod detail;
 mod input;
+mod layout;
 mod live;
 mod menu;
 mod picker;
+mod redraw;
 
 pub use picker::Choice;
 

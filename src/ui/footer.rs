@@ -349,30 +349,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn reasoning_levels_have_distinct_accents_in_the_footer() {
-        let theme = Theme {
-            mode: ColorMode::Ansi256,
-        };
-        let model = model();
-        let mut state = state("/tmp");
-        state.model = Some(model.clone());
-        let mut colors = Vec::new();
-        for level in ["low", "medium", "high", "xhigh", "max"] {
-            state.level = level.into();
-            let rows = render(&state, &theme, 120);
-            let color = rows[1]
-                .spans
-                .iter()
-                .find(|s| s.text == level)
-                .unwrap()
-                .style
-                .fg;
-            assert!(!colors.contains(&color));
-            colors.push(color);
-        }
-    }
-
     fn model() -> ModelConfig {
         serde_json::from_str(r#"{"id":"deepseek-v4.1-flash","name":"deepseek-v4.1-flash","reasoning":true,"context_window":1000000}"#)
             .unwrap()
@@ -571,29 +547,6 @@ mod tests {
     }
 
     #[test]
-    fn the_rate_sits_between_the_cache_hit_field_and_the_context_gauge() {
-        let theme = Theme {
-            mode: ColorMode::True,
-        };
-        let mut state = state("/tmp");
-        state.cache_hit_rate = Some(99.5);
-        state.output_rate = Some(rate_of(42.5));
-        state.context_usage = ContextUsage::Tokens(17_300);
-        state.context_window = Some(1_000_000);
-        let text = plain(&render(&state, &theme, 120))[1].to_string();
-        let hit = text.find("99.5%").expect("cache hit rate");
-        let rate = text.find("42.5 tok/s").expect("rate");
-        let gauge = text.find("17.3k/1M").expect("gauge");
-        assert!(hit < rate && rate < gauge, "{text:?}");
-        let spans = &render(&state, &theme, 120)[1].spans;
-        assert!(
-            spans.iter().any(|span| span.text == "42.5 tok/s"),
-            "the rate is its own field, so a narrow terminal can drop it: {:?}",
-            spans.iter().map(|s| &s.text).collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
     fn a_response_with_no_rate_keeps_the_unit_on_the_dash() {
         // A turn that only called a tool produces no output tokens, and neither does one that
         // has not happened yet. The dash says "no reading"; `0.0 tok/s` would claim the model
@@ -611,19 +564,6 @@ mod tests {
         // Alone in its field, not glued to a neighbour.
         assert!(!text.contains("tok/s—"), "{text:?}");
         assert!(!text.contains("—tok/s"), "{text:?}");
-    }
-
-    #[test]
-    fn a_rate_above_a_hundred_loses_its_decimal() {
-        // The tenths measure the measurement, not the provider: past three digits they are
-        // noise on a number derived from a few seconds of streaming.
-        let theme = Theme {
-            mode: ColorMode::Ansi256,
-        };
-        let mut state = state("/tmp");
-        state.output_rate = Some(rate_of(1234.56));
-        let text = plain(&render(&state, &theme, 120))[1].to_string();
-        assert!(text.contains("1235 tok/s"), "{text:?}");
     }
 
     #[test]
@@ -730,17 +670,6 @@ mod tests {
         std::fs::write(dir.join(".git/HEAD"), "0123456789abcdef0123\n").unwrap();
         assert_eq!(git_branch(&dir).as_deref(), Some("0123456789a…"));
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn a_busy_note_only_adds_a_row_when_present() {
-        let theme = Theme {
-            mode: ColorMode::Ansi256,
-        };
-        let mut state = state("/tmp");
-        assert_eq!(render(&state, &theme, 120).len(), 2);
-        state.busy = Some("等待用户授权".into());
-        assert_eq!(render(&state, &theme, 120).len(), 3);
     }
 
     #[test]

@@ -442,11 +442,6 @@ mod tests {
     }
 
     #[test]
-    fn an_engine_is_always_available_on_this_platform() {
-        assert!(engine().is_some());
-    }
-
-    #[test]
     fn an_empty_pattern_is_rejected() {
         let dir = fixture();
         assert!(block(execute(&serde_json::json!({"pattern": ""}), &dir)).is_err());

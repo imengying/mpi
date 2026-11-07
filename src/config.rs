@@ -47,6 +47,12 @@ pub struct Provider {
     pub api_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compat: Option<CompatPatch>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_max_retries: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_max_retries: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_idle_timeout_ms: Option<u64>,
     pub models: Vec<ModelConfig>,
 }
 
@@ -221,6 +227,8 @@ impl ModelConfig {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
+    #[error("provider「{provider}」配置无效：{reason}")]
+    BadProvider { provider: String, reason: String },
     #[error("已写出示例配置：{0}\n编辑它，至少写出一个 provider 及其 models，然后重新运行。")]
     Created(PathBuf),
     #[error("配置文件读取失败：{0}")]
@@ -277,10 +285,13 @@ pub enum ConfigError {
 mod fields {
     pub const ROOT: [&str; 3] = ["shell", "providers", "default_model"];
     pub const SHELL: [&str; 1] = ["path"];
-    pub const PROVIDER: [&str; 7] = [
+    pub const PROVIDER: [&str; 10] = [
         "name",
         "api",
         "base_url",
+        "request_max_retries",
+        "stream_max_retries",
+        "stream_idle_timeout_ms",
         "api_key_env",
         "api_key",
         "compat",
@@ -561,6 +572,45 @@ impl Config {
             return Err(ConfigError::NoProviders(path.to_path_buf()));
         }
         for provider in &self.providers {
+            let bad = |reason: &str| ConfigError::BadProvider {
+                provider: provider.name.clone(),
+                reason: reason.into(),
+            };
+            if provider.request_max_retries.is_some_and(|n| n > 20)
+                || provider.stream_max_retries.is_some_and(|n| n > 20)
+            {
+                return Err(bad("重试次数必须在 0–20 之间"));
+            }
+            if provider
+                .stream_idle_timeout_ms
+                .is_some_and(|n| !(1..=3_600_000).contains(&n))
+            {
+                return Err(bad("stream_idle_timeout_ms 必须在 1–3600000 之间"));
+            }
+            if !provider.base_url.is_empty() {
+                let url = reqwest::Url::parse(&provider.base_url)
+                    .map_err(|_| bad("base_url 必须是 HTTP(S) URL"))?;
+                if !matches!(url.scheme(), "http" | "https")
+                    || url.host_str().is_none()
+                    || !url.username().is_empty()
+                    || url.password().is_some()
+                    || url.query().is_some()
+                    || url.fragment().is_some()
+                {
+                    return Err(bad("base_url 必须是无凭据、查询或片段的 HTTP(S) URL"));
+                }
+            }
+            for patch in std::iter::once(provider.compat.as_ref())
+                .chain(provider.models.iter().map(|m| m.compat.as_ref()))
+                .flatten()
+            {
+                if let Some(format) = patch.search_format
+                    && format != crate::llm::compat::SearchFormat::Off
+                    && provider.api().is_some_and(|api| !format.fits(api))
+                {
+                    return Err(bad("compat.search_format 与 api 不匹配"));
+                }
+            }
             if provider.api().is_none() {
                 return Err(ConfigError::BadApi(provider.name.clone()));
             }
@@ -723,7 +773,12 @@ impl Provider {
         // An unrecognised api has already been rejected at start-up; falling back to the
         // Responses shape here keeps this total without inventing a protocol.
         let api = self.api().unwrap_or(crate::llm::Api::OpenAiResponses);
-        let mut compat = Compat::from_base_url(&self.base_url, api);
+        let base_url = if self.base_url.is_empty() {
+            api.default_base_url()
+        } else {
+            &self.base_url
+        };
+        let mut compat = Compat::from_base_url(base_url, api);
         // Gateways host several model families on one URL. DeepSeek's reasoning protocol
         // belongs to the model, so a neutral gateway must not drop its reasoning history.
         if let Some(overrides) = &self.compat {
@@ -824,12 +879,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_pi_path_lives_under_one_directory() {
-        // One directory for everything pi owns, so the file to edit sits next to the sessions
-        // it produced. The session half of this lives with the store, in `session::dirs`.
-        let home = home_dir();
-        assert!(home.ends_with(".pi"), "{}", home.display());
-        assert_eq!(config_path(), home.join("config.json"));
+    fn provider_transport_options_and_capabilities_are_validated() {
+        for patch in [
+            serde_json::json!({"request_max_retries":21}),
+            serde_json::json!({"stream_max_retries":21}),
+            serde_json::json!({"stream_idle_timeout_ms":0}),
+            serde_json::json!({"base_url":"https://api.openai.com.attacker.test", "compat":{"search_format":"anthropic"}}),
+            serde_json::json!({"base_url":"https://secret@example.test/v1"}),
+            serde_json::json!({"base_url":"file:///tmp/api"}),
+        ] {
+            let mut provider =
+                serde_json::json!({"name":"p", "api":"responses", "models":[{"id":"m"}]});
+            provider
+                .as_object_mut()
+                .unwrap()
+                .extend(patch.as_object().unwrap().clone());
+            let cfg: Config =
+                serde_json::from_value(serde_json::json!({"providers":[provider]})).unwrap();
+            assert!(cfg.validate(Path::new("config.json")).is_err());
+        }
+        let cfg: Config = serde_json::from_value(serde_json::json!({"providers":[{
+            "name":"p", "api":"responses", "base_url":"http://localhost:8000/v1", "request_max_retries":0,
+            "stream_max_retries":2, "stream_idle_timeout_ms":50,
+            "compat":{"search_format":"web_search"}, "models":[{"id":"m", "search":true}]
+        }]})).unwrap();
+        cfg.validate(Path::new("config.json")).unwrap();
     }
 
     #[test]

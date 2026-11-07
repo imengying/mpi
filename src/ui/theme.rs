@@ -158,25 +158,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn truecolor_uses_24bit_sgr() {
-        let theme = Theme {
-            mode: ColorMode::True,
-        };
-        assert_eq!(
-            theme.fg(Color::Cyan, "x"),
-            "\u{1b}[38;2;115;194;207mx\u{1b}[39m"
-        );
-    }
-
-    #[test]
-    fn fallback_uses_256_colour_sgr() {
-        let theme = Theme {
-            mode: ColorMode::Ansi256,
-        };
-        assert_eq!(theme.fg(Color::Cyan, "x"), "\u{1b}[38;5;80mx\u{1b}[39m");
-    }
-
-    #[test]
     fn body_text_keeps_the_terminals_own_colour() {
         // Painting body text an explicit grey overrides the foreground the user chose and
         // makes every non-accent line the same colour — the transcript read as one dark

@@ -263,7 +263,7 @@ fn temp_output_path() -> PathBuf {
         .map(|d| d.as_millis())
         .unwrap_or(0);
     counter &= 0xffff;
-    std::env::temp_dir().join(format!("pi-{pid}-{stamp:x}-{counter:x}.log"))
+    crate::tools::sandbox::output_dir().join(format!("pi-{pid}-{stamp:x}-{counter:x}.log"))
 }
 
 static TEMP_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);

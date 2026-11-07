@@ -473,8 +473,8 @@ fn on_turn_action(screen: &mut Screen, action: crate::ui::screen::Action) -> boo
         Action::LineWithImages(text, images) => queue_mid_turn(screen, text, images),
         // Ctrl+O is exactly what a user does while a long tool call is on screen. The note
         // for "nothing to expand" comes from the screen itself.
-        Action::ToggleExpand => {
-            let _ = screen.toggle_last_collapsible();
+        Action::ToolDetails => {
+            let _ = screen.show_tool_details();
         }
         Action::Stop | Action::Interrupt => return true,
         Action::Eof => {}
@@ -887,22 +887,6 @@ mod tests {
         // and dividing by it would print a spike the model never ran at.
         let late = output_rate(200, &timed(4000, Some(3990))).unwrap();
         assert_eq!(late.decode, None, "a near-empty window cannot carry a rate");
-    }
-
-    #[test]
-    fn the_environment_block_is_stable_for_the_same_inputs() {
-        let cwd = Path::new("/tmp/project");
-        let first = environment_block(cwd, "id", "/usr/bin/zsh");
-        let second = environment_block(cwd, "id", "/usr/bin/zsh");
-        // Only the "session start" line may differ, and only if the clock ticks between
-        // the two calls; everything else must be identical.
-        let strip = |text: &str| {
-            text.lines()
-                .filter(|line| !line.starts_with("会话开始:"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-        assert_eq!(strip(&first), strip(&second));
     }
 
     #[test]

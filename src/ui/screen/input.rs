@@ -102,6 +102,10 @@ impl Screen {
         crate::ui::terminal::ensure_raw_mode()?;
         self.begin_line();
         loop {
+            self.flush_pending_frame();
+            if !event::poll(super::redraw::FRAME_INTERVAL)? {
+                continue;
+            }
             let event = match event::read() {
                 Ok(event) => event,
                 Err(_) => return Ok(Action::Eof),
@@ -152,18 +156,38 @@ impl Screen {
         let mut changed = false;
         // The first action ends the drain: it is a submitted line or a Ctrl+O, and the
         // caller acts on it before any more typing is read.
-        while pending.is_none() && event::poll(std::time::Duration::ZERO).unwrap_or(false) {
+        while pending.is_none() {
+            match event::poll(std::time::Duration::ZERO) {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(_) => {
+                    if let Some((_, sender)) = self.approval.take() {
+                        let _ = sender.send(crate::auth::guard::Decision::Deny);
+                    }
+                    return Some(Action::Eof);
+                }
+            }
             match event::read() {
                 Ok(event) => {
+                    let was_approval = self.approval.is_some();
                     pending = self.handle_event(event);
                     changed = true;
+                    if was_approval && self.approval.is_none() {
+                        break;
+                    }
                 }
-                Err(_) => break,
+                Err(_) => {
+                    if let Some((_, sender)) = self.approval.take() {
+                        let _ = sender.send(crate::auth::guard::Decision::Deny);
+                    }
+                    break;
+                }
             }
         }
         if changed {
             self.render();
         }
+        self.flush_pending_frame();
         pending
     }
 
@@ -180,6 +204,14 @@ impl Screen {
     }
 
     fn handle_event(&mut self, event: Event) -> Option<Action> {
+        if self.detail.is_some() {
+            self.detail_event(event);
+            return None;
+        }
+        if self.approval.is_some() {
+            self.approval_event(event);
+            return None;
+        }
         if let Event::Paste(text) = event {
             self.notice = None;
             self.editing.get_or_insert_with(Editor::new).paste(&text);
@@ -297,7 +329,7 @@ impl Screen {
                 }
                 return Some(Action::Line(line));
             }
-            KeyCode::Char('o') if ctrl => return Some(Action::ToggleExpand),
+            KeyCode::Char('o') if ctrl => return Some(Action::ToolDetails),
             KeyCode::Char('c') if ctrl => {
                 let empty = self.editing.as_ref().is_none_or(Editor::is_empty)
                     && self.pending_images.is_empty();

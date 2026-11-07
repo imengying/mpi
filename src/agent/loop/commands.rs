@@ -117,6 +117,7 @@ impl Agent {
     pub(super) fn start_new_session(&mut self) -> anyhow::Result<()> {
         let model_spec = self.model_spec.clone();
         self.session = Session::create(&self.cwd, &model_spec)?;
+        self.gate.clear_approvals();
         self.observed = tools::observed::Observed::default();
         // Nothing has been timed in the new session yet.
         self.output_rate = None;

@@ -48,7 +48,8 @@ pub fn teardown() {
         event::PopKeyboardEnhancementFlags,
         event::DisableBracketedPaste,
         cursor::Show,
-        terminal::EndSynchronizedUpdate
+        terminal::EndSynchronizedUpdate,
+        terminal::LeaveAlternateScreen
     );
     let _ = out.flush();
 }

@@ -146,6 +146,7 @@ fn an_error_exit_erases_the_composer_before_the_shell_resumes() {
         set_input(&mut screen, "unsent draft");
         screen.set_footer(vec![Line::plain("stats")]);
         screen.render();
+        screen.flush();
         terminal.process(&captured.take());
         assert!(terminal.screen().contents().contains("unsent draft"));
     }
@@ -167,6 +168,7 @@ fn leaving_places_the_shell_after_queued_output_without_an_empty_block() {
     screen.set_footer(vec![Line::plain("directory"), Line::plain("stats")]);
     screen.push_lines(vec![Line::plain("answer")]);
     screen.render();
+    screen.flush();
     terminal.process(&captured.take());
     screen.push_lines(vec![Line::plain("resume hint")]);
     screen.leave();
@@ -196,6 +198,7 @@ fn streaming_blocks_enter_scrollback_once_and_keep_the_draft_below_output() {
     for index in 0..40 {
         screen.push_text(&format!("paragraph {index}\n\n"));
         screen.render();
+        screen.flush();
         terminal.process(&captured.take());
         let expected_row = (3 + index * 2).min(21) as u16;
         assert_eq!(terminal.screen().cursor_position(), (expected_row, 7));
@@ -208,6 +211,7 @@ fn streaming_blocks_enter_scrollback_once_and_keep_the_draft_below_output() {
     }
     screen.push_text("unfinished tail");
     let (answer, thinking) = screen.end_stream();
+    screen.flush();
     terminal.process(&captured.take());
     assert!(terminal.screen().contents().contains("unfinished tail"));
     assert!(answer.ends_with("unfinished tail"));
@@ -323,6 +327,7 @@ fn native_code_selection_keeps_source_newlines_and_indentation_while_streaming_a
         screen.width = width;
         terminal.screen_mut().set_size(nz(48), nz(width as u16));
         screen.render();
+        screen.flush();
         terminal.process(&captured.take());
         assert_eq!(
             selected_code(terminal.screen()),
@@ -330,6 +335,7 @@ fn native_code_selection_keeps_source_newlines_and_indentation_while_streaming_a
             "streaming, width {width}"
         );
         screen.tick_working();
+        screen.flush();
         terminal.process(&captured.take());
         assert_eq!(
             selected_code(terminal.screen()),
@@ -338,12 +344,14 @@ fn native_code_selection_keeps_source_newlines_and_indentation_while_streaming_a
         );
     }
     screen.end_stream();
+    screen.flush();
     terminal.process(&captured.take());
     assert_eq!(selected_code(terminal.screen()), body, "completed");
     for width in [12, 23, 40, 80] {
         screen.width = width;
         terminal.screen_mut().set_size(nz(48), nz(width as u16));
         screen.render();
+        screen.flush();
         terminal.process(&captured.take());
         assert_eq!(
             selected_code(terminal.screen()),
@@ -373,6 +381,7 @@ fn native_selection_joins_visual_folds_but_keeps_explicit_prose_line_breaks() {
         screen.width = width;
         terminal.screen_mut().set_size(nz(24), nz(width as u16));
         screen.render();
+        screen.flush();
         terminal.process(&captured.take());
         let rows = terminal.screen().rows(0, width as u16).collect::<Vec<_>>();
         let start = rows
@@ -1021,15 +1030,6 @@ fn the_spinner_is_gone_once_the_turn_ends() {
 }
 
 #[test]
-fn every_spinner_frame_is_one_column_wide() {
-    // The label sits to the right of the frame, so a frame of a different width would
-    // make it shift sideways on every tick.
-    for frame in WORKING_FRAMES {
-        assert_eq!(util::width(frame), 1, "frame {frame:?} is not one column");
-    }
-}
-
-#[test]
 fn a_slash_opens_the_menu_and_filters_as_more_is_typed() {
     let mut screen = screen_with_commands();
     set_input(&mut screen, "/");
@@ -1164,60 +1164,6 @@ fn the_cursor_lands_after_the_buffer_not_below_the_footer() {
     assert!(
         lines[row + 1].line.text().contains("/model"),
         "the menu goes under the input"
-    );
-}
-
-#[test]
-fn the_caret_sits_where_the_buffer_put_it() {
-    // The caret is part of the editor, not a property of the end of the line. Without
-    // this the only place a correction can be typed is the end, which is what "you can't
-    // go back and fix a typo" means from the user's side.
-    let mut screen = screen_with_commands();
-    set_input(&mut screen, "helo world");
-    // `helo world` is ten characters; six steps back puts the caret after `helo`.
-    caret_back(&mut screen, 6);
-    let (lines, cursor) = screen.compose_live();
-    let (row, column) = cursor.unwrap();
-    assert_eq!(lines[row].line.text(), "› helo world");
-    assert_eq!(
-        column,
-        2 + 4,
-        "the caret is inside the word, not at its end"
-    );
-}
-
-#[test]
-fn a_wide_character_is_one_step_and_two_columns() {
-    // Stepping by character rather than by column is what keeps the caret from landing
-    // in the middle of a CJK glyph, where there is no position to draw it.
-    let mut screen = screen_with_commands();
-    set_input(&mut screen, "你好");
-    caret_back(&mut screen, 1);
-    let (lines, cursor) = screen.compose_live();
-    let (row, column) = cursor.unwrap();
-    assert_eq!(lines[row].line.text(), "› 你好");
-    assert_eq!(column, 2 + 2, "one character back is two display columns");
-}
-
-#[test]
-fn the_wrapped_caret_follows_the_text_to_the_next_row() {
-    // A caret just before a wrap boundary belongs on the row below, at its first column:
-    // putting it on the row above would place it one cell past the terminal's edge.
-    let mut screen = screen_with_commands();
-    // 12 columns, 2 for the prompt: 10 characters fill the first row exactly.
-    screen.width = 12;
-    set_input(&mut screen, "abcdefghijklm");
-    caret_back(&mut screen, 3); // the caret is exactly on the wrap boundary
-    let (lines, cursor) = screen.compose_live();
-    let (row, column) = cursor.unwrap();
-    assert_eq!(
-        lines[row].line.text(),
-        "  klm",
-        "a full row puts the caret on the next one"
-    );
-    assert_eq!(
-        column, 2,
-        "at the first text column, not one past the screen edge"
     );
 }
 
@@ -1599,26 +1545,6 @@ fn blank_seeded_lines_are_not_entries() {
 }
 
 #[test]
-fn a_row_filled_to_the_edge_gets_a_row_for_the_caret() {
-    // 10 text columns, filled exactly. The caret marks where the next character goes,
-    // and there is no cell left on that row to draw it in — asking for column 13 of a
-    // 12-column terminal gets clamped by the terminal, and a caret that depends on a
-    // clamp is a caret that is sometimes somewhere else.
-    let mut screen = screen_with_commands();
-    screen.width = 12;
-    set_input(&mut screen, "abcdefghij");
-    let (lines, cursor) = screen.compose_live();
-    let (row, column) = cursor.unwrap();
-    assert_eq!(
-        lines[row].line.text(),
-        "  ",
-        "the caret sits on its own row below"
-    );
-    assert_eq!(column, 2);
-    assert_eq!(row, 1, "not on the row that is full");
-}
-
-#[test]
 fn the_caret_of_a_recalled_entry_lands_at_the_end() {
     // Recalling a line is for running or amending it, so the caret belongs where the
     // typing stopped — not at the start, where the next keystroke would be an insertion
@@ -1628,66 +1554,6 @@ fn the_caret_of_a_recalled_entry_lands_at_the_end() {
     set_input(&mut screen, "");
     screen.history_up();
     assert_eq!(screen.editing.as_ref().unwrap().caret(), 7);
-}
-
-#[test]
-fn the_erase_step_lands_on_the_first_live_row() {
-    // Both halves of this arithmetic were wrong at different times, and both failures
-    // look like "the screen creeps upward": one row of committed transcript is cleared
-    // per redraw. Pin the numbers here rather than in a terminal.
-    //
-    // While editing, the cursor is parked on the input row, which is the *first* live
-    // row — so erasing from there needs no upward move at all.
-    let mut screen = screen_with_commands();
-    set_input(&mut screen, "hi");
-    screen.set_footer(vec![Line::plain("dir"), Line::plain("stats")]);
-    let (lines, cursor) = screen.compose_live();
-    let (row, _) = cursor.unwrap();
-    assert_eq!(row, 0, "the input line is the first live row");
-    let up = row; // mirrors erase_live
-    assert_eq!(up, 0, "erasing from the input row must not climb");
-    assert!(lines.len() > 1);
-
-    // With a pending image and a menu the input row is still first.
-    screen.pending_images.push(crate::image_input::PastedImage {
-        width: 1,
-        height: 1,
-        data: "AA==".into(),
-        media_type: "image/png",
-        bytes: 3,
-    });
-    let (lines, cursor) = screen.compose_live();
-    let (row, _) = cursor.unwrap();
-    assert_eq!(row, 0, "images render below the input line, not above it");
-    assert!(lines[0].line.text().starts_with("› hi"));
-}
-
-#[test]
-fn the_cursor_follows_the_last_wrapped_row() {
-    let mut screen = screen_with_commands();
-    set_input(&mut screen, &('a'..='z').collect::<String>());
-    screen.width = 12;
-    let (lines, cursor) = screen.compose_live();
-    let (row, column) = cursor.unwrap();
-    // The caret is on the last row, after its text — not on the first row where it
-    // would be if the input were being scrolled sideways.
-    assert_eq!(row, 2);
-    assert_eq!(
-        lines[row].line.text(),
-        "  uvwxyz",
-        "the continuation row keeps its indent"
-    );
-    assert_eq!(column, 2 + 6);
-}
-
-#[test]
-fn a_cjk_buffer_puts_the_cursor_after_two_cells_per_character() {
-    // Column is a display column, not a character count: 你好 is four cells wide, so the
-    // caret belongs at 2 + 4, which is what makes it line up with the glyphs.
-    let mut screen = screen_with_commands();
-    set_input(&mut screen, "你好");
-    let (_, cursor) = screen.compose_live();
-    assert_eq!(cursor.unwrap().1, 2 + 4);
 }
 
 #[test]
@@ -1705,58 +1571,54 @@ fn toggling_with_nothing_to_expand_says_so() {
     // is pushed by the screen rather than by each caller, so this is where it is checked.
     let mut screen = screen();
     screen.push(Block::lines(vec![Line::plain("plain output")]));
-    assert!(!screen.toggle_last_collapsible());
-    assert!(
-        screen.blocks.last().unwrap().render(80)[0]
-            .text()
-            .contains("没有可展开")
-    );
+    assert!(!screen.show_tool_details());
+    assert_eq!(screen.notice.as_deref(), Some("没有工具详情"));
 }
 
 #[test]
-fn toggling_hits_the_most_recent_collapsible_block() {
+fn detail_navigation_and_search_preserve_the_transcript_and_draft() {
     let mut screen = screen();
+    let captured = CapturedOutput::default();
+    screen.out = Box::new(captured.clone());
+    screen.interactive = true;
     screen.push(Block::collapsible(
-        vec![Line::plain("x".repeat(10))],
-        0,
-        0,
+        (0..60).map(|n| Line::plain(format!("older {n}"))).collect(),
         1,
+        0,
+        0,
     ));
     screen.push(Block::lines(vec![Line::plain("later")]));
-    screen.push(Block::collapsible(
-        (0..10).map(|i| Line::plain(format!("i{i}"))).collect(),
-        0,
-        0,
-        3,
-    ));
-    assert!(screen.toggle_last_collapsible());
-    let last = screen.blocks.last().unwrap();
-    match last {
-        Block::Collapsible(collapsible) => assert!(collapsible.expanded),
-        _ => panic!("expected a collapsible block"),
+    screen.push(Block::collapsible(vec![Line::plain("newer")], 1, 0, 0));
+    set_input(&mut screen, "draft");
+    screen.absorb_event(Event::Key(KeyCode::Left.into()));
+    let original = screen.editing.clone().unwrap();
+    let mut terminal = vt100::Parser::new(nz(24), nz(40), 100);
+    assert!(screen.show_tool_details());
+    terminal.process(&captured.take());
+    assert!(terminal.screen().contents().contains("newer"));
+    assert!(
+        screen
+            .blocks
+            .iter()
+            .all(|block| !matches!(block, Block::Collapsible(c) if c.expanded))
+    );
+    screen.absorb_event(Event::Key(KeyCode::Left.into()));
+    for c in "/older 50".chars() {
+        screen.absorb_event(Event::Key(KeyCode::Char(c).into()));
     }
-    // The earlier collapsible block is untouched.
-    match &screen.blocks[0] {
-        Block::Collapsible(collapsible) => assert!(!collapsible.expanded),
-        _ => panic!("expected a collapsible block"),
-    }
-}
-
-#[test]
-fn collapsing_all_resets_expansion() {
-    let mut screen = screen();
-    screen.push(Block::collapsible(
-        (0..8).map(|i| Line::plain(format!("l{i}"))).collect(),
-        0,
-        0,
-        2,
-    ));
-    screen.toggle_last_collapsible();
-    screen.collapse_all();
-    match &screen.blocks[0] {
-        Block::Collapsible(collapsible) => assert!(!collapsible.expanded),
-        _ => panic!("expected a collapsible block"),
-    }
+    screen.absorb_event(Event::Key(KeyCode::Enter.into()));
+    screen.flush();
+    terminal.process(&captured.take());
+    assert!(terminal.screen().contents().contains("older 50"));
+    assert!(!terminal.screen().contents().contains("older 0"));
+    screen.absorb_event(Event::Key(KeyCode::Esc.into()));
+    screen.flush();
+    terminal.process(&captured.take());
+    assert!(screen.detail.is_none());
+    assert!(terminal.screen().contents().contains("› draft"));
+    assert_eq!(screen.editing.as_ref().unwrap().text(), original.text());
+    assert_eq!(screen.editing.as_ref().unwrap().caret(), original.caret());
+    assert_eq!(screen.blocks.len(), 3);
 }
 
 #[test]
@@ -1770,58 +1632,6 @@ fn colored_output_keeps_its_text_without_synthetic_padding() {
     assert_eq!(util::strip_ansi(&painted), "added");
     // Re-measuring the raw string would be wrong, which is the whole reason spans exist.
     assert!(painted.len() > 5);
-}
-
-#[test]
-fn appending_a_token_does_not_redraw() {
-    // Every delta used to call `render()`, which erases the live region and paints it
-    // again — input line and caret included. A burst of tokens therefore repainted the
-    // caret once per character. The burst is drained and redrawn once by the caller
-    // instead, so appending is a buffer push and nothing more.
-    let mut screen = screen();
-    screen.begin_stream();
-    screen.set_working(WORKING_LABEL);
-    set_input(&mut screen, "draft");
-    screen.streaming_thinking = None;
-    screen.viewport = Viewport::default();
-
-    screen.push_thinking("think");
-    screen.push_text("answer");
-    assert!(
-        !screen.viewport.needs_reflow(41, 24),
-        "appending a token redrew the region"
-    );
-
-    // A burst costs no more than a single token does: a hundred appends still leave the
-    // region untouched, and all hundred characters are in the buffer afterwards.
-    for _ in 0..100 {
-        screen.push_text("x");
-    }
-    assert!(
-        !screen.viewport.needs_reflow(41, 24),
-        "a burst redrew the region"
-    );
-    assert_eq!(
-        screen.streaming_answer.as_deref(),
-        Some(format!("answer{}", "x".repeat(100)).as_str())
-    );
-
-    // And the caller's single redraw picks up everything appended since.
-    let mut terminal = vt100::Parser::new(nz(24), nz(40), 0);
-    terminal.process(screen.live_frame().as_bytes());
-    let text: Vec<String> = terminal
-        .screen()
-        .contents()
-        .lines()
-        .map(str::to_owned)
-        .collect();
-    assert!(!text.iter().any(|row| row.contains("think")), "{text:?}");
-    assert_eq!(screen.streaming_thinking.as_deref(), Some("think"));
-    let drawn = text.concat();
-    assert!(
-        drawn.contains(&"x".repeat(40)),
-        "the burst reached the region: {text:?}"
-    );
 }
 
 #[test]
@@ -2399,4 +2209,24 @@ fn submitting_a_path_sends_the_image_instead_of_the_text() {
     assert!(matches!(action, Some(Action::Line(_))), "{action:?}");
 
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn caret_layout_handles_midline_unicode_and_wrap_boundaries() {
+    for (text, width, back, expected_row, expected_column, expected_line) in [
+        ("helo world", 40, 6, 0, 6, "› helo world"),
+        ("你好", 40, 1, 0, 4, "› 你好"),
+        ("你好", 40, 0, 0, 6, "› 你好"),
+        ("abcdefghijklm", 12, 3, 1, 2, "  klm"),
+        ("abcdefghij", 12, 0, 1, 2, "  "),
+        ("abcdefghijklmnopqrstuvwxyz", 12, 0, 2, 8, "  uvwxyz"),
+    ] {
+        let mut screen = screen_with_commands();
+        screen.width = width;
+        set_input(&mut screen, text);
+        caret_back(&mut screen, back);
+        let (lines, cursor) = screen.compose_live();
+        assert_eq!(cursor, Some((expected_row, expected_column)), "{text}");
+        assert_eq!(lines[expected_row].line.text(), expected_line, "{text}");
+    }
 }

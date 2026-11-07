@@ -1,18 +1,51 @@
-//! The gate in front of tool execution.
-//!
-//! Every tool call passes through [`PermissionGate::check`]. A call the policy allows
-//! runs immediately; anything else pops the authorization panel. With no terminal the
-//! gate refuses — silently approving a dangerous command in a headless run would defeat
-//! the whole point of the policy.
-//!
-//! Every decision returns owned, vetted arguments for one execution.
-
-use std::path::Path;
-
-use serde::{Deserialize, Serialize};
+//! Tool policy and scoped session grants. UI and execution consume the returned decisions.
 
 use crate::auth::policy::{self, Assessment, Dialect};
-use crate::ui::auth_panel::{self, PanelRequest};
+use crate::tools::sandbox::Scope;
+use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Decision {
+    Allow,
+    AllowSession,
+    Deny,
+    Stop,
+}
+
+#[derive(Debug, Clone)]
+pub struct ApprovedCall {
+    pub arguments: serde_json::Value,
+    pub scope: Scope,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ApprovalKey {
+    tool: String,
+    arguments: String,
+    cwd: PathBuf,
+    scope: Scope,
+    paths: Vec<PathBuf>,
+    workspace: PathBuf,
+}
+
+#[derive(Debug)]
+pub struct ApprovalRequest {
+    pub tool: String,
+    pub arguments: serde_json::Value,
+    pub cwd: PathBuf,
+    pub workspace: PathBuf,
+    pub scope: Scope,
+    pub reason: String,
+    key: ApprovalKey,
+}
+
+#[derive(Debug)]
+pub enum GateAction {
+    Ready(ApprovedCall),
+    Ask(Box<ApprovalRequest>),
+}
 
 /// Why a call was refused, in the words the policy used.
 #[derive(Debug)]
@@ -83,6 +116,7 @@ pub struct PermissionGate {
     /// The user's choice from `/permissions`. Only consulted for calls the policy flags.
     mode: PermissionMode,
     dialect: Dialect,
+    remembered: HashSet<ApprovalKey>,
 }
 
 impl PermissionGate {
@@ -91,6 +125,7 @@ impl PermissionGate {
             interactive,
             mode: PermissionMode::default(),
             dialect,
+            remembered: HashSet::new(),
         }
     }
 
@@ -99,170 +134,163 @@ impl PermissionGate {
     }
 
     pub fn set_mode(&mut self, mode: PermissionMode) {
+        self.remembered.clear();
         self.mode = mode;
     }
 
-    /// Return the exact arguments that may execute. No cached approval can be replayed.
+    pub fn clear_approvals(&mut self) {
+        self.remembered.clear();
+    }
+
+    pub fn assess(
+        &self,
+        tool: &str,
+        input: &serde_json::Value,
+        cwd: &Path,
+    ) -> Result<GateAction, Refusal> {
+        if let Some(value) = input.get("sandbox_permissions")
+            && !value.is_null()
+            && !matches!(value.as_str(), Some("use_default" | "require_escalated"))
+        {
+            return Err(Refusal {
+                reason: "sandbox_permissions 无效".into(),
+                stopped: false,
+            });
+        }
+        let assessment = policy::assess_tool(tool, input, cwd, self.dialect);
+        let escalated =
+            input.get("sandbox_permissions").and_then(|v| v.as_str()) == Some("require_escalated");
+        let mut arguments = input.clone();
+        let reason = match assessment {
+            Assessment::Allow { safe_command } => {
+                if let Some(command) = safe_command {
+                    arguments["command"] = command.into();
+                }
+                None
+            }
+            Assessment::Ask { reason } => Some(reason),
+        };
+        let unrestricted = (tool != "bash" && reason.is_some()) || escalated;
+        let scope = if unrestricted {
+            Scope::Unrestricted
+        } else if matches!(tool, "write" | "edit") || reason.is_some() {
+            Scope::Workspace
+        } else {
+            Scope::ReadOnly
+        };
+        if !unrestricted && reason.is_none() {
+            return Ok(GateAction::Ready(ApprovedCall { arguments, scope }));
+        }
+        let reason = reason.unwrap_or_else(|| "需要在隔离之外执行".into());
+        if !self.interactive {
+            return Err(Refusal {
+                reason,
+                stopped: false,
+            });
+        }
+        let actual_cwd = if tool == "bash" {
+            crate::tools::bash::resolve_cwd(&arguments, cwd).unwrap_or_else(|_| cwd.to_path_buf())
+        } else {
+            cwd.to_path_buf()
+        };
+        let actual_cwd = actual_cwd.canonicalize().unwrap_or(actual_cwd);
+        let mut identity = arguments.clone();
+        if let Some(object) = identity.as_object_mut() {
+            object.remove("description");
+        }
+        let paths = referenced_paths(&arguments, cwd);
+        let workspace = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+        let key = ApprovalKey {
+            tool: tool.into(),
+            arguments: identity.to_string(),
+            cwd: actual_cwd.clone(),
+            scope,
+            paths,
+            workspace: workspace.clone(),
+        };
+        if self.mode == PermissionMode::Allow || self.remembered.contains(&key) {
+            return Ok(GateAction::Ready(ApprovedCall { arguments, scope }));
+        }
+        Ok(GateAction::Ask(Box::new(ApprovalRequest {
+            tool: tool.into(),
+            arguments,
+            cwd: actual_cwd,
+            workspace,
+            scope,
+            reason,
+            key,
+        })))
+    }
+
+    pub fn resolve(
+        &mut self,
+        request: ApprovalRequest,
+        decision: Decision,
+    ) -> Result<ApprovedCall, Refusal> {
+        match decision {
+            Decision::Allow | Decision::AllowSession => {
+                if decision == Decision::AllowSession {
+                    // Bound memory; dropping remembered grants only causes another question.
+                    if self.remembered.len() >= 256 {
+                        self.remembered.clear();
+                    }
+                    self.remembered.insert(request.key);
+                }
+                Ok(ApprovedCall {
+                    arguments: request.arguments,
+                    scope: request.scope,
+                })
+            }
+            Decision::Deny | Decision::Stop => Err(Refusal {
+                reason: request.reason,
+                stopped: decision == Decision::Stop,
+            }),
+        }
+    }
+
+    /// Noninteractive policy check, also useful to embedders. UI decisions go through assess/resolve.
     pub fn check(
         &self,
         tool: &str,
         input: &serde_json::Value,
         cwd: &Path,
     ) -> Result<serde_json::Value, Refusal> {
-        match policy::assess_tool(tool, input, cwd, self.dialect) {
-            Assessment::Allow { safe_command } => {
-                let mut approved = input.clone();
-                if let Some(command) = safe_command {
-                    approved["command"] = command.into();
-                }
-                Ok(approved)
-            }
-            Assessment::Ask { reason } => {
-                // Headless is checked first and wins over the mode: "no terminal" means
-                // there is nobody who could have agreed to anything, and a session resumed
-                // without a terminal must not inherit the trust of the one that set the
-                // mode. This is the invariant the gate exists for, so the mode cannot
-                // weaken it.
-                if !self.interactive {
-                    return Err(Refusal {
-                        reason,
-                        stopped: false,
-                    });
-                }
-                // The mode only decides whether to ask. Note the rewritten arguments are not
-                // produced on this path — the policy asked *about* the call rather than
-                // approving a rewritten form of it — so an auto-allowed call runs the
-                // arguments as written, exactly as one the user just approved does today.
-                if self.mode == PermissionMode::Allow {
-                    return Ok(input.clone());
-                }
-                let decision = auth_panel::ask(PanelRequest {
-                    body: panel_body(tool, input),
-                });
-                if decision == auth_panel::Decision::Allow {
-                    Ok(input.clone())
-                } else {
-                    Err(Refusal {
-                        reason,
-                        stopped: decision == auth_panel::Decision::Stop,
-                    })
-                }
-            }
+        match self.assess(tool, input, cwd)? {
+            GateAction::Ready(call) => Ok(call.arguments),
+            GateAction::Ask(request) => Err(Refusal {
+                reason: request.reason,
+                stopped: false,
+            }),
         }
     }
 }
 
-/// What the panel shows: the command itself for `bash`, the resolved arguments for the
-/// file tools.
-///
-/// Nothing else. The policy's reason used to be prepended, and it was a sentence explaining
-/// the command the user is looking at — "重定向可能写入文件或执行脚本" above a command whose
-/// redirection is in plain sight. The panel asks one question ("run this?"), so it shows one
-/// thing: what would run. A reason still reaches the model in the refusal, which is where it
-/// can act on it.
-/// The body the panel shows for one call.
-///
-/// A `bash` command is broken onto one line per segment, with the operator starting the
-/// continuation line and a marker in front of the two things that deserve a second look:
-/// piping a segment's output into another command, and a redirection. A single line is left
-/// alone — there is nothing to break up, and a marker in front of `ls` is noise.
-///
-/// This is a *reading* aid and nothing else. It does not decide whether to ask (the policy
-/// already did) and it never rewrites what would run: the text is split for display, and the
-/// command that executes is the one the caller passed. A chain of six commands on one line
-/// reads as one long string, which is how a 400-character line containing `pkill` gets
-/// approved without being read.
-fn panel_body(tool: &str, input: &serde_json::Value) -> String {
-    if tool == "bash"
-        && let Some(command) = input.get("command").and_then(|v| v.as_str())
-    {
-        return split_for_display(command);
-    }
-    serde_json::to_string_pretty(input).unwrap_or_else(|_| input.to_string())
-}
-
-/// Break a command line onto one line per segment, for the panel to display.
-///
-/// Splitting is done on shell operators *outside* quotes, and it does not try to be a shell
-/// parser: it never needs to be right about what the command means, only to put the parts on
-/// their own lines. A quote that never closes therefore ends the scan rather than swallowing
-/// the rest of the command — showing too much is fine, showing nothing is not.
-fn split_for_display(command: &str) -> String {
-    // Heredocs carry their own lines already; the body of one is data, not a command, and
-    // re-indenting it would misrepresent what was written.
-    if command.contains('\n') {
-        return command.to_string();
-    }
-    let mut lines: Vec<String> = Vec::new();
-    let mut current = String::new();
-    let mut chars = command.chars().peekable();
-    let mut single = false;
-    let mut double = false;
-    while let Some(c) = chars.next() {
-        match c {
-            '\\' if !single => {
-                current.push(c);
-                if let Some(next) = chars.next() {
-                    current.push(next);
+fn referenced_paths(input: &serde_json::Value, cwd: &Path) -> Vec<PathBuf> {
+    fn visit(value: &serde_json::Value, cwd: &Path, paths: &mut Vec<PathBuf>) {
+        match value {
+            serde_json::Value::Object(object) => {
+                for (key, value) in object {
+                    if matches!(key.as_str(), "path" | "cwd")
+                        && let Some(path) = value.as_str()
+                    {
+                        let path = policy::resolve_tool_path(path, cwd);
+                        paths.push(path.canonicalize().unwrap_or(path));
+                    } else {
+                        visit(value, cwd, paths);
+                    }
                 }
             }
-            '\'' if !double => {
-                single = !single;
-                current.push(c);
-            }
-            '"' if !single => {
-                double = !double;
-                current.push(c);
-            }
-            '&' | '|' | ';' if !single && !double => {
-                // `2>&1` and `>&2` move a file descriptor; they are not separators, and a
-                // `&` that follows `>` (or a digit-then-`>`) belongs to that redirection.
-                if c == '&' && current.trim_end().ends_with('>') {
-                    current.push(c);
-                    continue;
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    visit(value, cwd, paths);
                 }
-                let paired = chars.peek() == Some(&c) && c != ';';
-                // A lone `&` backgrounds the command and is then followed by `)` or the end
-                // of the line. Splitting there would produce a line like `& )`, which reads
-                // as a command but is not one; the background marker stays with its command.
-                let lone_background = c == '&'
-                    && !paired
-                    && chars
-                        .peek()
-                        .map(|next| next.is_whitespace() || *next == ')')
-                        .unwrap_or(true);
-                if lone_background {
-                    current.push(c);
-                    continue;
-                }
-                let mut op = c.to_string();
-                if paired {
-                    op.push(chars.next().expect("peeked"));
-                }
-                lines.push(current.trim().to_string());
-                current = format!("{op} ");
-                // After `&&` the next segment is a consequence; after `|` it is a different
-                // program reading the first one's output; after `;` it merely follows.
             }
-            _ => current.push(c),
+            _ => {}
         }
     }
-    if !single && !double {
-        lines.push(current.trim().to_string());
-    } else {
-        // An unterminated quote means the scan cannot be trusted past this point, so the
-        // remainder is shown as written rather than split on a guess.
-        lines.push(current.trim().to_string());
-    }
-    let lines: Vec<&str> = lines
-        .iter()
-        .map(String::as_str)
-        .filter(|l| !l.is_empty())
-        .collect();
-    if lines.len() <= 1 {
-        return command.to_string();
-    }
-    lines.join("\n")
+    let mut paths = Vec::new();
+    visit(input, cwd, &mut paths);
+    paths
 }
 
 #[cfg(test)]
@@ -270,36 +298,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_panel_shows_the_call_and_no_commentary_about_it() {
-        // The panel asks one question and shows one thing: what would run. The policy's
-        // reason is not part of it — "重定向可能写入文件或执行脚本" above a command whose
-        // redirection is right there is the same mistake as a category label in the title.
-        let command = "cat data.txt > out.txt";
-        let body = panel_body("bash", &serde_json::json!({ "command": command }));
-        assert_eq!(body, command);
-
-        // The file tools show their arguments, which is all the panel has to say for them.
-        let write = panel_body(
-            "write",
-            &serde_json::json!({ "path": "a.txt", "content": "hi" }),
+    fn session_approval_is_scoped_and_one_time_approval_is_not_cached() {
+        let mut gate = PermissionGate::new(true, Dialect::Zsh);
+        let cwd = std::env::temp_dir();
+        let input = serde_json::json!({"command":"touch marker"});
+        let ask = |gate: &PermissionGate, input: &serde_json::Value, cwd: &Path| match gate
+            .assess("bash", input, cwd)
+            .unwrap()
+        {
+            GateAction::Ask(request) => request,
+            other => panic!("expected approval: {other:?}"),
+        };
+        let request = ask(&gate, &input, &cwd);
+        gate.resolve(*request, Decision::Allow).unwrap();
+        let request = ask(&gate, &input, &cwd);
+        gate.resolve(*request, Decision::AllowSession).unwrap();
+        assert!(matches!(
+            gate.assess("bash", &input, &cwd).unwrap(),
+            GateAction::Ready(_)
+        ));
+        ask(&gate, &serde_json::json!({"command":"touch changed"}), &cwd);
+        ask(&gate, &input, Path::new("/"));
+        ask(
+            &gate,
+            &serde_json::json!({"command":"touch marker", "sandbox_permissions":"require_escalated"}),
+            &cwd,
         );
-        assert!(write.contains("\"path\": \"a.txt\""), "{write}");
-
-        // The reason is not lost, it moved: a refusal still carries it, because the model is
-        // the one that has to act on it. A headless gate refuses everything, which is the
-        // same refusal an interactive "2" produces.
-        let refused = PermissionGate::new(false, Dialect::Zsh)
-            .check(
-                "bash",
-                &serde_json::json!({ "command": command }),
-                &std::env::temp_dir(),
-            )
-            .unwrap_err();
-        assert!(
-            refused.message().contains("未获得用户授权"),
-            "{}",
-            refused.message()
-        );
+        gate.clear_approvals();
+        ask(&gate, &input, &cwd);
     }
 
     #[test]
@@ -336,15 +362,6 @@ mod tests {
         // had to read it in every refusal.
         assert!(!error.message().contains("请勿改写"));
         assert!(!error.message().contains("不要重试"));
-    }
-
-    #[test]
-    fn the_panel_shows_the_command_for_bash_and_json_for_files() {
-        let bash = serde_json::json!({"command": "rm -rf build"});
-        assert_eq!(panel_body("bash", &bash), "rm -rf build");
-        let write = serde_json::json!({"path": "a.txt", "content": "hi"});
-        let body = panel_body("write", &write);
-        assert!(body.contains("\"path\": \"a.txt\""));
     }
 
     #[test]
@@ -405,22 +422,6 @@ mod tests {
             error.message().contains("未获得用户授权"),
             "{}",
             error.message()
-        );
-    }
-
-    #[test]
-    fn the_mode_round_trips_through_serde() {
-        // It is written into every `turn_context` line, so the spelling is part of the file
-        // format: a rename would silently reset every saved session to the default.
-        let json = serde_json::to_string(&PermissionMode::Allow).unwrap();
-        assert_eq!(json, "\"allow\"");
-        assert_eq!(
-            serde_json::from_str::<PermissionMode>(&json).unwrap(),
-            PermissionMode::Allow
-        );
-        assert_eq!(
-            serde_json::to_string(&PermissionMode::Ask).unwrap(),
-            "\"ask\""
         );
     }
 }

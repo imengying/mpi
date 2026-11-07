@@ -61,11 +61,24 @@ impl Agent {
             }
             self.render_footer(None);
             self.screen.set_running(running.clone());
-            self.screen.suspend_live();
             // Every call keeps its own authorization decision; no batch-wide grant.
             let mut approved = Vec::with_capacity(batch.len());
             for (_, name, arguments) in batch {
-                match self.gate.check(name, arguments, &self.cwd) {
+                let mut execution_arguments = arguments.clone();
+                if !tools::sandbox::available() && execution_arguments.is_object() {
+                    // Backend availability affects execution scope, not the command policy.
+                    // Escalation still goes through the normal, scoped approval request.
+                    execution_arguments["sandbox_permissions"] = "require_escalated".into();
+                }
+                let approval = match self.gate.assess(name, &execution_arguments, &self.cwd) {
+                    Ok(crate::auth::guard::GateAction::Ready(call)) => Ok(call),
+                    Ok(crate::auth::guard::GateAction::Ask(request)) => {
+                        let decision = self.screen.request_approval(&request).await;
+                        self.gate.resolve(*request, decision)
+                    }
+                    Err(refusal) => Err(refusal),
+                };
+                match approval {
                     Err(refusal) if refusal.stopped => {
                         self.screen.clear_running();
                         self.skip_tools(&calls[next..], true)?;
@@ -83,7 +96,7 @@ impl Agent {
                     self.session.push_tool_start(
                         id,
                         name,
-                        arguments.clone(),
+                        arguments.arguments.clone(),
                         tools::replay_safe(name),
                     )?;
                 }
@@ -154,7 +167,7 @@ impl Agent {
     async fn run_tool_batch(
         &mut self,
         calls: &[(String, String, serde_json::Value)],
-        approved: Vec<Result<serde_json::Value, ToolOutput>>,
+        approved: Vec<Result<crate::auth::guard::ApprovedCall, ToolOutput>>,
     ) -> (Vec<(ToolOutput, ToolStatus)>, bool) {
         let mut workers = tokio::task::JoinSet::new();
         let mut task_indices = std::collections::HashMap::new();
@@ -171,7 +184,10 @@ impl Agent {
                     let name = calls[index].1.clone();
                     let context = context.clone();
                     let task = workers.spawn(async move {
-                        (index, tools::execute(&name, &arguments, &context).await)
+                        (
+                            index,
+                            tools::sandbox::execute(&name, arguments, context).await,
+                        )
                     });
                     task_indices.insert(task.id(), index);
                 }
@@ -343,6 +359,13 @@ mod tests {
     #[tokio::test]
     async fn file_versions_survive_batches_until_reread_or_own_write() {
         let (mut agent, dir) = test_agent();
+        if !tools::sandbox::available() {
+            // These fixtures exercise file ordering; authorize the fallback on unsupported OSes.
+            agent.gate = PermissionGate::new(true, policy::Dialect::Zsh);
+            agent
+                .gate
+                .set_mode(crate::auth::guard::PermissionMode::Allow);
+        }
         let file = dir.join("shared");
         std::fs::write(&file, "alpha\nbeta\n").unwrap();
         agent
@@ -524,6 +547,13 @@ mod tests {
     #[tokio::test]
     async fn read_batches_preserve_result_order_and_mutation_boundaries() {
         let (mut agent, dir) = test_agent();
+        if !tools::sandbox::available() {
+            // These fixtures exercise file ordering; authorize the fallback on unsupported OSes.
+            agent.gate = PermissionGate::new(true, policy::Dialect::Zsh);
+            agent
+                .gate
+                .set_mode(crate::auth::guard::PermissionMode::Allow);
+        }
         std::fs::write(dir.join("shared"), "before").unwrap();
         std::fs::write(dir.join("other"), "other").unwrap();
         agent
@@ -594,6 +624,13 @@ mod tests {
     async fn steering_preserves_completed_work_and_skips_obsolete_calls() {
         use crate::ui::screen::Queued;
         let (mut agent, dir) = test_agent();
+        if !tools::sandbox::available() {
+            // These fixtures exercise file ordering; authorize the fallback on unsupported OSes.
+            agent.gate = PermissionGate::new(true, policy::Dialect::Zsh);
+            agent
+                .gate
+                .set_mode(crate::auth::guard::PermissionMode::Allow);
+        }
         std::fs::write(dir.join("original"), "original data").unwrap();
         agent
             .session

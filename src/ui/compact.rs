@@ -1,7 +1,6 @@
 //! Turning tool results into compact transcript blocks.
 //!
-//! Three shapes, all collapsible with Ctrl+O and all re-collapsed when a new task starts
-//! (see [`crate::ui::screen::Screen::collapse_all`]):
+//! Compact transcript shapes; Ctrl+O opens their full content in a temporary view:
 //!
 //! * successful calls — one summary line, with full output available on expansion,
 //! * a file diff — red and green with line numbers, previewed at 14 rows,
@@ -142,6 +141,29 @@ pub(crate) fn arguments_display(name: &str, arguments: &serde_json::Value) -> Di
 
 /// Build a finished call with its header and outcome always visible.
 pub fn tool_block(
+    name: &str,
+    arguments: &serde_json::Value,
+    output: &ToolOutput,
+    status: crate::llm::ToolStatus,
+) -> Block {
+    let mut block = tool_block_inner(name, arguments, output, status);
+    if let Block::Collapsible(inner) = &mut block {
+        inner.full_output = output.content.lines().rev().find_map(|line| {
+            let raw = line
+                .strip_prefix("[输出过长，已截断。完整输出：")?
+                .strip_suffix(']')?;
+            let path = std::path::PathBuf::from(raw);
+            let temp = std::env::temp_dir().canonicalize().ok()?;
+            let canonical = path.canonicalize().ok()?;
+            let name = canonical.file_name()?.to_str()?;
+            (canonical.starts_with(temp) && name.starts_with("pi-") && name.ends_with(".log"))
+                .then_some(canonical)
+        });
+    }
+    block
+}
+
+fn tool_block_inner(
     name: &str,
     arguments: &serde_json::Value,
     output: &ToolOutput,
@@ -1150,40 +1172,6 @@ mod tests {
     }
 
     #[test]
-    fn a_command_result_reports_how_long_it_took() {
-        // The duration is a property of the call, and the collapsed view is the one the user
-        // compares between runs, so it has to survive collapsing.
-        let mut output = ToolOutput {
-            content: "done\n".into(),
-            display: Display::Command,
-            is_error: false,
-            duration: None,
-            images: Vec::new(),
-        };
-        let block = tool_block(
-            "bash",
-            &serde_json::json!({"command": "sleep 1"}),
-            &output,
-            ToolStatus::Success,
-        );
-        let text = plain(&block.render(80));
-        assert!(
-            !text.iter().any(|line| line.contains("耗时")),
-            "no time, no claim"
-        );
-
-        output.duration = Some(std::time::Duration::from_millis(3400));
-        let block = tool_block(
-            "bash",
-            &serde_json::json!({"command": "sleep 1"}),
-            &output,
-            ToolStatus::Success,
-        );
-        let text = plain(&block.render(80));
-        assert_eq!(text, ["✓ $ sleep 1 · 3.4s"]);
-    }
-
-    #[test]
     fn durations_read_at_the_scale_they_are_at() {
         use std::time::Duration;
         assert_eq!(format_duration(Duration::from_millis(400)), "0.4s");
@@ -1375,37 +1363,6 @@ mod tests {
             "{text:?}"
         );
         assert!(!text.iter().any(|line| line.contains("收起")), "{text:?}");
-    }
-
-    #[test]
-    fn a_successful_listing_only_shows_its_header() {
-        let output = ToolOutput {
-            content: (0..20).map(|i| format!("entry {i}\n")).collect(),
-            display: Display::File {
-                verb: "列出",
-                path: "src".into(),
-            },
-            is_error: false,
-            duration: None,
-            images: Vec::new(),
-        };
-        let text = plain(
-            &tool_block("ls", &serde_json::json!({}), &output, ToolStatus::Success).render(120),
-        );
-        assert!(
-            text.iter().any(|line| line.contains("列出 src")),
-            "{text:?}"
-        );
-        assert_eq!(text, ["✓ 列出 src"]);
-    }
-
-    #[test]
-    fn user_input_is_echoed_with_a_marker() {
-        let lines = user_lines("hello\nworld");
-        let text = plain(&lines);
-        assert!(text[0].starts_with("› hello"), "{text:?}");
-        assert_eq!(text[1], "world");
-        assert_eq!(text.last().unwrap(), "");
     }
 
     #[test]

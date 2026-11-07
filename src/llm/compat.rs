@@ -70,38 +70,26 @@ impl Default for Compat {
 impl Compat {
     pub fn from_base_url(base_url: &str, api: crate::llm::Api) -> Self {
         let mut compat = Compat::default();
-        let url = base_url.to_lowercase();
-        if api == crate::llm::Api::AnthropicMessages {
-            compat.search_format = Some(SearchFormat::Anthropic);
-            return compat;
+        let url = reqwest::Url::parse(base_url).ok();
+        let host = url
+            .as_ref()
+            .and_then(|url| url.host_str())
+            .unwrap_or_default();
+        match (api, host) {
+            (crate::llm::Api::AnthropicMessages, "api.anthropic.com") => {
+                compat.search_format = Some(SearchFormat::Anthropic);
+            }
+            (crate::llm::Api::OpenAiResponses, "api.openai.com") => {
+                compat.supports_strict_mode = true;
+                compat.supports_long_cache = true;
+                compat.search_format = Some(SearchFormat::WebSearch);
+            }
+            (crate::llm::Api::OpenAiResponses, "api.x.ai") => {
+                compat.search_format = Some(SearchFormat::WebAndX);
+            }
+            _ => {}
         }
-        compat.search_format = Some(SearchFormat::WebSearch);
-        let host = url.split("//").nth(1).unwrap_or(&url);
-        let host = host.split('/').next().unwrap_or(host);
-        if host.ends_with("api.openai.com") {
-            compat.supports_strict_mode = true;
-            compat.supports_long_cache = true;
-        } else if [
-            "deepseek",
-            "bigmodel",
-            "z.ai",
-            "zhipu",
-            "dashscope",
-            "aliyuncs",
-            "qwen",
-        ]
-        .iter()
-        .any(|name| host.contains(name))
-        {
-            // These Responses routes do not run hosted search. Reject it at startup.
-            compat.search_format = None;
-        } else if host == "x.ai" || host.ends_with(".x.ai") {
-            compat.search_format = Some(SearchFormat::WebAndX);
-        } else if host.contains("openrouter")
-            || host.contains("localhost")
-            || host.contains("127.0.0.1")
-        {
-            // OpenRouter handles affinity itself; local gateways need no affinity headers.
+        if matches!(host, "openrouter.ai" | "localhost" | "127.0.0.1" | "[::1]") {
             compat.send_session_affinity = false;
         }
         compat
@@ -149,10 +137,20 @@ mod tests {
     use crate::llm::Api;
 
     #[test]
-    fn openai_accepts_the_strict_flag_and_the_long_cache() {
-        let compat = Compat::from_base_url("https://api.openai.com/v1", Api::OpenAiResponses);
-        assert!(compat.supports_strict_mode);
-        assert!(compat.supports_long_cache);
+    fn capabilities_follow_exact_hosts_not_substrings_or_url_credentials() {
+        for url in [
+            "https://notapi.openai.com/v1",
+            "https://api.openai.com.example/v1",
+            "https://api.openai.com@proxy.test/v1",
+        ] {
+            let compat = Compat::from_base_url(url, Api::OpenAiResponses);
+            assert!(!compat.supports_strict_mode && !compat.supports_long_cache);
+            assert_eq!(compat.search_format, None);
+        }
+        assert!(
+            Compat::from_base_url("https://api.openai.com:443/v1", Api::OpenAiResponses)
+                .supports_strict_mode
+        );
     }
 
     #[test]
@@ -166,15 +164,9 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_gets_its_own_search_shape() {
-        let compat = Compat::from_base_url("https://api.anthropic.com", Api::AnthropicMessages);
-        assert_eq!(compat.search_format, Some(SearchFormat::Anthropic));
-    }
-
-    #[test]
     fn config_patch_overrides_only_what_it_names() {
-        let mut compat = Compat::from_base_url("url", Api::OpenAiResponses);
-        assert!(!compat.supports_strict_mode);
+        let mut compat = Compat::from_base_url("https://api.openai.com/v1", Api::OpenAiResponses);
+        assert!(compat.supports_strict_mode);
         assert_eq!(compat.search_format, Some(SearchFormat::WebSearch));
         let patch: CompatPatch = serde_json::from_str(r#"{"supports_strict_mode":true}"#).unwrap();
         compat.apply(&patch);
@@ -225,10 +217,10 @@ mod tests {
                 .search_format,
             None
         );
-        // An unknown host gets the Responses default: the tool shape is the same everywhere.
+        // Unknown gateways need an explicit capability override.
         assert_eq!(
             Compat::from_base_url("https://example.test/v1", Api::OpenAiResponses).search_format,
-            Some(SearchFormat::WebSearch)
+            None
         );
     }
 

@@ -12,10 +12,7 @@ pub struct Client {
     http: reqwest::Client,
 }
 
-/// How many times one request may be sent again before the failure is reported.
-///
-/// Five, like codex. The count is per request, not per turn: a turn that makes three calls
-/// gets five for each, because the failures are independent.
+#[cfg(test)]
 const RETRY_LIMIT: u32 = 5;
 
 /// The first wait, doubling per attempt: 0.5s, 1s, 2s, 4s, 8s. About 15s of patience.
@@ -41,6 +38,7 @@ enum Retry {
     Never,
     /// Worth another try. `Duration::ZERO` means "as soon as the backoff allows".
     After(Duration),
+    StreamAfter(Duration),
 }
 
 /// How one attempt ended.
@@ -110,6 +108,7 @@ enum Frame {
 ///
 /// They are not merged into one type despite the resemblance: see the note in `llm/mod.rs`.
 struct Assemblers {
+    terminal: bool,
     anthropic: anthropic::Assembler,
     responses: responses::Assembler,
 }
@@ -144,7 +143,6 @@ impl Client {
             // Long generations: time out the connect and the gaps between chunks, never
             // the whole response.
             .connect_timeout(std::time::Duration::from_secs(20))
-            .read_timeout(std::time::Duration::from_secs(300))
             .build()?;
         Ok(Client { http })
     }
@@ -169,13 +167,14 @@ impl Client {
         let provider = req.provider;
         let api = api_of(provider)?;
         let api_key = Self::api_key(provider)?;
-        let mut attempts = 0u32;
+        let mut request_attempts = 0u32;
+        let mut stream_attempts = 0u32;
         loop {
             // Reset per attempt: what matters is whether *this* request has already put
             // something on screen. `attempt` maintains it, because the decision it feeds —
             // retry or report — is made there, where the partial completion still exists.
             let mut emitted = false;
-            let (error, mut delay) = match self
+            let (error, mut delay, attempts, limit) = match self
                 .attempt(req, provider, api, &api_key, &mut emitted, on_delta)
                 .await
             {
@@ -188,21 +187,32 @@ impl Client {
                     }
                     match retry {
                         Retry::Never => return Err(error),
-                        Retry::After(delay) => (error, delay),
+                        Retry::After(delay) => (
+                            error,
+                            delay,
+                            &mut request_attempts,
+                            provider.request_max_retries.unwrap_or(5),
+                        ),
+                        Retry::StreamAfter(delay) => (
+                            error,
+                            delay,
+                            &mut stream_attempts,
+                            provider.stream_max_retries.unwrap_or(2),
+                        ),
                     }
                 }
             };
-            if attempts >= RETRY_LIMIT {
+            if *attempts >= limit {
                 return Err(error);
             }
-            attempts += 1;
+            *attempts += 1;
             // The server's own `Retry-After` wins when it asks for longer than the backoff
             // would; a shorter one does not make us ignore the backoff.
-            let scheduled = retry_delay(RETRY_BASE_DELAY, attempts);
+            let scheduled = retry_delay(RETRY_BASE_DELAY, *attempts);
             if delay < scheduled {
                 delay = scheduled;
             }
-            on_delta(Delta::Notice(format!("请求重试 {attempts}/{RETRY_LIMIT}")));
+            on_delta(Delta::Notice(format!("请求重试 {attempts}/{limit}")));
             tokio::time::sleep(delay).await;
         }
     }
@@ -248,21 +258,36 @@ impl Client {
                 .header("x-session-affinity", req.session_id)
                 .header("x-session-id", req.session_id);
         }
-        let response = match request.send().await {
-            Ok(response) => response,
-            Err(err) => {
-                // Nothing left the client, or nothing came back: the same request can be sent
-                // again. Connect timeouts, resets and DNS failures are all here.
+        let idle = Duration::from_millis(provider.stream_idle_timeout_ms.unwrap_or(300_000));
+        let response = match tokio::time::timeout(idle, request.send()).await {
+            Err(_) => {
                 return Attempt::Failed {
-                    error: LlmError::Transport(err.to_string()),
+                    error: LlmError::Transport("等待响应超时".into()),
                     retry: Retry::After(Duration::ZERO),
                 };
             }
+            Ok(result) => match result {
+                Ok(response) => response,
+                Err(err) => {
+                    // Nothing left the client, or nothing came back: the same request can be sent
+                    // again. Connect timeouts, resets and DNS failures are all here.
+                    return Attempt::Failed {
+                        error: LlmError::Transport(err.to_string()),
+                        retry: if err.is_builder() {
+                            Retry::Never
+                        } else {
+                            Retry::After(Duration::ZERO)
+                        },
+                    };
+                }
+            },
         };
         let status = response.status();
         if !status.is_success() {
             let retry_after = retry_after(&response);
-            let text = response.text().await.unwrap_or_default();
+            let text = bounded_body(response, idle, 64 * 1024)
+                .await
+                .unwrap_or_else(|err| err.to_string());
             return Attempt::Failed {
                 error: LlmError::Api {
                     status: status.as_u16(),
@@ -298,19 +323,30 @@ impl Client {
                 on_delta(delta);
             };
             loop {
-                let chunk = match response.chunk().await {
-                    Ok(Some(chunk)) => chunk,
-                    Ok(None) => break,
-                    Err(err) => {
-                        interruption = Some(format!("流式传输中断：{err}"));
+                let chunk = match tokio::time::timeout(idle, response.chunk()).await {
+                    Err(_) => {
+                        interruption = Some("流式响应空闲超时".into());
                         break;
                     }
+                    Ok(result) => match result {
+                        Ok(Some(chunk)) => chunk,
+                        Ok(None) => break,
+                        Err(err) => {
+                            interruption = Some(format!("流式传输中断：{err}"));
+                            break;
+                        }
+                    },
                 };
                 buffer.extend_from_slice(&chunk);
                 if let Err(err) = drain_sse(&mut buffer, api, &mut assemblers, &mut forward) {
                     interruption = Some(err.to_string());
                     break;
                 }
+                if assemblers.terminal {
+                    buffer.clear();
+                    break;
+                }
+                tokio::task::yield_now().await;
                 if buffer.len() > 8 * 1024 * 1024 {
                     interruption = Some("SSE 单帧超过 8 MiB".into());
                     break;
@@ -328,13 +364,16 @@ impl Client {
         // The connection broke partway. If nothing was shown yet this is just a failed
         // attempt and worth retrying; if text already arrived it is the caller's answer,
         // cut short, and pretending a second request would fix it would duplicate it.
+        if interruption.is_none() && !assemblers.terminal {
+            interruption = Some("流式响应在完成事件之前结束".into());
+        }
         if let Some(reason) = interruption {
             return if *emitted {
                 Attempt::Finished(assemblers.finish(api).failed(reason))
             } else {
                 Attempt::Failed {
                     error: LlmError::Transport(reason),
-                    retry: Retry::After(Duration::ZERO),
+                    retry: Retry::StreamAfter(Duration::ZERO),
                 }
             };
         }
@@ -343,6 +382,29 @@ impl Client {
 
     /// Buffered auxiliary completion with its own routing identity and tools disabled.
     pub async fn complete(&self, req: &Request<'_>) -> Result<super::Completion, LlmError> {
+        let limit = req.provider.request_max_retries.unwrap_or(5);
+        for attempt in 0..=limit {
+            match self.complete_once(req).await {
+                Err(error)
+                    if attempt < limit
+                        && matches!(
+                            &error,
+                            LlmError::Transport(_)
+                                | LlmError::Api {
+                                    status: 500..=599,
+                                    ..
+                                }
+                        ) =>
+                {
+                    tokio::time::sleep(retry_delay(RETRY_BASE_DELAY, attempt + 1)).await;
+                }
+                result => return result,
+            }
+        }
+        unreachable!("last attempt returns")
+    }
+
+    async fn complete_once(&self, req: &Request<'_>) -> Result<super::Completion, LlmError> {
         super::validate_tool_history(req.messages)?;
         let provider = req.provider;
         let api = api_of(provider)?;
@@ -367,15 +429,24 @@ impl Client {
                 .header("x-session-affinity", req.session_id)
                 .header("x-session-id", req.session_id);
         }
-        let response = request
-            .send()
+        let idle = Duration::from_millis(provider.stream_idle_timeout_ms.unwrap_or(300_000));
+        let response = tokio::time::timeout(idle, request.send())
             .await
-            .map_err(|err| LlmError::Transport(err.to_string()))?;
+            .map_err(|_| LlmError::Transport("等待响应超时".into()))?
+            .map_err(|err| {
+                if err.is_builder() {
+                    LlmError::Decode(err.to_string())
+                } else {
+                    LlmError::Transport(err.to_string())
+                }
+            })?;
         let status = response.status();
-        let text = response
-            .text()
-            .await
-            .map_err(|err| LlmError::Transport(err.to_string()))?;
+        let limit = if status.is_success() {
+            8 * 1024 * 1024
+        } else {
+            64 * 1024
+        };
+        let text = bounded_body(response, idle, limit).await?;
         if !status.is_success() {
             return Err(LlmError::Api {
                 status: status.as_u16(),
@@ -398,6 +469,28 @@ impl Client {
             }
         }
     }
+}
+
+async fn bounded_body(
+    mut response: reqwest::Response,
+    idle: Duration,
+    limit: usize,
+) -> Result<String, LlmError> {
+    let mut bytes = Vec::new();
+    loop {
+        let chunk = tokio::time::timeout(idle, response.chunk())
+            .await
+            .map_err(|_| LlmError::Transport("读取响应超时".into()))?
+            .map_err(|err| LlmError::Transport(err.to_string()))?;
+        let Some(chunk) = chunk else {
+            break;
+        };
+        if bytes.len().saturating_add(chunk.len()) > limit {
+            return Err(LlmError::Decode("响应超过大小限制".into()));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Append a path to a base URL, unless the user already configured the full one.
@@ -445,8 +538,17 @@ fn dispatch(
     on_delta: &mut dyn FnMut(Delta),
 ) -> Result<(), LlmError> {
     match parse_sse_frame(frame, api)? {
-        Some(Frame::Anthropic(event)) => assemblers.anthropic.feed(*event, on_delta),
-        Some(Frame::Responses(event)) => event.feed(&mut assemblers.responses, on_delta),
+        Some(Frame::Anthropic(event)) => {
+            assemblers.terminal |= matches!(event.kind.as_str(), "message_stop" | "error");
+            assemblers.anthropic.feed(*event, on_delta);
+        }
+        Some(Frame::Responses(event)) => {
+            assemblers.terminal |= matches!(
+                event.kind.as_str(),
+                "response.completed" | "response.incomplete" | "response.failed" | "error"
+            );
+            event.feed(&mut assemblers.responses, on_delta);
+        }
         None => {}
     }
     Ok(())
@@ -543,10 +645,17 @@ fn drain_sse(
             None
         });
         let Some(end) = end else { break };
+        if end > 8 * 1024 * 1024 {
+            return Err(LlmError::Decode("SSE 单帧超过 8 MiB".into()));
+        }
         let frame =
             std::str::from_utf8(&rest[..end]).map_err(|err| LlmError::Decode(err.to_string()))?;
         dispatch(frame, api, assemblers, on_delta)?;
         consumed += end;
+        if assemblers.terminal {
+            buffer.clear();
+            return Ok(());
+        }
     }
     buffer.drain(..consumed);
     Ok(())
@@ -971,6 +1080,111 @@ mod tests {
             session_id: "test-session",
             cache_hints: false,
         }
+    }
+
+    #[tokio::test]
+    async fn terminal_events_finish_without_waiting_for_http_eof() {
+        for (api, body, failed) in [
+            (
+                "responses",
+                "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
+                false,
+            ),
+            (
+                "responses",
+                "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\"}}\n\n",
+                true,
+            ),
+            (
+                "messages",
+                "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n",
+                false,
+            ),
+            (
+                "messages",
+                "data: {\"type\":\"error\",\"error\":{\"message\":\"failed\"}}\n\n",
+                true,
+            ),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let (release, wait) = std::sync::mpsc::channel::<()>();
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = accept_request(&listener, Duration::from_secs(5)).unwrap();
+                // A poisoned suffix must also be ignored after the terminal event.
+                respond(
+                    &mut socket,
+                    200,
+                    &format!("{body}data: invalid json\n\n"),
+                    9999,
+                );
+                let _ = wait.recv_timeout(Duration::from_secs(5));
+            });
+            let provider: Provider = serde_json::from_value(serde_json::json!({
+                "name":"test", "api":api, "base_url":format!("http://{address}"), "api_key":"k"
+            }))
+            .unwrap();
+            let model = crate::config::ModelConfig {
+                id: "m".into(),
+                ..Default::default()
+            };
+            let client = Client::local_test_client();
+            let result = tokio::time::timeout(
+                Duration::from_secs(1),
+                client.stream(&streaming_request(&provider, &model, &[], &[]), &mut |_| {}),
+            )
+            .await;
+            drop(release);
+            server.join().unwrap();
+            let completion = result.expect("terminal event must end the stream").unwrap();
+            assert_eq!(
+                completion.stop_reason == super::super::StopReason::Error,
+                failed
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_timeout_and_stream_retry_budget_are_independent() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = accept_request(&listener, Duration::from_secs(5)).unwrap();
+            respond(&mut socket, 200, ": heartbeat\n\n", 999);
+            let _ = wait.recv_timeout(Duration::from_secs(5));
+        });
+        let provider: Provider = serde_json::from_value(serde_json::json!({
+            "name":"test", "api":"responses", "base_url":format!("http://{address}"), "api_key":"k",
+            "stream_max_retries":0, "request_max_retries":5, "stream_idle_timeout_ms":100
+        }))
+        .unwrap();
+        let model = crate::config::ModelConfig {
+            id: "m".into(),
+            ..Default::default()
+        };
+        let mut notices = Vec::new();
+        let client = Client::local_test_client();
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            client.stream(
+                &streaming_request(&provider, &model, &[], &[]),
+                &mut |delta| notices.push(delta),
+            ),
+        )
+        .await;
+        drop(release);
+        server.join().unwrap();
+        assert!(
+            result
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("空闲超时")
+        );
+        assert!(notices.is_empty());
     }
 
     #[tokio::test]

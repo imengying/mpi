@@ -98,9 +98,9 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     break;
                 }
             }
-            Action::ToggleExpand => {
+            Action::ToolDetails => {
                 // The note for "nothing to expand" comes from the screen itself.
-                let _ = agent.screen.toggle_last_collapsible();
+                let _ = agent.screen.show_tool_details();
             }
             Action::Interrupt => break,
             // Esc stops the turn in flight, and this is the prompt: nothing is running, so

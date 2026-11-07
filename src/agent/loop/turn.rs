@@ -52,7 +52,6 @@ impl Agent {
         input: &str,
         images: Vec<crate::image_input::PastedImage>,
     ) -> anyhow::Result<()> {
-        self.screen.collapse_all();
         self.append_user_input(input, images)?;
         // Record the model and level this turn is about to run with, so resuming the session
         // continues with the model the user chose rather than the one the session happened to
@@ -101,8 +100,7 @@ impl Agent {
                 }
             }
         }
-        // A finished task leaves every block collapsed and everything committed.
-        self.screen.collapse_all();
+        // Finish the status display after all results have been committed.
         self.screen.clear_working();
         self.render_footer(None);
         Ok(())

@@ -173,6 +173,7 @@ impl Line {
 /// excerpt is visibly an excerpt: the rows simply stop.
 #[derive(Debug, Clone)]
 pub struct Collapsible {
+    pub full_output: Option<std::path::PathBuf>,
     pub lines: Vec<Line>,
     /// Logical lines that stay visible in both states: a tool result's header belongs here, so
     /// collapsing never hides which command produced the output.
@@ -230,6 +231,7 @@ impl Block {
     /// and last `tail` logical lines are always visible, including wrapped continuations.
     pub fn collapsible(lines: Vec<Line>, head: usize, tail: usize, preview: usize) -> Self {
         Block::Collapsible(Collapsible {
+            full_output: None,
             lines,
             head,
             tail,
@@ -249,6 +251,7 @@ impl Block {
         preview: usize,
     ) -> Self {
         Block::Collapsible(Collapsible {
+            full_output: None,
             lines,
             head,
             tail,
