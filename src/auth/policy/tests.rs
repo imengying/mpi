@@ -8,6 +8,10 @@ use super::{Assessment, Dialect, Operation, assess_command, assess_tool, refusal
 
 use super::*;
 
+fn temp_dir() -> PathBuf {
+    std::env::temp_dir().canonicalize().unwrap()
+}
+
 #[test]
 fn process_environments_need_approval() {
     for command in [
@@ -31,7 +35,7 @@ fn process_environments_need_approval() {
 #[cfg(unix)]
 #[test]
 fn parent_components_are_resolved_after_symlinks() {
-    let dir = std::env::temp_dir().join(format!("pi-path-{}", uuid::Uuid::now_v7()));
+    let dir = temp_dir().join(format!("pi-path-{}", uuid::Uuid::now_v7()));
     std::fs::create_dir_all(dir.join(".ssh/child")).unwrap();
     std::fs::write(dir.join(".ssh/fixture.txt"), "secret").unwrap();
     std::os::unix::fs::symlink(dir.join(".ssh/child"), dir.join("alias")).unwrap();
@@ -84,6 +88,11 @@ fn search_patterns_are_data_but_pattern_files_are_checked() {
         "git --no-pager diff --stat",
         "pwd;",
     ] {
+        if command.starts_with("rg ") && trusted_executable("rg").is_none() {
+            // A Homebrew binary is outside the policy's system-only trusted roots.
+            assert!(!allows(command));
+            continue;
+        }
         assert!(allows(command), "{command}: {}", reason(command));
     }
     for command in [
@@ -110,13 +119,14 @@ fn directory_changes_cannot_escape_pipeline_or_failure_scopes() {
             "{command}"
         );
     }
-    assert!(assess_command("cd /tmp && pwd", Path::new("/"), Dialect::Zsh).allows());
+    let command = format!("cd {} && pwd", shell_quote(temp_dir().to_str().unwrap()));
+    assert!(assess_command(&command, Path::new("/"), Dialect::Zsh).allows());
 }
 
 #[cfg(unix)]
 #[test]
 fn an_executable_alias_cannot_turn_a_reader_into_a_writer() {
-    let dir = std::env::temp_dir().join(format!("pi-executable-{}", uuid::Uuid::now_v7()));
+    let dir = temp_dir().join(format!("pi-executable-{}", uuid::Uuid::now_v7()));
     std::fs::create_dir(&dir).unwrap();
     let alias = dir.join("cat");
     std::os::unix::fs::symlink("/usr/bin/rm", &alias).unwrap();
@@ -125,7 +135,7 @@ fn an_executable_alias_cannot_turn_a_reader_into_a_writer() {
 }
 
 fn cwd() -> PathBuf {
-    std::env::temp_dir().join("pi-policy-cwd")
+    temp_dir().join("pi-policy-cwd")
 }
 
 fn allows(command: &str) -> bool {
@@ -167,7 +177,7 @@ fn a_cwd_must_resolve_to_a_directory() {
     assert!(!allows_bash("pwd", missing.to_str()));
     assert!(bash_reason("pwd", missing.to_str()).contains("cwd"));
     // A file is not a directory either.
-    let file = std::env::temp_dir().join(format!("pi-cwd-file-{}", uuid::Uuid::now_v7()));
+    let file = temp_dir().join(format!("pi-cwd-file-{}", uuid::Uuid::now_v7()));
     std::fs::write(&file, b"x").unwrap();
     assert!(!allows_bash("pwd", file.to_str()));
     std::fs::remove_file(&file).unwrap();
@@ -178,7 +188,7 @@ fn a_cwd_that_is_a_symlink_asks_like_a_symlinked_cd_does() {
     // The same rule `cd_target` enforces: the shell keeps the name it was given while the
     // paths resolve through the link, so what the checker validated and what the child
     // opens would be two different directories.
-    let dir = std::env::temp_dir().join(format!("pi-cwd-link-{}", uuid::Uuid::now_v7()));
+    let dir = temp_dir().join(format!("pi-cwd-link-{}", uuid::Uuid::now_v7()));
     let real = dir.join("real");
     std::fs::create_dir_all(&real).unwrap();
     let link = dir.join("link");
@@ -206,7 +216,7 @@ fn a_cwd_does_not_widen_what_the_command_may_do() {
     // `cwd` says where to run, not "this is allowed": a writing command is still judged on
     // its own merits after the directory checks out.
     assert!(!allows_bash("rm -rf /tmp/x && touch /tmp/y", Some("/tmp")));
-    assert!(allows_bash("ls", Some("/tmp")));
+    assert!(allows_bash("ls", temp_dir().to_str()));
 }
 
 fn reason(command: &str) -> String {
@@ -223,7 +233,11 @@ fn simple_read_commands_are_rewritten_to_absolute_paths() {
         Assessment::Allow {
             safe_command: Some(command),
         } => {
-            assert_eq!(command, "'/usr/bin/cat' 'notes.txt'");
+            #[cfg(target_os = "macos")]
+            let cat = "/bin/cat";
+            #[cfg(not(target_os = "macos"))]
+            let cat = "/usr/bin/cat";
+            assert_eq!(command, format!("'{cat}' 'notes.txt'"));
         }
         other => panic!("expected allow with rewrite, got {other:?}"),
     }
@@ -320,6 +334,11 @@ fn inspection_commands_do_not_ask_but_keep_their_dangerous_options() {
         "lscpu",
         "seq 1 5",
     ] {
+        // Linux-only programs are not auto-approved when they are unavailable.
+        if trusted_executable(command.split_whitespace().next().unwrap()).is_none() {
+            assert!(!allows(command));
+            continue;
+        }
         assert!(
             allows(command),
             "`{command}` should not ask: {}",
@@ -335,7 +354,7 @@ fn inspection_commands_do_not_ask_but_keep_their_dangerous_options() {
     assert!(reason("date -f /etc/passwd").contains("系统时间"));
     // And a path argument is still checked, so these are not a way to read a secret.
     assert!(reason("column -t /etc/shadow").contains("凭据"));
-    assert!(reason("lscpu /etc/shadow").contains("凭据"));
+    assert!(!allows("lscpu /etc/shadow"));
     // `env` prints every variable, the provider key included, so it never joins this
     // group however convenient it would be.
     assert!(!allows("env"));
@@ -463,13 +482,27 @@ fn sed_only_allows_line_range_printing() {
 
 #[test]
 fn unknown_options_ask() {
-    assert!(reason("rg --pre 'evil' pattern").contains("外部程序"));
-    assert!(reason("rg --unknown-flag x").contains("未被确认"));
+    // Argument rules do not depend on where an optional executable is installed.
+    assert!(
+        option_problem("rg", &["--pre".into(), "evil".into(), "pattern".into()])
+            .unwrap()
+            .contains("外部程序")
+    );
+    assert!(
+        option_problem("rg", &["--unknown-flag".into(), "x".into()])
+            .unwrap()
+            .contains("未被确认")
+    );
+    assert!(!allows("rg --pre 'evil' pattern"));
+    assert!(!allows("rg --unknown-flag x"));
     assert!(reason("find . -delete").contains("find"));
     assert!(reason("find . -frobnicate").contains("未被确认"));
     assert!(reason("sort --output=/tmp/x f").contains("写入文件"));
     assert!(reason("file --uncompress x").contains("外部程序"));
-    assert!(allows("rg --hidden pattern"));
+    assert_eq!(
+        allows("rg --hidden pattern"),
+        trusted_executable("rg").is_some()
+    );
     assert!(allows("find . -name '*.rs' -type f"));
     assert!(allows("sort -u file"));
     assert!(allows("file -b x"));

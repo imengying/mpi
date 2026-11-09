@@ -31,6 +31,7 @@ async fn compaction_has_separate_session_headers_and_no_main_cache_key() {
                 Err(err) => panic!("{err}"),
             }
         };
+        socket.set_nonblocking(false).unwrap();
         socket
             .set_read_timeout(Some(std::time::Duration::from_secs(5)))
             .unwrap();
@@ -150,6 +151,10 @@ async fn a_compaction_carries_the_environment_block_through_the_real_path() {
                 Err(err) => panic!("{err}"),
             }
         };
+        socket.set_nonblocking(false).unwrap();
+        socket
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
         let mut reader = std::io::BufReader::new(socket.try_clone().unwrap());
         let mut headers = std::collections::HashMap::new();
         loop {

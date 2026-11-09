@@ -703,6 +703,7 @@ mod tests {
                 match listener.accept() {
                     Ok((mut socket, _)) => {
                         connections += 1;
+                        socket.set_nonblocking(false).unwrap();
                         socket
                             .set_read_timeout(Some(std::time::Duration::from_secs(5)))
                             .unwrap();
@@ -800,6 +801,7 @@ mod tests {
                     Err(error) => panic!("{error}"),
                 }
             };
+            socket.set_nonblocking(false).unwrap();
             socket
                 .set_read_timeout(Some(std::time::Duration::from_secs(5)))
                 .unwrap();
@@ -898,6 +900,7 @@ mod tests {
                     Err(error) => panic!("{error}"),
                 }
             };
+            socket.set_nonblocking(false).unwrap();
             socket
                 .set_read_timeout(Some(std::time::Duration::from_secs(5)))
                 .unwrap();

@@ -47,8 +47,10 @@ jobs:
           log = Path(os.environ["RUNNER_TEMP"], "pi-tests.log").read_text()
           start = log.find("failures:")
           message = (log[start:] if start >= 0 else log)[-12000:]
-          message = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
-          print("::error title=Rust tests::" + message)
+          for offset in range(0, len(message), 3000):
+              part = message[offset:offset + 3000]
+              part = part.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+              print("::error title=Rust tests::" + part)
           PY
           exit 1
       - run: sh -n install.sh

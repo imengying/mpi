@@ -1018,6 +1018,8 @@ mod tests {
                 Err(err) => panic!("{err}"),
             }
         };
+        // macOS inherits O_NONBLOCK from the listener; reads below use a timeout.
+        socket.set_nonblocking(false).unwrap();
         socket
             .set_read_timeout(Some(std::time::Duration::from_secs(5)))
             .unwrap();
