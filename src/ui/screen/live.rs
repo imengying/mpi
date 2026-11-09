@@ -4,6 +4,20 @@ use super::*;
 
 impl Screen {
     pub(super) fn compose_live(&self) -> (Vec<HistoryRow<Line>>, Option<(usize, usize)>) {
+        if let Some(picker) = &self.picker {
+            return (
+                self.choice_lines(
+                    &picker.title,
+                    &picker.hint,
+                    &picker.choices,
+                    picker.selected,
+                )
+                .into_iter()
+                .map(HistoryRow::hard)
+                .collect(),
+                None,
+            );
+        }
         let budget = self.height.saturating_sub(1).max(1);
         let rendered_footer = self
             .footer_state
@@ -102,11 +116,9 @@ impl Screen {
                 if first + index + 1 == self.pending.len() {
                     marker.push_str(" · Alt+↑ 编辑");
                 }
-                let mut text = util::one_line(queued.text());
-                if let Queued::Message(_, images) = queued
-                    && !images.is_empty()
-                {
-                    text.push_str(&format!(" [{} 张图片]", images.len()));
+                let mut text = util::one_line(&queued.text);
+                if !queued.images.is_empty() {
+                    text.push_str(&format!(" [{} 张图片]", queued.images.len()));
                 }
                 above.push(Line::dim(format!("{marker}：{text}")));
             }

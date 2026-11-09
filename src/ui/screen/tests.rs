@@ -20,8 +20,8 @@ fn editing_a_queued_message_withdraws_it_and_restores_text_and_images() {
         bytes: 3,
     };
     let text = "long pasted line\n".repeat(50);
-    screen.queue(Queued::Message("older".into(), Vec::new()));
-    screen.queue(Queued::Message(text.clone(), vec![image.clone()]));
+    screen.queue(Queued::new("older".into(), Vec::new()));
+    screen.queue(Queued::new(text.clone(), vec![image.clone()]));
     let live: String = screen
         .compose_live()
         .0
@@ -37,7 +37,7 @@ fn editing_a_queued_message_withdraws_it_and_restores_text_and_images() {
     );
     assert_eq!(
         screen.take_steering(),
-        [Queued::Message("older".into(), Vec::new())]
+        [Queued::new("older".into(), Vec::new())]
     );
     assert!(screen.take_steering().is_empty());
     assert_eq!(
@@ -51,7 +51,7 @@ fn editing_a_queued_message_withdraws_it_and_restores_text_and_images() {
 fn queued_recall_preserves_an_existing_draft_and_its_images() {
     let mut screen = screen_with_commands();
     screen.interactive = false;
-    screen.queue(Queued::Message("pending".into(), Vec::new()));
+    screen.queue(Queued::new("pending".into(), Vec::new()));
     set_input(&mut screen, "draft");
     let recall = Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT));
     screen.absorb_event(recall.clone());
@@ -71,68 +71,71 @@ fn queued_recall_preserves_an_existing_draft_and_its_images() {
     assert_eq!(screen.pending.len(), 1);
 }
 
-#[test]
-fn a_recalled_command_can_be_edited_or_discarded_without_being_dispatched() {
-    let mut screen = screen_with_commands();
-    screen.interactive = false;
-    set_input(&mut screen, "");
-    screen.queue(Queued::Command("/model".into()));
-    screen.absorb_event(Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT)));
-    assert!(screen.menu.is_empty());
-    assert!(screen.pop_queued().is_none());
-    assert_eq!(
-        screen.absorb_event(Event::Key(KeyCode::Enter.into())),
-        Some(Action::Line("/model".into()))
-    );
-    screen.queue(Queued::Command("/new".into()));
-    screen.absorb_event(Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT)));
-    screen.absorb_event(Event::Key(KeyEvent::new(
-        KeyCode::Char('c'),
-        KeyModifiers::CONTROL,
-    )));
-    assert!(screen.editing.as_ref().unwrap().is_empty());
-    assert!(screen.pop_queued().is_none());
-}
-
-#[test]
-fn steering_preserves_submission_order_and_waits_behind_commands() {
-    let mut screen = screen_with_commands();
-    screen.interactive = false;
-    screen.queue(Queued::Message("不要提交".into(), Vec::new()));
-    screen.queue(Queued::Command("/model".into()));
-    screen.queue(Queued::Message("调整后的任务".into(), Vec::new()));
-    assert!(screen.has_steering());
-    assert_eq!(
-        screen.take_steering(),
-        [Queued::Message("不要提交".into(), Vec::new())]
-    );
-    assert!(!screen.has_steering());
-    assert!(screen.take_steering().is_empty());
-    assert_eq!(
-        drain_queued(&mut screen),
-        [
-            Queued::Command("/model".into()),
-            Queued::Message("调整后的任务".into(), Vec::new())
-        ]
-    );
-}
-
-#[test]
-fn draining_a_command_keeps_older_messages_ahead_of_new_steering() {
-    let mut screen = screen_with_commands();
-    screen.interactive = false;
-    screen.queue(Queued::Command("/model".into()));
-    screen.queue(Queued::Message("先前提交的补充".into(), Vec::new()));
-    assert_eq!(screen.pop_queued(), Some(Queued::Command("/model".into())));
-    screen.queue(Queued::Message("新提交的补充".into(), Vec::new()));
-    assert_eq!(
-        screen.take_steering(),
-        [
-            Queued::Message("先前提交的补充".into(), Vec::new()),
-            Queued::Message("新提交的补充".into(), Vec::new()),
-        ]
-    );
-    assert!(screen.pop_queued().is_none());
+#[tokio::test]
+async fn commands_reveal_their_menus_and_feedback_after_browsing_output() {
+    let dir = std::env::temp_dir().join(format!("pi-queued-view-{}", uuid::Uuid::now_v7()));
+    std::fs::create_dir(&dir).unwrap();
+    let config = serde_json::from_value(serde_json::json!({
+        "providers":[{"name":"test","api":"responses","base_url":"http://127.0.0.1:9/v1","api_key":"unused","models":[{"id":"m"}]}],
+        "default_model":"test/m"
+    })).unwrap();
+    let mut agent = crate::agent::r#loop::Agent::new(config, dir.clone(), false).unwrap();
+    agent.session = crate::agent::session::Session::create_in(&dir, &dir, "test/m").unwrap();
+    agent.screen = screen();
+    let captured = CapturedOutput::default();
+    agent.screen.out = Box::new(captured.clone());
+    agent.screen.interactive = true;
+    set_input(&mut agent.screen, "draft");
+    agent.screen.push(Block::collapsible(
+        (0..60)
+            .map(|n| Line::plain(format!("tool output {n}")))
+            .collect(),
+        1,
+        0,
+        0,
+    ));
+    agent.screen.flush();
+    let mut terminal = vt100::Parser::new(nz(24), nz(40), 100);
+    for details in [false, true] {
+        if details {
+            assert!(agent.screen.show_tool_details());
+        } else {
+            agent
+                .screen
+                .absorb_event(Event::Key(KeyCode::PageUp.into()));
+        }
+        agent.screen.flush();
+        terminal.process(&captured.take());
+        assert!(terminal.screen().contents().contains(if details {
+            "工具详情"
+        } else {
+            "PgUp/PgDn"
+        }));
+        assert!(agent.command("/model").await.unwrap());
+        assert!(agent.screen.picker.is_some());
+        agent.screen.begin_stream();
+        agent.screen.push_text("background answer");
+        agent.screen.end_stream();
+        agent.screen.flush();
+        terminal.process(&captured.take());
+        assert!(terminal.screen().contents().contains("选择模型"));
+        let action = agent.screen.absorb_event(Event::Key(KeyCode::Esc.into()));
+        assert_eq!(action, Some(Action::Selection(None)));
+        agent.handle_selection(None).unwrap();
+        assert!(agent.command("/compact").await.unwrap());
+        agent.screen.flush();
+        terminal.process(&captured.take());
+        let visible = terminal.screen().contents();
+        assert!(visible.contains("历史太短"), "{visible}");
+        assert!(visible.contains("› draft"), "{visible}");
+        assert!(visible.contains("background answer"), "{visible}");
+        assert!(
+            !visible.contains("PgUp/PgDn") && !visible.contains("工具详情"),
+            "{visible}"
+        );
+    }
+    drop(agent);
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
@@ -530,7 +533,7 @@ fn large_pastes_queues_images_and_menus_fit_even_small_terminals() {
             screen.height = height;
             set_input(&mut screen, &"一行中文 👩‍💻\n".repeat(100));
             screen.pending = (0..100)
-                .map(|index| Queued::Message(format!("queued {index}"), Vec::new()))
+                .map(|index| Queued::new(format!("queued {index}"), Vec::new()))
                 .collect();
             screen.pending_images = (0..10)
                 .map(|_| PastedImage {
@@ -1322,56 +1325,26 @@ fn esc_closes_the_menu_and_it_stays_closed() {
 }
 
 #[test]
-fn a_line_submitted_mid_turn_is_held_as_what_it_is() {
-    // A command typed while a turn is running cannot run then, but it also must not be
-    // sent to the model as prose: `/model` is not something the user said. It waits as a
-    // command, and a message waits as a message with its images — the two part ways the
-    // moment the turn ends.
+fn slash_commands_dispatch_immediately_without_blocking_ordinary_messages() {
     let mut screen = screen_with_commands();
-    screen.interactive = false;
-
-    crate::agent::r#loop::queue_mid_turn(&mut screen, "/model".to_string(), Vec::new());
-    crate::agent::r#loop::queue_mid_turn(&mut screen, "hello".to_string(), Vec::new());
-    crate::agent::r#loop::queue_mid_turn(&mut screen, "   ".to_string(), Vec::new());
-
-    let queued = drain_queued(&mut screen);
-    assert_eq!(queued.len(), 2, "a blank line is not queued: {queued:?}");
-    assert_eq!(queued[0], Queued::Command("/model".to_string()));
-    assert_eq!(queued[1], Queued::Message("hello".to_string(), Vec::new()));
-
-    // Taking them empties the queue, so the next turn does not re-send them.
-    assert!(drain_queued(&mut screen).is_empty());
-}
-
-#[test]
-fn a_queued_line_is_trimmed_the_way_the_prompt_trims_it() {
-    // A line has to reach the conversation the same way whether it was typed at the
-    // prompt or during a turn. The prompt trims, so queueing does too — otherwise
-    // " /model" would go to the model as a message while the same text typed at the
-    // prompt would be rejected as an unknown command.
-    let mut screen = screen_with_commands();
-    crate::agent::r#loop::queue_mid_turn(&mut screen, "  /model  ".to_string(), Vec::new());
-    crate::agent::r#loop::queue_mid_turn(&mut screen, "  hello  ".to_string(), Vec::new());
-
-    let queued = drain_queued(&mut screen);
-    assert_eq!(queued[0], Queued::Command("/model".to_string()));
-    assert_eq!(queued[1], Queued::Message("hello".to_string(), Vec::new()));
-}
-
-#[test]
-fn a_command_queued_mid_turn_never_becomes_a_message() {
-    // The bug this pins: the command used to be queued as a *message* with a note welded
-    // into the text ("/model　（回合结束后执行）"), so the model received the text of a
-    // command as something the user had said, and the command itself never ran.
-    let mut screen = screen_with_commands();
-    crate::agent::r#loop::queue_mid_turn(&mut screen, "/name x".to_string(), Vec::new());
-    let queued = drain_queued(&mut screen);
-    assert!(
-        queued
-            .iter()
-            .all(|item| !matches!(item, Queued::Message(..))),
-        "a command must not be queued as a message: {queued:?}"
+    for text in ["  /model  ", "/compact", "/name x", "/exit"] {
+        let command = crate::agent::r#loop::queue_mid_turn(&mut screen, text.into(), Vec::new());
+        assert_eq!(command.as_deref(), Some(text.trim()));
+        assert!(!screen.has_steering());
+    }
+    for text in ["  first  ", "second", "   "] {
+        assert!(
+            crate::agent::r#loop::queue_mid_turn(&mut screen, text.into(), Vec::new()).is_none()
+        );
+    }
+    assert_eq!(
+        screen.take_steering(),
+        [
+            Queued::new("first".into(), Vec::new()),
+            Queued::new("second".into(), Vec::new())
+        ]
     );
+    assert!(screen.pop_queued().is_none());
 }
 
 #[test]
@@ -1396,8 +1369,8 @@ fn a_paste_that_was_never_submitted_stays_with_the_draft() {
         1,
         "the unsubmitted paste still belongs to the line being written"
     );
-    assert!(matches!(&queued[0], Queued::Message(text, images)
-            if text == "queued message" && images.is_empty()));
+    assert_eq!(queued[0].text, "queued message");
+    assert!(queued[0].images.is_empty());
 }
 
 #[test]
@@ -1740,7 +1713,7 @@ fn no_live_row_is_wider_than_the_terminal() {
     }
 
     // A queued line is user input, so it can be as long as a paste.
-    screen.queue(Queued::Message(long.into(), Vec::new()));
+    screen.queue(Queued::new(long.into(), Vec::new()));
     check(&screen, "queued line");
 
     // The command menu and its help text.

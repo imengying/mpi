@@ -24,6 +24,7 @@ fn transport_detail(error: reqwest::Error) -> String {
     parts.join(" -> ")
 }
 
+#[derive(Clone)]
 pub struct Client {
     http: reqwest::Client,
 }

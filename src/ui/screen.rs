@@ -46,6 +46,7 @@ pub enum Action {
     /// A line with one or more pasted images attached. The caller sends them as a single
     /// user message so the text and the pictures stay together.
     LineWithImages(String, Vec<PastedImage>),
+    Selection(Option<usize>),
     ToolDetails,
     /// Ctrl+C on an empty line: exit at the prompt, interrupt a running turn.
     Interrupt,
@@ -59,31 +60,16 @@ pub enum Action {
     Eof,
 }
 
-/// A line the user submitted while a turn was running.
-///
-/// It cannot be acted on where it was typed: a turn is in flight, and starting a second one
-/// (or running `/new`, or a picker) underneath it would interleave two conversations. So it
-/// waits for the turn it interrupted to finish.
-///
-/// It waits as *what it is*, not as text. Both kinds look the same in the input line, but
-/// they part ways the moment the turn ends: a command has to be dispatched as a command, and
-/// a message has to carry the images that were submitted with it. Held as one kind of thing,
-/// the two would swap roles on the way out — a queued `/model` handed to the model as prose,
-/// and a queued screenshot silently dropped.
+/// A message waiting for the next model request. Slash commands are dispatched immediately.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Queued {
-    /// A message: applied at the next safe execution boundary, with its submitted images.
-    Message(String, Vec<PastedImage>),
-    /// A slash command: run once the turn in flight is over.
-    Command(String),
+pub struct Queued {
+    pub text: String,
+    pub images: Vec<PastedImage>,
 }
 
 impl Queued {
-    /// The line as the user typed it, for the row that shows what is waiting.
-    pub fn text(&self) -> &str {
-        match self {
-            Queued::Message(text, _) | Queued::Command(text) => text,
-        }
+    pub fn new(text: String, images: Vec<PastedImage>) -> Self {
+        Self { text, images }
     }
 }
 
@@ -100,6 +86,7 @@ pub struct Screen {
     printed: usize,
     /// An expanded/collapsed presentation waiting to be inserted into history.
     detail: Option<detail::Detail>,
+    picker: Option<picker::Picker>,
     footer: Vec<Line>,
     footer_state: Option<crate::ui::footer::FooterState>,
     viewport: Viewport,
@@ -239,6 +226,7 @@ impl Screen {
             redraw: redraw::Redraw::default(),
             printed: 0,
             detail: None,
+            picker: None,
             footer: Vec::new(),
             footer_state: None,
             viewport: Viewport::default(),
@@ -324,6 +312,12 @@ impl Screen {
         self.open_detail()
     }
 
+    /// Commands reveal their menu or feedback even while browsing output.
+    pub(crate) fn close_views(&mut self) {
+        self.close_transcript();
+        self.close_detail();
+    }
+
     /// Restore the shell screen without adding session content to its scrollback.
     pub fn leave(&mut self) {
         if !self.interactive {
@@ -339,6 +333,7 @@ impl Screen {
             self.alternate_screen = false;
         }
         self.detail = None;
+        self.picker = None;
         self.transcript_view = None;
         self.viewport = Viewport::default();
         let _ = self.out.flush();
@@ -354,6 +349,7 @@ impl Screen {
         self.layout = layout::LayoutCache::default();
         self.printed = 0;
         self.detail = None;
+        self.picker = None;
         self.transcript_view = None;
         self.streaming_answer = None;
         self.streaming_thinking = None;
@@ -539,18 +535,13 @@ impl Screen {
     }
 
     pub fn has_steering(&self) -> bool {
-        matches!(self.pending.first(), Some(Queued::Message(..)))
+        !self.pending.is_empty()
     }
 
-    /// Commands remain idle-only and block later messages from overtaking them.
+    /// Consume submitted messages in order at the next model boundary.
     pub fn take_steering(&mut self) -> Vec<Queued> {
-        let count = self
-            .pending
-            .iter()
-            .take_while(|item| matches!(item, Queued::Message(..)))
-            .count();
-        let messages = self.pending.drain(..count).collect();
-        if count > 0 {
+        let messages = std::mem::take(&mut self.pending);
+        if !messages.is_empty() {
             self.render();
         }
         messages

@@ -114,7 +114,7 @@ impl Screen {
         }
     }
 
-    fn close_transcript(&mut self) {
+    pub(super) fn close_transcript(&mut self) {
         if self.transcript_view.take().is_some() {
             self.erase_live();
         }

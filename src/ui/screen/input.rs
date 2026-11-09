@@ -21,10 +21,8 @@ impl Screen {
             return;
         }
         let queued = self.pending.pop().expect("queue is not empty");
-        self.editing = Some(Editor::from_history(queued.text()));
-        if let Queued::Message(_, images) = queued {
-            self.pending_images = images;
-        }
+        self.editing = Some(Editor::from_history(&queued.text));
+        self.pending_images = queued.images;
         self.history_index = None;
         self.history_draft = None;
         self.menu_dismissed = self.editing.as_ref().map(Editor::text);
@@ -211,6 +209,9 @@ impl Screen {
         if self.approval.is_some() {
             self.approval_event(event);
             return None;
+        }
+        if self.picker.is_some() {
+            return self.picker_event(event);
         }
         if self.transcript_event(&event) {
             return None;

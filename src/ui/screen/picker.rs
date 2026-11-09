@@ -1,8 +1,4 @@
-//! Full-screen list pickers: `/model`, `/resume`, and the like.
-//!
-//! They run *inside* a turn, so each takes raw mode for its duration and gives the screen
-//! back the way it found it. The choice is returned rather than acted on: what a picked
-//! entry means is the caller's business.
+//! List pickers share the event loop with streaming output and tool execution.
 
 use super::*;
 
@@ -40,6 +36,13 @@ impl Choice {
             detail: Some(detail.into()),
         }
     }
+}
+
+pub(super) struct Picker {
+    pub(super) title: String,
+    pub(super) hint: String,
+    pub(super) choices: Vec<Choice>,
+    pub(super) selected: usize,
 }
 
 impl Screen {
@@ -99,80 +102,108 @@ impl Screen {
             // No terminal to choose on: fall back to the highlighted entry.
             return Some(initial.min(choices.len() - 1));
         }
-        if self.detail.is_some() {
-            self.close_detail();
-        }
-        let mut cursor = initial.min(choices.len() - 1);
         if crate::ui::terminal::ensure_raw_mode().is_err() {
             return None;
         }
-        let saved_footer = self.footer.clone();
-        let saved_state = self.footer_state.take();
-        let saved_editing = self.editing.take();
-        // Clear the composer before presenting the bounded list.
-        self.erase_live();
-        let result = loop {
-            // The menu replaces the footer so it always sits in the same place.
-            self.footer = self.choice_lines(title, hint, choices, cursor);
-            self.draw_live();
-            let event = match event::read() {
-                Ok(event) => event,
-                Err(_) => break None,
-            };
-            let Event::Key(key) = event else {
-                if let Event::Resize(width, height) = event {
-                    self.width = usize::from(width.max(1));
-                    self.height = usize::from(height.max(1));
-                }
-                continue;
-            };
-            if key.kind == KeyEventKind::Release {
-                continue;
-            }
-            match key.code {
-                KeyCode::Enter => break Some(cursor),
-                KeyCode::Esc => break None,
-                KeyCode::Char('c') | KeyCode::Char('q')
-                    if key.modifiers.contains(KeyModifiers::CONTROL)
-                        || key.code == KeyCode::Char('q') =>
-                {
-                    break None;
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    cursor = if cursor == 0 {
-                        choices.len() - 1
-                    } else {
-                        cursor - 1
-                    };
-                }
-                KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
-                    cursor = (cursor + 1) % choices.len();
-                }
-                KeyCode::Home => cursor = 0,
-                KeyCode::End => cursor = choices.len() - 1,
-                KeyCode::PageUp => {
-                    cursor = cursor.saturating_sub(self.height.saturating_sub(3).clamp(1, 12))
-                }
-                KeyCode::PageDown => {
-                    cursor =
-                        (cursor + self.height.saturating_sub(3).clamp(1, 12)).min(choices.len() - 1)
-                }
-                KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
-                    let index = c as usize - '1' as usize;
-                    if index < choices.len() {
-                        break Some(index);
-                    }
-                }
-                _ => {}
+        self.open_picker(title, hint, choices.to_vec(), initial);
+        let selected = loop {
+            self.flush();
+            let Ok(event) = event::read() else { break None };
+            if let Some(Action::Selection(selected)) = self.absorb_event(event) {
+                break selected;
             }
         };
-        self.footer = saved_footer;
-        self.footer_state = saved_state;
-        self.editing = saved_editing;
-        // The menu shared the live region with the footer, so nothing has to be erased
-        // beyond redrawing it.
+        self.picker = None;
         self.draw_live();
-        result
+        selected
+    }
+
+    /// Open a picker without blocking the request or tool currently running.
+    pub(crate) fn open_picker(
+        &mut self,
+        title: &str,
+        hint: &str,
+        choices: Vec<Choice>,
+        initial: usize,
+    ) {
+        if choices.is_empty() {
+            return;
+        }
+        self.close_views();
+        self.erase_live();
+        self.picker = Some(Picker {
+            title: title.into(),
+            hint: hint.into(),
+            selected: initial.min(choices.len() - 1),
+            choices,
+        });
+        self.render();
+    }
+
+    pub(super) fn picker_event(&mut self, event: Event) -> Option<Action> {
+        if let Event::Resize(width, height) = event {
+            self.width = usize::from(width.max(1));
+            self.height = usize::from(height.max(1));
+            return None;
+        }
+        let key = match event {
+            Event::Key(key) if key.kind != KeyEventKind::Release => key,
+            Event::Mouse(mouse) => match mouse.kind {
+                event::MouseEventKind::ScrollUp => KeyCode::Up.into(),
+                event::MouseEventKind::ScrollDown => KeyCode::Down.into(),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let picker = self.picker.as_mut().expect("open picker");
+        let count = picker.choices.len();
+        let selected = match key.code {
+            KeyCode::Enter => Some(Some(picker.selected)),
+            KeyCode::Esc => Some(None),
+            KeyCode::Char('c' | 'q')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    || key.code == KeyCode::Char('q') =>
+            {
+                Some(None)
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                picker.selected = (picker.selected + count - 1) % count;
+                None
+            }
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
+                picker.selected = (picker.selected + 1) % count;
+                None
+            }
+            KeyCode::Home => {
+                picker.selected = 0;
+                None
+            }
+            KeyCode::End => {
+                picker.selected = count - 1;
+                None
+            }
+            KeyCode::PageUp => {
+                picker.selected = picker
+                    .selected
+                    .saturating_sub(self.height.saturating_sub(3).clamp(1, 12));
+                None
+            }
+            KeyCode::PageDown => {
+                picker.selected =
+                    (picker.selected + self.height.saturating_sub(3).clamp(1, 12)).min(count - 1);
+                None
+            }
+            KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
+                let index = c as usize - '1' as usize;
+                (index < count).then_some(Some(index))
+            }
+            _ => None,
+        };
+        if let Some(selected) = selected {
+            self.picker = None;
+            return Some(Action::Selection(selected));
+        }
+        None
     }
 
     pub(super) fn choice_lines(

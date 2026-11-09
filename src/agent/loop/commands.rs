@@ -1,6 +1,14 @@
 //! The slash commands: `/new`, `/resume`, `/model`, `/compact`, `/delete`.
 
 use super::*;
+use crate::ui::screen::Choice;
+
+pub(super) enum SelectionKind {
+    Model(Vec<String>),
+    Level { spec: String, levels: Vec<String> },
+    Permissions(Vec<crate::auth::guard::PermissionMode>),
+    Resume(Vec<PathBuf>),
+}
 
 impl Agent {
     /// Handle a slash command. Returns false when the session should end.
@@ -12,14 +20,26 @@ impl Agent {
             },
             None => return Ok(true),
         };
+        self.screen.close_views();
+        if self.running && matches!(name, "compact" | "new" | "resume" | "delete") {
+            self.screen.push_lines(ui_compact::note_lines(
+                &format!("/{name}：请先按 Esc 停止任务"),
+                crate::ui::screen::Style::new(Color::Yellow),
+            ));
+            self.screen.flush();
+            return Ok(true);
+        }
         match name {
-            "exit" | "quit" => return Ok(false),
-            "model" => self.command_model().await?,
+            "exit" | "quit" => {
+                self.exit_requested = true;
+                return Ok(false);
+            }
+            "model" => self.command_model()?,
             "name" => self.command_name(argument)?,
             "permissions" => self.command_permissions()?,
             "compact" => self.command_compact(argument).await?,
             "new" => self.start_new_session()?,
-            "resume" => self.command_resume().await?,
+            "resume" => self.command_resume()?,
             "delete" => return self.command_delete(),
             other => {
                 self.screen.push_lines(ui_compact::note_lines(
@@ -146,38 +166,24 @@ impl Agent {
     /// Only the *asking* is decided here. Nothing the policy already allows is affected.
     pub(super) fn command_permissions(&mut self) -> anyhow::Result<()> {
         use crate::auth::guard::PermissionMode;
-        use crate::ui::screen::Choice;
-        let modes = [PermissionMode::Ask, PermissionMode::Allow];
-        let current = self.gate.mode();
-        let current_index = modes.iter().position(|mode| *mode == current).unwrap_or(0);
-        // The label is the answer; the second row is what picking it changes. Without that
-        // row the two entries are a pair of names, and the difference between them — whether
-        // the agent asks before acting — is the whole decision.
-        let choices: Vec<Choice> = modes
+        let modes = vec![PermissionMode::Ask, PermissionMode::Allow];
+        let current = modes
+            .iter()
+            .position(|mode| *mode == self.gate.mode())
+            .unwrap_or(0);
+        let choices = modes
             .iter()
             .map(|mode| Choice::with_detail(mode.label(), mode.detail()))
             .collect();
-        let Some(index) = self.screen.pick_choices(
+        self.choose(
+            SelectionKind::Permissions(modes),
             "命令审核",
-            "↑↓ 选择 · Enter 确认 · Esc 取消",
-            &choices,
-            current_index,
-        ) else {
-            return Ok(());
-        };
-        let chosen = modes[index];
-        if chosen == current {
-            return Ok(());
-        }
-        self.gate.set_mode(chosen);
-        // Recorded with the turn context, which is what a resume reads back — the mode is
-        // part of how the session runs, like the model and the thinking level beside it.
-        self.session
-            .push_turn_context(&self.cwd, &self.model_spec, &self.level, chosen)?;
-        Ok(())
+            choices,
+            current,
+        )
     }
 
-    pub(super) async fn command_resume(&mut self) -> anyhow::Result<()> {
+    pub(super) fn command_resume(&mut self) -> anyhow::Result<()> {
         let summaries = crate::agent::session::list(&self.cwd);
         if summaries.is_empty() {
             self.screen.push_lines(ui_compact::note_lines(
@@ -186,43 +192,26 @@ impl Agent {
             ));
             return Ok(());
         }
-        let items: Vec<String> = summaries
+        let choices = summaries
             .iter()
             .map(|summary| {
-                format!(
+                Choice::new(format!(
                     "{}   {}   {} 条消息",
                     summary.label(40),
                     summary.modified_label(),
-                    summary.messages
-                )
+                    summary.messages,
+                ))
             })
             .collect();
-        let Some(index) = self.screen.pick("恢复历史会话", &items) else {
-            return Ok(());
-        };
-        let target = summaries[index].path.clone();
-        if target == self.session.path() {
-            return Ok(());
-        }
-        match Session::open(&target) {
-            Ok(session) => {
-                self.restore_session(session)?;
-            }
-            Err(err) => {
-                self.screen.push_lines(ui_compact::note_lines(
-                    &format!("无法打开会话：{err}"),
-                    crate::ui::screen::Style::new(Color::Red),
-                ));
-            }
-        }
-        Ok(())
+        self.choose(
+            SelectionKind::Resume(summaries.into_iter().map(|summary| summary.path).collect()),
+            "恢复历史会话",
+            choices,
+            0,
+        )
     }
 
-    /// `/model`: pick a model, then — only for a reasoning model — pick a thinking level.
-    ///
-    /// The two-step flow is why there is no `/thinking` command: the level belongs to the
-    /// model, and a model that cannot reason is asked nothing.
-    pub(super) async fn command_model(&mut self) -> anyhow::Result<()> {
+    pub(super) fn command_model(&mut self) -> anyhow::Result<()> {
         let catalogue = self.config.catalogue();
         if catalogue.is_empty() {
             self.screen.push_lines(ui_compact::note_lines(
@@ -231,17 +220,15 @@ impl Agent {
             ));
             return Ok(());
         }
-        let current_index = catalogue
+        let current = catalogue
             .iter()
             .position(|(_, spec)| *spec == self.model_spec)
             .unwrap_or(0);
-        let items: Vec<String> = catalogue
+        let choices = catalogue
             .iter()
             .map(|(provider, spec)| {
                 let (_, model) = self.config.find(spec).unwrap();
-                // The listed entries and their levels are exactly what the config declares;
-                // nothing is hidden and nothing is added.
-                if model.reasoning {
+                Choice::new(if model.reasoning {
                     format!(
                         "{} ({} · {})",
                         model.display_name(),
@@ -250,33 +237,105 @@ impl Agent {
                     )
                 } else {
                     format!("{} ({})", model.display_name(), provider)
-                }
+                })
             })
             .collect();
-        let Some(index) = self.screen.pick_at("选择模型", &items, current_index) else {
+        self.choose(
+            SelectionKind::Model(catalogue.into_iter().map(|(_, spec)| spec).collect()),
+            "选择模型",
+            choices,
+            current,
+        )
+    }
+
+    fn choose(
+        &mut self,
+        kind: SelectionKind,
+        title: &str,
+        choices: Vec<Choice>,
+        initial: usize,
+    ) -> anyhow::Result<()> {
+        self.selection = Some(kind);
+        if self.screen.interactive() {
+            self.screen
+                .open_picker(title, "↑↓ 选择 · Enter 确认 · Esc 取消", choices, initial);
+            Ok(())
+        } else {
+            self.handle_selection(Some(initial))
+        }
+    }
+
+    /// Apply picker selections without pausing the active stream or tool batch.
+    pub fn handle_selection(&mut self, selected: Option<usize>) -> anyhow::Result<()> {
+        let Some(kind) = self.selection.take() else {
             return Ok(());
         };
-        let spec = catalogue[index].1.clone();
-        let (_, model) = self.config.find(&spec).expect("chosen from the catalogue");
-        let levels = model.levels();
-        let level = if levels.is_empty() {
-            String::new()
-        } else {
-            let current = levels
-                .iter()
-                .position(|level| *level == self.level)
-                .unwrap_or(0);
-            let level_items: Vec<String> = levels.iter().map(|level| level.to_string()).collect();
-            let Some(chosen) = self.screen.pick_at("思考级别", &level_items, current) else {
-                return Ok(());
-            };
-            levels[chosen].clone()
-        };
-        // Both choices must be confirmed before changing the current model.
+        let Some(index) = selected else { return Ok(()) };
+        match kind {
+            SelectionKind::Model(specs) => {
+                let Some(spec) = specs.get(index) else {
+                    return Ok(());
+                };
+                let (_, model) = self.config.find(spec).expect("listed model");
+                let levels = model.levels();
+                if levels.is_empty() {
+                    self.select_model(spec.clone(), String::new())?;
+                } else {
+                    let current = levels
+                        .iter()
+                        .position(|level| *level == self.level)
+                        .unwrap_or(0);
+                    let choices = levels.iter().map(Choice::new).collect();
+                    self.choose(
+                        SelectionKind::Level {
+                            spec: spec.clone(),
+                            levels,
+                        },
+                        "思考级别",
+                        choices,
+                        current,
+                    )?;
+                }
+            }
+            SelectionKind::Level { spec, levels } => {
+                if let Some(level) = levels.get(index) {
+                    self.select_model(spec, level.clone())?;
+                }
+            }
+            SelectionKind::Permissions(modes) => {
+                if let Some(mode) = modes.get(index)
+                    && *mode != self.gate.mode()
+                {
+                    self.gate.set_mode(*mode);
+                    self.session.push_turn_context(
+                        &self.cwd,
+                        &self.model_spec,
+                        &self.level,
+                        *mode,
+                    )?;
+                }
+            }
+            SelectionKind::Resume(paths) => {
+                let Some(path) = paths.get(index).filter(|path| *path != self.session.path())
+                else {
+                    return Ok(());
+                };
+                match Session::open(path) {
+                    Ok(session) => self.restore_session(session)?,
+                    Err(err) => self.screen.push_lines(ui_compact::note_lines(
+                        &format!("无法打开会话：{err}"),
+                        crate::ui::screen::Style::new(Color::Red),
+                    )),
+                }
+            }
+        }
+        self.render_footer(None);
+        Ok(())
+    }
+
+    fn select_model(&mut self, spec: String, level: String) -> anyhow::Result<()> {
         self.model_spec = spec;
         self.level = level;
-        // The rate measured the previous provider. Keeping it under a new model name would
-        // attribute one vendor's speed to another.
         self.output_rate = None;
         self.session.push_turn_context(
             &self.cwd,

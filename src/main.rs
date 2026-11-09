@@ -74,8 +74,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
 
     // The turn loop: read a line, dispatch a slash command or run a turn.
     //
-    // Submitted messages can steer the active turn at safe boundaries. Commands and any
-    // remaining submissions are drained in order when that turn finishes.
+    // Messages steer the active turn at safe boundaries; slash commands dispatch immediately.
     loop {
         match agent.read_input() {
             Action::Line(line) => {
@@ -108,6 +107,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 // The note for "nothing to expand" comes from the screen itself.
                 let _ = agent.screen.show_tool_details();
             }
+            Action::Selection(index) => agent.handle_selection(index)?,
             Action::Interrupt => break,
             // Esc stops the turn in flight, and this is the prompt: nothing is running, so
             // there is nothing to stop. The screen only raises it while the spinner is up,
@@ -130,38 +130,27 @@ fn run(cli: Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Run a turn and drain submitted input in order. Messages can steer an active turn;
-/// commands wait for it to finish. Keep the backlog in the screen so newer steering
-/// cannot overtake older submissions held in a second queue.
+/// Run a turn and drain ordinary messages; slash commands are handled immediately.
 fn run_turn_and_drain(
     agent: &mut Agent,
     line: &str,
     images: Vec<mpi::image_input::PastedImage>,
 ) -> anyhow::Result<bool> {
     use mpi::ui::screen::Queued;
-    let mut next = Some(Queued::Message(line.to_string(), images));
+    let mut next = Some(Queued::new(line.to_string(), images));
     while let Some(item) = next {
-        match item {
-            Queued::Command(command) => {
-                // A command can end the session (`/exit`, `/delete`), and that decision was
-                // made by the user before this turn even finished — it is carried out as
-                // given rather than being dropped on the floor.
-                if !futures_block(agent.command(&command))? {
-                    return Ok(false);
-                }
-            }
-            Queued::Message(text, images) => {
-                if let Err(err) = futures_block(agent.run_turn_with_images(&text, images)) {
-                    // A failed turn is reported and the session carries on: the conversation
-                    // is still perfectly usable, and ending the program over one bad request
-                    // would throw it away. Whatever was queued behind it is still acted on,
-                    // because it was typed and the user is waiting to see it run.
-                    agent.screen.push_lines(ui_compact::note_lines(
-                        &format!("本轮失败：{err:#}"),
-                        mpi::ui::screen::Style::new(Color::Red),
-                    ));
-                }
-            }
+        if let Err(err) = futures_block(agent.run_turn_with_images(&item.text, item.images)) {
+            // A failed turn is reported and the session carries on: the conversation
+            // is still perfectly usable, and ending the program over one bad request
+            // would throw it away. Whatever was queued behind it is still acted on,
+            // because it was typed and the user is waiting to see it run.
+            agent.screen.push_lines(ui_compact::note_lines(
+                &format!("本轮失败：{err:#}"),
+                mpi::ui::screen::Style::new(Color::Red),
+            ));
+        }
+        if agent.wants_exit() {
+            return Ok(false);
         }
         next = agent.screen.pop_queued();
     }

@@ -131,6 +131,9 @@ pub struct Agent {
     retry: RetryBudget,
     /// Set while a turn is streaming, so `/compact` can refuse instead of corrupting it.
     streaming: bool,
+    running: bool,
+    selection: Option<commands::SelectionKind>,
+    exit_requested: bool,
     /// The session's system message, read from `AGENTS.md` when the session started.
     ///
     /// `None` means "send no system message". Held rather than re-read so the prefix stays
@@ -232,6 +235,9 @@ impl Agent {
             compaction: CompactionState::default(),
             retry: RetryBudget::default(),
             streaming: false,
+            running: false,
+            selection: None,
+            exit_requested: false,
             system_prompt,
             deleted: false,
             output_rate: None,
@@ -330,6 +336,9 @@ impl Agent {
             compaction: CompactionState::default(),
             retry: RetryBudget::default(),
             streaming: false,
+            running: false,
+            selection: None,
+            exit_requested: false,
             system_prompt,
             deleted: false,
             output_rate: None,
@@ -455,54 +464,63 @@ impl Agent {
 
 /// Handle what the user did while a turn was running.
 ///
-/// Submitted messages wait for a balanced tool/result boundary; commands wait for idle.
+/// Messages wait for a balanced tool/result boundary; commands dispatch immediately.
 ///
-/// Returns `true` when the caller must stop the turn: Esc is the one action that changes what
-/// the running turn is doing, and it has to be acted on by whoever owns the request.
-fn on_turn_action(screen: &mut Screen, action: crate::ui::screen::Action) -> bool {
-    use crate::ui::screen::Action;
-    match action {
-        Action::Line(text) => queue_mid_turn(screen, text, Vec::new()),
-        Action::LineWithImages(text, images) => queue_mid_turn(screen, text, images),
-        // Ctrl+O is exactly what a user does while a long tool call is on screen. The note
-        // for "nothing to expand" comes from the screen itself.
-        Action::ToolDetails => {
-            let _ = screen.show_tool_details();
-        }
-        Action::Stop | Action::Interrupt => return true,
-        Action::Eof => {}
+impl Agent {
+    pub fn wants_exit(&self) -> bool {
+        self.exit_requested
     }
-    false
+
+    /// Commands act now; only ordinary messages wait for the next model boundary.
+    async fn on_turn_action(&mut self, action: Action) -> bool {
+        let result = match action {
+            Action::Line(text) => {
+                if let Some(command) = queue_mid_turn(&mut self.screen, text, Vec::new()) {
+                    self.command(&command).await.map(|_| ())
+                } else {
+                    Ok(())
+                }
+            }
+            Action::LineWithImages(text, images) => {
+                if let Some(command) = queue_mid_turn(&mut self.screen, text, images) {
+                    self.command(&command).await.map(|_| ())
+                } else {
+                    Ok(())
+                }
+            }
+            Action::Selection(index) => self.handle_selection(index),
+            Action::ToolDetails => {
+                self.screen.show_tool_details();
+                Ok(())
+            }
+            Action::Stop | Action::Interrupt => return true,
+            Action::Eof => Ok(()),
+        };
+        if let Err(err) = result {
+            self.screen.push_lines(ui_compact::note_lines(
+                &err.to_string(),
+                crate::ui::screen::Style::new(Color::Red),
+            ));
+        }
+        self.render_footer(None);
+        self.exit_requested
+    }
 }
 
-/// Hold submitted input until a safe boundary (or idle for commands).
-///
-/// A line starting with `/` is a command, and commands are dispatched as commands, never as
-/// messages: `/model` is not something the user said to the model. It is the same rule the
-/// prompt applies — a slash command is text-only, so any image submitted with it is dropped
-/// rather than smuggled into the conversation as prose.
-///
-/// Messages keep their images when they steer the active task.
+/// Return slash commands for immediate dispatch; queue only text and its images.
 pub(crate) fn queue_mid_turn(
     screen: &mut Screen,
     text: String,
     images: Vec<crate::image_input::PastedImage>,
-) {
-    use crate::ui::screen::Queued;
-    // Trimmed, because the prompt trims: a line goes into the conversation the same way
-    // whether it was typed at the prompt or during a turn, and a leading space is not part
-    // of what the user meant to say.
+) -> Option<String> {
     let text = text.trim();
-    if text.is_empty() && images.is_empty() {
-        return;
-    }
-    // A leading `/` makes it a command, exactly as at the prompt: ` /model` with a space in
-    // front is not a command there either.
     if text.starts_with('/') {
-        screen.queue(Queued::Command(text.to_string()));
-    } else {
-        screen.queue(Queued::Message(text.to_string(), images));
+        return Some(text.to_string());
     }
+    if !text.is_empty() || !images.is_empty() {
+        screen.queue(crate::ui::screen::Queued::new(text.to_string(), images));
+    }
+    None
 }
 
 /// Output tokens per second for the response that just finished.

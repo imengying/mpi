@@ -29,10 +29,8 @@ impl Agent {
 
     pub(super) fn accept_steering(&mut self) -> anyhow::Result<()> {
         for item in self.screen.take_steering() {
-            if let crate::ui::screen::Queued::Message(text, images) = item {
-                self.append_user_input(&text, images)?;
-                self.retry.reset();
-            }
+            self.append_user_input(&item.text, item.images)?;
+            self.retry.reset();
         }
         Ok(())
     }
@@ -65,9 +63,13 @@ impl Agent {
         // when nothing else on screen moves, and a mark that does not move cannot be told
         // apart from a process that has hung.
         self.screen.set_working(WORKING_LABEL);
-
+        self.running = true;
         loop {
-            self.accept_steering()?;
+            if let Err(err) = self.accept_steering() {
+                self.running = false;
+                self.screen.clear_working();
+                return Err(err);
+            }
             match self.assistant_turn().await {
                 Ok(TurnEnd::Done) => {
                     if self.screen.has_steering() {
@@ -99,6 +101,7 @@ impl Agent {
                 }
             }
         }
+        self.running = false;
         // Finish the status display after all results have been committed.
         self.screen.clear_working();
         self.render_footer(None);
@@ -195,7 +198,9 @@ impl Agent {
             // Timed around the whole stream, retries included: this is the wait the user
             // actually sat through, and the number worth comparing between providers.
             let started = std::time::Instant::now();
-            let stream = self.client.stream(&request, &mut sink);
+            // The HTTP handle is shared; UI commands may change agent state while streaming.
+            let client = self.client.clone();
+            let stream = client.stream(&request, &mut sink);
             tokio::pin!(stream);
             let mut ticker = ticker();
             // Esc ends the request by dropping the future, which closes the connection. The
@@ -213,10 +218,8 @@ impl Agent {
                 // the composer as they read; Enter there queues the message rather than
                 // dropping it, because starting a second turn underneath this one would
                 // interleave two conversations.
-                if let Some(action) = self.screen.poll_input()
-                    && on_turn_action(&mut self.screen, action)
-                {
-                    stop_requested = true;
+                if let Some(action) = self.screen.poll_input() {
+                    stop_requested = self.on_turn_action(action).await;
                 }
                 if stop_requested {
                     break;
@@ -340,7 +343,9 @@ impl Agent {
             Some(completion.usage),
             Some(completion.stop_reason),
         )?;
-        self.output_rate = rate;
+        if self.model_spec == format!("{}/{}", provider.name, model.id) {
+            self.output_rate = rate;
+        }
         self.render_footer(None);
 
         if let Some(error) = &completion.error {

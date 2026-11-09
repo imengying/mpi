@@ -31,10 +31,11 @@ impl Agent {
     ) -> anyhow::Result<bool> {
         let mut next = 0;
         while next < calls.len() {
-            let stopped = self
-                .screen
-                .poll_input()
-                .is_some_and(|action| on_turn_action(&mut self.screen, action));
+            let stopped = if let Some(action) = self.screen.poll_input() {
+                self.on_turn_action(action).await
+            } else {
+                false
+            };
             if stopped || self.screen.has_steering() {
                 self.skip_tools(&calls[next..], stopped)?;
                 return Ok(stopped);
@@ -194,10 +195,8 @@ impl Agent {
         let mut ticker = ticker();
         let mut stopped = false;
         while !workers.is_empty() {
-            if self
-                .screen
-                .poll_input()
-                .is_some_and(|action| on_turn_action(&mut self.screen, action))
+            if let Some(action) = self.screen.poll_input()
+                && self.on_turn_action(action).await
             {
                 stopped = true;
                 break;
@@ -651,7 +650,7 @@ mod tests {
         append_calls(&mut agent, &obsolete);
         agent
             .screen
-            .queue(Queued::Message("不用写文件，直接解释".into(), Vec::new()));
+            .queue(Queued::new("不用写文件，直接解释".into(), Vec::new()));
         assert!(!agent.execute_tools(&obsolete).await.unwrap());
         agent.accept_steering().unwrap();
         let messages = agent.session.context_messages();
@@ -663,6 +662,23 @@ mod tests {
         assert!(!dir.join("must-not-exist").exists());
         assert!(agent.session.file_operations().lists().1.is_empty());
         assert!(!agent.screen.has_steering());
+        agent.running = true;
+        let session_id = agent.session.id().to_string();
+        let records = agent.session.records().len();
+        for command in ["/compact", "/new", "/resume", "/delete"] {
+            assert!(!agent.on_turn_action(Action::Line(command.into())).await);
+            assert!(!agent.screen.has_steering());
+            assert_eq!(agent.session.id(), session_id);
+            assert_eq!(agent.session.records().len(), records);
+        }
+        assert!(
+            !agent
+                .on_turn_action(Action::Line("/name immediate".into()))
+                .await
+        );
+        assert_eq!(agent.session.name().as_deref(), Some("immediate"));
+        assert!(agent.on_turn_action(Action::Line("/exit".into())).await);
+        assert!(agent.wants_exit());
         drop(agent);
         std::fs::remove_dir_all(dir).unwrap();
     }
