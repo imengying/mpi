@@ -116,11 +116,12 @@ os.read(int(sys.argv[2]), 1)
                 return bool(chunk)
             return False
 
-        def until(condition):
+        def until(condition, exiting=False):
             deadline = time.monotonic() + 10
             while not condition():
                 assert process.poll() is None, (mode, process.returncode, output[-1000:])
-                assert exit_status() is None, (mode, exit_status(), output[-1000:])
+                if not exiting:
+                    assert exit_status() is None, (mode, exit_status(), output[-1000:])
                 assert time.monotonic() < deadline, (mode, "timeout", output[-1000:])
                 read_available()
 
@@ -158,7 +159,7 @@ os.read(int(sys.argv[2]), 1)
                 send("/exit\r")
             else:
                 os.kill(pi_pid, exit_signal)
-            until(lambda: exit_status() is not None)
+            until(lambda: exit_status() is not None, exiting=True)
             # An exited PTY stays readable at EOF on macOS.
             while read_available():
                 pass
