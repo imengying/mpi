@@ -1,5 +1,6 @@
 """Exercise the installed terminal lifecycle on Linux and macOS, using only stdlib."""
 
+import ast
 import errno
 import fcntl
 import http.server
@@ -78,8 +79,9 @@ def check(binary, mode, exit_signal):
         # slave when its session leader exits, preventing inspection of its modes.
         release_reader, release_writer = os.pipe()
         owner = """
-import os, subprocess, sys
+import os, subprocess, sys, termios
 from pathlib import Path
+Path('pi.mode').write_text(repr(termios.tcgetattr(0)))
 child = subprocess.Popen([sys.argv[1]])
 Path('pi.pid').write_text(str(child.pid))
 Path('pi.exit').write_text(str(child.wait()))
@@ -128,6 +130,7 @@ os.read(int(sys.argv[2]), 1)
         try:
             until(lambda: b"\x1b[?1049h" in output)
             pi_pid = int((root / "pi.pid").read_text())
+            original = ast.literal_eval((root / "pi.mode").read_text())
             if mode == "picker":
                 send("save session\r")
                 until(lambda: b"SAVED_FOR_SIGNAL" in output)
@@ -151,19 +154,24 @@ os.read(int(sys.argv[2]), 1)
                           and bool((root / "child.pid").read_text().strip()))
                     child_pid = int((root / "child.pid").read_text())
 
-            os.kill(pi_pid, exit_signal)
+            if mode == "normal":
+                send("/exit\r")
+            else:
+                os.kill(pi_pid, exit_signal)
             until(lambda: exit_status() is not None)
             # An exited PTY stays readable at EOF on macOS.
             while read_available():
                 pass
-            assert exit_status() == 128 + exit_signal, (mode, exit_status())
-            assert termios.tcgetattr(slave) == original, (mode, "terminal mode not restored")
+            expected_status = 0 if mode == "normal" else 128 + exit_signal
+            assert exit_status() == expected_status, (mode, exit_status())
+            restored = termios.tcgetattr(slave)
+            assert restored == original, (mode, "terminal mode not restored", original, restored)
             assert b"\x1b[?1049l" in output, (mode, "alternate screen not restored")
             if child_pid:
                 status = subprocess.run(["ps", "-o", "stat=", "-p", str(child_pid)],
                                         capture_output=True, text=True).stdout.strip()
                 assert not status or status.startswith("Z"), ("surviving tool child", status)
-            print(f"PASS {mode}: {exit_signal.name}")
+            print(f"PASS {mode}: {'/exit' if mode == 'normal' else exit_signal.name}")
         finally:
             if pi_pid and exit_status() is None:
                 try:
@@ -192,6 +200,7 @@ os.read(int(sys.argv[2]), 1)
 if __name__ == "__main__":
     binary = Path(sys.argv[1]).resolve()
     try:
+        check(binary, "normal", None)
         for exit_signal in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
             check(binary, "idle", exit_signal)
         for mode in ("model", "picker", "stream", "approval", "tool"):
