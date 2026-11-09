@@ -159,6 +159,32 @@ impl Line {
         self.spans.iter().map(|span| util::width(&span.text)).sum()
     }
 
+    /// Keep compact headings to one visual row while preserving their styles.
+    pub fn truncate(&self, width: usize) -> Self {
+        if self.width() <= width {
+            return self.clone();
+        }
+        let mut remaining = width.saturating_sub(1);
+        let mut spans = Vec::new();
+        'spans: for span in &self.spans {
+            let mut text = String::new();
+            for grapheme in span.text.graphemes(true) {
+                let cells = util::width(grapheme);
+                if cells > remaining {
+                    spans.push(Span::new(text, span.style));
+                    break 'spans;
+                }
+                remaining -= cells;
+                text.push_str(grapheme);
+            }
+            spans.push(Span::new(text, span.style));
+        }
+        if width > 0 {
+            spans.push(Span::new("…", Style::new(Color::Dim)));
+        }
+        Self::spans(spans)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.spans.iter().all(|span| span.text.is_empty())
     }
@@ -174,6 +200,8 @@ impl Line {
 #[derive(Debug, Clone)]
 pub struct Collapsible {
     pub full_output: Option<std::path::PathBuf>,
+    /// Tool cards use an indented excerpt; the detail view keeps original output.
+    pub tool_output: bool,
     pub lines: Vec<Line>,
     /// Logical lines that stay visible in both states: a tool result's header belongs here, so
     /// collapsing never hides which command produced the output.
@@ -200,6 +228,39 @@ pub enum Block {
 }
 
 impl Collapsible {
+    fn compact_rows(&self, width: usize) -> Vec<HistoryRow<Line>> {
+        let head = self.head.min(self.lines.len());
+        let mut out: Vec<_> = self.lines[..head]
+            .iter()
+            .map(|line| HistoryRow::hard(line.truncate(width)))
+            .collect();
+        let body_width = width.saturating_sub(4).max(1);
+        let body = history_rows(&self.lines[head..], body_width);
+        let tail = self.tail.min(body.len());
+        let (prefix, suffix) = self.excerpt(body.len(), 0, tail);
+        let hidden = suffix.start - prefix.end;
+        let mut first = true;
+        for range in [prefix, suffix] {
+            for row in &body[range] {
+                let marker = if first { "  └ " } else { "    " };
+                let mut spans = vec![Span::new(marker, Style::new(Color::Dim))];
+                spans.extend(row.line.spans.clone());
+                out.push(HistoryRow::hard(Line::spans(spans).truncate(width)));
+                first = false;
+            }
+        }
+        if hidden > 0 {
+            let hint = if self.middle_head + self.preview == 0 {
+                "    Ctrl+O 查看".to_string()
+            } else {
+                format!("    + {hidden} 行 · Ctrl+O 查看")
+            };
+            out.push(HistoryRow::hard(Line::dim(hint).truncate(width)));
+        }
+        out.push(HistoryRow::hard(Line::blank()));
+        out
+    }
+
     /// The retained prefix and suffix, with no overlap even for short blocks.
     fn excerpt(
         &self,
@@ -232,6 +293,7 @@ impl Block {
     pub fn collapsible(lines: Vec<Line>, head: usize, tail: usize, preview: usize) -> Self {
         Block::Collapsible(Collapsible {
             full_output: None,
+            tool_output: false,
             lines,
             head,
             tail,
@@ -252,6 +314,7 @@ impl Block {
     ) -> Self {
         Block::Collapsible(Collapsible {
             full_output: None,
+            tool_output: false,
             lines,
             head,
             tail,
@@ -283,6 +346,9 @@ impl Block {
                 history_rows(&lines, width)
             }
             Block::Collapsible(block) => {
+                if block.tool_output && !block.expanded {
+                    return block.compact_rows(width);
+                }
                 let rows = history_rows(&block.lines, width);
                 let head = block.head.min(block.lines.len());
                 let tail = block.tail.min(block.lines.len() - head);

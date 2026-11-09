@@ -2,7 +2,7 @@
 //!
 //! Compact transcript shapes; Ctrl+O opens their full content in a temporary view:
 //!
-//! * successful calls — one summary line, with full output available on expansion,
+//! * commands — one heading and a short, indented output excerpt,
 //! * a file diff — red and green with line numbers, previewed at 14 rows,
 //! * failures — a header and an excerpt from both ends of the error.
 //!
@@ -169,6 +169,7 @@ pub fn tool_block(
     let mut block = tool_block_inner(name, arguments, output, status);
     if let Block::Collapsible(inner) = &mut block {
         inner.full_output = output.content.lines().rev().find_map(util::output_log_path);
+        inner.tool_output = true;
     }
     block
 }
@@ -214,11 +215,8 @@ fn tool_block_inner(
                 ));
             }
             lines.extend(header);
-            // A header with no result under it is a complete statement — "this command, no
-            // output" — so the blank separator only appears when something follows.
             if !body.is_empty() {
-                lines.push(Line::blank());
-                lines.extend(plain_text_lines(&body, Style::plain()));
+                lines.extend(plain_text_lines(&body, Style::new(Color::Output)));
             }
         }
         Display::Diff { .. } => {
@@ -285,12 +283,10 @@ fn tool_block_inner(
     }
     if status == crate::llm::ToolStatus::Error {
         // Keep the cause at the start and the exit status at the end of long errors.
-        if matches!(output.display, Display::Command) && lines.get(head).is_some_and(Line::is_empty)
-        {
-            lines.remove(head);
-        }
         let budget = Defaults::ERROR_PREVIEW_LINES;
         Block::collapsible_excerpted(lines, head, tail, budget / 2, budget - budget / 2)
+    } else if matches!(output.display, Display::Command) {
+        Block::collapsible_excerpted(lines, head, tail, 3, 0)
     } else {
         Block::collapsible(lines, head, tail, 0)
     }
@@ -1058,7 +1054,7 @@ mod tests {
     }
 
     #[test]
-    fn a_successful_command_collapses_to_its_header() {
+    fn a_successful_command_shows_a_short_excerpt_and_expands_to_full_output() {
         let output = ToolOutput {
             content: (0..20).map(|i| format!("row {i}\n")).collect(),
             display: Display::Command,
@@ -1076,7 +1072,17 @@ mod tests {
         let text = plain(&block.render(80));
         assert!(text[0].starts_with("✓ "), "{text:?}");
         assert!(text[0].contains("$ ls -l"), "{text:?}");
-        assert_eq!(text, ["✓ $ ls -l · 0.4s"]);
+        assert_eq!(
+            text,
+            [
+                "✓ $ ls -l · 0.4s",
+                "  └ row 0",
+                "    row 1",
+                "    row 2",
+                "    + 17 行 · Ctrl+O 查看",
+                ""
+            ]
+        );
         let Block::Collapsible(mut expanded) = block else {
             unreachable!()
         };
@@ -1107,7 +1113,7 @@ mod tests {
             )
             .render(80),
         );
-        assert_eq!(text, vec!["⊘ $ sleep 30"], "{text:?}");
+        assert_eq!(text, vec!["⊘ $ sleep 30", ""], "{text:?}");
         assert!(
             !text.iter().any(|line| line.contains("检查实际状态")),
             "{text:?}"
@@ -1151,7 +1157,7 @@ mod tests {
             )
             .render(80),
         );
-        assert_eq!(text, vec!["⊘ 读取 src/main.rs"], "{text:?}");
+        assert_eq!(text, vec!["⊘ 读取 src/main.rs", ""], "{text:?}");
     }
 
     #[test]
@@ -1179,7 +1185,15 @@ mod tests {
             "{text:?}"
         );
         assert!(text[0].starts_with("× $ false"), "{text:?}");
-        assert_eq!(text.last().unwrap(), "[退出码 3]", "{text:?}");
+        assert_eq!(
+            text.iter()
+                .rev()
+                .find(|line| !line.is_empty())
+                .unwrap()
+                .trim(),
+            "[退出码 3]",
+            "{text:?}"
+        );
 
         // Truncation and the full-log path belong only in the model's result.
         let huge: String = (0..40_000).map(|i| format!("row {i}\n")).collect();
@@ -1388,12 +1402,22 @@ mod tests {
             .iter()
             .find(|line| line.text().contains("two"))
             .unwrap_or_else(|| panic!("the removed row is missing: {painted:?}"));
-        assert_eq!(removed.spans[0].style.bg, Bg::Removed);
+        assert!(
+            removed
+                .spans
+                .iter()
+                .any(|span| span.text.contains("two") && span.style.bg == Bg::Removed)
+        );
         let added = painted
             .iter()
             .find(|line| line.text().contains("TWO"))
             .unwrap_or_else(|| panic!("the added row is missing: {painted:?}"));
-        assert_eq!(added.spans[0].style.bg, Bg::Added);
+        assert!(
+            added
+                .spans
+                .iter()
+                .any(|span| span.text.contains("TWO") && span.style.bg == Bg::Added)
+        );
         // The removed and added rows must not be the same line.
         assert!(!std::ptr::eq(removed, added));
     }

@@ -54,13 +54,10 @@ impl Agent {
                 1
             };
             let batch = &calls[next..next + count];
-            let mut running = ui_compact::running_line(&first.1, &first.2);
-            if count > 1 {
-                running.push(crate::ui::screen::Span::new(
-                    format!("（另 {} 项）", count - 1),
-                    crate::ui::screen::Style::new(Color::Dim),
-                ));
-            }
+            let running: Vec<_> = batch
+                .iter()
+                .map(|(_, name, arguments)| ui_compact::running_line(name, arguments))
+                .collect();
             self.render_footer(None);
             self.screen.set_running(running.clone());
             // Every call keeps its own authorization decision; no batch-wide grant.

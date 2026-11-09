@@ -1,4 +1,4 @@
-//! An inline viewport that grows from the shell cursor into native scrollback.
+//! Incremental painting inside the session's alternate screen.
 
 use crate::ui::text::HistoryRow;
 use std::fmt::Write;
@@ -9,25 +9,12 @@ pub(super) struct Viewport {
     top: usize,
     /// Empty space above a shrunken composer, kept out of transcript/scrollback.
     gap: usize,
-    history_top: usize,
-    origin: Option<(usize, usize)>,
     rows: Vec<HistoryRow<String>>,
     cursor: Option<(usize, usize)>,
     invalidated: bool,
 }
 
 impl Viewport {
-    pub(super) fn needs_position(&self) -> bool {
-        self.size.is_none() && self.origin.is_none()
-    }
-
-    pub(super) fn start_at(&mut self, row: usize, column: usize) {
-        debug_assert!(self.size.is_none());
-        self.top = row;
-        self.history_top = row;
-        self.origin = Some((row, column));
-    }
-
     pub(super) fn needs_reflow(&self, width: usize, height: usize) -> bool {
         self.size
             .is_some_and(|size| size != (width, height) || self.invalidated)
@@ -64,36 +51,11 @@ impl Viewport {
             self.gap = 0;
         }
 
-        if first_frame {
-            self.top = self.top.min(height - 1);
-            if self.origin.is_some_and(|(_, column)| column != 0) {
-                // Keep a partial shell line intact, including when it occupies the last row.
-                frame.push_str("\r\n");
-                self.top = (self.top + 1).min(height - 1);
-            }
-            self.history_top = self.top;
-        } else if reflowing {
-            // Only the visible transcript is reconstructed. If it needs more room, move
-            // shell rows into scrollback before clearing pi's area, never clear over them.
+        if reflowing {
             let shown = reflow.len().min(height - rows.len());
-            self.history_top = self.history_top.min(height - 1);
-            let scroll = (self.history_top + shown + rows.len()).saturating_sub(height);
-            if scroll > 0 {
-                erase_rows(
-                    &mut frame,
-                    self.top.min(height),
-                    self.rows.len().min(height.saturating_sub(self.top)),
-                );
-                scroll_screen(&mut frame, height, scroll);
-                self.history_top = self.history_top.saturating_sub(scroll);
-            }
-            erase_rows(&mut frame, self.history_top, height - self.history_top);
-            write_rows(
-                &mut frame,
-                self.history_top,
-                &reflow[reflow.len() - shown..],
-            );
-            self.top = self.history_top + shown;
+            erase_rows(&mut frame, 0, height);
+            write_rows(&mut frame, 0, &reflow[reflow.len() - shown..]);
+            self.top = shown;
         } else if layout_changed || !history.is_empty() {
             // The previous live rows are ours. Clear them before appending history or growing
             // the composer, so drafts can never be moved into native scrollback.
@@ -101,20 +63,16 @@ impl Viewport {
         }
 
         if !history.is_empty() {
-            let scroll = (self.top + history.len() + rows.len()).saturating_sub(height);
             write_rows(&mut frame, self.top, history);
-            // Reserve just the live rows. Full-screen newlines preserve native scrollback
-            // and wrap flags, including on terminals that discard partial scroll regions.
+            // Reserve the live rows, retaining native wrap flags for text selection.
             frame.push_str(&"\r\n\x1b[K".repeat(rows.len()));
             self.top = (self.top + history.len()).min(height - rows.len());
-            self.history_top = self.history_top.saturating_sub(scroll);
         } else {
             let scroll = (self.top + rows.len()).saturating_sub(height);
             if scroll > 0 {
                 // Old live rows were erased before scrolling, so drafts never enter history.
                 scroll_screen(&mut frame, height, scroll);
                 self.top -= scroll;
-                self.history_top = self.history_top.saturating_sub(scroll);
             }
         }
         if was_docked && (layout_changed || !history.is_empty()) {
@@ -172,7 +130,7 @@ impl Viewport {
         }
         let mut frame = String::from("\x1b[?2026h");
         erase_rows(&mut frame, self.top, self.rows.len());
-        // The shell resumes immediately after the transcript, on the first former live row.
+        // Return to the transcript boundary before a modal overlay or redraw.
         self.top -= self.gap;
         self.gap = 0;
         move_to(&mut frame, self.top, 0);
@@ -185,8 +143,6 @@ impl Viewport {
 
     pub(super) fn clear(&mut self) {
         *self = Self::default();
-        // The caller has explicitly cleared the terminal and moved its cursor to the origin.
-        self.start_at(0, 0);
     }
 }
 
@@ -242,11 +198,9 @@ mod tests {
     #[test]
     fn history_reaches_the_bottom_without_drafts_in_scrollback() {
         let mut terminal = vt100::Parser::new(nz(12), nz(24), 200);
-        terminal.process(b"shell output\r\n");
         let mut view = Viewport::default();
-        view.start_at(1, 0);
         let base = rows(&["working", "draft", "directory", "stats"]);
-        for (count, caret_row) in [(0, 2), (1, 3), (40, 9)] {
+        for (count, caret_row) in [(0, 1), (1, 2), (40, 9)] {
             let history = (0..count)
                 .map(|index| HistoryRow {
                     line: format!("output {index}"),
@@ -266,10 +220,7 @@ mod tests {
         }
         terminal.screen_mut().set_scrollback(200);
         let all = terminal.screen().contents();
-        assert!(
-            all.contains("shell output"),
-            "the shell's existing output must stay visible: {all}"
-        );
+        assert!(all.contains("output 0"), "{all}");
         assert!(
             !all.contains("draft"),
             "composer leaked into scrollback: {all}"
@@ -277,109 +228,18 @@ mod tests {
     }
 
     #[test]
-    fn first_inline_frame_starts_at_the_existing_cursor() {
-        let mut terminal = vt100::Parser::new(nz(12), nz(24), 100);
-        terminal.process(b"shell 0\r\nshell 1\r\nshell 2\r\n");
+    fn a_shrinking_live_area_stays_docked_after_the_screen_fills() {
+        let mut terminal = vt100::Parser::new(nz(12), nz(24), 0);
         let mut view = Viewport::default();
-        view.start_at(3, 0);
-        let frame = view.draw((24, 12), rows(&["draft", "stats"]), Some((0, 5)), &[], &[]);
-
-        assert!(!frame.contains(&"\r\n".repeat(9)));
-        assert!(!frame.contains("\x1b[J"), "entry must not clear the screen");
-        terminal.process(frame.as_bytes());
-        let visible = terminal.screen().contents();
-        assert!(visible.contains("shell 0"), "{visible}");
-        assert!(visible.contains("shell 2"), "{visible}");
-        assert!(visible.ends_with("draft\nstats"), "{visible}");
-        assert_eq!(terminal.screen().cursor_position(), (3, 5));
-    }
-
-    #[test]
-    fn erasing_inline_frame_returns_cursor_to_the_shell_row() {
-        let mut terminal = vt100::Parser::new(nz(12), nz(24), 100);
-        terminal.process(b"previous shell output\r\n");
-        let mut view = Viewport::default();
-        view.start_at(1, 0);
-        terminal.process(
-            view.draw((24, 12), rows(&["draft", "stats"]), Some((0, 5)), &[], &[])
-                .as_bytes(),
-        );
-        terminal.process(view.erase().as_bytes());
-
-        assert_eq!(terminal.screen().cursor_position(), (1, 0));
-        assert!(
-            terminal
-                .screen()
-                .contents()
-                .contains("previous shell output"),
-            "erasing the composer must not clear the shell screen"
-        );
-    }
-
-    #[test]
-    fn a_full_shell_screen_survives_entry_and_exit() {
-        let mut terminal = vt100::Parser::new(nz(12), nz(24), 100);
-        for index in 0..11 {
-            terminal.process(format!("shell {index}\r\n").as_bytes());
-        }
-        let mut view = Viewport::default();
-        view.start_at(11, 0);
-        terminal.process(
-            view.draw(
-                (24, 12),
-                rows(&["draft", "directory", "stats"]),
-                Some((0, 5)),
-                &[],
-                &[],
-            )
-            .as_bytes(),
-        );
-        terminal.process(view.erase().as_bytes());
-        assert_eq!(terminal.screen().cursor_position(), (9, 0));
-        terminal.screen_mut().set_scrollback(100);
-        assert_eq!(
-            terminal.screen().scrollback(),
-            2,
-            "reserve only the live rows"
-        );
-        let visible = terminal.screen().contents();
-        for index in 0..11 {
-            assert!(visible.contains(&format!("shell {index}")), "{visible}");
-        }
-    }
-
-    #[test]
-    fn partial_shell_lines_survive_even_at_the_bottom() {
-        for row in [2, 11] {
-            let mut terminal = vt100::Parser::new(nz(12), nz(24), 100);
-            terminal.process(format!("\x1b[{};1Hpartial shell line", row + 1).as_bytes());
-            let mut view = Viewport::default();
-            view.start_at(row, 18);
-            let frame = view.draw((24, 12), rows(&["draft", "stats"]), Some((0, 5)), &[], &[]);
-            terminal.process(frame.as_bytes());
-            terminal.process(view.erase().as_bytes());
-            assert_eq!(
-                terminal.screen().cursor_position(),
-                ((row + 1).min(10) as u16, 0)
-            );
-            assert!(terminal.screen().contents().ends_with("partial shell line"));
-        }
-    }
-
-    #[test]
-    fn a_shrinking_live_area_does_not_scroll_the_shell_down() {
-        let mut terminal = vt100::Parser::new(nz(12), nz(24), 100);
-        for index in 0..11 {
-            terminal.process(format!("shell {index}\r\n").as_bytes());
-        }
-        let mut view = Viewport::default();
-        view.start_at(11, 0);
+        let transcript: Vec<_> = (0..30)
+            .map(|i| HistoryRow::hard(format!("answer {i}")))
+            .collect();
         terminal.process(
             view.draw(
                 (24, 12),
                 rows(&["one", "two", "three", "draft", "stats"]),
                 Some((3, 5)),
-                &[],
+                &transcript,
                 &[],
             )
             .as_bytes(),
@@ -389,25 +249,15 @@ mod tests {
                 .as_bytes(),
         );
         assert_eq!(terminal.screen().rows(0, 24).last().unwrap(), "stats");
-        terminal.process(
-            view.draw((24, 12), rows(&["draft", "stats"]), Some((0, 5)), &[], &[])
-                .as_bytes(),
-        );
-        terminal.process(view.erase().as_bytes());
-        assert_eq!(terminal.screen().cursor_position(), (7, 0));
-        assert!(terminal.screen().contents().ends_with("shell 10"));
-        terminal.screen_mut().set_scrollback(100);
-        assert_eq!(terminal.screen().scrollback(), 4);
-        assert!(!terminal.screen().contents().contains("draft"));
-        assert!(!terminal.screen().contents().contains("one"));
+        assert_eq!(terminal.screen().cursor_position(), (10, 5));
+        assert!(terminal.screen().contents().contains("answer 29"));
+        assert!(!terminal.screen().contents().contains("three"));
     }
 
     #[test]
-    fn reflow_preserves_the_shell_prefix_and_inserts_fresh_history_once() {
+    fn reflow_preserves_visible_history_and_inserts_fresh_output_once() {
         let mut terminal = vt100::Parser::new(nz(12), nz(24), 100);
-        terminal.process(b"shell 0\r\nshell 1\r\n");
         let mut view = Viewport::default();
-        view.start_at(2, 0);
         terminal.process(
             view.draw(
                 (24, 12),
@@ -430,10 +280,7 @@ mod tests {
                 )
                 .as_bytes(),
             );
-            assert_eq!(
-                terminal.screen().contents(),
-                "shell 0\nshell 1\nanswer\ndraft\nstats"
-            );
+            assert_eq!(terminal.screen().contents(), "answer\ndraft\nstats");
         }
         terminal.process(view.erase().as_bytes());
         terminal.process(
@@ -447,11 +294,8 @@ mod tests {
             .as_bytes(),
         );
         terminal.process(view.erase().as_bytes());
-        assert_eq!(
-            terminal.screen().contents(),
-            "shell 0\nshell 1\nanswer\nexit hint"
-        );
-        assert_eq!(terminal.screen().cursor_position(), (4, 0));
+        assert_eq!(terminal.screen().contents(), "answer\nexit hint");
+        assert_eq!(terminal.screen().cursor_position(), (2, 0));
         terminal.screen_mut().set_scrollback(100);
         assert_eq!(
             terminal.screen().scrollback(),

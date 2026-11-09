@@ -212,6 +212,9 @@ impl Screen {
             self.approval_event(event);
             return None;
         }
+        if self.transcript_event(&event) {
+            return None;
+        }
         if let Event::Paste(text) = event {
             self.notice = None;
             self.editing.get_or_insert_with(Editor::new).paste(&text);

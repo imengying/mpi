@@ -47,6 +47,7 @@ pub fn teardown() {
         out,
         event::PopKeyboardEnhancementFlags,
         event::DisableBracketedPaste,
+        event::DisableMouseCapture,
         cursor::Show,
         terminal::EndSynchronizedUpdate,
         terminal::LeaveAlternateScreen

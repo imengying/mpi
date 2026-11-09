@@ -88,7 +88,6 @@ mod tests {
             .collect();
         screen.printed = screen.blocks.len();
         screen.editing = Some(Editor::new());
-        screen.viewport.start_at(0, 0);
         screen.live_frame();
         for width in [30, 80, 12] {
             screen.width = width;
@@ -102,5 +101,16 @@ mod tests {
                     .all(|entry| entry.index >= 9_970)
             );
         }
+        screen.transcript_event(&Event::Key(KeyCode::PageUp.into()));
+        screen.transcript_event(&Event::Key(KeyCode::Home.into()));
+        screen.draw_transcript();
+        assert!(screen.layout.entries.iter().any(|entry| entry.index == 0));
+        assert!(
+            screen
+                .layout
+                .entries
+                .iter()
+                .all(|entry| entry.index < 30 || entry.index >= 9_970)
+        );
     }
 }

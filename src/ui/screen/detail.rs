@@ -96,7 +96,7 @@ impl Screen {
             return false;
         }
         self.draw_live();
-        let _ = crossterm::execute!(self.out, terminal::EnterAlternateScreen, cursor::Hide);
+        let _ = crossterm::execute!(self.out, cursor::Hide);
         self.detail = Some(Detail {
             index,
             offset: 0,
@@ -117,7 +117,7 @@ impl Screen {
         if self.detail.take().is_none() {
             return;
         }
-        let _ = crossterm::execute!(self.out, terminal::LeaveAlternateScreen, cursor::Show);
+        self.erase_live();
         self.draw_live();
     }
 
@@ -127,6 +127,14 @@ impl Screen {
             self.height = usize::from(height.max(1));
             return;
         }
+        let event = match event {
+            Event::Mouse(mouse) => match mouse.kind {
+                event::MouseEventKind::ScrollUp => Event::Key(KeyCode::Up.into()),
+                event::MouseEventKind::ScrollDown => Event::Key(KeyCode::Down.into()),
+                _ => return,
+            },
+            event => event,
+        };
         let Event::Key(key) = event else {
             return;
         };

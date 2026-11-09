@@ -156,35 +156,50 @@ fn an_error_exit_erases_the_composer_before_the_shell_resumes() {
 }
 
 #[test]
-fn leaving_places_the_shell_after_queued_output_without_an_empty_block() {
+fn leaving_restores_the_shell_and_preserves_only_its_scrollback() {
     let mut terminal = vt100::Parser::new(nz(24), nz(40), 100);
-    terminal.process(b"previous shell output\r\n");
+    for index in 0..60 {
+        terminal.process(format!("shell history {index}\r\n").as_bytes());
+    }
+    let shell = terminal.screen().contents();
+    let shell_cursor = terminal.screen().cursor_position();
+    terminal.screen_mut().set_scrollback(100);
+    let shell_history = terminal.screen().contents();
+    terminal.screen_mut().set_scrollback(0);
     let captured = CapturedOutput::default();
     let mut screen = screen();
     screen.out = Box::new(captured.clone());
     screen.interactive = true;
-    screen.viewport.start_at(1, 0);
     set_input(&mut screen, "unsent draft");
     screen.set_footer(vec![Line::plain("directory"), Line::plain("stats")]);
-    screen.push_lines(vec![Line::plain("answer")]);
-    screen.render();
+    for index in 0..100 {
+        screen.push_lines(vec![Line::plain(format!("session answer {index}"))]);
+    }
     screen.flush();
     terminal.process(&captured.take());
-    screen.push_lines(vec![Line::plain("resume hint")]);
+    assert!(terminal.screen().alternate_screen());
+    assert!(terminal.screen().contents().contains("session answer 99"));
+    screen.push_lines(vec![Line::plain("queued session output")]);
     screen.leave();
-    let exit = captured.take();
-    assert!(!exit.windows(3).any(|bytes| bytes == b"\x1b[J"));
-    terminal.process(&exit);
-    assert_eq!(terminal.screen().cursor_position(), (3, 0));
-    terminal.process(b"shell prompt> ");
+    terminal.process(&captured.take());
+    assert!(!terminal.screen().alternate_screen());
+    assert_eq!(terminal.screen().contents(), shell);
+    assert_eq!(terminal.screen().cursor_position(), shell_cursor);
     assert_eq!(
-        terminal.screen().contents(),
-        "previous shell output\nanswer\nresume hint\nshell prompt> "
+        terminal.screen().mouse_protocol_mode(),
+        vt100::MouseProtocolMode::None
+    );
+    terminal.screen_mut().set_scrollback(100);
+    assert_eq!(terminal.screen().contents(), shell_history);
+    screen.leave();
+    assert!(
+        captured.take().is_empty(),
+        "leaving twice must not erase shell output"
     );
 }
 
 #[test]
-fn streaming_blocks_enter_scrollback_once_and_keep_the_draft_below_output() {
+fn streaming_blocks_commit_once_and_remain_browsable_inside_the_session() {
     let mut screen = screen();
     let captured = CapturedOutput::default();
     screen.out = Box::new(captured.clone());
@@ -234,10 +249,43 @@ fn streaming_blocks_enter_scrollback_once_and_keep_the_draft_below_output() {
     }
     assert!(!transcript.contains("思考完成"));
     assert!(!transcript.contains("thinking"));
-    terminal.screen_mut().set_scrollback(500);
-    let scrollback = terminal.screen().contents();
-    assert!(scrollback.contains("paragraph 0"));
-    assert!(!scrollback.contains("draft"));
+    screen.absorb_event(Event::Key(KeyCode::PageUp.into()));
+    screen.absorb_event(Event::Key(KeyCode::Home.into()));
+    screen.flush();
+    terminal.process(&captured.take());
+    assert!(terminal.screen().contents().contains("paragraph 0"));
+    assert!(!terminal.screen().contents().contains("draft"));
+    // Background completion does not move the page being read.
+    screen.push_lines(vec![Line::plain("new background result")]);
+    screen.flush();
+    terminal.process(&captured.take());
+    assert!(terminal.screen().contents().contains("paragraph 0"));
+    assert!(
+        !terminal
+            .screen()
+            .contents()
+            .contains("new background result")
+    );
+    screen.absorb_event(Event::Key(KeyCode::Esc.into()));
+    screen.flush();
+    terminal.process(&captured.take());
+    assert!(
+        terminal
+            .screen()
+            .contents()
+            .contains("new background result")
+    );
+    assert!(terminal.screen().contents().contains("› draft"));
+    screen.absorb_event(Event::Mouse(event::MouseEvent {
+        kind: event::MouseEventKind::ScrollUp,
+        column: 0,
+        row: 0,
+        modifiers: KeyModifiers::NONE,
+    }));
+    assert!(screen.transcript_view.is_some());
+    screen.absorb_event(Event::Paste(" more".into()));
+    assert!(screen.transcript_view.is_none());
+    assert_eq!(input(&screen), "draft more");
 }
 
 #[test]
@@ -365,8 +413,8 @@ fn native_code_selection_keeps_source_newlines_and_indentation_while_streaming_a
             body,
             "completed, width {width}"
         );
-        assert!(!terminal.screen().alternate_screen());
-        assert_eq!(
+        assert!(terminal.screen().alternate_screen());
+        assert_ne!(
             terminal.screen().mouse_protocol_mode(),
             vt100::MouseProtocolMode::None
         );
@@ -849,7 +897,6 @@ fn screen() -> Screen {
     screen.interactive = false;
     screen.width = 40;
     screen.height = 24;
-    screen.viewport.start_at(0, 0);
     screen
 }
 
@@ -876,53 +923,15 @@ fn caret_back(screen: &mut Screen, back: usize) {
 }
 
 #[test]
-fn leaving_takes_the_live_region_down() {
-    // The live region is the prompt and the footer, not part of the transcript. If it is
-    // left on screen the shell inherits a cursor parked mid-row, and zsh marks a partial
-    // line with `%` — so pi's prompt appears to survive as `› /%`.
-    //
-    // The draw and erase steps are tested above; what this pins is that the exit path
-    // actually erases, because the residue only shows up in a real shell.
-    //
-    // `interactive` has to be on: a piped run writes no escape sequences at all, and
-    // `erase_live` is a no-op there by design.
+fn piped_output_is_committed_on_exit_without_terminal_controls() {
+    let captured = CapturedOutput::default();
     let mut screen = screen();
-    screen.interactive = true;
-    set_input(&mut screen, "/");
-    screen.set_footer(vec![Line::plain("dir"), Line::plain("stats")]);
-
-    // Draw once, as the input loop does, so there is a region to take down.
-    let (_, cursor) = screen.compose_live();
-    assert!(cursor.is_some(), "an input line means a cursor to park");
-    let _ = screen.live_frame();
-
+    screen.out = Box::new(captured.clone());
+    screen.push_lines(vec![Line::plain("last answer")]);
     screen.leave();
-
-    // The region is gone, so a later erase has nothing to do — which is exactly the
-    // state that keeps the shell's marker off the screen.
-    let mut terminal = vt100::Parser::new(nz(24), nz(40), 0);
-    terminal.process(screen.viewport.erase().as_bytes());
-    assert!(terminal.screen().contents().is_empty());
-}
-
-#[test]
-fn leaving_commits_what_was_queued_but_not_yet_drawn() {
-    // The note telling the user how to come back is pushed *after* the turn loop ends,
-    // so no draw ever follows it. Erasing without committing threw it away silently: the
-    // last thing pi is supposed to say was the one thing it never said.
-    let mut screen = screen();
-    screen.interactive = true;
-    screen.push_lines(vec![Line::plain("继续此会话：pi resume abc")]);
-    assert!(!screen.blocks.is_empty(), "the note is queued");
-
+    assert_eq!(captured.take(), b"last answer\n");
     screen.leave();
-
-    // `printed` catches up with `blocks` only if the queued row was written.
-    assert_eq!(
-        screen.printed,
-        screen.blocks.len(),
-        "a queued row must be written before the live region is taken down"
-    );
+    assert!(captured.take().is_empty());
 }
 
 #[test]
@@ -1641,10 +1650,17 @@ fn detail_navigation_and_search_preserve_the_transcript_and_draft() {
 
     let (mut log, path) = util::create_output_file().unwrap();
     writeln!(log, "early output").unwrap();
-    screen.set_running(vec![Span::plain("long command")]);
+    screen.set_running(vec![vec![Span::plain("long command ".repeat(20))]]);
     screen.running_started = Some(std::time::Instant::now() - std::time::Duration::from_secs(3));
     screen.set_running_log(path.clone());
     assert!(util::strip_ansi(&screen.live_frame()).contains("3s"));
+    assert!(
+        screen
+            .compose_live()
+            .0
+            .iter()
+            .any(|row| row.line.text().contains("Ctrl+O"))
+    );
     assert!(screen.show_tool_details());
     screen.flush();
     terminal.process(&captured.take());
@@ -1743,8 +1759,22 @@ fn no_live_row_is_wider_than_the_terminal() {
     // The running line is built from the command the model asked for, so it is as long as
     // the command is.
     screen.notice = None;
-    screen.set_running(vec![Span::plain(format!("● $ echo {long}"))]);
+    screen.set_running(vec![
+        vec![Span::plain(format!("● $ echo {long}"))],
+        vec![Span::plain("● 读取 src/main.rs")],
+        vec![Span::plain("● 搜索 src/ui")],
+    ]);
     check(&screen, "running line");
+    let running = screen.compose_live().0;
+    for command in ["● $ echo", "● 读取 src/main.rs", "● 搜索 src/ui"] {
+        assert_eq!(
+            running
+                .iter()
+                .filter(|row| row.line.text().starts_with(command))
+                .count(),
+            1
+        );
+    }
 
     // The footer is produced by `footer::render`, which is width-aware, so what is checked
     // here is that the width it produced is the width the region gets. `set_footer` is fed

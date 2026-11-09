@@ -1,7 +1,6 @@
 //! Layout and painting of the inline viewport.
 
 use super::*;
-use unicode_segmentation::UnicodeSegmentation;
 
 impl Screen {
     pub(super) fn compose_live(&self) -> (Vec<HistoryRow<Line>>, Option<(usize, usize)>) {
@@ -137,21 +136,24 @@ impl Screen {
                 preview.push(HistoryRow::hard(Line::blank()));
             }
         }
-        if let Some(spans) = &self.running_call {
-            let mut spans = spans.clone();
+        for spans in &self.running_calls {
+            let mut suffix = Vec::new();
             if let Some(started) = self.running_started {
                 let elapsed = started.elapsed().as_secs();
                 if elapsed >= 1 {
-                    spans.push(Span::new(format!(" · {elapsed}s"), Style::new(Color::Dim)));
+                    suffix.push(Span::new(format!(" · {elapsed}s"), Style::new(Color::Dim)));
                 }
             }
-            if self.running_log.is_some() {
-                spans.push(Span::new(" · Ctrl+O 日志", Style::new(Color::Dim)));
+            if self.running_log.is_some() && self.width >= 40 {
+                suffix.push(Span::new(" · Ctrl+O 日志", Style::new(Color::Dim)));
             }
-            preview.extend(crate::ui::text::history_rows(
-                &[Line::spans(spans)],
-                self.width,
-            ));
+            let suffix = Line::spans(suffix);
+            let mut line =
+                Line::spans(spans.clone()).truncate(self.width.saturating_sub(suffix.width()));
+            line.spans.extend(suffix.spans);
+            preview.push(HistoryRow::hard(line.truncate(self.width)));
+        }
+        if !self.running_calls.is_empty() {
             preview.push(HistoryRow::hard(Line::blank()));
         }
         let first = preview.len().saturating_sub(room);
@@ -178,7 +180,7 @@ impl Screen {
             lines
                 .iter()
                 .map(|row| HistoryRow {
-                    line: clip_line(&row.line, self.width),
+                    line: row.line.truncate(self.width),
                     wrapped: row.wrapped,
                 })
                 .collect(),
@@ -210,6 +212,9 @@ impl Screen {
     }
 
     pub(super) fn erase_live(&mut self) {
+        if let Some(view) = self.transcript_view.as_mut() {
+            view.rendered = None;
+        }
         if self.interactive && self.detail.is_none() {
             let _ = write!(self.out, "{}", self.viewport.erase());
         }
@@ -228,6 +233,18 @@ impl Screen {
 
     pub(super) fn draw_live(&mut self) {
         self.redraw.drawn(std::time::Instant::now());
+        if self.interactive && !self.alternate_screen {
+            let _ = crate::ui::terminal::ensure_raw_mode();
+            let _ = crossterm::execute!(
+                self.out,
+                terminal::EnterAlternateScreen,
+                event::EnableMouseCapture,
+                terminal::Clear(terminal::ClearType::All),
+                cursor::MoveTo(0, 0)
+            );
+            self.alternate_screen = true;
+            self.viewport.clear();
+        }
         if self.detail.is_some() {
             self.draw_detail();
             return;
@@ -244,13 +261,9 @@ impl Screen {
             self.commit();
             return;
         }
-        if self.viewport.needs_position() {
-            let position = crate::ui::terminal::ensure_raw_mode().and_then(|()| cursor::position());
-            // If a terminal cannot report its cursor, reserve space from the bottom rather
-            // than painting over unknown shell output at the top of the screen.
-            let (column, row) = position.unwrap_or((0, self.height.saturating_sub(1) as u16));
-            self.viewport
-                .start_at(usize::from(row), usize::from(column));
+        if self.transcript_view.is_some() {
+            self.draw_transcript();
+            return;
         }
         let frame = self.live_frame();
         let _ = write!(self.out, "{frame}");
@@ -338,25 +351,4 @@ impl Screen {
         }
         out
     }
-}
-
-fn clip_line(line: &Line, width: usize) -> Line {
-    let mut spans = Vec::new();
-    let mut used = 0;
-    for span in &line.spans {
-        let mut text = String::new();
-        for grapheme in span.text.graphemes(true) {
-            let cells = util::width(grapheme);
-            if used + cells > width {
-                break;
-            }
-            used += cells;
-            text.push_str(grapheme);
-        }
-        spans.push(Span::new(text, span.style));
-        if used >= width {
-            break;
-        }
-    }
-    Line::spans(spans)
 }

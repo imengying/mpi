@@ -1,4 +1,4 @@
-//! Native scrollback with an inline composer and status area.
+//! A session-local terminal screen with an inline composer and status area.
 
 // The rendered-line model and the line editor live in their own modules; re-exported here
 // because every consumer already says `ui::screen::Line` and `ui::screen::Editor`, and the
@@ -103,6 +103,8 @@ pub struct Screen {
     footer: Vec<Line>,
     footer_state: Option<crate::ui::footer::FooterState>,
     viewport: Viewport,
+    alternate_screen: bool,
+    transcript_view: Option<transcript::TranscriptView>,
     approval: Option<(
         crate::ui::auth_panel::PanelState,
         tokio::sync::oneshot::Sender<crate::auth::guard::Decision>,
@@ -134,13 +136,13 @@ pub struct Screen {
     /// from a hung process — which is the one thing the user needs to be able to tell.
     working: Option<String>,
     working_frame: usize,
-    /// The tool call in flight, as one line: `● $ sleep 30`.
+    /// Each tool call in flight occupies its own row.
     ///
     /// A tool can take minutes, and without it the screen would sit unchanged with no sign
     /// that anything is happening. It is a *live* row, not a transcript block: the finished
     /// call is committed afterwards with its output and duration, and this line disappears
     /// in the same redraw.
-    running_call: Option<Vec<Span>>,
+    running_calls: Vec<Vec<Span>>,
     running_started: Option<std::time::Instant>,
     running_log: Option<std::path::PathBuf>,
     /// Whether stdout is a terminal at all.
@@ -184,8 +186,7 @@ impl Default for Screen {
 impl Drop for Screen {
     fn drop(&mut self) {
         if !std::thread::panicking() {
-            self.erase_live();
-            let _ = self.out.flush();
+            self.leave();
         }
     }
 }
@@ -241,6 +242,8 @@ impl Screen {
             footer: Vec::new(),
             footer_state: None,
             viewport: Viewport::default(),
+            alternate_screen: false,
+            transcript_view: None,
             approval: None,
             editing: None,
             history: Vec::new(),
@@ -250,7 +253,7 @@ impl Screen {
             thinking_active: false,
             working: None,
             working_frame: 0,
-            running_call: None,
+            running_calls: Vec::new(),
             running_started: None,
             running_log: None,
             streaming_answer: None,
@@ -321,28 +324,24 @@ impl Screen {
         self.open_detail()
     }
 
-    /// Take the live region down for good, on the way out of the program.
-    ///
-    /// The region is not part of the transcript: it is the prompt and the footer, redrawn on
-    /// every keystroke. Leaving it on screen makes the shell inherit a terminal whose cursor
-    /// sits in the middle of a row, and zsh — which marks a partial line with `PROMPT_SP` —
-    /// then prints a `%` right after it, so the pi prompt appears to survive as `› /%`.
-    ///
-    /// Erasing it means the cursor ends up back where the region started, on a line of its
-    /// own, which is where the shell expects to find it.
+    /// Restore the shell screen without adding session content to its scrollback.
     pub fn leave(&mut self) {
-        // Commit first: anything queued since the last draw is part of the transcript — the
-        // note naming the command that resumes this session, for one — and erasing without
-        // committing would silently throw it away. The note is written *after* the turn loop
-        // ends, which is why this cannot be left to a later draw that never comes.
-        if self.detail.take().is_some() {
-            let _ = crossterm::execute!(self.out, terminal::LeaveAlternateScreen);
+        if !self.interactive {
+            self.commit();
+        } else if self.alternate_screen {
+            let _ = crossterm::execute!(
+                self.out,
+                terminal::EndSynchronizedUpdate,
+                event::DisableMouseCapture,
+                cursor::Show,
+                terminal::LeaveAlternateScreen
+            );
+            self.alternate_screen = false;
         }
-        self.commit();
-        self.erase_live();
-        if self.interactive {
-            let _ = self.out.flush();
-        }
+        self.detail = None;
+        self.transcript_view = None;
+        self.viewport = Viewport::default();
+        let _ = self.out.flush();
     }
 
     /// Forget the transcript and wipe the screen. Used by `/new` and `/resume`, where the
@@ -355,10 +354,11 @@ impl Screen {
         self.layout = layout::LayoutCache::default();
         self.printed = 0;
         self.detail = None;
+        self.transcript_view = None;
         self.streaming_answer = None;
         self.streaming_thinking = None;
         self.thinking_active = false;
-        self.running_call = None;
+        self.running_calls.clear();
         self.running_started = None;
         self.running_log = None;
         self.working = None;
@@ -417,12 +417,12 @@ impl Screen {
         self.render();
     }
 
-    /// Show the tool call that is now running, as a single live line.
+    /// Show each tool in the running batch on a separate line.
     ///
     /// Replaced (or cleared with [`Screen::clear_running`]) when the call finishes; the
     /// finished call is committed to the transcript in its place.
-    pub fn set_running(&mut self, spans: Vec<Span>) {
-        self.running_call = Some(spans);
+    pub fn set_running(&mut self, calls: Vec<Vec<Span>>) {
+        self.running_calls = calls;
         self.running_started = Some(std::time::Instant::now());
         self.running_log = None;
         self.render();
@@ -441,7 +441,8 @@ impl Screen {
         }
         self.running_started = None;
         self.running_log = None;
-        if self.running_call.take().is_some() {
+        if !self.running_calls.is_empty() {
+            self.running_calls.clear();
             self.render();
         }
     }
@@ -564,6 +565,7 @@ mod live;
 mod menu;
 mod picker;
 mod redraw;
+mod transcript;
 
 pub use picker::Choice;
 

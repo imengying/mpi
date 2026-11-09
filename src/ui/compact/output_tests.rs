@@ -24,7 +24,7 @@ fn summaries_expand_to_the_result_and_errors_keep_the_cause_and_exit_status() {
     let block = compact::tool_block("read", &arguments, &output, ToolStatus::Success);
     assert_eq!(
         render(vec![block.clone()], false),
-        "✓ 读取 src/main.rs · 2 行"
+        "✓ 读取 src/main.rs · 2 行\n    Ctrl+O 查看\n"
     );
     let expanded = render(vec![block], true);
     assert!(expanded.contains("first") && expanded.contains("last"));
@@ -42,7 +42,10 @@ fn summaries_expand_to_the_result_and_errors_keep_the_cause_and_exit_status() {
             )],
             false,
         );
-        assert!(summary.ends_with(" · 无匹配"), "{summary}");
+        assert!(
+            summary.lines().next().unwrap().ends_with(" · 无匹配"),
+            "{summary}"
+        );
     }
 
     output.content = format!("无法访问目标目录\n{}[退出码 3]", "stack frame\n".repeat(30));
@@ -56,19 +59,21 @@ fn summaries_expand_to_the_result_and_errors_keep_the_cause_and_exit_status() {
     let preview = render(vec![block.clone()], false);
     assert!(preview.contains("无法访问目标目录"));
     assert!(preview.contains("[退出码 3]"));
-    assert!(preview.lines().count() <= 6);
+    assert!(preview.lines().count() <= 8);
     assert_eq!(render(vec![block], true).matches("stack frame").count(), 30);
 }
 
 #[test]
-fn a_collapsed_summary_keeps_the_whole_path_on_narrow_terminals() {
+fn a_narrow_summary_stays_on_one_row_and_details_keep_the_full_path() {
     let path = "src/很长的目录/another-directory/main.rs";
     let arguments = serde_json::json!({"path": path});
     let mut output = ToolOutput::text("1\tfile content\n");
     output.display = compact::arguments_display("read", &arguments);
     let block = compact::tool_block("read", &arguments, &output, ToolStatus::Success);
-    let text: String = block.render(12).iter().map(screen::Line::text).collect();
-    assert_eq!(text, format!("✓ 读取 {path} · 1 行"));
+    let rows = block.render(12);
+    assert!(rows[0].text().ends_with('…'));
+    assert!(rows.iter().all(|row| row.width() <= 12));
+    assert!(render(vec![block], true).contains(path));
 }
 
 fn requests(messages: &[Message]) -> (serde_json::Value, serde_json::Value) {

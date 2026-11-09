@@ -13,6 +13,12 @@ use mpi::ui::screen::{Action, teardown};
 use mpi::ui::{compact as ui_compact, theme::Color};
 
 fn main() {
+    let panic_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        teardown();
+        mpi::ui::screen::clear_title();
+        panic_hook(info);
+    }));
     let cli = Cli::parse();
     let result = run(cli);
     // Leave the terminal as it was found, window title included.
@@ -111,23 +117,15 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         }
     }
 
-    // Leave the user something they can act on: the exact command that brings this
-    // conversation back, not the path of the file it happens to live in. The id is the
-    // file name, so it is already the shortest thing that names the session.
-    //
-    // After `/delete` there is no session to resume, so nothing is printed — offering a
-    // command for a file that no longer exists would be worse than silence.
-    // A session that never said anything has no file, so there is no command to give: the
-    // id would name nothing, and printing one anyway would send the user to an error.
-    if !agent.session_deleted() && agent.session().is_saved() {
+    // Piped transcripts retain a resume hint. Interactive sessions restore the shell.
+    if !agent.screen.interactive() && !agent.session_deleted() && agent.session().is_saved() {
         let id = agent.session().id();
         agent.screen.push_lines(ui_compact::note_lines(
             &format!("继续此会话：pi resume {id}"),
             mpi::ui::screen::Style::new(Color::Dim),
         ));
     }
-    // Take the live region down before returning: it is the input prompt and footer, not
-    // part of the transcript, and leaving it behind hands the shell a cursor parked mid-row.
+    // Restore the terminal before returning, including when a detail view is open.
     agent.screen.leave();
     Ok(())
 }
