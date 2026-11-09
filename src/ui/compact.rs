@@ -1017,7 +1017,7 @@ mod tests {
         std::fs::write(dir.join("a.rs"), "fn a() {}\n").unwrap();
         let context = crate::tools::ToolContext {
             cwd: dir.clone(),
-            shell: "/usr/bin/zsh".into(),
+            shell: "/bin/zsh".into(),
             observed: Default::default(),
             progress: None,
         };

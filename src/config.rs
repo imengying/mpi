@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::llm::compat::{Compat, CompatPatch};
 
-pub const DEFAULT_SHELL: &str = "/usr/bin/zsh";
+pub const DEFAULT_SHELL: &str = "/bin/zsh";
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -481,7 +481,7 @@ pub fn config_path() -> PathBuf {
 /// against it, because a template that silently "works" would send requests to a host that
 /// does not exist and report that as a network failure.
 pub const TEMPLATE: &str = r#"{
-  "shell": { "path": "/usr/bin/zsh" },
+  "shell": { "path": "/bin/zsh" },
   "providers": [
     {
       "name": "provider-name",
@@ -1207,7 +1207,7 @@ mod tests {
     fn a_correct_config_passes_the_field_check() {
         // Every documented field, so the check cannot be passing by rejecting the docs.
         let raw = serde_json::json!({
-            "shell": {"path": "/usr/bin/zsh"},
+            "shell": {"path": "/bin/zsh"},
             "providers": [{
                 "name": "p",
                 "api": "responses",

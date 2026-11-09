@@ -8,7 +8,7 @@
 #
 # 校验和不用单独的 .sha256 附件：GitHub API 对每个资产自带 sha256 digest
 # （与 Release 页面展示的一致），脚本直接对它校验。只依赖 POSIX sh、
-# curl 或 wget、tar。
+# curl 或 wget、tar，以及 sha256sum 或 shasum。
 
 set -eu
 
@@ -126,38 +126,36 @@ ASSET="pi-${VERSION}-${TARGET}.tar.gz"
 URL="https://github.com/$REPO/releases/download/$TAG/$ASSET"
 
 # JSON 压成单行后：先定位精确的资产名（带前后引号，避免误配 .sha256 附件），
-# 再取其后第一个 "digest"。资产对象里 name 在 digest 之前、两者之间不会出现
-# 其他资产的 digest，所以取到的必是本资产的。解析失败只是跳过校验，不影响安装
-# （下载地址由 tag 拼出，不靠 JSON 里的 URL）。
+# 再取其后的 "digest"，并止于下一个 name，避免本资产缺少摘要时误用其他资产。
+# 摘要缺失或格式异常都停止安装。
 DIGEST=$(tr -d '\n' < "$TMP/release.json" \
   | awk -v n="\"name\": \"${ASSET}\"" '
       index($0, n) {
-        rest = substr($0, index($0, n))
-        if (match(rest, /"digest": *"sha256:[0-9a-fA-F]+/))
+        rest = substr($0, index($0, n) + length(n))
+        if (match(rest, /"name"[[:space:]]*:/))
+          rest = substr(rest, 1, RSTART - 1)
+        if (match(rest, /"digest"[[:space:]]*:[[:space:]]*"sha256:[0-9a-fA-F]+"/))
           print substr(rest, RSTART, RLENGTH)
       }' \
-  | sed 's/.*sha256://' | head -n 1)
+  | sed 's/.*sha256://; s/"$//' | tr 'A-F' 'a-f' | head -n 1)
+[ "${#DIGEST}" -eq 64 ] || die 'Release API 未提供有效的 sha256，无法校验下载'
+
+if have sha256sum; then
+  hash_file() { sha256sum "$1"; }
+elif have shasum; then
+  hash_file() { shasum -a 256 "$1"; }
+else
+  die '找不到 sha256sum / shasum，无法校验下载'
+fi
 
 # ---------------------------------------------------------------- 下载安装
 
 printf '==> 安装 pi %s（%s）\n' "$VERSION" "$TARGET"
 fetch "$URL" "$TMP/$ASSET" || die "下载失败：$URL（该 Release 可能没有 $TARGET 产物）"
 
-if [ -n "$DIGEST" ]; then
-  if have sha256sum; then
-    SUM=$(sha256sum "$TMP/$ASSET" | awk '{print $1}')
-  elif have shasum; then
-    SUM=$(shasum -a 256 "$TMP/$ASSET" | awk '{print $1}')
-  else
-    SUM=''; warn '没有 sha256sum / shasum，跳过校验'
-  fi
-  if [ -n "$SUM" ]; then
-    [ "$SUM" = "$DIGEST" ] || die "sha256 不匹配：期望 $DIGEST，实际 $SUM"
-    printf '==> sha256 校验通过\n'
-  fi
-else
-  warn 'Release API 未提供 digest，跳过校验'
-fi
+SUM=$(hash_file "$TMP/$ASSET" | awk '{print $1}')
+[ "$SUM" = "$DIGEST" ] || die "sha256 不匹配：期望 $DIGEST，实际 $SUM"
+printf '==> sha256 校验通过\n'
 
 tar -xzf "$TMP/$ASSET" -C "$TMP" --strip-components=1
 [ -f "$TMP/pi" ] || die '压缩包里没有 pi 二进制'

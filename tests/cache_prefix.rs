@@ -256,7 +256,7 @@ fn the_environment_block_is_a_message_not_the_system_prompt() {
     // The split is the mechanism that keeps the cache prefix stable, so it is worth asserting
     // that the volatile facts really do land in the conversation.
     let cwd = std::path::Path::new("/tmp/some-project");
-    let block = mpi::agent::r#loop::environment_block(cwd, "session-1", "/usr/bin/zsh");
+    let block = mpi::agent::r#loop::environment_block(cwd, "session-1", "/bin/zsh");
     let messages = vec![
         Message::System {
             content: SYSTEM.into(),

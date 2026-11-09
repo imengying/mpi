@@ -38,11 +38,23 @@ enum Engine {
     GnuGrep(std::path::PathBuf),
 }
 
+const RG_PATHS: &[&str] = &[
+    "/usr/bin/rg",
+    "/usr/local/bin/rg",
+    "/opt/homebrew/bin/rg",
+    "/bin/rg",
+];
+// BSD grep uses different output delimiters. Homebrew installs GNU grep as ggrep.
+#[cfg(target_os = "macos")]
+const GREP_PATHS: &[&str] = &["/opt/homebrew/bin/ggrep", "/usr/local/bin/ggrep"];
+#[cfg(not(target_os = "macos"))]
+const GREP_PATHS: &[&str] = &["/usr/bin/grep", "/bin/grep"];
+
 fn engine() -> Option<Engine> {
-    if let Some(path) = super::first_present(&["/usr/bin/rg", "/usr/local/bin/rg", "/bin/rg"]) {
+    if let Some(path) = super::first_present(RG_PATHS) {
         return Some(Engine::Ripgrep(path));
     }
-    super::first_present(&["/usr/bin/grep", "/bin/grep"]).map(Engine::GnuGrep)
+    super::first_present(GREP_PATHS).map(Engine::GnuGrep)
 }
 
 pub async fn execute(arguments: &serde_json::Value, cwd: &Path) -> Result<ToolOutput, String> {
@@ -70,7 +82,7 @@ pub(super) async fn capture(
     capture_with_engine(
         arguments,
         cwd,
-        engine().ok_or("系统中既没有 rg 也没有 grep，无法搜索")?,
+        engine().ok_or("找不到 rg 或 GNU grep，无法搜索")?,
     )
     .await
 }
@@ -256,9 +268,8 @@ mod tests {
         // engines are the same tool only where their behaviour overlaps. A test on whichever
         // one happens to be installed would leave the other path unverified.
         for engine in [
-            crate::tools::first_present(&["/usr/bin/rg", "/usr/local/bin/rg", "/bin/rg"])
-                .map(Engine::Ripgrep),
-            crate::tools::first_present(&["/usr/bin/grep", "/bin/grep"]).map(Engine::GnuGrep),
+            crate::tools::first_present(RG_PATHS).map(Engine::Ripgrep),
+            crate::tools::first_present(GREP_PATHS).map(Engine::GnuGrep),
         ]
         .into_iter()
         .flatten()
@@ -290,7 +301,7 @@ mod tests {
         // The two engines print the same shape, so content alone cannot tell them apart.
         // `rg` honours `.gitignore` and GNU `grep` does not, which is a difference a test
         // can see — and the reason to prefer rg in a checkout in the first place.
-        if !super::super::engine_present("/usr/bin/rg") {
+        if !super::super::engine_present(RG_PATHS) {
             return;
         }
         let dir = std::env::temp_dir().join(format!("pi-grep-engine-{}", uuid::Uuid::now_v7()));
@@ -317,11 +328,13 @@ mod tests {
 
     #[test]
     fn gnu_fallback_enforces_the_same_limits_and_secret_filters() {
+        if !super::super::engine_present(GREP_PATHS) {
+            return;
+        }
         let dir = fixture();
         std::fs::write(dir.join(".env"), "beta\n").unwrap();
         let input = serde_json::json!({"pattern":"beta", "context":1, "max_results":1});
-        let engine =
-            Engine::GnuGrep(super::super::first_present(&["/usr/bin/grep", "/bin/grep"]).unwrap());
+        let engine = Engine::GnuGrep(super::super::first_present(GREP_PATHS).unwrap());
         let (output, failed) = block(capture_with_engine(&input, &dir, engine)).unwrap();
         let text = output.finish(true).unwrap();
         assert!(!failed, "{text}");

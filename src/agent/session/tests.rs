@@ -333,6 +333,28 @@ fn context_pressure_includes_new_input_and_ignores_summary_usage_after_reopen() 
     let cost = input.estimate_tokens();
     session.push_message(input, None, None).unwrap();
     assert_eq!(session.measured_context_tokens(), Some(170 + cost));
+    let mut image_result = Message::Tool {
+        tool_call_id: "image".into(),
+        name: "read_image".into(),
+        content: "screenshot".into(),
+        status: crate::llm::ToolStatus::Success,
+        images: Vec::new(),
+    };
+    let text_cost = image_result.estimate_tokens();
+    if let Message::Tool { images, .. } = &mut image_result {
+        *images = vec![
+            crate::llm::Block::Image {
+                media_type: "image/png".into(),
+                data: "pixels".into(),
+            };
+            10
+        ];
+    }
+    session.push_message(image_result, None, None).unwrap();
+    assert_eq!(
+        session.measured_context_tokens(),
+        Some(170 + cost + text_cost + 12_000)
+    );
     push_test_compaction(
         &mut session,
         "manual",
@@ -359,7 +381,7 @@ fn only_the_environment_block_counts_as_having_said_nothing() {
     // session starts with the block and nothing else, and the first real message — the
     // user's or a resumed history's — is what makes the field worth printing.
     let (mut session, dir) = temp_session("only-environment");
-    let block = crate::agent::r#loop::environment_block(&dir, "sid", "/usr/bin/zsh");
+    let block = crate::agent::r#loop::environment_block(&dir, "sid", "/bin/zsh");
     assert!(
         session.context_holds_only_environment(),
         "a session with no records at all has nothing to measure"
@@ -1163,7 +1185,7 @@ fn resuming_elsewhere_moves_the_recorded_directory() {
     assert_eq!(session.header().cwd, dir.to_string_lossy());
     assert_eq!(session.current_cwd().as_deref(), Some(elsewhere.as_path()));
 
-    let block = crate::agent::r#loop::environment_block(&elsewhere, "sid", "/usr/bin/zsh");
+    let block = crate::agent::r#loop::environment_block(&elsewhere, "sid", "/bin/zsh");
     session
         .push_message(Message::user_text(block), None, None)
         .unwrap();

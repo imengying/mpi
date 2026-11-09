@@ -77,7 +77,7 @@ mod tests {
         std::fs::create_dir(&dir).unwrap();
         let task_dir = dir.clone();
         let task = tokio::spawn(async move {
-            let mut command = tokio::process::Command::new("/usr/bin/zsh");
+            let mut command = tokio::process::Command::new("/bin/zsh");
             command
                 .args([
                     "-c",

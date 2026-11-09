@@ -100,6 +100,9 @@ impl Screen {
         crate::ui::terminal::ensure_raw_mode()?;
         self.begin_line();
         loop {
+            if crate::ui::terminal::exit_signal().is_some() {
+                return Ok(Action::Interrupt);
+            }
             self.flush_pending_frame();
             if !event::poll(super::redraw::FRAME_INTERVAL)? {
                 continue;

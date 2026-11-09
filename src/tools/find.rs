@@ -32,19 +32,22 @@ enum Engine {
     GnuFind(std::path::PathBuf),
 }
 
+const FD_PATHS: &[&str] = &[
+    "/usr/bin/fd",
+    "/usr/local/bin/fd",
+    "/opt/homebrew/bin/fd",
+    "/bin/fd",
+    "/usr/bin/fdfind",
+    "/usr/local/bin/fdfind",
+    "/bin/fdfind",
+];
+
 fn engine() -> Option<Engine> {
     // `fdfind` is the name Debian and Ubuntu install: they ship the same binary under a
     // different one because `fd` was taken by another package long before. Looking for only
     // `/usr/bin/fd` meant an `apt install fd-find` was ignored and every search silently
     // fell back to `find`.
-    if let Some(path) = super::first_present(&[
-        "/usr/bin/fd",
-        "/usr/local/bin/fd",
-        "/bin/fd",
-        "/usr/bin/fdfind",
-        "/usr/local/bin/fdfind",
-        "/bin/fdfind",
-    ]) {
+    if let Some(path) = super::first_present(FD_PATHS) {
         return Some(Engine::Fd(path));
     }
     super::first_present(&["/usr/bin/find", "/bin/find"]).map(Engine::GnuFind)
@@ -204,26 +207,13 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn debians_fdfind_is_recognised_as_fd() {
+    fn fd_is_preferred_including_debians_fdfind() {
         // `apt install fd-find` puts the binary at `/usr/bin/fdfind`, because `fd` was
         // already taken. Looking only for `/usr/bin/fd` meant the install was invisible and
         // every search quietly fell back to `find` — the tool's own description says it
         // prefers fd, so the fallback was silent and wrong.
-        if super::super::engine_present("/usr/bin/fdfind") {
-            match engine() {
-                Some(Engine::Fd(path)) => assert!(
-                    path.ends_with("fdfind"),
-                    "fdfind is installed, so it should win over fd: {path:?}"
-                ),
-                other => panic!(
-                    "fdfind is installed but the engine is {}",
-                    match other {
-                        Some(Engine::GnuFind(_)) => "GNU find",
-                        Some(Engine::Fd(_)) => "fd",
-                        None => "nothing",
-                    }
-                ),
-            }
+        if super::super::engine_present(FD_PATHS) {
+            assert!(matches!(engine(), Some(Engine::Fd(_))));
         }
         // Either way an engine is found: fd, fdfind or find.
         assert!(engine().is_some());
@@ -233,7 +223,7 @@ mod tests {
     fn the_fd_flags_work_on_both_spellings() {
         // The two names are the same program, so the arguments must not be chosen by name.
         // `--max-results` exists on both; this asserts the fd arm is what runs for fdfind.
-        for name in ["/usr/bin/fd", "/usr/bin/fdfind"] {
+        for name in FD_PATHS {
             if !Path::new(name).is_file() {
                 continue;
             }

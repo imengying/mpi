@@ -130,7 +130,7 @@ async fn reading_secrets_asks_but_reading_source_does_not() {
     let gate = PermissionGate::new(false, Dialect::Zsh);
     let context = mpi::tools::ToolContext {
         cwd: dir.clone(),
-        shell: "/usr/bin/zsh".into(),
+        shell: "/bin/zsh".into(),
         observed: Default::default(),
         progress: None,
     };
@@ -257,7 +257,7 @@ async fn a_single_file_search_carries_no_exclusions_but_still_cannot_leak() {
     let gate = PermissionGate::new(false, Dialect::Zsh);
     let context = mpi::tools::ToolContext {
         cwd: dir.clone(),
-        shell: "/usr/bin/zsh".into(),
+        shell: "/bin/zsh".into(),
         observed: Default::default(),
         progress: None,
     };
@@ -302,7 +302,7 @@ async fn broad_and_explicit_glob_searches_cannot_read_secrets() {
     let gate = PermissionGate::new(false, Dialect::Zsh);
     let context = mpi::tools::ToolContext {
         cwd: dir.clone(),
-        shell: "/usr/bin/zsh".into(),
+        shell: "/bin/zsh".into(),
         observed: Default::default(),
         progress: None,
     };

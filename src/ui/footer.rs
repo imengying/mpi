@@ -317,20 +317,26 @@ fn stats_line(state: &FooterState, theme: &Theme, width: usize) -> Line {
 /// Read straight from `.git/HEAD` rather than shelling out to git: this runs on every
 /// render, and `git` is not always installed.
 pub fn git_branch(cwd: &Path) -> Option<String> {
-    let mut dir = Some(cwd);
-    while let Some(current) = dir {
-        let head = current.join(".git/HEAD");
-        if let Ok(contents) = std::fs::read_to_string(&head) {
-            let contents = contents.trim();
-            if let Some(reference) = contents.strip_prefix("ref: ") {
-                let name = reference.rsplit('/').next().unwrap_or(reference);
-                return Some(name.to_string());
-            }
-            if !contents.is_empty() {
-                return Some(util::truncate(contents, 12, "…"));
-            }
+    for current in cwd.ancestors() {
+        let git = current.join(".git");
+        if !git.exists() {
+            continue;
         }
-        dir = current.parent();
+        // Worktrees and submodules point to their own git directory. Relative paths
+        // are relative to this .git file, not to cwd or the parent repository.
+        let git = if git.is_file() {
+            let pointer = std::fs::read_to_string(&git).ok()?;
+            current.join(pointer.trim().strip_prefix("gitdir: ")?)
+        } else {
+            git
+        };
+        // Once a repository is found, an unreadable HEAD must not expose a parent's branch.
+        let contents = std::fs::read_to_string(git.join("HEAD")).ok()?;
+        let contents = contents.trim();
+        if let Some(reference) = contents.strip_prefix("ref: ") {
+            return reference.strip_prefix("refs/heads/").map(str::to_string);
+        }
+        return (!contents.is_empty()).then(|| util::truncate(contents, 12, "…"));
     }
     None
 }
@@ -661,11 +667,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         std::fs::write(dir.join(".git/HEAD"), "ref: refs/heads/feature/x\n").unwrap();
-        assert_eq!(git_branch(&dir).as_deref(), Some("x"));
+        assert_eq!(git_branch(&dir).as_deref(), Some("feature/x"));
         // A subdirectory still finds the repository root.
         let nested = dir.join("src/deep");
         std::fs::create_dir_all(&nested).unwrap();
-        assert_eq!(git_branch(&nested).as_deref(), Some("x"));
+        assert_eq!(git_branch(&nested).as_deref(), Some("feature/x"));
+        // Both absolute worktree pointers and relative submodule pointers stay in
+        // their own repository, even when the directory is inside another checkout.
+        for (name, pointer) in [
+            ("worktree", dir.join(".git/worktrees/wt")),
+            ("submodule", std::path::PathBuf::from("../.git/modules/sub")),
+        ] {
+            let checkout = dir.join(name);
+            let gitdir = checkout.join(&pointer);
+            std::fs::create_dir_all(checkout.join("src")).unwrap();
+            std::fs::create_dir_all(&gitdir).unwrap();
+            std::fs::write(
+                checkout.join(".git"),
+                format!("gitdir: {}\n", pointer.display()),
+            )
+            .unwrap();
+            std::fs::write(gitdir.join("HEAD"), "ref: refs/heads/own/branch\n").unwrap();
+            assert_eq!(
+                git_branch(&checkout.join("src")).as_deref(),
+                Some("own/branch")
+            );
+            std::fs::remove_file(gitdir.join("HEAD")).unwrap();
+            assert_eq!(git_branch(&checkout), None);
+        }
         // A detached HEAD shows the short hash.
         std::fs::write(dir.join(".git/HEAD"), "0123456789abcdef0123\n").unwrap();
         assert_eq!(git_branch(&dir).as_deref(), Some("0123456789a…"));

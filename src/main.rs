@@ -1,9 +1,9 @@
 //! pi: a minimal terminal coding agent.
 //!
 //! The binary is a thin shell around `mpi::agent::loop::Agent`: read config, open (or resume) a
-//! session, then alternate between reading a line and running a turn. Slash commands are
-//! handled here so the loop itself stays about talking to the model.
+//! session, then alternate between reading input and driving the agent on one runtime.
 
+use anyhow::Context;
 use clap::Parser;
 
 use mpi::agent::r#loop::Agent;
@@ -24,6 +24,9 @@ fn main() {
     // Leave the terminal as it was found, window title included.
     teardown();
     mpi::ui::screen::clear_title();
+    if let Some(signal) = mpi::ui::terminal::exit_signal() {
+        std::process::exit(128 + signal);
+    }
     if let Err(err) = result {
         eprintln!("pi: {err:#}");
         std::process::exit(1);
@@ -31,11 +34,35 @@ fn main() {
 }
 
 fn run(cli: Cli) -> anyhow::Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("构建 Tokio 运行时失败")?;
+    runtime.block_on(async {
+        #[cfg(unix)]
+        if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+            // The watcher also wakes synchronous input loops. Dropping the session
+            // future cancels its tools before the runtime and terminal are torn down.
+            let mut shutdown =
+                mpi::ui::terminal::watch_exit_signals().context("监听退出信号失败")?;
+            let result = tokio::select! {
+                biased;
+                _ = &mut shutdown => Ok(()),
+                result = run_session(cli) => result,
+            };
+            shutdown.abort();
+            return result;
+        }
+        run_session(cli).await
+    })
+}
+
+async fn run_session(cli: Cli) -> anyhow::Result<()> {
     // Update does not touch the config or the session store, so it runs before the
     // config load — `pi update` has to work on a machine where the config is missing
     // or broken too.
     if cli.command == Some(Command::Update) {
-        mpi::update::run()?;
+        mpi::update::run().await?;
         return Ok(());
     }
 
@@ -83,10 +110,10 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     continue;
                 }
                 if line.starts_with('/') {
-                    if !futures_block(agent.command(line))? {
+                    if !agent.command(line).await? {
                         break;
                     }
-                } else if !run_turn_and_drain(&mut agent, line, Vec::new())? {
+                } else if !run_turn_and_drain(&mut agent, line, Vec::new()).await? {
                     break;
                 }
             }
@@ -96,10 +123,10 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 // something pi defines, so the images are dropped rather than silently
                 // sent as a turn.
                 if line.starts_with('/') {
-                    if !futures_block(agent.command(&line))? {
+                    if !agent.command(&line).await? {
                         break;
                     }
-                } else if !run_turn_and_drain(&mut agent, &line, images)? {
+                } else if !run_turn_and_drain(&mut agent, &line, images).await? {
                     break;
                 }
             }
@@ -131,7 +158,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
 }
 
 /// Run a turn and drain ordinary messages; slash commands are handled immediately.
-fn run_turn_and_drain(
+async fn run_turn_and_drain(
     agent: &mut Agent,
     line: &str,
     images: Vec<mpi::image_input::PastedImage>,
@@ -139,7 +166,7 @@ fn run_turn_and_drain(
     use mpi::ui::screen::Queued;
     let mut next = Some(Queued::new(line.to_string(), images));
     while let Some(item) = next {
-        if let Err(err) = futures_block(agent.run_turn_with_images(&item.text, item.images)) {
+        if let Err(err) = agent.run_turn_with_images(&item.text, item.images).await {
             // A failed turn is reported and the session carries on: the conversation
             // is still perfectly usable, and ending the program over one bad request
             // would throw it away. Whatever was queued behind it is still acted on,
@@ -161,13 +188,4 @@ fn most_recent_session(cwd: &std::path::Path) -> Option<std::path::PathBuf> {
     mpi::agent::session::list(cwd)
         .first()
         .map(|summary| summary.path.clone())
-}
-
-/// Drive an async agent call from the synchronous turn loop.
-fn futures_block<F: std::future::Future>(future: F) -> F::Output {
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("a Tokio runtime")
-        .block_on(future)
 }

@@ -15,16 +15,7 @@ use crate::cli;
 
 const REPO: &str = "imengying/mpi";
 
-/// Entry point from `main`: drives the async flow on a throwaway runtime.
-pub fn run() -> Result<()> {
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .context("构建 Tokio 运行时失败")?
-        .block_on(update())
-}
-
-async fn update() -> Result<()> {
+pub async fn run() -> Result<()> {
     let triple = target_triple()
         .context("当前平台没有对应的 Release 产物（只有 Linux / macOS 的 x86_64 / aarch64）")?;
     let current = cli::version();

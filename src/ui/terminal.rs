@@ -6,6 +6,7 @@
 
 use std::io::{IsTerminal, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicI32, Ordering};
 
 use crossterm::{cursor, event, terminal};
 
@@ -13,6 +14,32 @@ use crate::util;
 
 /// The name the window title leads with, as pi uses `π`.
 pub const APP_TITLE: &str = "π";
+
+static EXIT_SIGNAL: AtomicI32 = AtomicI32::new(0);
+
+/// Shared with synchronous terminal readers so a signal can end an idle prompt or picker.
+pub fn exit_signal() -> Option<i32> {
+    let signal = EXIT_SIGNAL.load(Ordering::Relaxed);
+    (signal != 0).then_some(signal)
+}
+
+/// Receive signals on a runtime worker; cleanup stays on the normal application path.
+#[cfg(unix)]
+pub fn watch_exit_signals() -> std::io::Result<tokio::task::JoinHandle<()>> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    let mut terminate = signal(SignalKind::terminate())?;
+    let mut hangup = signal(SignalKind::hangup())?;
+    Ok(tokio::spawn(async move {
+        let kind = tokio::select! {
+            _ = interrupt.recv() => SignalKind::interrupt(),
+            _ = terminate.recv() => SignalKind::terminate(),
+            _ = hangup.recv() => SignalKind::hangup(),
+        };
+        EXIT_SIGNAL.store(kind.as_raw_value(), Ordering::Relaxed);
+    }))
+}
 
 /// Raw mode belongs to the interactive session and ends at teardown.
 /// Nested pickers and approval panels reuse it without changing its lifetime.

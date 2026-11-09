@@ -30,12 +30,14 @@ curl -fsSL https://raw.githubusercontent.com/imengying/mpi/main/install.sh | sh 
 装好后的升级不用重新跑脚本，`pi update` 就地自更新：下载最新 Release、
 按 GitHub 提供的 sha256 校验、原子替换自身。
 
-脚本只依赖 POSIX sh、curl（或 wget）、tar。产物覆盖 Linux / macOS 的
+脚本只依赖 POSIX sh、curl（或 wget）、tar，以及 sha256sum（或 shasum）。产物覆盖 Linux / macOS 的
 x86_64 / aarch64；Linux 产物要求 glibc ≥ 2.39（ubuntu-24.04 构建），脚本会先检查
 再下载，musl（Alpine 等）暂无产物。需要代理时设 `https_proxy` 环境变量即可，
 curl / wget 会自己认。
 
-pi 用 zsh 执行命令（默认 `/usr/bin/zsh`），系统里得有它。
+pi 用 zsh 执行命令（默认 `/bin/zsh`），系统里得有它。
+macOS 自带 zsh；推荐用 `brew install ripgrep fd eza grep` 安装搜索、目录工具，
+其中 GNU grep 是 ripgrep 不可用时的备用引擎。
 
 ### 手动安装
 
@@ -63,7 +65,7 @@ install -m755 target/release/pi ~/.local/bin/pi
 
 ```json
 {
-  "shell": { "path": "/usr/bin/zsh" },
+  "shell": { "path": "/bin/zsh" },
   "providers": [
     {
       "name": "name",
@@ -234,6 +236,8 @@ Linux 二进制依赖 runner 自带的 glibc（当前 2.39），构建摘要里�
 
 构建用 `--locked`，即按 `Cargo.lock` 里锁定的版本编译；依赖更新走
 `cargo update` 后提交 lock 文件。
+PR 和 main 分支推送会在 Linux、macOS 上检查格式、Clippy、Rust 测试与终端退出；
+发布前四个平台都运行测试。
 
 ## 命令
 

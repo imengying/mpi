@@ -803,9 +803,9 @@ mod tests {
     #[test]
     fn the_environment_block_is_separate_from_the_system_prompt() {
         let cwd = Path::new("/tmp/project");
-        let block = environment_block(cwd, "abc123", "/usr/bin/zsh");
+        let block = environment_block(cwd, "abc123", "/bin/zsh");
         assert!(block.contains("/tmp/project"));
-        assert!(block.contains("/usr/bin/zsh"));
+        assert!(block.contains("/bin/zsh"));
         assert!(block.contains("abc123"));
         assert!(block.starts_with("<environment>"));
     }
@@ -909,7 +909,7 @@ mod tests {
     #[test]
     fn the_dialect_comes_from_the_configured_shell() {
         let mut config = Config::default();
-        config.shell.path = "/usr/bin/zsh".into();
+        config.shell.path = "/bin/zsh".into();
         assert_eq!(
             policy::configured_dialect(&config.shell.path),
             policy::Dialect::Zsh

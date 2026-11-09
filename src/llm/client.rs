@@ -29,8 +29,8 @@ pub struct Client {
     http: reqwest::Client,
 }
 
-#[cfg(test)]
-const RETRY_LIMIT: u32 = 5;
+const DEFAULT_REQUEST_RETRIES: u32 = 5;
+const DEFAULT_STREAM_RETRIES: u32 = 2;
 
 /// The first wait, doubling per attempt: 0.5s, 1s, 2s, 4s, 8s. About 15s of patience.
 ///
@@ -172,7 +172,7 @@ impl Client {
 
     /// Stream one assistant turn, invoking `on_delta` for every token.
     ///
-    /// A failure that produced **nothing** is retried (see `RETRY_LIMIT`); one that
+    /// A failure that produced **nothing** is retried within the provider's budget; one that
     /// already delivered text is not. Tokens cannot be un-shown, so a second request would
     /// print the answer twice and the caller would have to choose which copy to keep.
     pub async fn stream(
@@ -208,13 +208,17 @@ impl Client {
                             error,
                             delay,
                             &mut request_attempts,
-                            provider.request_max_retries.unwrap_or(5),
+                            provider
+                                .request_max_retries
+                                .unwrap_or(DEFAULT_REQUEST_RETRIES),
                         ),
                         Retry::StreamAfter(delay) => (
                             error,
                             delay,
                             &mut stream_attempts,
-                            provider.stream_max_retries.unwrap_or(2),
+                            provider
+                                .stream_max_retries
+                                .unwrap_or(DEFAULT_STREAM_RETRIES),
                         ),
                     }
                 }
@@ -410,7 +414,10 @@ impl Client {
 
     /// Buffered auxiliary completion with its own routing identity and tools disabled.
     pub async fn complete(&self, req: &Request<'_>) -> Result<super::Completion, LlmError> {
-        let limit = req.provider.request_max_retries.unwrap_or(5);
+        let limit = req
+            .provider
+            .request_max_retries
+            .unwrap_or(DEFAULT_REQUEST_RETRIES);
         for attempt in 0..=limit {
             match self.complete_once(req).await {
                 Err(error)
@@ -1280,7 +1287,7 @@ mod tests {
             "{error:?}"
         );
         let seen = server.join().unwrap();
-        assert_eq!(seen.len(), RETRY_LIMIT as usize + 1);
+        assert_eq!(seen.len(), DEFAULT_REQUEST_RETRIES as usize + 1);
     }
 
     #[tokio::test]

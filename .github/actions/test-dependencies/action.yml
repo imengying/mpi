@@ -1,0 +1,19 @@
+name: Test dependencies
+description: Install the shells and search engines exercised by the tests.
+runs:
+  using: composite
+  steps:
+    - if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        sudo apt-get update -q
+        sudo apt-get install -y --no-install-recommends zsh ripgrep fd-find eza
+    - if: runner.os == 'macOS'
+      shell: bash
+      run: brew install ripgrep fd eza grep
+    - shell: bash
+      run: |
+        test -x /bin/zsh
+        command -v rg
+        command -v fd || command -v fdfind
+        command -v eza

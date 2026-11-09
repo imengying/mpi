@@ -107,7 +107,15 @@ impl Screen {
         }
         self.open_picker(title, hint, choices.to_vec(), initial);
         let selected = loop {
-            self.flush();
+            if crate::ui::terminal::exit_signal().is_some() {
+                break None;
+            }
+            self.flush_pending_frame();
+            match event::poll(super::redraw::FRAME_INTERVAL) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(_) => break None,
+            }
             let Ok(event) = event::read() else { break None };
             if let Some(Action::Selection(selected)) = self.absorb_event(event) {
                 break selected;

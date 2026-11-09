@@ -1,6 +1,6 @@
 //! `bash`: run a command through zsh.
 //!
-//! The shell is fixed to the configured path (default `/usr/bin/zsh`) and is invoked as
+//! The shell is fixed to the configured path (default `/bin/zsh`) and is invoked as
 //! `zsh -o no_nomatch -o noequals -o pipefail -c '<command>'`. The command string handed here is the
 //! one the authorization gate already vetted — for auto-approved calls it is the rewritten
 //! form with quoted absolute paths, so a PATH change cannot redirect it.
@@ -168,7 +168,7 @@ mod tests {
             execute_with_shell(
                 "sh -c 'printf ready > ready; sleep 0.5; printf survived > marker' & wait",
                 &task_dir,
-                "/usr/bin/zsh",
+                "/bin/zsh",
             )
             .await
         });
@@ -189,7 +189,7 @@ mod tests {
         execute_with_shell(
             "sh -c 'sleep 0.1; printf complete > normal' &",
             &dir,
-            "/usr/bin/zsh",
+            "/bin/zsh",
         )
         .await
         .unwrap();
@@ -211,7 +211,7 @@ mod tests {
                 execute_with_shell(
                     "printf '%*s' 262144 '' >&2; printf '\\nlast-output\\n'",
                     &std::env::temp_dir(),
-                    "/usr/bin/zsh",
+                    "/bin/zsh",
                 ),
             )
             .await
@@ -236,7 +236,7 @@ mod tests {
         let out = block(execute_with_shell(
             "printf '\\377ok\\n'",
             &std::env::temp_dir(),
-            "/usr/bin/zsh",
+            "/bin/zsh",
         ))
         .unwrap();
         assert!(out.content.contains("ok"));
@@ -245,19 +245,14 @@ mod tests {
     #[test]
     fn runs_through_zsh_and_reports_the_exit_code() {
         let cwd = std::env::temp_dir();
-        let out = block(execute_with_shell("echo hi", &cwd, "/usr/bin/zsh")).unwrap();
+        let out = block(execute_with_shell("echo hi", &cwd, "/bin/zsh")).unwrap();
         assert!(out.content.contains("hi"));
         assert!(!out.is_error);
 
-        let failed = block(execute_with_shell(
-            "echo oops; exit 3",
-            &cwd,
-            "/usr/bin/zsh",
-        ))
-        .unwrap();
+        let failed = block(execute_with_shell("echo oops; exit 3", &cwd, "/bin/zsh")).unwrap();
         assert!(failed.is_error);
         assert!(failed.content.contains("[退出码 3]"));
-        for shell in ["/usr/bin/zsh", "/bin/bash"] {
+        for shell in ["/bin/zsh", "/bin/bash"] {
             for (command, code) in [
                 ("sh -c 'echo build-failed; exit 7' | tail -n 1", 7),
                 ("yes | head -n 1", 141),
@@ -278,7 +273,7 @@ mod tests {
     fn zsh_specific_syntax_works() {
         let cwd = std::env::temp_dir();
         // `$^array` style expansion only exists in zsh; this proves the shell really is zsh.
-        let out = block(execute_with_shell("echo ${(U)foo}", &cwd, "/usr/bin/zsh")).unwrap();
+        let out = block(execute_with_shell("echo ${(U)foo}", &cwd, "/bin/zsh")).unwrap();
         assert!(!out.content.contains("bad substitution"), "{}", out.content);
     }
 
@@ -293,7 +288,7 @@ mod tests {
         let out = block(execute_with_shell(
             "grep -rn needle-in-glob . --include=*.rs",
             &dir,
-            "/usr/bin/zsh",
+            "/bin/zsh",
         ))
         .unwrap();
         assert!(!out.is_error, "{}", out.content);
@@ -304,7 +299,7 @@ mod tests {
         let literal = block(execute_with_shell(
             "printf '%s' *.nomatch",
             &dir,
-            "/usr/bin/zsh",
+            "/bin/zsh",
         ))
         .unwrap();
         assert!(literal.content.contains("*.nomatch"), "{}", literal.content);
@@ -316,7 +311,7 @@ mod tests {
         // The other recorded failure: `echo ===` as a separator. zsh expands `=cmd` to the
         // path of cmd, so `===` became a lookup for a program named `=` and the line failed.
         let cwd = std::env::temp_dir();
-        let out = block(execute_with_shell("echo ===", &cwd, "/usr/bin/zsh")).unwrap();
+        let out = block(execute_with_shell("echo ===", &cwd, "/bin/zsh")).unwrap();
         assert!(!out.is_error, "{}", out.content);
         assert!(out.content.contains("==="), "{}", out.content);
 
@@ -326,7 +321,7 @@ mod tests {
             ("[[ abc =~ ^a ]] && echo regex", "regex"),
             ("FOO=bar; echo \"set:$FOO\"", "set:bar"),
         ] {
-            let out = block(execute_with_shell(command, &cwd, "/usr/bin/zsh")).unwrap();
+            let out = block(execute_with_shell(command, &cwd, "/bin/zsh")).unwrap();
             assert!(
                 !out.is_error && out.content.contains(marker),
                 "{command}: {}",
@@ -339,7 +334,7 @@ mod tests {
     fn a_non_zsh_shell_still_runs_the_command() {
         // The options are skipped for other shells, and the command must still work there.
         let cwd = std::env::temp_dir();
-        for shell in ["/bin/sh", "/usr/bin/bash"] {
+        for shell in ["/bin/sh", "/bin/bash"] {
             let out = block(execute_with_shell("echo plain", &cwd, shell)).unwrap();
             assert!(!out.is_error, "{shell}: {}", out.content);
             assert!(out.content.contains("plain"), "{shell}: {}", out.content);
@@ -352,7 +347,7 @@ mod tests {
         let out = block(execute_with_shell(
             "printf '\\033[31mred\\033[0m\\n' 1>&2",
             &cwd,
-            "/usr/bin/zsh",
+            "/bin/zsh",
         ))
         .unwrap();
         assert!(out.content.contains("red"));

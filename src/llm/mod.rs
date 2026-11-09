@@ -294,31 +294,34 @@ impl Message {
         const IMAGE_TOKENS: u64 = 1_200;
         let mut tokens = 0u64;
         let mut images = 0u64;
-        match self {
-            Message::System { content } => tokens += util::estimate_tokens(content),
-            Message::Tool { .. } => tokens += util::estimate_tokens(&self.text()),
-            Message::User { content } | Message::Assistant { content, .. } => {
-                for block in content {
-                    match block {
-                        Block::Text { text } => tokens += util::estimate_tokens(text),
-                        Block::Thinking { thinking, .. } => {
-                            tokens += util::estimate_tokens(thinking)
-                        }
-                        Block::ToolCall {
-                            name, arguments, ..
-                        } => {
-                            tokens += util::estimate_tokens(name)
-                                + util::estimate_tokens(&arguments.to_string())
-                        }
-                        Block::Hosted { payload, .. } => {
-                            tokens += util::estimate_tokens(&payload.to_string())
-                        }
-                        Block::Citation { url, title } => {
-                            tokens += util::estimate_tokens(url) + util::estimate_tokens(title)
-                        }
-                        Block::Image { .. } => images += 1,
-                    }
+        let blocks = match self {
+            Message::System { content } => {
+                tokens += util::estimate_tokens(content);
+                &[][..]
+            }
+            Message::Tool { images, .. } => {
+                tokens += util::estimate_tokens(&self.text());
+                images.as_slice()
+            }
+            Message::User { content } | Message::Assistant { content, .. } => content.as_slice(),
+        };
+        for block in blocks {
+            match block {
+                Block::Text { text } => tokens += util::estimate_tokens(text),
+                Block::Thinking { thinking, .. } => tokens += util::estimate_tokens(thinking),
+                Block::ToolCall {
+                    name, arguments, ..
+                } => {
+                    tokens +=
+                        util::estimate_tokens(name) + util::estimate_tokens(&arguments.to_string())
                 }
+                Block::Hosted { payload, .. } => {
+                    tokens += util::estimate_tokens(&payload.to_string())
+                }
+                Block::Citation { url, title } => {
+                    tokens += util::estimate_tokens(url) + util::estimate_tokens(title)
+                }
+                Block::Image { .. } => images += 1,
             }
         }
         tokens + images * IMAGE_TOKENS + 4

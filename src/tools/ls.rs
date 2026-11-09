@@ -19,15 +19,15 @@ pub fn spec() -> ToolSpec {
     }
 }
 
+const EZA_PATHS: &[&str] = &[
+    "/usr/bin/eza",
+    "/usr/local/bin/eza",
+    "/opt/homebrew/bin/eza",
+    "/bin/eza",
+];
+
 fn executable() -> std::path::PathBuf {
-    for candidate in ["/usr/bin/eza", "/usr/local/bin/eza", "/bin/eza"] {
-        let path = Path::new(candidate);
-        if path.is_file() {
-            return path.to_path_buf();
-        }
-    }
-    // `ls` is always present, and the fallback path is fixed rather than looked up.
-    Path::new("/usr/bin/ls").to_path_buf()
+    super::first_present(EZA_PATHS).unwrap_or_else(|| Path::new("/bin/ls").to_path_buf())
 }
 
 pub async fn execute(arguments: &serde_json::Value, cwd: &Path) -> Result<ToolOutput, String> {
@@ -54,11 +54,13 @@ pub async fn execute(arguments: &serde_json::Value, cwd: &Path) -> Result<ToolOu
         }
         command.arg("--").arg(&target_path);
     } else {
-        command.arg("-la").arg("--color=never");
-        if !all {
-            // `-la` already implies `-a`; drop back to the requested view.
-            command = tokio::process::Command::new(&binary);
-            command.arg("-l").arg("--color=never");
+        // GNU and BSD ls both default to plain output; BSD also accepts CLICOLOR=0.
+        command
+            .arg("-l")
+            .env("CLICOLOR", "0")
+            .env_remove("CLICOLOR_FORCE");
+        if all {
+            command.arg("-a");
         }
         command.arg("--").arg(&target_path);
     }
@@ -97,7 +99,7 @@ mod tests {
         // which binary the tool reached. Without this the preference in the description
         // ("存在 eza 时优先使用 eza") would be unverified: the fallback output looks close
         // enough that a silent downgrade would go unnoticed.
-        if !super::super::engine_present("/usr/bin/eza") {
+        if !super::super::engine_present(EZA_PATHS) {
             return;
         }
         let dir = std::env::temp_dir().join(format!("pi-ls-eza-{}", uuid::Uuid::now_v7()));
