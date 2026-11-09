@@ -18,7 +18,7 @@ impl Screen {
             request.cwd.display(),
             request.scope.label()
         );
-        if request.scope == crate::tools::sandbox::Scope::Workspace {
+        if request.scope == crate::auth::guard::Scope::Workspace {
             body.push_str(&format!("\n可写范围：{}", request.workspace.display()));
         }
         let (sender, mut receiver) = tokio::sync::oneshot::channel();

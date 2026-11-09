@@ -1,10 +1,31 @@
 //! Tool policy and scoped session grants. UI and execution consume the returned decisions.
 
 use crate::auth::policy::{self, Assessment, Dialect};
-use crate::tools::sandbox::Scope;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+
+/// How much a call was approved to touch.
+///
+/// This used to double as the sandbox level. The sandbox is gone, so what remains is what the
+/// approval prompt says and what a remembered session grant is keyed on: a grant to write
+/// inside the project must not also cover reading a secret outside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Scope {
+    ReadOnly,
+    Workspace,
+    Unrestricted,
+}
+
+impl Scope {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "只读文件",
+            Self::Workspace => "工作目录可写",
+            Self::Unrestricted => "不限制文件和网络访问",
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decision {
@@ -148,18 +169,7 @@ impl PermissionGate {
         input: &serde_json::Value,
         cwd: &Path,
     ) -> Result<GateAction, Refusal> {
-        if let Some(value) = input.get("sandbox_permissions")
-            && !value.is_null()
-            && !matches!(value.as_str(), Some("use_default" | "require_escalated"))
-        {
-            return Err(Refusal {
-                reason: "sandbox_permissions 无效".into(),
-                stopped: false,
-            });
-        }
         let assessment = policy::assess_tool(tool, input, cwd, self.dialect);
-        let escalated =
-            input.get("sandbox_permissions").and_then(|v| v.as_str()) == Some("require_escalated");
         let mut arguments = input.clone();
         let reason = match assessment {
             Assessment::Allow { safe_command } => {
@@ -170,7 +180,7 @@ impl PermissionGate {
             }
             Assessment::Ask { reason } => Some(reason),
         };
-        let unrestricted = (tool != "bash" && reason.is_some()) || escalated;
+        let unrestricted = tool != "bash" && reason.is_some();
         let scope = if unrestricted {
             Scope::Unrestricted
         } else if matches!(tool, "write" | "edit") || reason.is_some() {
