@@ -122,6 +122,8 @@ pub struct Screen {
     history_draft: Option<Editor>,
     /// Streaming preview: thinking tail plus the answer so far.
     streaming_thinking: Option<String>,
+    /// A new thinking segment can arrive after an earlier piece of answer text.
+    thinking_active: bool,
     streaming_answer: Option<String>,
     /// The spinner's label while a turn is in flight, and which frame of the animation it
     /// is on.
@@ -245,6 +247,7 @@ impl Screen {
             history_index: None,
             history_draft: None,
             streaming_thinking: None,
+            thinking_active: false,
             working: None,
             working_frame: 0,
             running_call: None,
@@ -354,6 +357,7 @@ impl Screen {
         self.detail = None;
         self.streaming_answer = None;
         self.streaming_thinking = None;
+        self.thinking_active = false;
         self.running_call = None;
         self.running_started = None;
         self.running_log = None;
@@ -446,6 +450,7 @@ impl Screen {
     /// region below the transcript until the turn ends.
     pub fn begin_stream(&mut self) {
         self.streaming_thinking = None;
+        self.thinking_active = false;
         self.streaming_answer = Some(String::new());
     }
 
@@ -455,12 +460,18 @@ impl Screen {
     pub fn push_thinking(&mut self, text: &str) {
         let buffer = self.streaming_thinking.get_or_insert_with(String::new);
         buffer.push_str(text);
+        if !text.trim().is_empty() {
+            self.thinking_active = true;
+        }
     }
 
     /// Append to the answer preview. No redraw, for the same reason as [`Screen::push_thinking`].
     pub fn push_text(&mut self, text: &str) {
         let buffer = self.streaming_answer.get_or_insert_with(String::new);
         buffer.push_str(text);
+        if !text.trim().is_empty() {
+            self.thinking_active = false;
+        }
     }
 
     /// Throw away an in-flight preview without committing anything. Used when a request
@@ -468,6 +479,7 @@ impl Screen {
     pub fn discard_stream(&mut self) {
         self.streaming_answer = None;
         self.streaming_thinking = None;
+        self.thinking_active = false;
         self.erase_live();
         let _ = self.out.flush();
     }
@@ -476,6 +488,7 @@ impl Screen {
     pub fn end_stream(&mut self) -> (String, String) {
         let answer = self.streaming_answer.take().unwrap_or_default();
         let thinking = self.streaming_thinking.take().unwrap_or_default();
+        self.thinking_active = false;
         if !answer.trim().is_empty() {
             self.blocks.push(Block::markdown(&answer));
         }

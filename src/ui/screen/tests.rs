@@ -242,19 +242,26 @@ fn streaming_blocks_enter_scrollback_once_and_keep_the_draft_below_output() {
 
 #[test]
 fn streamed_summaries_and_restored_markdown_have_the_same_layout() {
+    let long_list = (1..=80)
+        .map(|n| {
+            format!("{n}. item {n}\n\n   continuation {n}\n\n   ```rust\n   call({n});\n   ```\n\n")
+        })
+        .collect::<String>();
     let fixtures = [
         "Intro\n\n1. first\n\n   continuation\n\n   - nested\n\n2. second\n\nDone",
         "Intro\n\n[说明][doc]\n\n**完成**\n\n[doc]: https://example.com\n",
         "Intro\n\n    let x = 1;\n\n| A | B |\n| - | - |\n| 中文 | **完成** |\n\nDone",
+        &long_list,
     ];
     for source in fixtures {
         let mut screen = screen();
         screen.interactive = true;
         screen.out = Box::new(std::io::sink());
         screen.begin_stream();
-        for character in source.chars() {
-            screen.push_text(&character.to_string());
-            screen.render();
+        for chunk in source.chars().collect::<Vec<_>>().chunks(17) {
+            screen.push_text(&chunk.iter().collect::<String>());
+            let (live, _) = screen.compose_live();
+            assert!(live.len() <= screen.height);
         }
         assert_eq!(screen.end_stream().0, source);
         for width in [12, 40, 80] {
@@ -1726,7 +1733,7 @@ fn no_live_row_is_wider_than_the_terminal() {
     check(&screen, "menu");
 
     // The thinking preview is wrapped too, and one_line() has to run before it is.
-    screen.streaming_thinking = Some(long.repeat(3));
+    screen.push_thinking(&long.repeat(3));
     check(&screen, "thinking preview");
 
     // A notice: a failed paste carries the error text, which can be long.
@@ -1858,10 +1865,52 @@ fn the_composer_does_not_move_while_thinking_streams() {
 #[test]
 fn the_thinking_preview_only_keeps_the_last_two_lines() {
     let mut screen = screen();
-    screen.streaming_thinking = Some("a\nb\nc\nd\ne".to_string());
+    screen.push_thinking("a\nb\nc\nd\ne");
     let (live, _) = screen.compose_live();
     assert!(live.len() <= 2, "{live:?}");
     assert!(live.iter().any(|line| line.line.text().contains('e')));
+
+    // Earlier prose must not permanently suppress a later thinking segment, even when
+    // that prose fills the viewport. The next answer hides it again without losing text.
+    screen.push_text(&"answer\n".repeat(40));
+    screen.push_thinking("\n\n");
+    assert!(!screen.thinking_active);
+    for chunk in [" first thought", " continuing thought", " latest thought"] {
+        screen.push_thinking(chunk);
+        let (live, _) = screen.compose_live();
+        let thought_rows: Vec<_> = live
+            .iter()
+            .filter(|row| {
+                row.line
+                    .spans
+                    .iter()
+                    .any(|span| span.style.fg == Color::Dim)
+            })
+            .map(|row| row.line.text())
+            .collect();
+        assert!(thought_rows.len() <= 2);
+        assert!(
+            thought_rows.join(" ").contains(chunk.trim()),
+            "{thought_rows:?}"
+        );
+    }
+    screen.push_text("done");
+    assert!(!screen.thinking_active);
+    let (answer, thinking) = screen.end_stream();
+    assert!(answer.ends_with("done"));
+    assert!(thinking.ends_with("latest thought"));
+    assert!(
+        !screen
+            .blocks
+            .iter()
+            .flat_map(|block| block.render(80))
+            .any(|line| line.text().contains("latest thought"))
+    );
+    screen.begin_stream();
+    screen.push_thinking("next call");
+    assert!(screen.thinking_active);
+    screen.discard_stream();
+    assert!(!screen.thinking_active);
 }
 
 #[test]

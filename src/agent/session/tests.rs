@@ -848,7 +848,7 @@ fn the_newest_turn_context_names_the_model_in_use() {
     // And it does not leak into the conversation.
     assert_eq!(reopened.context_messages().len(), 2);
     assert!(reopened.records().iter().any(|record| matches!(record,
-        Record::RequestContext { app_version, request_id, .. } if app_version.as_deref() == Some(crate::cli::version()) && request_id == "request"
+        Record::RequestContext { app_version, request_id, .. } if app_version == crate::cli::version() && request_id == "request"
     )));
     assert!(reopened.records().iter().any(|record| matches!(record,
         Record::RequestEnd { request_id, outcome, duration_ms:1200, retries, error, .. }

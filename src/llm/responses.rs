@@ -651,6 +651,22 @@ struct Slot {
     index: usize,
 }
 
+impl Slot {
+    /// Completed items can supply text that was not sent as deltas.
+    fn complete_text(&mut self, text: String, on_delta: &mut dyn FnMut(Delta)) {
+        if let Some(missing) = text.strip_prefix(&self.text)
+            && !missing.is_empty()
+        {
+            match self.kind.as_deref() {
+                Some("reasoning") => on_delta(Delta::Thinking(missing.into())),
+                Some("message") => on_delta(Delta::Text(missing.into())),
+                _ => {}
+            }
+        }
+        self.text = text;
+    }
+}
+
 impl Assembler {
     /// Tell the assembler where the reasoning it is about to receive comes from, so the
     /// signatures it writes can be checked before being sent back.
@@ -723,8 +739,10 @@ impl Assembler {
             "response.reasoning_summary_part.done" => {
                 if let Some(index) = event.output_index {
                     let slot = self.slot(index);
-                    slot.text.push_str("\n\n");
-                    on_delta(Delta::Thinking("\n\n".into()));
+                    if !slot.text.is_empty() {
+                        slot.text.push_str("\n\n");
+                        on_delta(Delta::Thinking("\n\n".into()));
+                    }
                 }
             }
             "response.function_call_arguments.delta" => {
@@ -791,13 +809,13 @@ impl Assembler {
                             .collect::<Vec<_>>()
                             .join("\n\n");
                         if !joined.is_empty() {
-                            slot.text = joined;
+                            slot.complete_text(joined, on_delta);
                         }
                     }
                     if let Some(content) = item.content {
                         let text: String = content.iter().filter_map(ItemContent::body).collect();
                         if !text.is_empty() {
-                            slot.text = text;
+                            slot.complete_text(text, on_delta);
                         }
                     }
                     let announce = slot.kind.as_deref().is_some_and(is_search_call);
@@ -1479,6 +1497,20 @@ mod tests {
         };
         assert!(matches!(&content[0], Block::Thinking { thinking, .. } if thinking == "think"));
         assert!(matches!(&content[1], Block::Text { text } if text == "hello"));
+
+        // Missing/partial deltas must still reach the UI when the whole item arrives.
+        // An already-streamed item must not emit the same text twice.
+        for prefix in ["", "thi", "think"] {
+            let delta = serde_json::json!({"type":"response.reasoning_summary_text.delta","output_index":0,"delta":prefix}).to_string();
+            let completion = stream(&[
+                &delta,
+                r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"think"}]}}"#,
+                r#"{"type":"response.output_item.done","output_index":1,"item":{"type":"message","content":[{"type":"output_text","text":"hello"}]}}"#,
+                r#"{"type":"response.completed","response":{"status":"completed"}}"#,
+            ]);
+            assert_eq!(completion.message.thinking(), "think");
+            assert_eq!(completion.text(), "hello");
+        }
     }
 
     #[test]

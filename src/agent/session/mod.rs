@@ -371,7 +371,7 @@ impl Session {
             system_prompt_hash,
             tools_hash,
             cache_hints: request.cache_hints,
-            app_version: Some(crate::cli::version().into()),
+            app_version: crate::cli::version().into(),
             timestamp: now(),
         };
         self.append(record, id)

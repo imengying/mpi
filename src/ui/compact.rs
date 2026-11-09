@@ -119,13 +119,8 @@ fn model_output_note(line: &str) -> bool {
 /// better shown as an unnamed target than as the tool's name.
 pub(crate) fn arguments_display(name: &str, arguments: &serde_json::Value) -> Display {
     let path = |fallback: &str| {
-        if arguments
-            .get("path")
-            .is_some_and(serde_json::Value::is_array)
-        {
-            return crate::tools::input_paths(arguments)
-                .map(|paths| util::one_line(&paths.join(", ")))
-                .unwrap_or_else(|_| fallback.to_string());
+        if let Some(label) = batch_path_label(arguments) {
+            return label;
         }
         arguments
             .get("path")
@@ -145,6 +140,23 @@ pub(crate) fn arguments_display(name: &str, arguments: &serde_json::Value) -> Di
         },
         _ => Display::None,
     }
+}
+
+/// Keep batch headings compact; the result body contains every complete target path.
+fn batch_path_label(arguments: &serde_json::Value) -> Option<String> {
+    arguments.get("path")?.as_array()?;
+    let paths = crate::tools::input_paths(arguments).ok()?;
+    let shown = paths
+        .iter()
+        .take(2)
+        .map(|path| util::truncate(&util::one_line(path), 24, "…"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(if paths.len() > 2 {
+        format!("{shown} 等 {} 个路径", paths.len())
+    } else {
+        shown
+    })
 }
 
 /// Build a finished call with its header and outcome always visible.
@@ -233,26 +245,20 @@ fn tool_block_inner(
             return Block::collapsible_excerpted(lines, head, tail, half, budget - half);
         }
         Display::File { verb, path } => {
+            let batch_path = batch_path_label(arguments);
             let mut header = vec![
                 mark_span.clone(),
                 Span::plain(" "),
                 Span::plain(*verb),
                 Span::plain(" "),
-                Span::new(util::one_line(path), Style::new(Color::Cyan)),
+                Span::new(
+                    batch_path.clone().unwrap_or_else(|| util::one_line(path)),
+                    Style::new(Color::Cyan),
+                ),
             ];
             if status == crate::llm::ToolStatus::Success {
                 let summary = match body.trim() {
-                    _ if arguments
-                        .get("path")
-                        .is_some_and(serde_json::Value::is_array) =>
-                    {
-                        format!(
-                            "{} 个路径",
-                            crate::tools::input_paths(arguments)
-                                .unwrap_or_default()
-                                .len()
-                        )
-                    }
+                    _ if batch_path.is_some() => String::new(),
                     "没有找到匹配。" | "没有找到匹配的文件。" => {
                         "无匹配".to_string()
                     }
@@ -918,6 +924,14 @@ mod tests {
             ("bash", serde_json::json!({"command": "ls -l", "cwd": "  "})),
             ("read", serde_json::json!({"path": "src/a.rs"})),
             ("read", serde_json::json!({"path": "nope.rs"})),
+            (
+                "read",
+                serde_json::json!({"path": ["src/a.rs", "src/b.rs"]}),
+            ),
+            (
+                "grep",
+                serde_json::json!({"pattern":"fn", "path":(0..16).map(|n| format!("src/很长的项目目录/{}/file-{n}.rs", "nested/".repeat(10))).collect::<Vec<_>>()}),
+            ),
             ("write", serde_json::json!({"path": "a.rs", "content": "x"})),
             ("edit", serde_json::json!({"path": "a.rs"})),
             ("grep", serde_json::json!({"pattern": "fn"})),
@@ -929,6 +943,30 @@ mod tests {
         for (name, arguments) in cases {
             let mut output = ToolOutput::text("body\n");
             output.display = arguments_display(name, &arguments);
+            if let Some(paths) = arguments.get("path").and_then(serde_json::Value::as_array) {
+                let paths: Vec<_> = paths.iter().map(|path| path.as_str().unwrap()).collect();
+                output.display = Display::File {
+                    verb: crate::tools::verb_for(name),
+                    path: paths.join(", "),
+                };
+                output.content = paths
+                    .iter()
+                    .map(|path| format!("── {path}\nbody\n"))
+                    .collect();
+                let running = running_line(name, &arguments)
+                    .iter()
+                    .map(|span| span.text.as_str())
+                    .collect::<String>();
+                assert!(util::width(&running) <= 80, "{running}");
+                let mut detail = tool_block(name, &arguments, &output, ToolStatus::Success);
+                if let Block::Collapsible(inner) = &mut detail {
+                    inner.expanded = true;
+                }
+                let detail = plain(&detail.render(1000)).join("\n");
+                for path in paths {
+                    assert!(detail.contains(path), "{path}");
+                }
+            }
             for status in [
                 ToolStatus::Success,
                 ToolStatus::Error,
@@ -965,6 +1003,12 @@ mod tests {
                     resumed.first(),
                     "{name} {arguments} {status:?} 的头在两条路上不一致"
                 );
+                if arguments
+                    .get("path")
+                    .is_some_and(serde_json::Value::is_array)
+                {
+                    assert!(util::width(live.first().unwrap()) <= 80);
+                }
             }
         }
     }

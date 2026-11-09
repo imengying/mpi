@@ -43,6 +43,8 @@ impl Agent {
             let count = if tools::execution_mode(&first.1) == tools::ExecutionMode::Parallel {
                 calls[next..]
                     .iter()
+                    // A conservative cap on simultaneous file reads/search processes.
+                    // Writes and shell calls below remain barriers between read batches.
                     .take(4)
                     .take_while(|(_, name, _)| {
                         tools::execution_mode(name) == tools::ExecutionMode::Parallel

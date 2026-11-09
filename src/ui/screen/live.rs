@@ -114,30 +114,28 @@ impl Screen {
             room = room.saturating_sub(above.len());
         }
         let mut preview = Vec::new();
-        if let Some(thinking) = &self.streaming_thinking
-            && self
-                .streaming_answer
-                .as_ref()
-                .is_none_or(|answer| answer.trim().is_empty())
-        {
-            let wrapped = util::wrap(&util::one_line(thinking), self.width);
-            let first = wrapped
-                .len()
-                .saturating_sub(Defaults::THINKING_PREVIEW_LINES);
-            preview.extend(
-                wrapped[first..]
-                    .iter()
-                    .map(|text| HistoryRow::hard(Line::dim(text.clone()))),
-            );
-            while preview.len() < Defaults::THINKING_PREVIEW_LINES {
-                preview.push(HistoryRow::hard(Line::blank()));
-            }
-        }
         if let Some(answer) = &self.streaming_answer {
             preview.extend(crate::ui::text::history_rows(
                 &crate::ui::markdown::render(answer, self.width),
                 self.width,
             ));
+        }
+        if let Some(thinking) = &self.streaming_thinking
+            && self.thinking_active
+        {
+            let wrapped = util::wrap(&util::one_line(thinking), self.width);
+            let first = wrapped
+                .len()
+                .saturating_sub(Defaults::THINKING_PREVIEW_LINES);
+            let thinking_rows = wrapped.len() - first;
+            preview.extend(
+                wrapped[first..]
+                    .iter()
+                    .map(|text| HistoryRow::hard(Line::dim(text.clone()))),
+            );
+            for _ in thinking_rows..Defaults::THINKING_PREVIEW_LINES {
+                preview.push(HistoryRow::hard(Line::blank()));
+            }
         }
         if let Some(spans) = &self.running_call {
             let mut spans = spans.clone();
