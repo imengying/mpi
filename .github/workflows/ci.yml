@@ -33,6 +33,23 @@ jobs:
       - uses: ./.github/actions/test-dependencies
       - run: cargo fmt --all --check
       - run: cargo clippy --locked --all-targets -- -D warnings
-      - run: cargo test --locked
+      - name: Test
+        run: |
+          if cargo test --locked --no-fail-fast > "$RUNNER_TEMP/pi-tests.log" 2>&1; then
+            cat "$RUNNER_TEMP/pi-tests.log"
+            exit 0
+          fi
+          cat "$RUNNER_TEMP/pi-tests.log"
+          # Keep assertion failures visible in the check summary as well as the full log.
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          log = Path(os.environ["RUNNER_TEMP"], "pi-tests.log").read_text()
+          start = log.find("failures:")
+          message = (log[start:] if start >= 0 else log)[-12000:]
+          message = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+          print("::error title=Rust tests::" + message)
+          PY
+          exit 1
       - run: sh -n install.sh
       - run: python3 tests/terminal_signals.py target/debug/pi
