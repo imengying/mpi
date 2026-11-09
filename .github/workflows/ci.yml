@@ -56,4 +56,5 @@ jobs:
           exit 1
       - run: sh -n install.sh
       - if: success() || (failure() && steps.tests.outcome == 'failure')
+        timeout-minutes: 2
         run: python3 tests/terminal_signals.py target/debug/pi

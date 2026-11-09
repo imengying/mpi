@@ -1,5 +1,6 @@
 """Exercise the installed terminal lifecycle on Linux and macOS, using only stdlib."""
 
+import errno
 import fcntl
 import http.server
 import json
@@ -83,7 +84,15 @@ def check(binary, mode, exit_signal):
 
         def read_available():
             if select.select([master], [], [], 0.02)[0]:
-                output.extend(os.read(master, 65536))
+                try:
+                    chunk = os.read(master, 65536)
+                except OSError as error:
+                    if error.errno == errno.EIO:
+                        return False
+                    raise
+                output.extend(chunk)
+                return bool(chunk)
+            return False
 
         def until(condition):
             deadline = time.monotonic() + 10
@@ -122,8 +131,9 @@ def check(binary, mode, exit_signal):
 
             process.send_signal(exit_signal)
             until(lambda: process.poll() is not None)
-            while select.select([master], [], [], 0.05)[0]:
-                output.extend(os.read(master, 65536))
+            # An exited PTY stays readable at EOF on macOS.
+            while read_available():
+                pass
             assert process.returncode == 128 + exit_signal, (mode, process.returncode)
             assert termios.tcgetattr(slave) == original, (mode, "terminal mode not restored")
             assert b"\x1b[?1049l" in output, (mode, "alternate screen not restored")
