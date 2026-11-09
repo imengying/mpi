@@ -11,7 +11,6 @@
 use std::path::{Path, PathBuf};
 
 use super::dirs::sessions_dir;
-use crate::llm::{Block, Message};
 
 use super::{Record, Session};
 
@@ -199,32 +198,6 @@ pub fn list_in(dir: &Path) -> Vec<SessionSummary> {
     summaries
 }
 
-/// A one-line summary of a message, for the transcript and the resume list.
-pub fn message_preview(message: &Message, width: usize) -> String {
-    match message {
-        Message::User { .. } => {
-            crate::util::truncate(&crate::util::one_line(&message.text()), width, "…")
-        }
-        Message::Assistant { content, .. } => {
-            let text = content
-                .iter()
-                .map(|block| match block {
-                    Block::Text { text } => text.clone(),
-                    Block::Thinking { .. } => "[思考]".to_string(),
-                    Block::ToolCall { name, .. } => format!("[{name}]"),
-                    Block::Hosted { .. } => "[搜索]".to_string(),
-                    Block::Citation { .. } => "[引用]".to_string(),
-                    Block::Image { .. } => "[图片]".to_string(),
-                })
-                .collect::<Vec<_>>()
-                .join(" ");
-            crate::util::truncate(&crate::util::one_line(&text), width, "…")
-        }
-        Message::Tool { name, .. } => format!("[{name} 结果]"),
-        Message::System { .. } => "[系统]".into(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,13 +211,6 @@ mod tests {
         assert_eq!(&stamp[10..11], "T");
         // 1 700 000 000 = 2023-11-14T22:13:20Z
         assert_eq!(civil_from_unix(1_700_000_000), (2023, 11, 14, 22, 13, 20));
-    }
-
-    #[test]
-    fn previews_are_single_line_and_bounded() {
-        let message = Message::user_text("line one\nline two");
-        assert_eq!(message_preview(&message, 100), "line one line two");
-        assert!(crate::util::width(&message_preview(&message, 6)) <= 6);
     }
 
     #[test]

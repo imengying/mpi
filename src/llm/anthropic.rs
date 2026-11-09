@@ -1185,7 +1185,7 @@ mod tests {
         let mut text = String::new();
         let mut sink = |delta: Delta| match delta {
             Delta::Text(t) => text.push_str(&t),
-            Delta::Thinking(_) | Delta::Notice(_) => {}
+            Delta::Thinking(_) | Delta::Notice(_) | Delta::Retry(_) => {}
         };
         let events = [
             (

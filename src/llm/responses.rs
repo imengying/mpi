@@ -1440,7 +1440,7 @@ mod tests {
             let mut sink = |delta: Delta| match delta {
                 Delta::Text(chunk) => text.push_str(&chunk),
                 Delta::Thinking(chunk) => thinking.push_str(&chunk),
-                Delta::Notice(_) => {}
+                Delta::Notice(_) | Delta::Retry(_) => {}
             };
             for json in events {
                 let event = parse_frame(json).unwrap().expect("an event");

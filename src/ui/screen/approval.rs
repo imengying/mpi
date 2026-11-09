@@ -12,15 +12,11 @@ impl Screen {
             self.close_detail();
         }
         self.suspend_live();
-        let mut body = format!(
-            "{}\n目录：{}\n权限：{}",
+        let body = format!(
+            "{}\n目录：{}",
             panel_body(&request.tool, &request.arguments),
-            request.cwd.display(),
-            request.scope.label()
+            request.cwd.display()
         );
-        if request.scope == crate::auth::guard::Scope::Workspace {
-            body.push_str(&format!("\n可写范围：{}", request.workspace.display()));
-        }
         let (sender, mut receiver) = tokio::sync::oneshot::channel();
         self.approval = Some((PanelState::new(&body), sender));
         let _ = crossterm::execute!(self.out, cursor::Hide);

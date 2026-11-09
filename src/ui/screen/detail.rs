@@ -9,10 +9,40 @@ pub(super) struct Detail {
     query: String,
     searching: bool,
     found: Option<usize>,
+    live_log: Option<std::path::PathBuf>,
+    refreshed: Option<std::time::Instant>,
+    follow: bool,
 }
 
 impl Detail {
+    pub(super) fn is_live(&self) -> bool {
+        self.live_log.is_some()
+    }
+
     fn refresh(&mut self, blocks: &[Block], width: usize) {
+        if let Some(path) = &self.live_log {
+            if self.width != width
+                || self
+                    .refreshed
+                    .is_none_or(|time| time.elapsed().as_millis() >= 250)
+            {
+                let text =
+                    read_log_tail(path).unwrap_or_else(|err| format!("无法读取运行日志：{err}"));
+                self.rows = crate::ui::text::history_rows(
+                    &text
+                        .lines()
+                        .map(|line| Line::plain(util::sanitize(line)))
+                        .collect::<Vec<_>>(),
+                    width,
+                )
+                .into_iter()
+                .map(|row| row.line)
+                .collect();
+                self.width = width;
+                self.refreshed = Some(std::time::Instant::now());
+            }
+            return;
+        }
         if self.width != width {
             let mut block = blocks[self.index].clone();
             if let Block::Collapsible(inner) = &mut block {
@@ -21,6 +51,10 @@ impl Detail {
                     match read_log(path) {
                         Ok(text) => {
                             inner.lines.truncate(inner.head);
+                            let text = crate::ui::compact::result_text(
+                                crate::llm::ToolStatus::Success,
+                                &text,
+                            );
                             inner
                                 .lines
                                 .extend(text.lines().map(|line| Line::plain(util::sanitize(line))));
@@ -47,7 +81,13 @@ impl Screen {
             self.close_detail();
             return true;
         }
-        let Some(index) = self.blocks.iter().rposition(Block::is_collapsible) else {
+        let live_log = self.running_log.clone();
+        let index = if live_log.is_some() {
+            Some(self.blocks.len())
+        } else {
+            self.blocks.iter().rposition(Block::is_collapsible)
+        };
+        let Some(index) = index else {
             self.notice = Some("没有工具详情".into());
             self.render();
             return false;
@@ -65,6 +105,9 @@ impl Screen {
             query: String::new(),
             searching: false,
             found: None,
+            follow: live_log.is_some(),
+            live_log,
+            refreshed: None,
         });
         self.draw_detail();
         true
@@ -110,6 +153,12 @@ impl Screen {
             return;
         }
         let page = self.height.saturating_sub(2).max(1);
+        if matches!(
+            key.code,
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::PageUp | KeyCode::Home | KeyCode::Char('/')
+        ) {
+            detail.follow = false;
+        }
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => self.close_detail(),
             KeyCode::Char('o' | 'c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -122,8 +171,11 @@ impl Screen {
                 detail.offset = detail.offset.saturating_add(page)
             }
             KeyCode::Home => detail.offset = 0,
-            KeyCode::End => detail.offset = usize::MAX,
-            KeyCode::Left | KeyCode::Char('[') => {
+            KeyCode::End => {
+                detail.offset = usize::MAX;
+                detail.follow = detail.is_live();
+            }
+            KeyCode::Left | KeyCode::Char('[') if !detail.is_live() => {
                 if let Some(index) = self.blocks[..detail.index]
                     .iter()
                     .rposition(Block::is_collapsible)
@@ -134,7 +186,7 @@ impl Screen {
                     detail.offset = 0;
                 }
             }
-            KeyCode::Right | KeyCode::Char(']') => {
+            KeyCode::Right | KeyCode::Char(']') if !detail.is_live() => {
                 if let Some(index) = self.blocks[detail.index + 1..]
                     .iter()
                     .position(Block::is_collapsible)
@@ -160,13 +212,24 @@ impl Screen {
         };
         detail.refresh(&self.blocks, self.width);
         let page = self.height.saturating_sub(2);
+        if detail.follow {
+            detail.offset = usize::MAX;
+        }
         detail.offset = detail
             .offset
             .min(detail.rows.len().saturating_sub(page.max(1)));
-        let title = format!(
-            "工具详情 · {} · ←/→ 切换 · / 搜索 · Esc 返回",
-            detail.index + 1
-        );
+        let title = if detail.is_live() {
+            format!(
+                "运行日志 · {}s · End 跟随 · Esc 返回",
+                self.running_started
+                    .map_or(0, |time| time.elapsed().as_secs())
+            )
+        } else {
+            format!(
+                "工具详情 · {} · ←/→ 切换 · / 搜索 · Esc 返回",
+                detail.index + 1
+            )
+        };
         let footer = if detail.searching {
             format!("/{}", detail.query)
         } else {
@@ -193,6 +256,26 @@ impl Screen {
         let _ = self.out.flush();
         self.detail = Some(detail);
     }
+}
+
+fn read_log_tail(path: &Path) -> std::io::Result<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path)?;
+    let offset = file.metadata()?.len().saturating_sub(64 * 1024);
+    file.seek(SeekFrom::Start(offset))?;
+    let mut bytes = Vec::new();
+    file.take(64 * 1024).read_to_end(&mut bytes)?;
+    let start = if offset > 0 {
+        bytes
+            .iter()
+            .position(|b| *b == b'\n')
+            .map(|i| i + 1)
+            .filter(|i| *i < bytes.len())
+            .unwrap_or_else(|| bytes.iter().take_while(|b| **b & 0xc0 == 0x80).count())
+    } else {
+        0
+    };
+    Ok(String::from_utf8_lossy(&bytes[start..]).into_owned())
 }
 
 fn find_next(detail: &mut Detail, from_start: bool) {

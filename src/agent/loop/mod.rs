@@ -116,13 +116,6 @@ struct TurnOutcome {
     first_token: Option<std::time::Duration>,
 }
 
-impl TurnOutcome {
-    /// Whether the request was ended by Esc rather than by the server or by an error.
-    fn stopped(&self) -> bool {
-        self.result.is_none()
-    }
-}
-
 pub struct Agent {
     pub config: Config,
     pub client: Client,
@@ -565,6 +558,9 @@ fn ticker() -> tokio::time::Interval {
 
 /// Put one delta into the screen's buffer. No redraw: the caller batches.
 fn apply_delta(screen: &mut Screen, delta: Delta) {
+    if delta.carries_output() {
+        screen.set_working(WORKING_LABEL);
+    }
     match delta {
         Delta::Text(text) => screen.push_text(&text),
         Delta::Thinking(text) => screen.push_thinking(&text),
@@ -572,6 +568,9 @@ fn apply_delta(screen: &mut Screen, delta: Delta) {
             &text,
             crate::ui::screen::Style::new(Color::Dim),
         )),
+        Delta::Retry(retry) => {
+            screen.set_working(&format!("请求重试 {}/{}", retry.attempt, retry.limit))
+        }
     }
 }
 

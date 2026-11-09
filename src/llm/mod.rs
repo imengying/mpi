@@ -356,6 +356,16 @@ pub enum Delta {
     Thinking(String),
     /// A one-line status that is not part of the answer, such as a hosted search starting.
     Notice(String),
+    Retry(RetryDiagnostic),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetryDiagnostic {
+    pub attempt: u32,
+    pub limit: u32,
+    pub delay_ms: u64,
+    pub kind: String,
+    pub error: String,
 }
 
 impl Delta {
@@ -475,10 +485,23 @@ pub enum LlmError {
 }
 
 impl LlmError {
-    /// Feed the raw error text through the overflow classifier later; this only
-    /// exposes the message for pattern matching.
-    pub fn message(&self) -> String {
-        self.to_string()
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Transport(_) => "transport",
+            Self::Api { .. } => "http",
+            Self::Decode(_) => "decode",
+            Self::MissingKey(_) | Self::UnknownApi(_, _) => "configuration",
+        }
+    }
+
+    pub fn summary(&self) -> String {
+        match self {
+            Self::Transport(detail) => {
+                let cause = detail.rsplit(" -> ").next().unwrap_or(detail);
+                format!("网络请求失败：{cause}")
+            }
+            _ => self.to_string(),
+        }
     }
 }
 

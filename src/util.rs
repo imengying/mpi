@@ -1,10 +1,19 @@
-//! Small text/path helpers shared by the UI and the tools.
-//!
-//! Everything here is display-layer: no function in this module is allowed to change
-//! what the model sees, except `truncate_output`, which is documented as such.
+//! Text, path and temporary-output helpers shared by the UI and the tools.
 
 use std::path::{Path, PathBuf};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+/// Resolve only logs created in pi's temporary-output namespace.
+pub(crate) fn output_log_path(line: &str) -> Option<PathBuf> {
+    let raw = line
+        .strip_prefix("[输出过长，已截断。完整输出：")?
+        .strip_suffix(']')?;
+    let canonical = Path::new(raw).canonicalize().ok()?;
+    let temp = std::env::temp_dir().canonicalize().ok()?;
+    let name = canonical.file_name()?.to_str()?;
+    (canonical.starts_with(temp) && name.starts_with("pi-") && name.ends_with(".log"))
+        .then_some(canonical)
+}
 
 /// Scale a count down to `k` / `M`, dropping a trailing `.0` so whole values read as
 /// `256k` / `1M` while fractional ones keep one decimal (`17.3k`).
@@ -254,19 +263,19 @@ pub fn shorten_home(path: &Path, home: Option<&Path>) -> String {
     }
 }
 
-/// Where the full (untruncated) tool output is parked.
-fn temp_output_path() -> PathBuf {
-    let mut counter = TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let pid = std::process::id();
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    counter &= 0xffff;
-    crate::tools::sandbox::output_dir().join(format!("pi-{pid}-{stamp:x}-{counter:x}.log"))
+/// Create a private output file without overwriting or following an existing path.
+pub(crate) fn create_output_file() -> std::io::Result<(std::fs::File, PathBuf)> {
+    let path = std::env::temp_dir().join(format!("pi-{}.log", uuid::Uuid::now_v7()));
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(&path)?;
+    Ok((file, path))
 }
-
-static TEMP_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Output truncation budget: 2000 lines or 50KB, whichever is reached first.
 pub const MAX_OUTPUT_LINES: usize = 2000;
@@ -281,12 +290,22 @@ pub fn truncate_output(raw: &str) -> String {
     if over_lines == 0 && over_bytes == 0 {
         return raw.to_string();
     }
-    let full_path = temp_output_path();
-    if let Err(err) = std::fs::write(&full_path, raw) {
-        // Losing the temp copy is better than losing the answer: report it inline.
-        let kept = tail(&lines);
-        return format!("{}\n\n[完整输出写入临时文件失败：{err}]", kept.trim_end());
-    }
+    let saved = (|| {
+        let (mut file, path) = create_output_file()?;
+        if let Err(err) = std::io::Write::write_all(&mut file, raw.as_bytes()) {
+            drop(file);
+            let _ = std::fs::remove_file(&path);
+            return Err(err);
+        }
+        Ok(path)
+    })();
+    let full_path = match saved {
+        Ok(path) => path,
+        Err(err) => {
+            let kept = tail(&lines);
+            return format!("{}\n\n[完整输出写入临时文件失败：{err}]", kept.trim_end());
+        }
+    };
     let kept = tail(&lines);
     // What the reader cannot work out for themselves: that this is a tail, and where the
     // whole thing is. How many lines and bytes were kept is countable from the content, so
@@ -391,6 +410,14 @@ mod tests {
             .unwrap()
             .trim_end_matches(']');
         assert_eq!(std::fs::read_to_string(path).unwrap(), raw);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o077,
+                0
+            );
+        }
         std::fs::remove_file(path).unwrap();
     }
 }

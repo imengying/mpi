@@ -200,7 +200,7 @@ fn streaming_blocks_enter_scrollback_once_and_keep_the_draft_below_output() {
         screen.render();
         screen.flush();
         terminal.process(&captured.take());
-        let expected_row = (3 + index * 2).min(21) as u16;
+        let expected_row = (2 + index * 2).min(20) as u16;
         assert_eq!(terminal.screen().cursor_position(), (expected_row, 7));
         assert!(
             terminal
@@ -1588,7 +1588,17 @@ fn detail_navigation_and_search_preserve_the_transcript_and_draft() {
         0,
     ));
     screen.push(Block::lines(vec![Line::plain("later")]));
+    screen.begin_stream();
+    screen.push_text("tool commentary");
+    screen.end_tool_stream();
     screen.push(Block::collapsible(vec![Line::plain("newer")], 1, 0, 0));
+    assert!(
+        !screen
+            .blocks
+            .iter()
+            .flat_map(|block| block.render(40))
+            .any(|line| line.text().contains("tool commentary"))
+    );
     set_input(&mut screen, "draft");
     screen.absorb_event(Event::Key(KeyCode::Left.into()));
     let original = screen.editing.clone().unwrap();
@@ -1596,6 +1606,7 @@ fn detail_navigation_and_search_preserve_the_transcript_and_draft() {
     assert!(screen.show_tool_details());
     terminal.process(&captured.take());
     assert!(terminal.screen().contents().contains("newer"));
+    assert!(terminal.screen().contents().contains("tool commentary"));
     assert!(
         screen
             .blocks
@@ -1619,6 +1630,31 @@ fn detail_navigation_and_search_preserve_the_transcript_and_draft() {
     assert_eq!(screen.editing.as_ref().unwrap().text(), original.text());
     assert_eq!(screen.editing.as_ref().unwrap().caret(), original.caret());
     assert_eq!(screen.blocks.len(), 3);
+
+    let (mut log, path) = util::create_output_file().unwrap();
+    writeln!(log, "early output").unwrap();
+    screen.set_running(vec![Span::plain("long command")]);
+    screen.running_started = Some(std::time::Instant::now() - std::time::Duration::from_secs(3));
+    screen.set_running_log(path.clone());
+    assert!(util::strip_ansi(&screen.live_frame()).contains("3s"));
+    assert!(screen.show_tool_details());
+    screen.flush();
+    terminal.process(&captured.take());
+    assert!(terminal.screen().contents().contains("early output"));
+    writeln!(log, "later output").unwrap();
+    screen.absorb_event(Event::Resize(41, 24));
+    screen.flush();
+    terminal.process(&captured.take());
+    assert!(terminal.screen().contents().contains("later output"));
+    screen.clear_running();
+    screen.flush();
+    terminal.process(&captured.take());
+    assert!(screen.detail.is_none());
+    assert_eq!(screen.editing.as_ref().unwrap().text(), original.text());
+    assert_eq!(screen.editing.as_ref().unwrap().caret(), original.caret());
+    assert_eq!(screen.blocks.len(), 3);
+    drop(log);
+    std::fs::remove_file(path).unwrap();
 }
 
 #[test]

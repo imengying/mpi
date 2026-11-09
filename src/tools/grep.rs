@@ -4,19 +4,21 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use crate::llm::ToolSpec;
-use crate::tools::{Display, ToolOutput};
+use crate::tools::{Display, ToolOutput, output::Capture};
 
 pub fn spec() -> ToolSpec {
     ToolSpec {
         name: "grep".into(),
         description: "在文件内容中搜索。优先使用系统 rg，回退 grep。输出为「文件:行号:内容」。\
-                      递归搜索默认跳过凭据、密钥及敏感目录；搜索敏感内容请明确指定其路径并获得授权。"
+                      path 可为文件、目录或最多 16 个目标的数组；\
+                      例如 {\"pattern\":\"fn main\",\"path\":[\"src\",\"tests\"],\"glob\":\"*.rs\"}。\
+                      无匹配正常返回；递归搜索跳过敏感文件，搜索敏感内容需明确路径并获得授权。"
             .into(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
                 "pattern": { "type": "string", "description": "要搜索的文本或正则" },
-                "path": { "type": "string", "description": "搜索目录或文件，默认当前目录" },
+                "path": { "anyOf": [{"type":"string"}, {"type":"array","items":{"type":"string"},"minItems":1,"maxItems":16}], "description": "搜索目录、文件或路径数组，默认当前目录" },
                 "glob": { "type": "string", "description": "文件名过滤，如 '*.rs'" },
                 "ignore_case": { "type": "boolean", "description": "是否忽略大小写" },
                 "fixed_strings": { "type": "boolean", "description": "把 pattern 当作纯文本而不是正则" },
@@ -44,7 +46,28 @@ fn engine() -> Option<Engine> {
 }
 
 pub async fn execute(arguments: &serde_json::Value, cwd: &Path) -> Result<ToolOutput, String> {
-    execute_with_engine(
+    let (output, failed) = capture(arguments, cwd).await?;
+    Ok(super::tool_output(
+        output
+            .finish(true)
+            .map_err(|err| format!("读取搜索输出失败：{err}"))?,
+        Display::File {
+            verb: "搜索",
+            path: arguments
+                .get("path")
+                .and_then(|path| path.as_str())
+                .unwrap_or(".")
+                .into(),
+        },
+        failed,
+    ))
+}
+
+pub(super) async fn capture(
+    arguments: &serde_json::Value,
+    cwd: &Path,
+) -> Result<(Capture, bool), String> {
+    capture_with_engine(
         arguments,
         cwd,
         engine().ok_or("系统中既没有 rg 也没有 grep，无法搜索")?,
@@ -52,11 +75,11 @@ pub async fn execute(arguments: &serde_json::Value, cwd: &Path) -> Result<ToolOu
     .await
 }
 
-async fn execute_with_engine(
+async fn capture_with_engine(
     arguments: &serde_json::Value,
     cwd: &Path,
     engine: Engine,
-) -> Result<ToolOutput, String> {
+) -> Result<(Capture, bool), String> {
     let pattern = crate::tools::required_str(arguments, "pattern")?;
     if pattern.is_empty() {
         return Err("pattern 不能为空".into());
@@ -163,35 +186,31 @@ async fn execute_with_engine(
         .await
         .map_err(|err| format!("搜索命令启动失败：{err}"))?;
     let failed = !matches!(output.status.code(), Some(0 | 1));
-    let body = tokio::task::spawn_blocking(move || select_matches(output.stdout, max_results))
+    let mut body = tokio::task::spawn_blocking(move || select_matches(output.stdout, max_results))
         .await
         .map_err(|err| err.to_string())?
         .map_err(|err| format!("读取搜索输出失败：{err}"))?;
-    let stderr = output.stderr.finish(true).map_err(|err| err.to_string())?;
-    let mut content = if body.is_empty() {
-        if failed {
-            format!("搜索失败（退出码 {:?}）", output.status.code())
-        } else {
-            "没有找到匹配。".into()
+    let finish = || -> std::io::Result<Capture> {
+        if body.file.metadata()?.len() == 0 {
+            if failed {
+                write!(body.file, "搜索失败（退出码 {:?}）", output.status.code())?;
+            } else {
+                write!(body.file, "没有找到匹配。")?;
+            }
         }
-    } else {
-        body
+        if output.stderr.file.metadata()?.len() > 0 {
+            writeln!(body.file)?;
+            body.append(output.stderr)?;
+        }
+        Ok(body)
     };
-    if !stderr.trim().is_empty() {
-        content.push('\n');
-        content.push_str(&stderr);
-    }
-    Ok(crate::tools::tool_output(
-        content,
-        Display::File {
-            verb: "搜索",
-            path: target.to_string(),
-        },
+    Ok((
+        finish().map_err(|err| format!("读取搜索输出失败：{err}"))?,
         failed,
     ))
 }
 
-fn select_matches(mut raw: super::output::Capture, max_results: u64) -> std::io::Result<String> {
+fn select_matches(mut raw: super::output::Capture, max_results: u64) -> std::io::Result<Capture> {
     raw.file.seek(SeekFrom::Start(0))?;
     let mut reader = std::io::BufReader::new(&mut raw.file);
     let mut selected = super::output::Capture::new()?;
@@ -224,7 +243,7 @@ fn select_matches(mut raw: super::output::Capture, max_results: u64) -> std::io:
         selected.file.write_all(&[separator])?;
         super::output::copy_line(&mut reader, &mut selected.file)?;
     }
-    selected.finish(true)
+    Ok(selected)
 }
 
 #[cfg(test)]
@@ -248,18 +267,19 @@ mod tests {
             std::fs::create_dir(&dir).unwrap();
             std::fs::write(dir.join("a.txt"), "keep one\ndrop me\nkeep two\n").unwrap();
             let label = format!("{engine:?}");
-            let out = block(execute_with_engine(
+            let (output, failed) = block(capture_with_engine(
                 &serde_json::json!({"pattern": "drop", "path": dir.join("a.txt").to_string_lossy(), "invert": true}),
                 &dir,
                 engine,
             ))
             .unwrap();
-            assert!(out.content.contains("keep one"), "{label}: {}", out.content);
-            assert!(out.content.contains("keep two"), "{label}: {}", out.content);
+            let text = output.finish(true).unwrap();
+            assert!(!failed, "{label}: {text}");
+            assert!(text.contains("keep one"), "{label}: {text}");
+            assert!(text.contains("keep two"), "{label}: {text}");
             assert!(
-                !out.content.contains("drop me"),
-                "{label} kept the matching line: {}",
-                out.content
+                !text.contains("drop me"),
+                "{label} kept the matching line: {text}"
             );
             std::fs::remove_dir_all(dir).unwrap();
         }
@@ -302,19 +322,17 @@ mod tests {
         let input = serde_json::json!({"pattern":"beta", "context":1, "max_results":1});
         let engine =
             Engine::GnuGrep(super::super::first_present(&["/usr/bin/grep", "/bin/grep"]).unwrap());
-        let out = block(execute_with_engine(&input, &dir, engine)).unwrap();
-        assert!(!out.is_error, "{}", out.content);
+        let (output, failed) = block(capture_with_engine(&input, &dir, engine)).unwrap();
+        let text = output.finish(true).unwrap();
+        assert!(!failed, "{text}");
         assert_eq!(
-            out.content
-                .lines()
-                .filter(|line| line.ends_with(":beta"))
-                .count(),
+            text.lines().filter(|line| line.ends_with(":beta")).count(),
             1,
             "{}",
-            out.content
+            text
         );
-        assert!(out.content.contains("已截断"));
-        assert!(!out.content.contains(".env"));
+        assert!(text.contains("已截断"));
+        assert!(!text.contains(".env"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

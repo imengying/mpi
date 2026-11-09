@@ -8,6 +8,22 @@ use std::time::Duration;
 use super::{Api, Delta, LlmError, Request, anthropic, responses};
 use crate::config::Provider;
 
+fn transport_detail(error: reqwest::Error) -> String {
+    use std::error::Error;
+    // Request URLs can contain credentials or query secrets. Keep only the error chain.
+    let error = error.without_url();
+    let mut parts = vec![error.to_string()];
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let text = cause.to_string();
+        if parts.last() != Some(&text) {
+            parts.push(text);
+        }
+        source = cause.source();
+    }
+    parts.join(" -> ")
+}
+
 pub struct Client {
     http: reqwest::Client,
 }
@@ -212,7 +228,17 @@ impl Client {
             if delay < scheduled {
                 delay = scheduled;
             }
-            on_delta(Delta::Notice(format!("请求重试 {attempts}/{limit}")));
+            on_delta(Delta::Retry(super::RetryDiagnostic {
+                attempt: *attempts,
+                limit,
+                delay_ms: delay.as_millis() as u64,
+                kind: error.kind().into(),
+                error: if api_key.is_empty() {
+                    error.to_string()
+                } else {
+                    error.to_string().replace(&api_key, "[redacted]")
+                },
+            }));
             tokio::time::sleep(delay).await;
         }
     }
@@ -269,11 +295,12 @@ impl Client {
             Ok(result) => match result {
                 Ok(response) => response,
                 Err(err) => {
+                    let builder_error = err.is_builder();
                     // Nothing left the client, or nothing came back: the same request can be sent
                     // again. Connect timeouts, resets and DNS failures are all here.
                     return Attempt::Failed {
-                        error: LlmError::Transport(err.to_string()),
-                        retry: if err.is_builder() {
+                        error: LlmError::Transport(transport_detail(err)),
+                        retry: if builder_error {
                             Retry::Never
                         } else {
                             Retry::After(Duration::ZERO)
@@ -332,7 +359,7 @@ impl Client {
                         Ok(Some(chunk)) => chunk,
                         Ok(None) => break,
                         Err(err) => {
-                            interruption = Some(format!("流式传输中断：{err}"));
+                            interruption = Some(format!("流式传输中断：{}", transport_detail(err)));
                             break;
                         }
                     },
@@ -437,7 +464,7 @@ impl Client {
                 if err.is_builder() {
                     LlmError::Decode(err.to_string())
                 } else {
-                    LlmError::Transport(err.to_string())
+                    LlmError::Transport(transport_detail(err))
                 }
             })?;
         let status = response.status();
@@ -481,7 +508,7 @@ async fn bounded_body(
         let chunk = tokio::time::timeout(idle, response.chunk())
             .await
             .map_err(|_| LlmError::Transport("读取响应超时".into()))?
-            .map_err(|err| LlmError::Transport(err.to_string()))?;
+            .map_err(|err| LlmError::Transport(transport_detail(err)))?;
         let Some(chunk) = chunk else {
             break;
         };
@@ -1191,8 +1218,9 @@ mod tests {
     async fn a_transient_failure_is_retried_and_the_answer_arrives() {
         // 503, not 429: the retried statuses are the ones that describe a failed *attempt*.
         let (base_url, server) = scripted_server(vec![503, 503, 200]);
+        // Local endpoints can use an empty key; redaction must leave diagnostics readable.
         let config: crate::config::Config = serde_json::from_value(serde_json::json!({
-            "providers":[{"name":"test","api":"responses","base_url":base_url,"api_key":"k",
+            "providers":[{"name":"test","api":"responses","base_url":base_url,"api_key":"",
                 "models":[{"id":"m"}]}],
             "default_model":"test/m"
         }))
@@ -1205,8 +1233,8 @@ mod tests {
             .stream(
                 &streaming_request(provider, model, &messages, &[]),
                 &mut |delta| {
-                    if let Delta::Notice(text) = delta {
-                        notices.push(text);
+                    if let Delta::Retry(retry) = delta {
+                        notices.push(retry);
                     }
                 },
             )
@@ -1217,8 +1245,13 @@ mod tests {
         // Three requests, and the two failures said so.
         assert_eq!(seen.len(), 3);
         assert_eq!(notices.len(), 2, "{notices:?}");
-        assert!(notices[0].contains("重试 1/5"), "{notices:?}");
-        assert!(notices[1].contains("重试 2/5"), "{notices:?}");
+        for (index, retry) in notices.iter().enumerate() {
+            assert_eq!(retry.attempt as usize, index + 1);
+            assert_eq!(retry.limit, 5);
+            assert_eq!(retry.kind, "http");
+            assert!(retry.error.contains("503"));
+            assert!(retry.delay_ms > 0);
+        }
     }
 
     #[tokio::test]

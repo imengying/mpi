@@ -800,6 +800,54 @@ fn the_newest_turn_context_names_the_model_in_use() {
             crate::auth::guard::PermissionMode::default(),
         )
         .unwrap();
+    let provider: crate::config::Provider = serde_json::from_value(serde_json::json!({
+        "name":"work", "api":"responses", "api_key":"unused"
+    }))
+    .unwrap();
+    let model = crate::config::ModelConfig {
+        id: "second".into(),
+        ..Default::default()
+    };
+    session
+        .push_request_context(
+            "request",
+            &crate::llm::Request {
+                provider: &provider,
+                model: &model,
+                messages: &session.context_messages(),
+                tools: &crate::tools::specs(),
+                level: "max",
+                session_id: "session",
+                cache_hints: true,
+            },
+        )
+        .unwrap();
+    session
+        .push_request_end(
+            "request",
+            "error",
+            std::time::Duration::from_millis(1200),
+            vec![crate::llm::RetryDiagnostic {
+                attempt: 1,
+                limit: 2,
+                delay_ms: 500,
+                kind: "transport".into(),
+                error: "connection reset".into(),
+            }],
+            Some(("transport", "connection refused".into())),
+        )
+        .unwrap();
+    let context = session
+        .records()
+        .iter()
+        .find(|r| matches!(r, Record::RequestContext { .. }))
+        .unwrap();
+    let mut missing_version = serde_json::to_value(context).unwrap();
+    missing_version
+        .as_object_mut()
+        .unwrap()
+        .remove("app_version");
+    assert!(serde_json::from_value::<Record>(missing_version).is_err());
     drop(session);
 
     let reopened = Session::open(&path).unwrap();
@@ -810,6 +858,13 @@ fn the_newest_turn_context_names_the_model_in_use() {
     );
     // And it does not leak into the conversation.
     assert_eq!(reopened.context_messages().len(), 2);
+    assert!(reopened.records().iter().any(|record| matches!(record,
+        Record::RequestContext { app_version, request_id, .. } if app_version == crate::cli::version() && request_id == "request"
+    )));
+    assert!(reopened.records().iter().any(|record| matches!(record,
+        Record::RequestEnd { request_id, outcome, duration_ms:1200, retries, error, .. }
+            if request_id == "request" && outcome == "error" && retries.len() == 1 && error.as_deref() == Some("connection refused")
+    )));
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -1009,7 +1064,7 @@ fn the_same_directory_always_gets_the_same_id() {
         first.as_str()
     );
     // A table written here is readable by the next process, which is the whole point.
-    let index = super::dirs::read_dirs_index_for_test(&store);
+    let index = super::dirs::read_dirs_index(&store);
     assert_eq!(
         index.get(&first).map(String::as_str),
         Some(project.to_string_lossy().as_ref())
@@ -1033,7 +1088,7 @@ fn merely_looking_at_a_directory_does_not_register_it() {
     // Asking twice gives two ids, which is fine: neither names a real directory.
     let _ = super::dirs::sessions_dir_in(&store, &project);
     let _ = super::dirs::sessions_dir_in(&store, &project);
-    assert!(super::dirs::read_dirs_index_for_test(&store).is_empty());
+    assert!(super::dirs::read_dirs_index(&store).is_empty());
     assert!(super::dirs::dir_id_in(&store, &project).is_none());
 
     // Creating a session is what registers it, and then the id is stable.
@@ -1162,8 +1217,7 @@ fn current_cwd_uses_turn_context_instead_of_parsing_conversation_text() {
 fn the_permission_mode_is_read_back_from_the_newest_turn() {
     use crate::auth::guard::PermissionMode;
     let (mut session, dir) = temp_session("permission-mode");
-    // Nothing recorded yet: the default, which is also what an old file with no such field
-    // has to mean.
+    // A fresh session starts with the default permission mode.
     assert_eq!(session.current_permission_mode(), PermissionMode::Ask);
     session
         .push_turn_context(Path::new("/tmp/a"), "p/m", "high", PermissionMode::Allow)
@@ -1183,39 +1237,6 @@ fn the_permission_mode_is_read_back_from_the_newest_turn() {
     drop(session);
     let reopened = Session::open(&path).unwrap();
     assert_eq!(reopened.current_permission_mode(), PermissionMode::Ask);
-    let _ = std::fs::remove_dir_all(dir);
-}
-
-#[test]
-fn a_session_file_without_the_permission_field_still_opens_as_ask() {
-    // Files written before `/permissions` existed have no `permission_mode`, and the record
-    // denies unknown fields — so the absent *and* the defaulted case both have to parse.
-    // Reading such a file back as `Allow` would be a permission change made by an upgrade.
-    let dir = std::env::temp_dir().join(format!("pi-perm-legacy-{}", uuid::Uuid::now_v7()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("legacy.jsonl");
-    let line = serde_json::json!({
-        "type": "turn_context",
-        "parent_id": null,
-        "id": "01a11bb4-d484-7656-adc2-8633eea30320",
-        "cwd": "/tmp/legacy",
-        "model": "p/m",
-        "level": "high",
-        "timestamp": "2026-10-08T13:29:58Z"
-    });
-    let header = serde_json::json!({
-        "type": "session_meta",
-        "id": "01a11bb4-d47b-70e5-a157-23ac6dcfc96f",
-        "timestamp": "2026-10-08T13:29:58Z",
-        "cwd": "/tmp/legacy",
-        "model": "p/m"
-    });
-    std::fs::write(&path, format!("{header}\n{line}\n")).unwrap();
-    let session = Session::open(&path).unwrap();
-    assert_eq!(
-        session.current_permission_mode(),
-        crate::auth::guard::PermissionMode::Ask
-    );
     let _ = std::fs::remove_dir_all(dir);
 }
 

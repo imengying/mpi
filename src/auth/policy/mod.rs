@@ -188,9 +188,16 @@ pub fn assess_tool(
                 None => assess_path(Operation::Write, default_path, cwd),
             }
         }
-        // `read_image` reads a file like `read` does, so it is vetted the same way: a path
-        // outside the project has to ask, and a secret is refused whichever tool names it.
-        "read" | "grep" | "find" | "ls" | "read_image" => {
+        // Every batch target uses the same sensitive-path check as a single read.
+        "read" | "grep" => match crate::tools::input_paths(input) {
+            Ok(paths) => paths
+                .into_iter()
+                .map(|path| assess_path(Operation::Read, path, cwd))
+                .find(|assessment| !assessment.allows())
+                .unwrap_or_else(Assessment::allow),
+            Err(reason) => Assessment::ask(reason),
+        },
+        "find" | "ls" | "read_image" => {
             let path = {
                 let explicit = string("path");
                 if explicit.is_empty() {

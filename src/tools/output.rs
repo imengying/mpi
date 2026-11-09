@@ -12,21 +12,24 @@ pub(super) struct Capture {
 }
 
 impl Capture {
+    pub(super) fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
     pub fn new() -> std::io::Result<Self> {
-        let path = super::sandbox::output_dir().join(format!("pi-{}.log", uuid::Uuid::now_v7()));
-        let mut options = std::fs::OpenOptions::new();
-        options.read(true).write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let file = options.open(&path)?;
+        let (file, path) = util::create_output_file()?;
         Ok(Self {
             file,
             path,
             retained: false,
         })
+    }
+
+    /// Merge the raw output while its temporary file is still owned by this process.
+    pub fn append(&mut self, mut other: Self) -> std::io::Result<()> {
+        other.file.rewind()?;
+        std::io::copy(&mut other.file, &mut self.file)?;
+        Ok(())
     }
 
     pub fn finish(mut self, sanitize: bool) -> std::io::Result<String> {

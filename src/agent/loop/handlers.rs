@@ -64,8 +64,7 @@ impl Agent {
             // Every call keeps its own authorization decision; no batch-wide grant.
             let mut approved = Vec::with_capacity(batch.len());
             for (_, name, arguments) in batch {
-                let execution_arguments = arguments.clone();
-                let approval = match self.gate.assess(name, &execution_arguments, &self.cwd) {
+                let approval = match self.gate.assess(name, arguments, &self.cwd) {
                     Ok(crate::auth::guard::GateAction::Ready(call)) => Ok(call),
                     Ok(crate::auth::guard::GateAction::Ask(request)) => {
                         let decision = self.screen.request_approval(&request).await;
@@ -91,7 +90,7 @@ impl Agent {
                     self.session.push_tool_start(
                         id,
                         name,
-                        arguments.arguments.clone(),
+                        arguments.clone(),
                         tools::replay_safe(name),
                     )?;
                 }
@@ -143,7 +142,7 @@ impl Agent {
         } else {
             "收到用户补充，这个调用尚未执行；请结合最新要求重新决定操作。"
         };
-        for (id, name, _) in calls {
+        for (id, name, arguments) in calls {
             self.session.push_message(
                 Message::Tool {
                     tool_call_id: id.clone(),
@@ -155,6 +154,12 @@ impl Agent {
                 None,
                 None,
             )?;
+            self.screen.push(ui_compact::tool_block(
+                name,
+                arguments,
+                &ToolOutput::error_for(name, arguments, content),
+                ToolStatus::Skipped,
+            ));
         }
         Ok(())
     }
@@ -162,15 +167,17 @@ impl Agent {
     async fn run_tool_batch(
         &mut self,
         calls: &[(String, String, serde_json::Value)],
-        approved: Vec<Result<crate::auth::guard::ApprovedCall, ToolOutput>>,
+        approved: Vec<Result<serde_json::Value, ToolOutput>>,
     ) -> (Vec<(ToolOutput, ToolStatus)>, bool) {
         let mut workers = tokio::task::JoinSet::new();
         let mut task_indices = std::collections::HashMap::new();
         let mut results = vec![None; calls.len()];
+        let (progress, mut progress_rx) = tokio::sync::watch::channel(None);
         let context = tools::ToolContext {
             cwd: self.cwd.clone(),
             shell: self.config.shell.path.clone(),
             observed: self.observed.clone(),
+            progress: Some(progress),
         };
         for (index, approval) in approved.into_iter().enumerate() {
             match approval {
@@ -179,10 +186,7 @@ impl Agent {
                     let name = calls[index].1.clone();
                     let context = context.clone();
                     let task = workers.spawn(async move {
-                        (
-                            index,
-                            tools::sandbox::execute(&name, arguments, context).await,
-                        )
+                        (index, tools::execute(&name, &arguments, &context).await)
                     });
                     task_indices.insert(task.id(), index);
                 }
@@ -200,6 +204,11 @@ impl Agent {
                 break;
             }
             tokio::select! {
+                Ok(()) = progress_rx.changed() => {
+                    if let Some(path) = progress_rx.borrow_and_update().clone() {
+                        self.screen.set_running_log(path);
+                    }
+                }
                 result = workers.join_next() => {
                     settle_tool_task(result.expect("a running worker"), &task_indices, calls, &mut results);
                 }

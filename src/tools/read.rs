@@ -4,19 +4,20 @@
 use std::path::Path;
 
 use crate::llm::ToolSpec;
-use crate::tools::ToolOutput;
+use crate::tools::{Display, ToolOutput, output::Capture};
 
 pub fn spec() -> ToolSpec {
     ToolSpec {
         name: "read".into(),
         description:
             "读取文本文件内容。可选 offset（起始行号，从 1 开始）与 limit（最多读取行数）。\
-                      输出带行号，便于后续 edit 引用。图片用 read_image 读，不要用 read。"
+                      输出带行号；多个文件可在 path 中传数组，共用 offset/limit。\
+                      例如 {\"path\":[\"src/main.rs\",\"Cargo.toml\"],\"limit\":100}。图片用 read_image。"
                 .into(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string", "description": "文件路径（相对当前工作目录或绝对路径）" },
+                "path": { "anyOf": [{"type":"string"}, {"type":"array","items":{"type":"string"},"minItems":1,"maxItems":16}], "description": "文件路径或路径数组（最多 16 个），相对于当前目录" },
                 "offset": { "type": "integer", "description": "起始行号，从 1 开始" },
                 "limit": { "type": "integer", "description": "最多读取的行数" }
             },
@@ -30,6 +31,25 @@ pub async fn execute(
     cwd: &Path,
     observed: &crate::tools::observed::Observed,
 ) -> Result<ToolOutput, String> {
+    let content = capture(arguments, cwd, observed)
+        .await?
+        .finish(false)
+        .map_err(|err| format!("无法读取：{err}"))?;
+    Ok(super::tool_output(
+        content,
+        Display::File {
+            verb: "读取",
+            path: super::required_str(arguments, "path")?.into(),
+        },
+        false,
+    ))
+}
+
+pub(super) async fn capture(
+    arguments: &serde_json::Value,
+    cwd: &Path,
+    observed: &crate::tools::observed::Observed,
+) -> Result<Capture, String> {
     let path = crate::tools::required_str(arguments, "path")?;
     let resolved = crate::auth::policy::resolve_tool_path(path, cwd);
     let meta = std::fs::metadata(&resolved).map_err(|err| format!("无法读取：{err}"))?;
@@ -44,26 +64,15 @@ pub async fn execute(
     // was shown, and noting the state first means a write landing mid-read still reads as a
     // change rather than being papered over.
     observed.note(&resolved);
-    let out = tokio::task::spawn_blocking(move || read_window(&resolved, offset, limit))
+    tokio::task::spawn_blocking(move || read_window(&resolved, offset, limit))
         .await
-        .map_err(|err| format!("读取任务失败：{err}"))??;
-
-    Ok(ToolOutput {
-        content: out,
-        display: crate::tools::Display::File {
-            verb: "读取",
-            path: path.to_string(),
-        },
-        is_error: false,
-        duration: None,
-        images: Vec::new(),
-    })
+        .map_err(|err| format!("读取任务失败：{err}"))?
 }
 
 /// Scan in fixed-size buffers, including when a single line is gigabytes long.
-fn read_window(path: &Path, offset: u64, limit: u64) -> Result<String, String> {
+fn read_window(path: &Path, offset: u64, limit: u64) -> Result<Capture, String> {
     use std::io::{BufRead, Read, Seek, SeekFrom, Write};
-    let read = || -> std::io::Result<String> {
+    let read = || -> std::io::Result<Capture> {
         let mut file = std::fs::File::open(path)?;
         let mut probe = [0; 4096];
         let count = file.read(&mut probe)?;
@@ -81,7 +90,7 @@ fn read_window(path: &Path, offset: u64, limit: u64) -> Result<String, String> {
         }
         file.seek(SeekFrom::Start(0))?;
         let mut reader = std::io::BufReader::new(file);
-        let mut output = super::output::Capture::new()?;
+        let mut output = Capture::new()?;
         let end = offset.saturating_add(limit);
         let mut number = 1u64;
         let mut prefixed = false;
@@ -119,7 +128,7 @@ fn read_window(path: &Path, offset: u64, limit: u64) -> Result<String, String> {
                 prefixed = false;
             }
         }
-        output.finish(false)
+        Ok(output)
     };
     read().map_err(|err| format!("无法读取：{err}"))
 }
@@ -149,8 +158,17 @@ mod tests {
             file.write_all(&chunk).unwrap();
         }
         file.write_all("\n目标\n结尾".as_bytes()).unwrap();
-        assert_eq!(read_window(&path, 2, 1).unwrap(), "2\t目标");
-        assert_eq!(read_window(&path, 2, u64::MAX).unwrap(), "2\t目标\n3\t结尾");
+        assert_eq!(
+            read_window(&path, 2, 1).unwrap().finish(false).unwrap(),
+            "2\t目标"
+        );
+        assert_eq!(
+            read_window(&path, 2, u64::MAX)
+                .unwrap()
+                .finish(false)
+                .unwrap(),
+            "2\t目标\n3\t结尾"
+        );
         std::fs::remove_file(path).unwrap();
     }
 
@@ -163,7 +181,7 @@ mod tests {
         for _ in 0..32 {
             file.write_all(&[b'x'; 8192]).unwrap();
         }
-        let text = read_window(&path, 1, 1).unwrap();
+        let text = read_window(&path, 1, 1).unwrap().finish(false).unwrap();
         assert!(text.len() <= crate::util::MAX_OUTPUT_BYTES);
         let log = text
             .split("完整输出：")

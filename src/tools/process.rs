@@ -35,18 +35,14 @@ impl Child {
         }
         Ok(status)
     }
-
-    fn stop_group(&mut self) {
-        #[cfg(unix)]
-        if let Some(group) = self.group.take() {
-            let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
-        }
-    }
 }
 
 impl Drop for Child {
     fn drop(&mut self) {
-        self.stop_group();
+        #[cfg(unix)]
+        if let Some(group) = self.group.take() {
+            let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+        }
         // Tokio's child drop arranges reaping; kill_on_drop also covers non-Unix systems.
     }
 }

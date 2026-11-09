@@ -3,7 +3,7 @@
 
 use crate::ui::text::Line;
 use crate::util;
-use pulldown_cmark::{Event, Options, Parser, TagEnd};
+use pulldown_cmark::{Options, Parser};
 
 mod code;
 mod render;
@@ -19,70 +19,6 @@ pub(super) fn parser(text: &str) -> Parser<'_> {
 /// Render logical lines; the screen preserves source breaks when the terminal wraps them.
 pub fn render(text: &str, width: usize) -> Vec<Line> {
     render::render(&util::sanitize(text), width)
-}
-
-/// Only commit complete top-level blocks. Blank lines inside lists, quotes and code
-/// do not prove those containers have ended. Reference links may be defined later.
-pub(crate) fn stable_prefix(text: &str) -> usize {
-    let mut unresolved = usize::MAX;
-    let mut callback = |link: pulldown_cmark::BrokenLink<'_>| {
-        unresolved = unresolved.min(link.span.start);
-        None
-    };
-    let parsed = Parser::new_with_broken_link_callback(text, OPTIONS, Some(&mut callback));
-    if parsed.reference_definitions().iter().next().is_some() {
-        return 0;
-    }
-    let mut depth = 0;
-    let mut blocks = Vec::new();
-    for (event, range) in parsed.into_offset_iter() {
-        match event {
-            Event::Start(_) => depth += 1,
-            Event::End(tag) => {
-                depth -= 1;
-                if depth == 0 {
-                    blocks.push((tag, range));
-                }
-            }
-            Event::Rule => blocks.push((TagEnd::Paragraph, range)),
-            _ => {}
-        }
-    }
-    let mut stable = 0;
-    for (index, (tag, range)) in blocks.iter().enumerate() {
-        if range.end > unresolved {
-            break;
-        }
-        if index + 1 == blocks.len()
-            && matches!(
-                tag,
-                TagEnd::List(_) | TagEnd::BlockQuote(_) | TagEnd::CodeBlock | TagEnd::Table
-            )
-        {
-            break;
-        }
-        if matches!(tag, TagEnd::List(_))
-            && blocks
-                .get(index + 1)
-                .is_some_and(|(_, next)| !text[next.start..].contains('\n'))
-        {
-            break;
-        }
-        let mut end = range.end;
-        for line in text[range.end..].split_inclusive('\n') {
-            if !line.ends_with('\n') || !line.trim().is_empty() {
-                break;
-            }
-            end += line.len();
-        }
-        if text[..end]
-            .trim_end_matches([' ', '\t', '\r'])
-            .ends_with("\n\n")
-        {
-            stable = end;
-        }
-    }
-    stable
 }
 
 #[cfg(test)]
@@ -125,24 +61,6 @@ mod tests {
     }
 
     #[test]
-    fn streaming_does_not_split_lists_or_lose_forward_reference_definitions() {
-        for source in [
-            "1. first\n\n   continuation\n\n2. second\n\n",
-            "> first\n>\n> second\n\n",
-            "[说明][doc]\n\n另一个段落\n\n[doc]: https://example.com\n\n",
-        ] {
-            assert_eq!(stable_prefix(source), 0, "{source}");
-        }
-        let source = "Intro\n\n    let x = 1;\n";
-        assert_eq!(&source[..stable_prefix(source)], "Intro\n\n");
-        assert!(
-            render(&source[stable_prefix(source)..], 80)[0]
-                .text()
-                .starts_with('┌')
-        );
-    }
-
-    #[test]
     fn raw_html_lines_are_safe_and_narrow_tables_keep_header_value_pairs() {
         let rows = render("<div>\nhello\n</div>\n", 40);
         assert!(rows.iter().all(|row| !row.text().contains('\n')));
@@ -171,23 +89,6 @@ mod tests {
         }
         let rows = render("| long first | long second |\n| --- | --- |", 12);
         assert_eq!(rendered_rows(&rows), vec!["long first  long second"]);
-    }
-
-    #[test]
-    fn stable_stream_blocks_hold_open_fences_and_partial_tables() {
-        for text in [
-            "段落\n\n尾",
-            "段落\n\n```rs\nfirst\n\nsecond\n",
-            "段落\n\n| A | B |\n| - | - |\n",
-        ] {
-            assert_eq!(&text[..stable_prefix(text)], "段落\n\n");
-        }
-        let closed = "段落\n\n~~~~\n\ncode\n~~~~\n\n尾";
-        assert_eq!(
-            &closed[..stable_prefix(closed)],
-            "段落\n\n~~~~\n\ncode\n~~~~\n\n"
-        );
-        assert_eq!(stable_prefix("尚未结束的段落"), 0);
     }
 
     #[test]

@@ -37,11 +37,6 @@ impl Agent {
         Ok(())
     }
 
-    /// Run one user turn to completion.
-    pub async fn run_turn(&mut self, input: &str) -> anyhow::Result<()> {
-        self.run_turn_with_images(input, Vec::new()).await
-    }
-
     /// A turn with pasted images attached.
     ///
     /// The images and the text become **one** user message: splitting them would let the
@@ -92,8 +87,12 @@ impl Agent {
                     break;
                 }
                 Err(err) => {
+                    let message = err
+                        .downcast_ref::<llm::LlmError>()
+                        .map(llm::LlmError::summary)
+                        .unwrap_or_else(|| err.to_string());
                     self.screen.push_lines(ui_compact::note_lines(
-                        &format!("请求失败：{err}"),
+                        &message,
                         crate::ui::screen::Style::new(Color::Red),
                     ));
                     break;
@@ -178,14 +177,19 @@ impl Agent {
         self.session.push_request_context(&request_id, &request)?;
 
         self.streaming = true;
+        self.screen.set_working(WORKING_LABEL);
         self.screen.begin_stream();
         // Deltas travel through a channel rather than straight into the screen, because the
         // spinner has to be advanced from the same place: the sink cannot keep hold of the
         // screen across the `select` below, and a model that has not produced its first
         // token yet is exactly when the spinner matters.
         let (sender, mut deltas) = tokio::sync::mpsc::unbounded_channel::<Delta>();
+        let mut retries = Vec::new();
         let outcome = {
             let mut sink = |delta: Delta| {
+                if let Delta::Retry(retry) = &delta {
+                    retries.push(retry.clone());
+                }
                 let _ = sender.send(delta);
             };
             // Timed around the whole stream, retries included: this is the wait the user
@@ -237,12 +241,33 @@ impl Agent {
             }
             drain_deltas(&mut self.screen, &mut deltas);
             TurnOutcome {
-                result,
+                result: result.map(|result| result.map(llm::Completion::checked)),
                 elapsed: started.elapsed(),
                 first_token,
             }
         };
         self.streaming = false;
+        self.screen.set_working(WORKING_LABEL);
+        let (status, error) = match &outcome.result {
+            None => ("cancelled", None),
+            Some(Err(error)) => ("error", Some((error.kind(), error.to_string()))),
+            Some(Ok(completion)) => match &completion.error {
+                Some(error) => ("error", Some(("upstream", error.clone()))),
+                None if completion.stop_reason == StopReason::Length => ("length", None),
+                None => ("success", None),
+            },
+        };
+        let error = error.map(|(kind, text)| {
+            (
+                kind,
+                provider
+                    .api_key()
+                    .filter(|key| !key.is_empty())
+                    .map_or_else(|| text.clone(), |key| text.replace(&key, "[redacted]")),
+            )
+        });
+        self.session
+            .push_request_end(&request_id, status, outcome.elapsed, retries, error)?;
         // A stop keeps the half-written answer, because it is a real answer the user chose to
         // cut short; a failure discards it, because a half-written answer that was never
         // recorded must not stay on screen.
@@ -251,17 +276,13 @@ impl Agent {
         let (elapsed, first_token) = (outcome.elapsed, outcome.first_token);
         let completion = match outcome.result {
             None => {
-                debug_assert!(
-                    outcome.stopped(),
-                    "no completion means the stream was stopped"
-                );
                 return self.finish_stopped().map(|()| TurnEnd::Stopped);
             }
-            Some(Ok(completion)) => completion.checked(),
+            Some(Ok(completion)) => completion,
             Some(Err(err)) => {
                 // Nothing is committed, so the discarded preview leaves no trace.
                 self.screen.discard_stream();
-                if let Some(retried) = self.recover_overflow(&err.message()).await? {
+                if let Some(retried) = self.recover_overflow(&err.to_string()).await? {
                     return Ok(retried);
                 }
                 return Err(err.into());
@@ -286,7 +307,11 @@ impl Agent {
             return Ok(TurnEnd::Done);
         }
 
-        self.screen.end_stream();
+        if completion.tool_calls().is_empty() {
+            self.screen.end_stream();
+        } else {
+            self.screen.end_tool_stream();
+        }
         let citations = llm::citation_lines(&completion.message);
         if !citations.is_empty() {
             let mut lines = Vec::new();
@@ -454,7 +479,7 @@ mod tests {
             agent.session = Session::create_in(&dir, &dir, "test/m").unwrap();
             tokio::time::timeout(
                 std::time::Duration::from_secs(10),
-                agent.run_turn("处理任务"),
+                agent.run_turn_with_images("处理任务", Vec::new()),
             )
             .await
             .unwrap()
@@ -477,6 +502,10 @@ mod tests {
                     ..
                 }
             ));
+            assert!(agent.session.records().iter().any(|record| matches!(record,
+                crate::agent::session::Record::RequestEnd { outcome, error, .. }
+                    if outcome == "error" && error.as_ref().is_some_and(|error| !error.is_empty())
+            )), "{failure}");
             drop(agent);
             std::fs::remove_dir_all(dir).unwrap();
         }
@@ -550,7 +579,7 @@ mod tests {
         agent.session = Session::create_in(&dir, &dir, "test/m").unwrap();
         tokio::time::timeout(
             std::time::Duration::from_secs(15),
-            agent.run_turn("完成任务"),
+            agent.run_turn_with_images("完成任务", Vec::new()),
         )
         .await
         .unwrap()
@@ -578,6 +607,9 @@ mod tests {
             "one usage record per response"
         );
         assert_eq!(agent.session.totals.output, 128);
+        assert!(agent.session.records().iter().any(|record| matches!(record,
+            crate::agent::session::Record::RequestEnd { outcome, error: None, .. } if outcome == "length"
+        )));
         let level = agent.level.clone();
         let exhausted = llm::Completion {
             message: Message::Assistant {

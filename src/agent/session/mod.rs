@@ -47,7 +47,7 @@ pub(crate) use file::Storage;
 mod tests;
 
 pub use record::{ContextSnapshot, Record, SessionHeader};
-pub use store::{SessionSummary, find_by_prefix, list, message_preview, now};
+pub use store::{SessionSummary, find_by_prefix, list, now};
 
 /// An append handle whose writer lock is released even if a child inherited its descriptor.
 /// A session, plus the bookkeeping needed to append safely.
@@ -371,9 +371,39 @@ impl Session {
             system_prompt_hash,
             tools_hash,
             cache_hints: request.cache_hints,
+            app_version: crate::cli::version().into(),
             timestamp: now(),
         };
         self.append(record, id)
+    }
+
+    pub fn push_request_end(
+        &mut self,
+        request_id: &str,
+        outcome: &str,
+        elapsed: std::time::Duration,
+        retries: Vec<crate::llm::RetryDiagnostic>,
+        error: Option<(&str, String)>,
+    ) -> Result<(), SessionError> {
+        let id = self.next_id();
+        let (error_kind, error) = match error {
+            Some((kind, text)) => (Some(kind.to_string()), Some(text)),
+            None => (None, None),
+        };
+        self.append(
+            Record::RequestEnd {
+                parent_id: self.last_id.clone(),
+                id: id.clone(),
+                request_id: request_id.into(),
+                outcome: outcome.into(),
+                duration_ms: elapsed.as_millis().min(u64::MAX as u128) as u64,
+                retries,
+                error_kind,
+                error,
+                timestamp: now(),
+            },
+            id,
+        )
     }
 
     pub fn push_compaction_start(

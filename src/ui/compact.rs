@@ -53,7 +53,7 @@ pub fn status_mark(status: crate::llm::ToolStatus) -> (Style, &'static str) {
 /// stored message keeps it; the transcript does not. `Unknown` was the one status left out of
 /// this list, so an interrupted call printed `请先检查文件或实际状态，再决定是否重试。`
 /// under a `×` — advice for the model, in the user's transcript.
-fn result_text(status: crate::llm::ToolStatus, content: &str) -> Cow<'_, str> {
+pub(super) fn result_text(status: crate::llm::ToolStatus, content: &str) -> Cow<'_, str> {
     use crate::llm::ToolStatus;
     match status {
         ToolStatus::Success | ToolStatus::Error => {
@@ -119,6 +119,14 @@ fn model_output_note(line: &str) -> bool {
 /// better shown as an unnamed target than as the tool's name.
 pub(crate) fn arguments_display(name: &str, arguments: &serde_json::Value) -> Display {
     let path = |fallback: &str| {
+        if arguments
+            .get("path")
+            .is_some_and(serde_json::Value::is_array)
+        {
+            return crate::tools::input_paths(arguments)
+                .map(|paths| util::one_line(&paths.join(", ")))
+                .unwrap_or_else(|_| fallback.to_string());
+        }
         arguments
             .get("path")
             .and_then(|value| value.as_str())
@@ -148,17 +156,7 @@ pub fn tool_block(
 ) -> Block {
     let mut block = tool_block_inner(name, arguments, output, status);
     if let Block::Collapsible(inner) = &mut block {
-        inner.full_output = output.content.lines().rev().find_map(|line| {
-            let raw = line
-                .strip_prefix("[输出过长，已截断。完整输出：")?
-                .strip_suffix(']')?;
-            let path = std::path::PathBuf::from(raw);
-            let temp = std::env::temp_dir().canonicalize().ok()?;
-            let canonical = path.canonicalize().ok()?;
-            let name = canonical.file_name()?.to_str()?;
-            (canonical.starts_with(temp) && name.starts_with("pi-") && name.ends_with(".log"))
-                .then_some(canonical)
-        });
+        inner.full_output = output.content.lines().rev().find_map(util::output_log_path);
     }
     block
 }
@@ -244,6 +242,17 @@ fn tool_block_inner(
             ];
             if status == crate::llm::ToolStatus::Success {
                 let summary = match body.trim() {
+                    _ if arguments
+                        .get("path")
+                        .is_some_and(serde_json::Value::is_array) =>
+                    {
+                        format!(
+                            "{} 个路径",
+                            crate::tools::input_paths(arguments)
+                                .unwrap_or_default()
+                                .len()
+                        )
+                    }
                     "没有找到匹配。" | "没有找到匹配的文件。" => {
                         "无匹配".to_string()
                     }
@@ -415,11 +424,17 @@ pub fn replay_blocks(messages: &[crate::llm::Message]) -> Vec<crate::ui::screen:
                 let stopped = *stop_reason == Some(crate::llm::StopReason::Aborted);
                 // Said once, on the first hosted call or citation, not once per result.
                 let mut announced_search = false;
+                let has_calls = content
+                    .iter()
+                    .any(|block| matches!(block, MsgBlock::ToolCall { .. }));
+                let mut commentary = has_calls
+                    .then(|| message.text())
+                    .filter(|text| !text.trim().is_empty());
                 for block in content {
                     match block {
                         MsgBlock::Text { text } => {
                             push_lines(&mut out, std::mem::take(&mut lines));
-                            if !text.trim().is_empty() {
+                            if !has_calls && !text.trim().is_empty() {
                                 out.push(Block::markdown(text));
                             }
                         }
@@ -440,7 +455,11 @@ pub fn replay_blocks(messages: &[crate::llm::Message]) -> Vec<crate::ui::screen:
                             // the record, which is what keeps a call the user stopped from
                             // rendering differently here than it did live.
                             let output = stored_output(name, arguments, content);
-                            out.push(tool_block(name, arguments, &output, status));
+                            let mut block = tool_block(name, arguments, &output, status);
+                            if let Block::Collapsible(inner) = &mut block {
+                                inner.commentary = commentary.take();
+                            }
+                            out.push(block);
                         }
                         MsgBlock::Hosted { .. } => {
                             if !announced_search {
@@ -732,6 +751,9 @@ mod tests {
             Message::user_text("跑一下 echo"),
             Message::Assistant {
                 content: vec![
+                    MsgBlock::Text {
+                        text: "先确认命令输出".into(),
+                    },
                     MsgBlock::Thinking {
                         thinking: "先跑命令".into(),
                         signature: None,
@@ -758,7 +780,8 @@ mod tests {
                 stop_reason: Some(StopReason::Stop),
             },
         ];
-        let blocks: Vec<Vec<String>> = replay_blocks(&messages)
+        let replayed = replay_blocks(&messages);
+        let blocks: Vec<Vec<String>> = replayed
             .iter()
             .map(|block| plain(&block.render(80)))
             .collect();
@@ -783,6 +806,18 @@ mod tests {
         );
         // The environment block is bookkeeping, not something the user said.
         assert!(!text.contains("<environment>"), "{text}");
+        assert!(!text.contains("先确认命令输出"));
+        let mut detail = replayed
+            .iter()
+            .find(|block| block.is_collapsible())
+            .unwrap()
+            .clone();
+        if let Block::Collapsible(inner) = &mut detail {
+            inner.expanded = true;
+        }
+        let detail = plain(&detail.render(80)).join("\n");
+        assert!(detail.contains("先确认命令输出"));
+        assert!(detail.contains("hi"));
     }
 
     #[test]
@@ -953,6 +988,7 @@ mod tests {
             cwd: dir.clone(),
             shell: "/usr/bin/zsh".into(),
             observed: Default::default(),
+            progress: None,
         };
         let cases: Vec<(&str, serde_json::Value)> = vec![
             ("read", serde_json::json!({"path": "nope.rs"})),

@@ -10,7 +10,9 @@ use crate::util;
 pub fn spec() -> ToolSpec {
     ToolSpec {
         name: "find".into(),
-        description: "按文件名查找文件。优先使用系统 fd，回退 find。返回相对路径列表。".into(),
+        description: "按文件名查找文件。优先使用系统 fd，回退 find。返回相对路径列表。\
+                      例如 {\"pattern\":\"*.rs\",\"path\":\"src\"}。"
+            .into(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {

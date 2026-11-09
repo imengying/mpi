@@ -1,7 +1,7 @@
 //! `bash`: run a command through zsh.
 //!
 //! The shell is fixed to the configured path (default `/usr/bin/zsh`) and is invoked as
-//! `zsh -o no_nomatch -o noequals -c '<command>'`. The command string handed here is the
+//! `zsh -o no_nomatch -o noequals -o pipefail -c '<command>'`. The command string handed here is the
 //! one the authorization gate already vetted — for auto-approved calls it is the rewritten
 //! form with quoted absolute paths, so a PATH change cannot redirect it.
 
@@ -16,7 +16,8 @@ pub fn spec() -> ToolSpec {
         name: "bash".into(),
         description: "在 zsh 中执行一条命令并返回输出。只读的简单命令会自动执行，\
                       其余命令会在执行前请求用户授权。自动授权的内容搜索会跳过敏感文件。\
-                      命令输出默认只显示末尾若干行。\
+                      输出自动截断并保留完整日志，不必接 head/tail；管道任一步失败会返回非零退出码。\
+                      换目录示例：command=cargo test，cwd=/path/to/project。\
                       列目录用 ls 工具、按内容搜索用 grep 工具、按文件名查找用 find 工具：\
                       它们不需要引号转义，也不会因为 zsh 的通配符匹配不到而失败。"
             .into(),
@@ -63,9 +64,7 @@ pub fn resolve_cwd(arguments: &serde_json::Value, cwd: &Path) -> Result<PathBuf,
 
 /// The options a zsh call needs to behave the way the caller expects.
 ///
-/// Both of these exist because zsh is stricter than the shell most callers have in mind, and
-/// the strictness lands as a *failed command*, not as a difference in output. Neither is a
-/// convenience: without them the command does not run at all.
+/// The zsh compatibility flags avoid failures before the command even runs.
 ///
 /// `no_nomatch`: an unmatched glob is an error in zsh, and the error aborts the whole command
 /// before any of it runs. `grep -rn pattern src --include=*.rs` — which works in bash, and is
@@ -79,22 +78,26 @@ pub fn resolve_cwd(arguments: &serde_json::Value, cwd: &Path) -> Result<PathBuf,
 /// the things that look similar: `[[ x =~ y ]]`, `[ x = y ]`, `FOO=bar` and `--opt=value` all
 /// still work, and the recorded sessions never once relied on `=cmd` expansion.
 ///
-/// Only applied to zsh — `-o no_nomatch` on bash is an error, not an ignored flag.
-fn shell_options(shell: &str) -> Vec<&'static str> {
+/// `pipefail` also applies to bash: a successful tail must not hide a failed build.
+/// The compatibility flags only apply to zsh; other shells keep their own defaults.
+fn shell_options(shell: &str) -> &'static [&'static str] {
     let name = shell.rsplit('/').next().unwrap_or(shell);
     let name = name.strip_suffix(".exe").unwrap_or(name);
     if name.eq_ignore_ascii_case("zsh") {
-        vec!["-o", "no_nomatch", "-o", "noequals"]
+        &["-o", "no_nomatch", "-o", "noequals", "-o", "pipefail"]
+    } else if name.eq_ignore_ascii_case("bash") {
+        &["-o", "pipefail"]
     } else {
-        Vec::new()
+        &[]
     }
 }
 
 /// Run `command` in `shell`, with the working directory set to `cwd`.
-pub async fn execute_with_shell(
+pub async fn execute(
     command: &str,
     cwd: &Path,
     shell: &str,
+    progress: Option<&tokio::sync::watch::Sender<Option<PathBuf>>>,
 ) -> Result<ToolOutput, String> {
     let shell = if shell.is_empty() {
         crate::config::DEFAULT_SHELL
@@ -111,11 +114,13 @@ pub async fn execute_with_shell(
         .arg("-c")
         .arg(command)
         .current_dir(cwd)
-        .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
     let mut child = super::process::Child::spawn(&mut process)
         .map_err(|err| format!("无法启动 {shell}：{err}"))?;
+    if let Some(progress) = progress {
+        progress.send_replace(Some(capture.path().to_path_buf()));
+    }
 
     let status = child
         .wait()
@@ -145,6 +150,14 @@ pub async fn execute_with_shell(
 mod tests {
     use super::*;
     use crate::tools::block;
+
+    async fn execute_with_shell(
+        command: &str,
+        cwd: &Path,
+        shell: &str,
+    ) -> Result<ToolOutput, String> {
+        execute(command, cwd, shell, None).await
+    }
 
     #[tokio::test]
     async fn cancellation_stops_background_descendants() {
@@ -244,6 +257,21 @@ mod tests {
         .unwrap();
         assert!(failed.is_error);
         assert!(failed.content.contains("[退出码 3]"));
+        for shell in ["/usr/bin/zsh", "/bin/bash"] {
+            for (command, code) in [
+                ("sh -c 'echo build-failed; exit 7' | tail -n 1", 7),
+                ("yes | head -n 1", 141),
+                ("printf clean | grep -c absent", 1),
+            ] {
+                let out = block(execute_with_shell(command, &cwd, shell)).unwrap();
+                assert!(out.is_error, "{shell}: {command}");
+                assert!(
+                    out.content.contains(&format!("[退出码 {code}]")),
+                    "{}",
+                    out.content
+                );
+            }
+        }
     }
 
     #[test]

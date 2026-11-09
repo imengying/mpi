@@ -101,9 +101,11 @@ fn a_write_inside_the_project_is_allowed_but_outside_it_asks() {
     assert!(!assess_tool("write", &outside, &dir, Dialect::Zsh).allows());
 }
 
-#[test]
-fn reading_secrets_asks_but_reading_source_does_not() {
-    let dir = cwd();
+#[tokio::test]
+async fn reading_secrets_asks_but_reading_source_does_not() {
+    use mpi::auth::guard::PermissionGate;
+    let dir = std::env::temp_dir().join(format!("pi-batch-read-{}", uuid::Uuid::now_v7()));
+    std::fs::create_dir(&dir).unwrap();
     for path in ["Cargo.toml", "src/main.rs", "."] {
         let input = serde_json::json!({"path": path});
         assert!(
@@ -125,6 +127,89 @@ fn reading_secrets_asks_but_reading_source_does_not() {
             "{path}"
         );
     }
+    let gate = PermissionGate::new(false, Dialect::Zsh);
+    let context = mpi::tools::ToolContext {
+        cwd: dir.clone(),
+        shell: "/usr/bin/zsh".into(),
+        observed: Default::default(),
+        progress: None,
+    };
+    for path in ["a.txt", "b.txt"] {
+        std::fs::write(dir.join(path), "first\nsentinel\nlast\n").unwrap();
+    }
+    for name in ["read", "grep"] {
+        for paths in [
+            serde_json::json!(["a.txt", ".env"]),
+            serde_json::json!(["/etc/shadow", "b.txt"]),
+            serde_json::json!([]),
+            serde_json::json!(["a.txt", 42]),
+            serde_json::json!(["a.txt", ""]),
+            serde_json::json!(vec!["a.txt"; 17]),
+        ] {
+            assert!(
+                gate.check(
+                    name,
+                    &serde_json::json!({"path":paths,"pattern":"sentinel"}),
+                    &dir
+                )
+                .is_err()
+            );
+        }
+        let args = gate
+            .check(
+                name,
+                &serde_json::json!({
+                    "path":["a.txt", "missing.txt", "b.txt"],
+                    "pattern":"sentinel", "offset":2, "limit":1
+                }),
+                &dir,
+            )
+            .unwrap();
+        let result = mpi::tools::execute(name, &args, &context).await;
+        assert!(result.is_error, "a missing file makes the batch fail");
+        assert_eq!(result.content.matches("sentinel").count(), 2);
+        assert!(!result.content.contains("first"));
+        let a = result.content.find("── a.txt").unwrap();
+        let missing = result.content.find("── missing.txt").unwrap();
+        let b = result.content.find("── b.txt").unwrap();
+        assert!(a < missing && missing < b);
+    }
+    for path in ["a.txt", "b.txt"] {
+        std::fs::write(dir.join(path), "changed").unwrap();
+        assert!(context.observed.stale(&dir.join(path), path).is_err());
+    }
+    for path in ["a.txt", "b.txt"] {
+        std::fs::write(
+            dir.join(path),
+            (0..3000)
+                .map(|n| format!("batch-sentinel-{n}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+    }
+    for name in ["read", "grep"] {
+        let args = serde_json::json!({"path":["a.txt", "b.txt"],"pattern":"batch-sentinel", "limit":3000, "max_results":3000});
+        let result =
+            mpi::tools::execute(name, &gate.check(name, &args, &dir).unwrap(), &context).await;
+        assert!(!result.is_error);
+        assert!(result.content.len() <= mpi::util::MAX_OUTPUT_BYTES);
+        let path = result
+            .content
+            .lines()
+            .last()
+            .unwrap()
+            .strip_prefix("[输出过长，已截断。完整输出：")
+            .unwrap()
+            .strip_suffix(']')
+            .unwrap();
+        let full = std::fs::read_to_string(path).unwrap();
+        assert!(full.contains("── a.txt") && full.contains("── b.txt"));
+        assert_eq!(full.matches("batch-sentinel-").count(), 6000);
+        assert_eq!(full.matches("batch-sentinel-0\n").count(), 2);
+        assert!(!full.contains("输出过长，已截断"));
+        std::fs::remove_file(path).unwrap();
+    }
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
@@ -174,6 +259,7 @@ async fn a_single_file_search_carries_no_exclusions_but_still_cannot_leak() {
         cwd: dir.clone(),
         shell: "/usr/bin/zsh".into(),
         observed: Default::default(),
+        progress: None,
     };
     for command in [
         "grep -n ordinary-sentinel ordinary.txt",
@@ -218,6 +304,7 @@ async fn broad_and_explicit_glob_searches_cannot_read_secrets() {
         cwd: dir.clone(),
         shell: "/usr/bin/zsh".into(),
         observed: Default::default(),
+        progress: None,
     };
     for command in [
         "rg --hidden --no-ignore policy-secret-sentinel .",
@@ -340,6 +427,7 @@ async fn a_batch_using_the_default_path_is_still_vetted() {
         cwd: dir.clone(),
         shell: mpi::config::DEFAULT_SHELL.into(),
         observed: Default::default(),
+        progress: None,
     };
     let result = mpi::tools::execute("edit", &inside, &context).await;
     assert!(!result.is_error, "{}", result.content);

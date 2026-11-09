@@ -51,14 +51,7 @@ pub enum Record {
         cwd: String,
         model: String,
         level: String,
-        /// The `/permissions` choice in force for this turn.
-        ///
-        /// Defaulted so a file written before the command existed still opens: an absent
-        /// value means the session asked, which is what it did. Recorded per turn rather
-        /// than in the header because `/permissions` changes it mid-session, and a resume
-        /// must come back to the mode the user last chose rather than the one the file
-        /// started with.
-        #[serde(default)]
+        /// The latest `/permissions` choice, restored when resuming this session.
         permission_mode: crate::auth::guard::PermissionMode,
         timestamp: String,
     },
@@ -77,6 +70,21 @@ pub enum Record {
         system_prompt_hash: Option<String>,
         tools_hash: String,
         cache_hints: bool,
+        app_version: String,
+        timestamp: String,
+    },
+    /// Internal request outcome; never sent to the model or replayed as conversation.
+    RequestEnd {
+        parent_id: Option<String>,
+        id: String,
+        request_id: String,
+        outcome: String,
+        duration_ms: u64,
+        retries: Vec<crate::llm::RetryDiagnostic>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error_kind: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
         timestamp: String,
     },
     /// Opens a durable compaction lifecycle. An unmatched start is an interrupted attempt.
@@ -178,6 +186,7 @@ impl Record {
             Record::ResponseItem { id, .. }
             | Record::TurnContext { id, .. }
             | Record::RequestContext { id, .. }
+            | Record::RequestEnd { id, .. }
             | Record::CompactionStart { id, .. }
             | Record::CompactionEnd { id, .. }
             | Record::ToolExecutionStart { id, .. }
@@ -194,6 +203,7 @@ impl Record {
             Record::ResponseItem { parent_id, .. }
             | Record::TurnContext { parent_id, .. }
             | Record::RequestContext { parent_id, .. }
+            | Record::RequestEnd { parent_id, .. }
             | Record::CompactionStart { parent_id, .. }
             | Record::CompactionEnd { parent_id, .. }
             | Record::ToolExecutionStart { parent_id, .. }

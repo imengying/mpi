@@ -123,8 +123,8 @@ pub struct Screen {
     /// Streaming preview: thinking tail plus the answer so far.
     streaming_thinking: Option<String>,
     streaming_answer: Option<String>,
-    /// Bytes already emitted as complete Markdown blocks during this stream.
-    streaming_committed: usize,
+    /// Tool-call prose is attached to the next result's detail view.
+    pending_commentary: Option<String>,
     /// The spinner's label while a turn is in flight, and which frame of the animation it
     /// is on.
     ///
@@ -141,6 +141,8 @@ pub struct Screen {
     /// call is committed afterwards with its output and duration, and this line disappears
     /// in the same redraw.
     running_call: Option<Vec<Span>>,
+    running_started: Option<std::time::Instant>,
+    running_log: Option<std::path::PathBuf>,
     /// Whether stdout is a terminal at all.
     interactive: bool,
     /// What was last written as the window title, so an unchanged title is not rewritten on
@@ -248,8 +250,10 @@ impl Screen {
             working: None,
             working_frame: 0,
             running_call: None,
+            running_started: None,
+            running_log: None,
             streaming_answer: None,
-            streaming_committed: 0,
+            pending_commentary: None,
             interactive,
             title: None,
             notice: None,
@@ -299,7 +303,10 @@ impl Screen {
     /// Queue a block. It is written to the terminal on the next redraw — which happens at
     /// the end of the current step, so a note appears immediately but never interleaves
     /// with a half-drawn frame.
-    pub fn push(&mut self, block: Block) {
+    pub fn push(&mut self, mut block: Block) {
+        if let Block::Collapsible(inner) = &mut block {
+            inner.commentary = self.pending_commentary.take().or(inner.commentary.take());
+        }
         self.blocks.push(block);
     }
 
@@ -353,8 +360,10 @@ impl Screen {
         self.detail = None;
         self.streaming_answer = None;
         self.streaming_thinking = None;
-        self.streaming_committed = 0;
+        self.pending_commentary = None;
         self.running_call = None;
+        self.running_started = None;
+        self.running_log = None;
         self.working = None;
         self.editing = None;
         self.erase_live();
@@ -384,6 +393,9 @@ impl Screen {
     /// model or a command has the upper hand, and only the label's neighbours change in
     /// between.
     pub fn set_working(&mut self, label: &str) {
+        if self.working.as_deref() == Some(label) {
+            return;
+        }
         self.working = Some(label.to_string());
         self.working_frame = 0;
         self.render();
@@ -414,12 +426,24 @@ impl Screen {
     /// finished call is committed to the transcript in its place.
     pub fn set_running(&mut self, spans: Vec<Span>) {
         self.running_call = Some(spans);
+        self.running_started = Some(std::time::Instant::now());
+        self.running_log = None;
+        self.render();
+    }
+
+    pub fn set_running_log(&mut self, path: std::path::PathBuf) {
+        self.running_log = Some(path);
         self.render();
     }
 
     /// Take the running line down. Called before the finished call is committed, so the two
     /// never show at once.
     pub fn clear_running(&mut self) {
+        if self.detail.as_ref().is_some_and(|detail| detail.is_live()) {
+            self.close_detail();
+        }
+        self.running_started = None;
+        self.running_log = None;
         if self.running_call.take().is_some() {
             self.render();
         }
@@ -430,7 +454,7 @@ impl Screen {
     pub fn begin_stream(&mut self) {
         self.streaming_thinking = None;
         self.streaming_answer = Some(String::new());
-        self.streaming_committed = 0;
+        self.pending_commentary = None;
     }
 
     /// Append to the thinking preview. No redraw: the caller drains a burst of deltas and
@@ -452,20 +476,29 @@ impl Screen {
     pub fn discard_stream(&mut self) {
         self.streaming_answer = None;
         self.streaming_thinking = None;
-        self.streaming_committed = 0;
         self.erase_live();
         let _ = self.out.flush();
     }
 
     /// Finish the stream and commit the answer. Thinking stays in the live preview only.
     pub fn end_stream(&mut self) -> (String, String) {
+        self.finish_stream(false)
+    }
+
+    pub fn end_tool_stream(&mut self) -> (String, String) {
+        self.finish_stream(true)
+    }
+
+    fn finish_stream(&mut self, tool_call: bool) -> (String, String) {
         let answer = self.streaming_answer.take().unwrap_or_default();
         let thinking = self.streaming_thinking.take().unwrap_or_default();
-        let tail = &answer[self.streaming_committed..];
-        if !tail.trim().is_empty() {
-            self.blocks.push(Block::markdown(tail));
+        if !answer.trim().is_empty() {
+            if tool_call {
+                self.pending_commentary = Some(answer.clone());
+            } else {
+                self.blocks.push(Block::markdown(&answer));
+            }
         }
-        self.streaming_committed = 0;
         self.flush();
         (answer, thinking)
     }

@@ -13,7 +13,6 @@ mod output;
 mod process;
 pub mod read;
 pub mod read_image;
-pub mod sandbox;
 pub mod write;
 
 use std::path::{Path, PathBuf};
@@ -212,6 +211,13 @@ pub async fn execute(
     // asks, so a render-based number would include the time spent reading the dialog.
     let started = std::time::Instant::now();
     let result = match name {
+        "read" | "grep"
+            if arguments
+                .get("path")
+                .is_some_and(serde_json::Value::is_array) =>
+        {
+            execute_paths(name, arguments, context).await
+        }
         "read" => read::execute(arguments, &context.cwd, &context.observed).await,
         "write" => {
             let result = write::execute(arguments, &context.cwd).await;
@@ -229,7 +235,10 @@ pub async fn execute(
             Ok(command) => {
                 let cwd = bash::resolve_cwd(arguments, &context.cwd);
                 match cwd {
-                    Ok(cwd) => bash::execute_with_shell(command, &cwd, &context.shell).await,
+                    Ok(cwd) => {
+                        bash::execute(command, &cwd, &context.shell, context.progress.as_ref())
+                            .await
+                    }
                     Err(err) => Err(err),
                 }
             }
@@ -252,6 +261,67 @@ pub async fn execute(
         .timed(elapsed)
 }
 
+/// Share path validation between execution and authorization.
+pub(crate) fn input_paths(arguments: &serde_json::Value) -> Result<Vec<&str>, String> {
+    match arguments.get("path") {
+        None => Ok(vec!["."]),
+        Some(serde_json::Value::String(path)) if !path.is_empty() => Ok(vec![path]),
+        Some(serde_json::Value::Array(paths)) if !paths.is_empty() && paths.len() <= 16 => paths
+            .iter()
+            .map(|path| {
+                path.as_str()
+                    .filter(|p| !p.is_empty())
+                    .ok_or_else(|| "path 必须是非空路径".into())
+            })
+            .collect(),
+        _ => Err("path 必须是路径或包含 1–16 个路径的数组".into()),
+    }
+}
+
+async fn execute_paths(
+    name: &str,
+    arguments: &serde_json::Value,
+    context: &ToolContext,
+) -> Result<ToolOutput, String> {
+    use std::io::Write;
+    let paths = input_paths(arguments)?;
+    let mut combined = output::Capture::new().map_err(|err| err.to_string())?;
+    let mut failed = false;
+    for path in &paths {
+        let mut item = arguments.clone();
+        item["path"] = (*path).into();
+        let result = if name == "read" {
+            read::capture(&item, &context.cwd, &context.observed)
+                .await
+                .map(|output| (output, false))
+        } else {
+            grep::capture(&item, &context.cwd).await
+        };
+        writeln!(combined.file, "── {}", util::review(path)).map_err(|err| err.to_string())?;
+        match result {
+            Ok((output, is_error)) => {
+                failed |= is_error;
+                combined.append(output).map_err(|err| err.to_string())?;
+            }
+            Err(error) => {
+                failed = true;
+                write!(combined.file, "{error}").map_err(|err| err.to_string())?;
+            }
+        }
+        writeln!(combined.file).map_err(|err| err.to_string())?;
+    }
+    Ok(tool_output(
+        combined
+            .finish(name == "grep")
+            .map_err(|err| err.to_string())?,
+        Display::File {
+            verb: verb_for(name),
+            path: paths.join(", "),
+        },
+        failed,
+    ))
+}
+
 /// Execution inputs shared by every tool in a batch.
 #[derive(Debug, Clone)]
 pub struct ToolContext {
@@ -259,6 +329,8 @@ pub struct ToolContext {
     pub shell: String,
     /// What this session has read, shared across tool batches.
     pub observed: observed::Observed,
+    /// The running command's output file, for the terminal's live log browser.
+    pub progress: Option<tokio::sync::watch::Sender<Option<PathBuf>>>,
 }
 
 /// Locate a command at the first of `candidates` that exists, as an absolute path.

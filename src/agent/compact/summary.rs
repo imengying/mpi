@@ -131,7 +131,7 @@ pub async fn summarize(
     let completion = client
         .complete(&prepared.request(&settings))
         .await
-        .map_err(|err| CompactError::Summarize(err.message()))?;
+        .map_err(|err| CompactError::Summarize(err.to_string()))?;
     let summary = check_summary(&completion)?;
     Ok((summary, completion.usage))
 }

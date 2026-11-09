@@ -20,6 +20,7 @@ fn context(cwd: &std::path::Path) -> ToolContext {
         cwd: cwd.to_path_buf(),
         shell: "/usr/bin/zsh".to_string(),
         observed: Default::default(),
+        progress: None,
     }
 }
 
@@ -109,7 +110,7 @@ async fn an_empty_cwd_means_the_session_directory() {
 /// These go through `tools::execute`, so they cover the whole path a real call takes —
 /// including the authorization rewrite, which re-quotes the command before it is handed to
 /// the shell. A flag that only works on the un-rewritten form would pass a unit test on
-/// `execute_with_shell` and still fail here.
+/// the shell executor and still fail here.
 #[tokio::test]
 async fn an_unmatched_glob_and_a_run_of_equals_signs_both_reach_the_command() {
     let session = dir("zsh-defaults");

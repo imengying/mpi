@@ -1,31 +1,9 @@
-//! Tool policy and scoped session grants. UI and execution consume the returned decisions.
+//! Tool policy and session grants for matching calls.
 
 use crate::auth::policy::{self, Assessment, Dialect};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-
-/// How much a call was approved to touch.
-///
-/// This used to double as the sandbox level. The sandbox is gone, so what remains is what the
-/// approval prompt says and what a remembered session grant is keyed on: a grant to write
-/// inside the project must not also cover reading a secret outside it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Scope {
-    ReadOnly,
-    Workspace,
-    Unrestricted,
-}
-
-impl Scope {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::ReadOnly => "只读文件",
-            Self::Workspace => "工作目录可写",
-            Self::Unrestricted => "不限制文件和网络访问",
-        }
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decision {
@@ -35,18 +13,11 @@ pub enum Decision {
     Stop,
 }
 
-#[derive(Debug, Clone)]
-pub struct ApprovedCall {
-    pub arguments: serde_json::Value,
-    pub scope: Scope,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ApprovalKey {
     tool: String,
     arguments: String,
     cwd: PathBuf,
-    scope: Scope,
     paths: Vec<PathBuf>,
     workspace: PathBuf,
 }
@@ -56,15 +27,13 @@ pub struct ApprovalRequest {
     pub tool: String,
     pub arguments: serde_json::Value,
     pub cwd: PathBuf,
-    pub workspace: PathBuf,
-    pub scope: Scope,
     pub reason: String,
     key: ApprovalKey,
 }
 
 #[derive(Debug)]
 pub enum GateAction {
-    Ready(ApprovedCall),
+    Ready(serde_json::Value),
     Ask(Box<ApprovalRequest>),
 }
 
@@ -176,22 +145,10 @@ impl PermissionGate {
                 if let Some(command) = safe_command {
                     arguments["command"] = command.into();
                 }
-                None
+                return Ok(GateAction::Ready(arguments));
             }
-            Assessment::Ask { reason } => Some(reason),
+            Assessment::Ask { reason } => reason,
         };
-        let unrestricted = tool != "bash" && reason.is_some();
-        let scope = if unrestricted {
-            Scope::Unrestricted
-        } else if matches!(tool, "write" | "edit") || reason.is_some() {
-            Scope::Workspace
-        } else {
-            Scope::ReadOnly
-        };
-        if !unrestricted && reason.is_none() {
-            return Ok(GateAction::Ready(ApprovedCall { arguments, scope }));
-        }
-        let reason = reason.unwrap_or_else(|| "需要在隔离之外执行".into());
         if !self.interactive {
             return Err(Refusal {
                 reason,
@@ -214,19 +171,16 @@ impl PermissionGate {
             tool: tool.into(),
             arguments: identity.to_string(),
             cwd: actual_cwd.clone(),
-            scope,
             paths,
-            workspace: workspace.clone(),
+            workspace,
         };
         if self.mode == PermissionMode::Allow || self.remembered.contains(&key) {
-            return Ok(GateAction::Ready(ApprovedCall { arguments, scope }));
+            return Ok(GateAction::Ready(arguments));
         }
         Ok(GateAction::Ask(Box::new(ApprovalRequest {
             tool: tool.into(),
             arguments,
             cwd: actual_cwd,
-            workspace,
-            scope,
             reason,
             key,
         })))
@@ -236,7 +190,7 @@ impl PermissionGate {
         &mut self,
         request: ApprovalRequest,
         decision: Decision,
-    ) -> Result<ApprovedCall, Refusal> {
+    ) -> Result<serde_json::Value, Refusal> {
         match decision {
             Decision::Allow | Decision::AllowSession => {
                 if decision == Decision::AllowSession {
@@ -246,10 +200,7 @@ impl PermissionGate {
                     }
                     self.remembered.insert(request.key);
                 }
-                Ok(ApprovedCall {
-                    arguments: request.arguments,
-                    scope: request.scope,
-                })
+                Ok(request.arguments)
             }
             Decision::Deny | Decision::Stop => Err(Refusal {
                 reason: request.reason,
@@ -266,7 +217,7 @@ impl PermissionGate {
         cwd: &Path,
     ) -> Result<serde_json::Value, Refusal> {
         match self.assess(tool, input, cwd)? {
-            GateAction::Ready(call) => Ok(call.arguments),
+            GateAction::Ready(arguments) => Ok(arguments),
             GateAction::Ask(request) => Err(Refusal {
                 reason: request.reason,
                 stopped: false,
@@ -280,11 +231,17 @@ fn referenced_paths(input: &serde_json::Value, cwd: &Path) -> Vec<PathBuf> {
         match value {
             serde_json::Value::Object(object) => {
                 for (key, value) in object {
-                    if matches!(key.as_str(), "path" | "cwd")
-                        && let Some(path) = value.as_str()
-                    {
-                        let path = policy::resolve_tool_path(path, cwd);
-                        paths.push(path.canonicalize().unwrap_or(path));
+                    if matches!(key.as_str(), "path" | "cwd") {
+                        let values = value
+                            .as_array()
+                            .map(Vec::as_slice)
+                            .unwrap_or(std::slice::from_ref(value));
+                        for value in values {
+                            if let Some(path) = value.as_str() {
+                                let path = policy::resolve_tool_path(path, cwd);
+                                paths.push(path.canonicalize().unwrap_or(path));
+                            }
+                        }
                     } else {
                         visit(value, cwd, paths);
                     }
@@ -308,7 +265,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn session_approval_is_scoped_and_one_time_approval_is_not_cached() {
+    fn session_approval_matches_the_call_and_one_time_approval_is_not_cached() {
         let mut gate = PermissionGate::new(true, Dialect::Zsh);
         let cwd = std::env::temp_dir();
         let input = serde_json::json!({"command":"touch marker"});
@@ -331,7 +288,7 @@ mod tests {
         ask(&gate, &input, Path::new("/"));
         ask(
             &gate,
-            &serde_json::json!({"command":"touch marker", "sandbox_permissions":"require_escalated"}),
+            &serde_json::json!({"command":"touch marker", "cwd":"/"}),
             &cwd,
         );
         gate.clear_approvals();
@@ -385,18 +342,27 @@ mod tests {
         );
     }
 
-    #[test]
-    fn auto_allow_runs_flagged_calls_without_a_panel() {
-        // The mode is consulted only where the policy asked, and there the call runs as
-        // written rather than being refused. `rm -rf /` is the strongest example the policy
-        // has: it asks, and this is what "do not ask" means for it.
+    #[tokio::test]
+    async fn auto_allow_runs_flagged_calls_without_a_panel() {
+        let dir = crate::tools::temp_dir("approved-call");
+        let cwd = dir.join("workspace");
+        std::fs::create_dir(&cwd).unwrap();
         let mut gate = PermissionGate::new(true, Dialect::Zsh);
-        let cwd = std::env::temp_dir();
-        let input = serde_json::json!({"command": "rm -rf /"});
+        let input = serde_json::json!({"command": "printf hi > ../outside"});
         assert!(gate.check("bash", &input, &cwd).is_err());
         gate.set_mode(PermissionMode::Allow);
         let approved = gate.check("bash", &input, &cwd).unwrap();
         assert_eq!(approved, input);
+        let context = crate::tools::ToolContext {
+            cwd,
+            shell: "/bin/sh".into(),
+            observed: Default::default(),
+            progress: None,
+        };
+        let output = crate::tools::execute("bash", &approved, &context).await;
+        assert!(!output.is_error, "{}", output.content);
+        assert_eq!(std::fs::read_to_string(dir.join("outside")).unwrap(), "hi");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

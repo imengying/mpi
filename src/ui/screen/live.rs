@@ -135,13 +135,23 @@ impl Screen {
         }
         if let Some(answer) = &self.streaming_answer {
             preview.extend(crate::ui::text::history_rows(
-                &crate::ui::markdown::render(&answer[self.streaming_committed..], self.width),
+                &crate::ui::markdown::render(answer, self.width),
                 self.width,
             ));
         }
         if let Some(spans) = &self.running_call {
+            let mut spans = spans.clone();
+            if let Some(started) = self.running_started {
+                let elapsed = started.elapsed().as_secs();
+                if elapsed >= 1 {
+                    spans.push(Span::new(format!(" · {elapsed}s"), Style::new(Color::Dim)));
+                }
+            }
+            if self.running_log.is_some() {
+                spans.push(Span::new(" · Ctrl+O 日志", Style::new(Color::Dim)));
+            }
             preview.extend(crate::ui::text::history_rows(
-                &[Line::spans(spans.clone())],
+                &[Line::spans(spans)],
                 self.width,
             ));
             preview.push(HistoryRow::hard(Line::blank()));
@@ -250,7 +260,6 @@ impl Screen {
     }
 
     pub(super) fn live_frame(&mut self) -> String {
-        self.commit_stream_prefix();
         let (lines, cursor) = self.compose_live();
         let reflow = if self.viewport.needs_reflow(self.width, self.height) {
             // The viewport only repaints its visible tail. Stop once that tail is filled.
@@ -292,24 +301,6 @@ impl Screen {
             .collect();
         self.viewport
             .draw((self.width, self.height), rows, cursor, &history, &reflow)
-    }
-
-    fn commit_stream_prefix(&mut self) {
-        let Some(answer) = &self.streaming_answer else {
-            return;
-        };
-        let start = self.streaming_committed;
-        let end = start + crate::ui::markdown::stable_prefix(&answer[start..]);
-        if end == start {
-            return;
-        }
-        let prefix = &answer[start..end];
-        if prefix.trim().is_empty() {
-            self.streaming_committed = end;
-            return;
-        }
-        self.blocks.push(Block::markdown(prefix));
-        self.streaming_committed = end;
     }
 
     pub(super) fn paint(&self, line: &Line) -> String {

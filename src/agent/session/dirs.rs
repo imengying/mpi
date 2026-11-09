@@ -135,7 +135,7 @@ fn short_id(full: &str) -> String {
     full[full.len() - 8..].to_string()
 }
 
-fn read_dirs_index(root: &Path) -> BTreeMap<String, String> {
+pub(super) fn read_dirs_index(root: &Path) -> BTreeMap<String, String> {
     std::fs::read_to_string(dirs_index_path_in(root))
         .ok()
         .and_then(|raw| serde_json::from_str(&raw).ok())
@@ -208,11 +208,6 @@ fn remove_dir_from_index(root: &Path, id: &str) -> bool {
     }
     drop(lock);
     removed
-}
-
-/// The table under a given store, for tests that assert on what was recorded.
-pub fn read_dirs_index_for_test(root: &Path) -> BTreeMap<String, String> {
-    read_dirs_index(root)
 }
 
 #[cfg(test)]
