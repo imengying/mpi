@@ -7,7 +7,10 @@ use mpi::llm::Message;
 
 #[test]
 fn a_saved_conversation_preserves_its_text_through_all_resume_entry_points() {
-    let root = std::env::temp_dir().join(format!("pi-resume-{}", uuid::Uuid::now_v7()));
+    let root = std::env::temp_dir()
+        .canonicalize()
+        .unwrap()
+        .join(format!("pi-resume-{}", uuid::Uuid::now_v7()));
     let project = root.join("project");
     let store = root.join(".pi/sessions/project");
     std::fs::create_dir_all(&project).unwrap();
@@ -74,8 +77,10 @@ fn a_saved_conversation_preserves_its_text_through_all_resume_entry_points() {
         let output = child.wait_with_output().unwrap();
         assert!(
             output.status.success(),
-            "{args:?}: {}",
-            String::from_utf8_lossy(&output.stderr)
+            "{args:?}: {}\nstdout: {}\nstderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
         );
         let text = String::from_utf8_lossy(&output.stdout);
         assert!(text.contains("BEFORE_UPGRADE"), "{args:?}: {text}");

@@ -151,7 +151,13 @@ def check(binary, mode, exit_signal):
 
 if __name__ == "__main__":
     binary = Path(sys.argv[1]).resolve()
-    for exit_signal in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
-        check(binary, "idle", exit_signal)
-    for mode in ("model", "picker", "stream", "approval", "tool"):
-        check(binary, mode, signal.SIGTERM)
+    try:
+        for exit_signal in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            check(binary, "idle", exit_signal)
+        for mode in ("model", "picker", "stream", "approval", "tool"):
+            check(binary, mode, signal.SIGTERM)
+    except Exception as error:
+        if os.environ.get("GITHUB_ACTIONS"):
+            message = str(error).replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+            print("::error title=Terminal signal test::" + message)
+        raise

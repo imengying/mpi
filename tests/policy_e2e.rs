@@ -1,7 +1,7 @@
 //! End-to-end checks on the authorization policy, with no model in the loop.
 //! These are the invariants the whole gate depends on, so they are asserted directly.
 
-use mpi::auth::policy::{Dialect, assess_command, assess_tool};
+use mpi::auth::policy::{Dialect, assess_command, assess_tool, trusted_executable};
 use std::path::Path;
 
 fn cwd() -> std::path::PathBuf {
@@ -76,6 +76,10 @@ fn only_the_vetted_read_commands_are_auto_approved() {
         "git ls-files",
     ] {
         let decision = assess_command(command, &cwd(), Dialect::Zsh);
+        if command.starts_with("rg ") && trusted_executable("rg").is_none() {
+            assert!(!decision.allows());
+            continue;
+        }
         assert!(
             decision.allows(),
             "`{command}` should be auto-approved, but asked: {:?}",
@@ -313,6 +317,13 @@ async fn broad_and_explicit_glob_searches_cannot_read_secrets() {
         "grep -r --include=.env policy-secret-sentinel .",
         "grep -r policy-secret-sentinel .",
     ] {
+        if command.starts_with("rg ") && trusted_executable("rg").is_none() {
+            assert!(
+                gate.check("bash", &serde_json::json!({"command":command}), &dir)
+                    .is_err()
+            );
+            continue;
+        }
         let approved = gate
             .check("bash", &serde_json::json!({"command":command}), &dir)
             .unwrap();
@@ -327,6 +338,13 @@ async fn broad_and_explicit_glob_searches_cannot_read_secrets() {
         "rg --hidden --no-ignore ordinary-sentinel .",
         "grep -r ordinary-sentinel .",
     ] {
+        if command.starts_with("rg ") && trusted_executable("rg").is_none() {
+            assert!(
+                gate.check("bash", &serde_json::json!({"command":command}), &dir)
+                    .is_err()
+            );
+            continue;
+        }
         let approved = gate
             .check("bash", &serde_json::json!({"command":command}), &dir)
             .unwrap();
