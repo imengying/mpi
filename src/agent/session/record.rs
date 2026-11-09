@@ -52,6 +52,8 @@ pub enum Record {
         model: String,
         level: String,
         /// The latest `/permissions` choice, restored when resuming this session.
+        /// An unrecorded choice requires confirmation.
+        #[serde(default)]
         permission_mode: crate::auth::guard::PermissionMode,
         timestamp: String,
     },
@@ -70,7 +72,9 @@ pub enum Record {
         system_prompt_hash: Option<String>,
         tools_hash: String,
         cache_hints: bool,
-        app_version: String,
+        /// Diagnostic metadata can be absent from an existing conversation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        app_version: Option<String>,
         timestamp: String,
     },
     /// Internal request outcome; never sent to the model or replayed as conversation.

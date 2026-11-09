@@ -837,17 +837,6 @@ fn the_newest_turn_context_names_the_model_in_use() {
             Some(("transport", "connection refused".into())),
         )
         .unwrap();
-    let context = session
-        .records()
-        .iter()
-        .find(|r| matches!(r, Record::RequestContext { .. }))
-        .unwrap();
-    let mut missing_version = serde_json::to_value(context).unwrap();
-    missing_version
-        .as_object_mut()
-        .unwrap()
-        .remove("app_version");
-    assert!(serde_json::from_value::<Record>(missing_version).is_err());
     drop(session);
 
     let reopened = Session::open(&path).unwrap();
@@ -859,7 +848,7 @@ fn the_newest_turn_context_names_the_model_in_use() {
     // And it does not leak into the conversation.
     assert_eq!(reopened.context_messages().len(), 2);
     assert!(reopened.records().iter().any(|record| matches!(record,
-        Record::RequestContext { app_version, request_id, .. } if app_version == crate::cli::version() && request_id == "request"
+        Record::RequestContext { app_version, request_id, .. } if app_version.as_deref() == Some(crate::cli::version()) && request_id == "request"
     )));
     assert!(reopened.records().iter().any(|record| matches!(record,
         Record::RequestEnd { request_id, outcome, duration_ms:1200, retries, error, .. }
