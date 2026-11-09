@@ -74,13 +74,33 @@ def check(binary, mode, exit_signal):
             os.setsid()
             fcntl.ioctl(0, termios.TIOCSCTTY, 0)
 
-        process = subprocess.Popen([str(binary)], stdin=slave, stdout=slave, stderr=slave,
+        # Keep a shell-like terminal owner alive after pi exits. macOS revokes the
+        # slave when its session leader exits, preventing inspection of its modes.
+        release_reader, release_writer = os.pipe()
+        owner = """
+import os, subprocess, sys
+from pathlib import Path
+child = subprocess.Popen([sys.argv[1]])
+Path('pi.pid').write_text(str(child.pid))
+Path('pi.exit').write_text(str(child.wait()))
+os.read(int(sys.argv[2]), 1)
+"""
+        process = subprocess.Popen([sys.executable, "-c", owner, str(binary), str(release_reader)],
+                                   stdin=slave, stdout=slave, stderr=slave,
                                    cwd=root, env={**os.environ, "HOME": temp,
                                                   "TERM": "xterm-256color"},
-                                   preexec_fn=take_terminal)
+                                   pass_fds=(release_reader,), preexec_fn=take_terminal)
+        os.close(release_reader)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         output = bytearray()
+        pi_pid = None
         child_pid = None
+
+        def exit_status():
+            try:
+                return int((root / "pi.exit").read_text())
+            except (FileNotFoundError, ValueError):
+                return None
 
         def read_available():
             if select.select([master], [], [], 0.02)[0]:
@@ -98,6 +118,7 @@ def check(binary, mode, exit_signal):
             deadline = time.monotonic() + 10
             while not condition():
                 assert process.poll() is None, (mode, process.returncode, output[-1000:])
+                assert exit_status() is None, (mode, exit_status(), output[-1000:])
                 assert time.monotonic() < deadline, (mode, "timeout", output[-1000:])
                 read_available()
 
@@ -106,6 +127,7 @@ def check(binary, mode, exit_signal):
 
         try:
             until(lambda: b"\x1b[?1049h" in output)
+            pi_pid = int((root / "pi.pid").read_text())
             if mode == "picker":
                 send("save session\r")
                 until(lambda: b"SAVED_FOR_SIGNAL" in output)
@@ -129,12 +151,12 @@ def check(binary, mode, exit_signal):
                           and bool((root / "child.pid").read_text().strip()))
                     child_pid = int((root / "child.pid").read_text())
 
-            process.send_signal(exit_signal)
-            until(lambda: process.poll() is not None)
+            os.kill(pi_pid, exit_signal)
+            until(lambda: exit_status() is not None)
             # An exited PTY stays readable at EOF on macOS.
             while read_available():
                 pass
-            assert process.returncode == 128 + exit_signal, (mode, process.returncode)
+            assert exit_status() == 128 + exit_signal, (mode, exit_status())
             assert termios.tcgetattr(slave) == original, (mode, "terminal mode not restored")
             assert b"\x1b[?1049l" in output, (mode, "alternate screen not restored")
             if child_pid:
@@ -143,15 +165,23 @@ def check(binary, mode, exit_signal):
                 assert not status or status.startswith("Z"), ("surviving tool child", status)
             print(f"PASS {mode}: {exit_signal.name}")
         finally:
-            if process.poll() is None:
-                process.kill()
-                process.wait()
+            if pi_pid and exit_status() is None:
+                try:
+                    os.kill(pi_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
             if child_pid:
                 try:
                     os.kill(child_pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
             termios.tcsetattr(slave, termios.TCSANOW, original)
+            os.close(release_writer)
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
             os.close(master)
             os.close(slave)
             released.set()
