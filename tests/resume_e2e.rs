@@ -22,7 +22,9 @@ fn an_existing_conversation_survives_an_upgrade_and_all_resume_entry_points() {
         serde_json::json!({"type":"response_item","id":"user","parent_id":id,"timestamp":"2026-11-08T12:00:01Z","message":{"role":"user","content":[{"type":"text","text":"BEFORE_UPGRADE"}]}}),
         serde_json::json!({"type":"turn_context","id":"turn","parent_id":"user","timestamp":"2026-11-08T12:00:01Z","cwd":project,"model":"test/m","level":"high"}),
         serde_json::json!({"type":"request_context","id":"request","parent_id":"turn","timestamp":"2026-11-08T12:00:01Z","request_id":"request","provider":"test","model":"m","level":"high","context_window":null,"token_estimate":123,"system_prompt_hash":null,"tools_hash":"tools","cache_hints":true}),
-        serde_json::json!({"type":"response_item","id":"answer","parent_id":"request","timestamp":"2026-11-08T12:00:02Z","message":{"role":"assistant","content":[{"type":"text","text":"HISTORICAL_REPLY"}],"stop_reason":"stop"}}),
+        serde_json::json!({"type":"response_item","id":"call","parent_id":"request","timestamp":"2026-11-08T12:00:02Z","message":{"role":"assistant","content":[{"type":"text","text":"EXPLANATION_BEFORE_TOOL"},{"type":"tool_call","id":"c1","name":"bash","arguments":{"command":"echo TOOL_RESULT"}}],"stop_reason":"tool_use"}}),
+        serde_json::json!({"type":"response_item","id":"result","parent_id":"call","timestamp":"2026-11-08T12:00:03Z","message":{"role":"tool","tool_call_id":"c1","name":"bash","content":"TOOL_RESULT\n","status":"success","images":[]}}),
+        serde_json::json!({"type":"response_item","id":"answer","parent_id":"result","timestamp":"2026-11-08T12:00:04Z","message":{"role":"assistant","content":[{"type":"text","text":"HISTORICAL_REPLY"}],"stop_reason":"stop"}}),
     ];
     let original: String = records.iter().map(|record| format!("{record}\n")).collect();
     std::fs::write(&path, &original).unwrap();
@@ -43,7 +45,7 @@ fn an_existing_conversation_survives_an_upgrade_and_all_resume_entry_points() {
 
     let session = Session::open(&path).unwrap();
     assert_eq!(session.current_permission_mode(), PermissionMode::Ask);
-    assert_eq!(session.context_messages().len(), 2);
+    assert_eq!(session.context_messages().len(), 4);
     assert!(session.records().iter().any(|record| matches!(
         record,
         Record::RequestContext {
@@ -81,6 +83,15 @@ fn an_existing_conversation_survives_an_upgrade_and_all_resume_entry_points() {
         );
         let text = String::from_utf8_lossy(&output.stdout);
         assert!(text.contains("BEFORE_UPGRADE"), "{args:?}: {text}");
+        assert_eq!(
+            text.matches("EXPLANATION_BEFORE_TOOL").count(),
+            1,
+            "{args:?}: {text}"
+        );
+        assert!(
+            text.find("EXPLANATION_BEFORE_TOOL").unwrap() < text.find("echo TOOL_RESULT").unwrap(),
+            "{args:?}: {text}"
+        );
         assert!(text.contains("HISTORICAL_REPLY"), "{args:?}: {text}");
         assert!(text.contains(&format!("pi resume {id}")), "{text}");
         assert!(!text.contains("暂无历史会话"), "{text}");
@@ -99,7 +110,7 @@ fn an_existing_conversation_survives_an_upgrade_and_all_resume_entry_points() {
     let resumed = Session::open(&path).unwrap();
     assert_eq!(resumed.current_permission_mode(), PermissionMode::Allow);
     assert_eq!(resumed.user_history(), ["BEFORE_UPGRADE", "AFTER_UPGRADE"]);
-    assert_eq!(resumed.context_messages().len(), 3);
+    assert_eq!(resumed.context_messages().len(), 5);
     assert!(
         std::fs::read_to_string(&path)
             .unwrap()

@@ -307,11 +307,7 @@ impl Agent {
             return Ok(TurnEnd::Done);
         }
 
-        if completion.tool_calls().is_empty() {
-            self.screen.end_stream();
-        } else {
-            self.screen.end_tool_stream();
-        }
+        self.screen.end_stream();
         let citations = llm::citation_lines(&completion.message);
         if !citations.is_empty() {
             let mut lines = Vec::new();

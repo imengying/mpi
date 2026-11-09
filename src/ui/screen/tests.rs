@@ -1590,10 +1590,10 @@ fn detail_navigation_and_search_preserve_the_transcript_and_draft() {
     screen.push(Block::lines(vec![Line::plain("later")]));
     screen.begin_stream();
     screen.push_text("tool commentary");
-    screen.end_tool_stream();
+    screen.end_stream();
     screen.push(Block::collapsible(vec![Line::plain("newer")], 1, 0, 0));
     assert!(
-        !screen
+        screen
             .blocks
             .iter()
             .flat_map(|block| block.render(40))
@@ -1606,7 +1606,7 @@ fn detail_navigation_and_search_preserve_the_transcript_and_draft() {
     assert!(screen.show_tool_details());
     terminal.process(&captured.take());
     assert!(terminal.screen().contents().contains("newer"));
-    assert!(terminal.screen().contents().contains("tool commentary"));
+    assert!(!terminal.screen().contents().contains("tool commentary"));
     assert!(
         screen
             .blocks
@@ -1627,9 +1627,10 @@ fn detail_navigation_and_search_preserve_the_transcript_and_draft() {
     terminal.process(&captured.take());
     assert!(screen.detail.is_none());
     assert!(terminal.screen().contents().contains("› draft"));
+    assert!(terminal.screen().contents().contains("tool commentary"));
     assert_eq!(screen.editing.as_ref().unwrap().text(), original.text());
     assert_eq!(screen.editing.as_ref().unwrap().caret(), original.caret());
-    assert_eq!(screen.blocks.len(), 3);
+    assert_eq!(screen.blocks.len(), 4);
 
     let (mut log, path) = util::create_output_file().unwrap();
     writeln!(log, "early output").unwrap();
@@ -1652,7 +1653,7 @@ fn detail_navigation_and_search_preserve_the_transcript_and_draft() {
     assert!(screen.detail.is_none());
     assert_eq!(screen.editing.as_ref().unwrap().text(), original.text());
     assert_eq!(screen.editing.as_ref().unwrap().caret(), original.caret());
-    assert_eq!(screen.blocks.len(), 3);
+    assert_eq!(screen.blocks.len(), 4);
     drop(log);
     std::fs::remove_file(path).unwrap();
 }

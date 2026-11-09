@@ -174,7 +174,6 @@ impl Line {
 #[derive(Debug, Clone)]
 pub struct Collapsible {
     pub full_output: Option<std::path::PathBuf>,
-    pub commentary: Option<String>,
     pub lines: Vec<Line>,
     /// Logical lines that stay visible in both states: a tool result's header belongs here, so
     /// collapsing never hides which command produced the output.
@@ -233,7 +232,6 @@ impl Block {
     pub fn collapsible(lines: Vec<Line>, head: usize, tail: usize, preview: usize) -> Self {
         Block::Collapsible(Collapsible {
             full_output: None,
-            commentary: None,
             lines,
             head,
             tail,
@@ -254,7 +252,6 @@ impl Block {
     ) -> Self {
         Block::Collapsible(Collapsible {
             full_output: None,
-            commentary: None,
             lines,
             head,
             tail,
@@ -286,14 +283,6 @@ impl Block {
                 history_rows(&lines, width)
             }
             Block::Collapsible(block) => {
-                if block.expanded
-                    && let Some(text) = &block.commentary
-                {
-                    let mut lines = crate::ui::markdown::render(text, width);
-                    lines.push(Line::blank());
-                    lines.extend(block.lines.clone());
-                    return history_rows(&lines, width);
-                }
                 let rows = history_rows(&block.lines, width);
                 let head = block.head.min(block.lines.len());
                 let tail = block.tail.min(block.lines.len() - head);

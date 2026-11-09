@@ -123,8 +123,6 @@ pub struct Screen {
     /// Streaming preview: thinking tail plus the answer so far.
     streaming_thinking: Option<String>,
     streaming_answer: Option<String>,
-    /// Tool-call prose is attached to the next result's detail view.
-    pending_commentary: Option<String>,
     /// The spinner's label while a turn is in flight, and which frame of the animation it
     /// is on.
     ///
@@ -253,7 +251,6 @@ impl Screen {
             running_started: None,
             running_log: None,
             streaming_answer: None,
-            pending_commentary: None,
             interactive,
             title: None,
             notice: None,
@@ -303,10 +300,7 @@ impl Screen {
     /// Queue a block. It is written to the terminal on the next redraw — which happens at
     /// the end of the current step, so a note appears immediately but never interleaves
     /// with a half-drawn frame.
-    pub fn push(&mut self, mut block: Block) {
-        if let Block::Collapsible(inner) = &mut block {
-            inner.commentary = self.pending_commentary.take().or(inner.commentary.take());
-        }
+    pub fn push(&mut self, block: Block) {
         self.blocks.push(block);
     }
 
@@ -360,7 +354,6 @@ impl Screen {
         self.detail = None;
         self.streaming_answer = None;
         self.streaming_thinking = None;
-        self.pending_commentary = None;
         self.running_call = None;
         self.running_started = None;
         self.running_log = None;
@@ -454,7 +447,6 @@ impl Screen {
     pub fn begin_stream(&mut self) {
         self.streaming_thinking = None;
         self.streaming_answer = Some(String::new());
-        self.pending_commentary = None;
     }
 
     /// Append to the thinking preview. No redraw: the caller drains a burst of deltas and
@@ -482,22 +474,10 @@ impl Screen {
 
     /// Finish the stream and commit the answer. Thinking stays in the live preview only.
     pub fn end_stream(&mut self) -> (String, String) {
-        self.finish_stream(false)
-    }
-
-    pub fn end_tool_stream(&mut self) -> (String, String) {
-        self.finish_stream(true)
-    }
-
-    fn finish_stream(&mut self, tool_call: bool) -> (String, String) {
         let answer = self.streaming_answer.take().unwrap_or_default();
         let thinking = self.streaming_thinking.take().unwrap_or_default();
         if !answer.trim().is_empty() {
-            if tool_call {
-                self.pending_commentary = Some(answer.clone());
-            } else {
-                self.blocks.push(Block::markdown(&answer));
-            }
+            self.blocks.push(Block::markdown(&answer));
         }
         self.flush();
         (answer, thinking)

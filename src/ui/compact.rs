@@ -424,17 +424,11 @@ pub fn replay_blocks(messages: &[crate::llm::Message]) -> Vec<crate::ui::screen:
                 let stopped = *stop_reason == Some(crate::llm::StopReason::Aborted);
                 // Said once, on the first hosted call or citation, not once per result.
                 let mut announced_search = false;
-                let has_calls = content
-                    .iter()
-                    .any(|block| matches!(block, MsgBlock::ToolCall { .. }));
-                let mut commentary = has_calls
-                    .then(|| message.text())
-                    .filter(|text| !text.trim().is_empty());
                 for block in content {
                     match block {
                         MsgBlock::Text { text } => {
                             push_lines(&mut out, std::mem::take(&mut lines));
-                            if !has_calls && !text.trim().is_empty() {
+                            if !text.trim().is_empty() {
                                 out.push(Block::markdown(text));
                             }
                         }
@@ -455,11 +449,7 @@ pub fn replay_blocks(messages: &[crate::llm::Message]) -> Vec<crate::ui::screen:
                             // the record, which is what keeps a call the user stopped from
                             // rendering differently here than it did live.
                             let output = stored_output(name, arguments, content);
-                            let mut block = tool_block(name, arguments, &output, status);
-                            if let Block::Collapsible(inner) = &mut block {
-                                inner.commentary = commentary.take();
-                            }
-                            out.push(block);
+                            out.push(tool_block(name, arguments, &output, status));
                         }
                         MsgBlock::Hosted { .. } => {
                             if !announced_search {
@@ -806,7 +796,8 @@ mod tests {
         );
         // The environment block is bookkeeping, not something the user said.
         assert!(!text.contains("<environment>"), "{text}");
-        assert!(!text.contains("先确认命令输出"));
+        assert_eq!(text.matches("先确认命令输出").count(), 1);
+        assert!(text.find("先确认命令输出").unwrap() < text.find("✓ $ echo hi").unwrap());
         let mut detail = replayed
             .iter()
             .find(|block| block.is_collapsible())
@@ -816,7 +807,7 @@ mod tests {
             inner.expanded = true;
         }
         let detail = plain(&detail.render(80)).join("\n");
-        assert!(detail.contains("先确认命令输出"));
+        assert!(!detail.contains("先确认命令输出"));
         assert!(detail.contains("hi"));
     }
 
