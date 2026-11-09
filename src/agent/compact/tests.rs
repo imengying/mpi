@@ -234,13 +234,34 @@ async fn a_block_that_opens_a_split_turn_is_still_pushed_only_once() {
     // The narrow shape where the carried block and the split-turn opener would collide: the
     // block is the last user message in the prefix. Both lists have to skip it, or the block
     // is pushed twice under one id and `push_compaction` rejects the checkpoint.
-    use std::io::Write;
+    use std::io::{BufRead, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let server = std::thread::spawn(move || {
         let (mut socket, _) = listener.accept().unwrap();
-        let mut buf = [0u8; 8192];
-        let _ = std::io::Read::read(&mut socket, &mut buf);
+        socket
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        // Read the whole request, not one 8 KiB chunk. A single `read` returns whatever has
+        // arrived, and this request is far larger than one chunk, so writing the response
+        // before the body was consumed left the client sending into a closed socket. That
+        // passed on a fast local machine, where the body happened to arrive in one piece, and
+        // failed on a slower CI runner.
+        let mut reader = std::io::BufReader::new(socket.try_clone().unwrap());
+        let mut length = 0usize;
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                break;
+            }
+            if let Some((key, value)) = line.split_once(':')
+                && key.eq_ignore_ascii_case("content-length")
+            {
+                length = value.trim().parse().unwrap();
+            }
+        }
+        let mut body = vec![0; length];
+        let _ = std::io::Read::read_exact(&mut reader, &mut body);
         let response = serde_json::json!({
             "status":"completed",
             "output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"## Goal\n继续"}]}],
