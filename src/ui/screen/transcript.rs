@@ -1,171 +1,332 @@
-//! Browse completed output without putting it in the shell's scrollback.
-
+//! Mouse browsing and selection, anchored to immutable blocks rather than a flat history.
 use super::*;
+use selection::{Point, Selection};
+use std::sync::Arc;
 
 pub(super) struct TranscriptView {
-    /// Freeze the last block while browsing so new output cannot move the page.
     end: usize,
-    block: usize,
-    row: usize,
+    top: Point,
+    tail: Arc<Vec<HistoryRow<Line>>>,
+    visible: Vec<(Point, HistoryRow<Line>)>,
+    selection: Option<Selection>,
     at_bottom: bool,
     pub(super) rendered: Option<(usize, usize)>,
 }
 
-impl Screen {
-    pub(super) fn transcript_event(&mut self, event: &Event) -> bool {
-        let page = self.height.saturating_sub(2).max(1);
-        let movement = match event {
-            Event::Mouse(mouse) => match mouse.kind {
-                event::MouseEventKind::ScrollUp => Some(3isize),
-                event::MouseEventKind::ScrollDown => Some(-3),
-                _ => return false,
-            },
-            Event::Key(key) if key.kind != KeyEventKind::Release => match key.code {
-                KeyCode::PageUp => Some(page as isize),
-                KeyCode::PageDown => Some(-(page as isize)),
-                KeyCode::Up if self.transcript_view.is_some() => Some(1),
-                KeyCode::Down if self.transcript_view.is_some() => Some(-1),
-                KeyCode::Home if self.transcript_view.is_some() => {
-                    let view = self.transcript_view.as_mut().unwrap();
-                    view.block = 0;
-                    view.row = 0;
-                    view.at_bottom = false;
-                    view.rendered = None;
-                    return true;
-                }
-                KeyCode::End | KeyCode::Esc if self.transcript_view.is_some() => {
-                    self.close_transcript();
-                    return true;
-                }
-                _ => None,
-            },
-            Event::Paste(_) => None,
-            _ => return false,
-        };
-        if let Some(movement) = movement {
-            self.move_transcript(movement);
-            return true;
-        }
-        // Typing resumes the composer without swallowing the first keystroke or paste.
-        self.close_transcript();
-        false
+impl TranscriptView {
+    pub(super) fn has_selection(&self) -> bool {
+        self.selection
+            .as_ref()
+            .is_some_and(|selection| !selection.is_empty())
     }
 
-    fn move_transcript(&mut self, movement: isize) {
-        let opening = self.transcript_view.is_none();
-        if opening && (movement < 0 || self.blocks.is_empty()) {
-            return;
+    fn rows(&self, screen: &mut Screen, block: usize) -> Arc<Vec<HistoryRow<Line>>> {
+        if block == self.end {
+            self.tail.clone()
+        } else {
+            screen
+                .layout
+                .rows(block, screen.width, &screen.blocks[block])
         }
-        if movement < 0
-            && self
-                .transcript_view
-                .as_ref()
-                .is_some_and(|view| view.at_bottom)
-        {
-            self.close_transcript();
-            return;
-        }
-        let view = self.transcript_view.get_or_insert(TranscriptView {
-            end: self.blocks.len(),
-            block: self.blocks.len(),
-            row: 0,
-            at_bottom: false,
-            rendered: None,
-        });
+    }
+
+    fn move_by(&mut self, screen: &mut Screen, movement: isize) {
         let mut remaining = movement.unsigned_abs();
-        if opening {
-            remaining += self.height.saturating_sub(1).max(1);
-        }
-        // Keep a block/row anchor: distant pages never rerender all the newer blocks.
         while remaining > 0 {
             if movement > 0 {
-                let moved = remaining.min(view.row);
+                let moved = remaining.min(self.top.row);
                 remaining -= moved;
-                view.row -= moved;
-                if remaining == 0 || view.block == 0 {
+                self.top.row -= moved;
+                if remaining == 0 || self.top.block == 0 {
                     break;
                 }
-                view.block -= 1;
-                view.row = self
-                    .layout
-                    .rows(view.block, self.width, &self.blocks[view.block])
-                    .len();
-            } else if view.block < view.end {
-                let rows = self
-                    .layout
-                    .rows(view.block, self.width, &self.blocks[view.block]);
-                let moved = remaining.min(rows.len().saturating_sub(view.row));
+                self.top.block -= 1;
+                self.top.row = self.rows(screen, self.top.block).len();
+            } else if self.top.block <= self.end {
+                let rows = self.rows(screen, self.top.block);
+                let moved = remaining.min(rows.len().saturating_sub(self.top.row));
                 remaining -= moved;
-                view.row += moved;
-                if view.row >= rows.len() {
-                    view.block += 1;
-                    view.row = 0;
+                self.top.row += moved;
+                if self.top.row >= rows.len() {
+                    self.top.block += 1;
+                    self.top.row = 0;
                 }
             } else {
                 break;
             }
         }
-        view.rendered = None;
-        if movement > 0 {
-            view.at_bottom = false;
+        self.rendered = None;
+        self.compose(screen);
+    }
+
+    fn compose(&mut self, screen: &mut Screen) {
+        self.visible.clear();
+        let mut point = self.top;
+        while point.block <= self.end && self.visible.len() < screen.height {
+            let rows = self.rows(screen, point.block);
+            for (row, line) in rows.iter().enumerate().skip(point.row) {
+                self.visible.push((
+                    Point {
+                        block: point.block,
+                        row,
+                        column: 0,
+                    },
+                    line.clone(),
+                ));
+                if self.visible.len() == screen.height {
+                    break;
+                }
+            }
+            let next_row = self
+                .visible
+                .last()
+                .filter(|(last, _)| last.block == point.block)
+                .map_or(point.row, |(last, _)| last.row + 1);
+            if next_row < rows.len() {
+                break;
+            }
+            point.block += 1;
+            point.row = 0;
         }
-        if view.block == view.end {
-            self.close_transcript();
+        self.at_bottom = point.block > self.end;
+    }
+
+    fn point(&self, row: usize, column: usize) -> Option<Point> {
+        self.visible
+            .get(row.min(self.visible.len().saturating_sub(1)))
+            .map(|(point, _)| Point { column, ..*point })
+    }
+}
+
+impl Screen {
+    fn open_transcript(&mut self) -> bool {
+        if self.transcript_view.is_some() {
+            return true;
         }
+        if self.printed == 0 && self.live_preview.is_empty() {
+            return false;
+        }
+        let mut view = TranscriptView {
+            end: self.printed,
+            top: Point {
+                block: self.printed,
+                ..Point::default()
+            },
+            tail: Arc::new(self.live_preview.clone()),
+            visible: Vec::new(),
+            selection: None,
+            at_bottom: true,
+            rendered: None,
+        };
+        view.move_by(self, self.viewport.history_height() as isize);
+        self.transcript_view = Some(view);
+        true
+    }
+
+    pub(super) fn transcript_event(&mut self, event: &Event) -> bool {
+        if let Event::Mouse(mouse) = event {
+            use event::{MouseButton::Left, MouseEventKind::*};
+            match mouse.kind {
+                ScrollUp | ScrollDown => {
+                    if mouse.kind == ScrollDown && self.transcript_view.is_none() {
+                        return true;
+                    }
+                    if self.open_transcript() {
+                        self.move_transcript(if mouse.kind == ScrollUp { 3 } else { -3 });
+                    }
+                }
+                Down(Left) => {
+                    if let Some(view) = self.transcript_view.as_mut() {
+                        if let Some(point) =
+                            view.point(usize::from(mouse.row), usize::from(mouse.column))
+                        {
+                            view.selection = Some(Selection::new(point, *mouse));
+                            view.rendered = None;
+                        }
+                    } else if usize::from(mouse.row)
+                        < self.viewport.history_height() + self.live_preview.len()
+                    {
+                        self.drag_start = Some(*mouse);
+                    }
+                }
+                Drag(Left) | Up(Left) => {
+                    if mouse.kind == Drag(Left)
+                        && let Some(start) = self.drag_start.take()
+                        && self.open_transcript()
+                    {
+                        let view = self.transcript_view.as_mut().unwrap();
+                        if let Some(point) =
+                            view.point(usize::from(start.row), usize::from(start.column))
+                        {
+                            view.selection = Some(Selection::new(point, start));
+                        }
+                    }
+                    if let Some(view) = self.transcript_view.as_mut()
+                        && let Some(point) =
+                            view.point(usize::from(mouse.row), usize::from(mouse.column))
+                        && let Some(selection) = view
+                            .selection
+                            .as_mut()
+                            .filter(|selection| selection.dragging)
+                    {
+                        selection.update(point, *mouse);
+                        view.rendered = None;
+                    }
+                    if mouse.kind == Up(Left) {
+                        self.drag_start = None;
+                    }
+                }
+                _ => {}
+            }
+            return true;
+        }
+        self.drag_start = None;
+        if let Event::Key(key) = event {
+            if key.kind == KeyEventKind::Release {
+                return false;
+            }
+            if self.transcript_view.is_some() {
+                match key.code {
+                    KeyCode::Up => self.move_transcript(1),
+                    KeyCode::Down => self.move_transcript(-1),
+                    KeyCode::Home => {
+                        let view = self.transcript_view.as_mut().unwrap();
+                        view.top = Point::default();
+                        view.rendered = None;
+                    }
+                    KeyCode::End | KeyCode::Esc => self.close_transcript(),
+                    KeyCode::Char('c')
+                        if key.modifiers.contains(KeyModifiers::CONTROL)
+                            && self.transcript_view.as_ref().unwrap().has_selection() =>
+                    {
+                        self.copy_selection()
+                    }
+                    _ => {
+                        self.close_transcript();
+                        return false;
+                    }
+                }
+                return true;
+            }
+        }
+        // Typing and resizing return to the live composer; a resize cancels cell anchors.
+        self.close_transcript();
+        false
+    }
+
+    fn move_transcript(&mut self, movement: isize) {
+        let Some(mut view) = self.transcript_view.take() else {
+            return;
+        };
+        if movement < 0
+            && view.at_bottom
+            && !view
+                .selection
+                .as_ref()
+                .is_some_and(|selection| selection.dragging)
+        {
+            self.erase_live();
+            self.copy_menu = None;
+            return;
+        }
+        if movement > 0 || !view.at_bottom {
+            view.move_by(self, movement);
+        }
+        if let Some((row, column)) = view
+            .selection
+            .as_ref()
+            .and_then(Selection::dragging_pointer)
+            && let Some(point) = view.point(row, column)
+        {
+            view.selection.as_mut().unwrap().extend_to(point);
+        }
+        self.transcript_view = Some(view);
+    }
+
+    pub(super) fn tick_transcript_selection(&mut self, now: std::time::Instant) -> bool {
+        let Some(mut view) = self.transcript_view.take() else {
+            return false;
+        };
+        let movement = view
+            .selection
+            .as_mut()
+            .and_then(|selection| selection.scroll(now, 0, self.height.saturating_sub(1)));
+        let mut changed = false;
+        if let Some((delta, row, column)) = movement {
+            if delta > 0 || !view.at_bottom {
+                view.move_by(self, delta);
+            }
+            if let Some(point) = view.point(row, column) {
+                view.selection.as_mut().unwrap().extend_to(point);
+                view.rendered = None;
+                changed = true;
+            }
+        }
+        self.transcript_view = Some(view);
+        changed
+    }
+
+    pub(super) fn transcript_selection(&mut self) -> String {
+        let Some(view) = self.transcript_view.take() else {
+            return String::new();
+        };
+        let mut text = String::new();
+        if let Some(selection) = &view.selection {
+            for block in selection.blocks() {
+                for (row, line) in view.rows(self, block).iter().enumerate() {
+                    selection.append(
+                        &mut text,
+                        line,
+                        Point {
+                            block,
+                            row,
+                            column: 0,
+                        },
+                    );
+                }
+            }
+        }
+        self.transcript_view = Some(view);
+        text
     }
 
     pub(super) fn close_transcript(&mut self) {
+        self.drag_start = None;
+        self.copy_menu = None;
         if self.transcript_view.take().is_some() {
             self.erase_live();
         }
     }
 
     pub(super) fn draw_transcript(&mut self) {
-        let view = self.transcript_view.as_mut().expect("open transcript");
-        if view.rendered == Some((self.width, self.height)) {
+        let Some(mut view) = self.transcript_view.take() else {
             return;
-        }
-        let page = self.height.saturating_sub(1).max(1);
-        let mut rows = Vec::new();
-        let mut block = view.block;
-        let mut row = view.row;
-        while block < view.end {
-            let current = self.layout.rows(block, self.width, &self.blocks[block]);
-            row = row.min(current.len());
-            let end = (row + page - rows.len()).min(current.len());
-            rows.extend_from_slice(&current[row..end]);
-            if end == current.len() {
-                block += 1;
-                row = 0;
+        };
+        if view.rendered != Some((self.width, self.height)) {
+            view.compose(self);
+            let mut rows: Vec<_> = view
+                .visible
+                .iter()
+                .map(|(point, row)| {
+                    let line = view.selection.as_ref().map_or_else(
+                        || row.line.clone(),
+                        |selection| selection.paint(&row.line, *point),
+                    );
+                    HistoryRow {
+                        line: self.paint(&line),
+                        wrapped: row.wrapped,
+                    }
+                })
+                .collect();
+            if let Some(last) = rows.last_mut() {
+                last.wrapped = false;
             }
-            if rows.len() == page {
-                break;
-            }
+            rows.resize_with(self.height, || HistoryRow::hard(String::new()));
+            let frame = Viewport::default().draw((self.width, self.height), rows, None, &[], &[]);
+            let _ = write!(self.out, "{frame}");
+            let _ = self.out.flush();
+            view.rendered = Some((self.width, self.height));
         }
-        view.at_bottom = block == view.end;
-        view.rendered = Some((self.width, self.height));
-        if let Some(last) = rows.last_mut() {
-            last.wrapped = false;
-        }
-        if self.height > 1 {
-            rows.resize_with(page, || HistoryRow::hard(Line::blank()));
-            rows.push(HistoryRow::hard(
-                Line::dim("滚轮 / PgUp/PgDn 翻页 · End / Esc 返回").truncate(self.width),
-            ));
-        }
-        if rows.is_empty() {
-            rows.push(HistoryRow::hard(Line::blank()));
-        }
-        let painted = rows
-            .iter()
-            .map(|row| HistoryRow {
-                line: self.paint(&row.line),
-                wrapped: row.wrapped,
-            })
-            .collect();
-        let mut viewport = Viewport::default();
-        let frame = viewport.draw((self.width, self.height), painted, None, &[], &[]);
-        let _ = write!(self.out, "{frame}");
-        let _ = self.out.flush();
+        self.transcript_view = Some(view);
     }
 }

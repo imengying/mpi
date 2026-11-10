@@ -100,16 +100,19 @@ async fn commands_reveal_their_menus_and_feedback_after_browsing_output() {
         if details {
             assert!(agent.screen.show_tool_details());
         } else {
-            agent
-                .screen
-                .absorb_event(Event::Key(KeyCode::PageUp.into()));
+            agent.screen.absorb_event(Event::Mouse(event::MouseEvent {
+                kind: event::MouseEventKind::ScrollUp,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            }));
         }
         agent.screen.flush();
         terminal.process(&captured.take());
         assert!(terminal.screen().contents().contains(if details {
             "工具详情"
         } else {
-            "PgUp/PgDn"
+            "tool output 0"
         }));
         assert!(agent.command("/model").await.unwrap());
         assert!(agent.screen.picker.is_some());
@@ -129,10 +132,8 @@ async fn commands_reveal_their_menus_and_feedback_after_browsing_output() {
         assert!(visible.contains("历史太短"), "{visible}");
         assert!(visible.contains("› draft"), "{visible}");
         assert!(visible.contains("background answer"), "{visible}");
-        assert!(
-            !visible.contains("PgUp/PgDn") && !visible.contains("工具详情"),
-            "{visible}"
-        );
+        assert!(agent.screen.transcript_view.is_none());
+        assert!(!visible.contains("工具详情"), "{visible}");
     }
     drop(agent);
     std::fs::remove_dir_all(dir).unwrap();
@@ -252,7 +253,12 @@ fn streaming_blocks_commit_once_and_remain_browsable_inside_the_session() {
     }
     assert!(!transcript.contains("思考完成"));
     assert!(!transcript.contains("thinking"));
-    screen.absorb_event(Event::Key(KeyCode::PageUp.into()));
+    screen.absorb_event(Event::Mouse(event::MouseEvent {
+        kind: event::MouseEventKind::ScrollUp,
+        column: 0,
+        row: 0,
+        modifiers: KeyModifiers::NONE,
+    }));
     screen.absorb_event(Event::Key(KeyCode::Home.into()));
     screen.flush();
     terminal.process(&captured.take());
@@ -422,6 +428,135 @@ fn native_code_selection_keeps_source_newlines_and_indentation_while_streaming_a
             vt100::MouseProtocolMode::None
         );
     }
+}
+
+#[test]
+fn dragging_preserves_unicode_and_code_and_only_copies_on_request() {
+    use event::{MouseButton::Left, MouseButton::Right, MouseEventKind::*};
+    let mut screen = screen();
+    let captured = CapturedOutput::default();
+    screen.out = Box::new(captured.clone());
+    screen.interactive = true;
+    screen.width = 14;
+    screen.height = 24;
+    set_input(&mut screen, "draft");
+    screen.begin_stream();
+    let code = "let 中文 = \"👩‍💻\";\n  next();";
+    screen.push_text(&format!("```rs\n{code}\n```"));
+    screen.flush();
+    let start = screen
+        .live_preview
+        .iter()
+        .position(|row| row.line.text().starts_with("let "))
+        .unwrap();
+    let end = screen
+        .live_preview
+        .iter()
+        .position(|row| row.line.text().contains("next();"))
+        .unwrap();
+    let mouse = |kind, row: usize, column| {
+        Event::Mouse(event::MouseEvent {
+            kind,
+            row: row as u16,
+            column,
+            modifiers: KeyModifiers::NONE,
+        })
+    };
+    screen.absorb_event(mouse(Down(Left), start, 0));
+    screen.absorb_event(mouse(Drag(Left), end, 13));
+    screen.absorb_event(mouse(Up(Left), end, 13));
+    screen.flush();
+    assert_eq!(screen.transcript_selection(), code);
+    assert!(
+        !String::from_utf8_lossy(&captured.take()).contains("]52;"),
+        "releasing the mouse must not copy"
+    );
+    screen.push_text("\nbackground result");
+    screen.end_stream();
+    assert_eq!(
+        screen.transcript_selection(),
+        code,
+        "completion cannot replace the selected preview"
+    );
+    screen.absorb_event(mouse(Down(Right), 10, 8));
+    screen.flush();
+    let (row, column) = screen.copy_menu.unwrap();
+    assert!(String::from_utf8_lossy(&captured.take()).contains("复制"));
+    screen.absorb_event(mouse(Down(Left), row, column as u16));
+    screen.flush();
+    let output = String::from_utf8(captured.take()).unwrap();
+    let encoded = output
+        .split("\x1b]52;c;")
+        .nth(1)
+        .unwrap()
+        .split('\x07')
+        .next()
+        .unwrap();
+    use base64::Engine;
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap(),
+        code.as_bytes()
+    );
+    screen.absorb_event(mouse(Down(Right), 10, 8));
+    let (row, column) = screen.copy_menu.unwrap();
+    screen.absorb_event(mouse(Down(Left), row + 1, column as u16));
+    assert!(
+        !String::from_utf8_lossy(&captured.take()).contains("]52;"),
+        "cancel must not copy"
+    );
+    screen.absorb_event(Event::Key(KeyCode::Esc.into()));
+    assert!(screen.transcript_view.is_none());
+    assert_eq!(input(&screen), "draft");
+}
+
+#[test]
+fn dragging_at_the_edge_scrolls_across_blocks_without_new_mouse_events() {
+    use event::{MouseButton::Left, MouseEventKind::*};
+    let mut screen = screen();
+    screen.out = Box::new(Vec::<u8>::new());
+    screen.interactive = true;
+    screen.width = 30;
+    screen.height = 8;
+    set_input(&mut screen, "draft");
+    for index in 0..100 {
+        screen.push_lines(vec![Line::plain(format!("history {index}"))]);
+    }
+    screen.flush();
+    let mouse = |kind, row| {
+        Event::Mouse(event::MouseEvent {
+            kind,
+            row,
+            column: 0,
+            modifiers: KeyModifiers::NONE,
+        })
+    };
+    screen.absorb_event(mouse(Down(Left), 3));
+    screen.absorb_event(mouse(Drag(Left), 0));
+    let now = std::time::Instant::now();
+    for tick in 1..60 {
+        screen.tick_transcript_selection(now + std::time::Duration::from_millis(tick * 60));
+    }
+    screen.absorb_event(mouse(Up(Left), 0));
+    let selected = screen.transcript_selection();
+    assert!(selected.starts_with("history 0\n"), "{selected}");
+    assert!(selected.contains("history 50\n"));
+    screen.push_lines(vec![Line::plain("new output")]);
+    screen.flush();
+    assert_eq!(screen.transcript_selection(), selected);
+    screen.absorb_event(mouse(ScrollDown, 2));
+    assert_eq!(
+        screen.transcript_selection(),
+        selected,
+        "wheel scrolling keeps the selection anchored"
+    );
+    screen.absorb_event(Event::Key(KeyCode::Esc.into()));
+    screen.absorb_event(Event::Key(KeyCode::PageUp.into()));
+    assert!(
+        screen.transcript_view.is_none(),
+        "PageUp no longer opens a separate browser"
+    );
 }
 
 #[test]

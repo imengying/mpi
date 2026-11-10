@@ -190,17 +190,6 @@ impl Screen {
                 picker.selected = count - 1;
                 None
             }
-            KeyCode::PageUp => {
-                picker.selected = picker
-                    .selected
-                    .saturating_sub(self.height.saturating_sub(3).clamp(1, 12));
-                None
-            }
-            KeyCode::PageDown => {
-                picker.selected =
-                    (picker.selected + self.height.saturating_sub(3).clamp(1, 12)).min(count - 1);
-                None
-            }
             KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
                 let index = c as usize - '1' as usize;
                 (index < count).then_some(Some(index))

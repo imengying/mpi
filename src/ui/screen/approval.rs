@@ -8,9 +8,7 @@ impl Screen {
         if !self.interactive {
             return Decision::Deny;
         }
-        if self.detail.is_some() {
-            self.close_detail();
-        }
+        self.close_views();
         self.suspend_live();
         let body = format!(
             "{}\n目录：{}",
@@ -34,6 +32,14 @@ impl Screen {
     }
 
     pub(super) fn approval_event(&mut self, event: Event) {
+        let event = match event {
+            Event::Mouse(mouse) => match mouse.kind {
+                event::MouseEventKind::ScrollUp => Event::Key(KeyCode::Char('k').into()),
+                event::MouseEventKind::ScrollDown => Event::Key(KeyCode::Char('j').into()),
+                _ => return,
+            },
+            event => event,
+        };
         let decision = match event {
             Event::Key(key) => self
                 .approval

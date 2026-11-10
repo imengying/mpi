@@ -13,6 +13,10 @@ pub(super) struct Viewport {
 }
 
 impl Viewport {
+    pub(super) fn history_height(&self) -> usize {
+        self.top
+    }
+
     pub(super) fn needs_reflow(&self, width: usize, height: usize, live_rows: usize) -> bool {
         self.size.is_some_and(|size| {
             size != (width, height) || self.invalidated || live_rows < self.rows.len()

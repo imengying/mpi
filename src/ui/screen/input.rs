@@ -205,6 +205,9 @@ impl Screen {
     }
 
     fn handle_event(&mut self, event: Event) -> Option<Action> {
+        if self.copy_menu_event(&event) {
+            return None;
+        }
         if self.detail.is_some() {
             self.detail_event(event);
             return None;

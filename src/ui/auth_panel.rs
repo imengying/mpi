@@ -56,10 +56,9 @@ impl PanelState {
             KeyCode::Char('q') => return Some(Decision::Deny),
             KeyCode::Down | KeyCode::Tab => self.selected = (self.selected + 1) % 3,
             KeyCode::Up | KeyCode::BackTab => self.selected = (self.selected + 2) % 3,
-            KeyCode::PageUp => self.offset = self.offset.saturating_sub(1),
             KeyCode::Char('k') => self.offset = self.offset.saturating_sub(1),
             KeyCode::Home => self.offset = 0,
-            KeyCode::PageDown | KeyCode::Char('j') => self.offset += 1,
+            KeyCode::Char('j') => self.offset += 1,
             KeyCode::Char(' ') => self.offset += 1,
             KeyCode::End => self.offset = usize::MAX,
             _ => {}

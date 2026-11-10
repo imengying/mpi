@@ -92,6 +92,9 @@ pub struct Screen {
     viewport: Viewport,
     alternate_screen: bool,
     transcript_view: Option<transcript::TranscriptView>,
+    live_preview: Vec<HistoryRow<Line>>,
+    drag_start: Option<event::MouseEvent>,
+    copy_menu: Option<(usize, usize)>,
     approval: Option<(
         crate::ui::auth_panel::PanelState,
         tokio::sync::oneshot::Sender<crate::auth::guard::Decision>,
@@ -233,6 +236,9 @@ impl Screen {
             viewport: Viewport::default(),
             alternate_screen: false,
             transcript_view: None,
+            live_preview: Vec::new(),
+            drag_start: None,
+            copy_menu: None,
             approval: None,
             editing: None,
             history: Vec::new(),
@@ -337,6 +343,9 @@ impl Screen {
         self.detail = None;
         self.picker = None;
         self.transcript_view = None;
+        self.live_preview.clear();
+        self.drag_start = None;
+        self.copy_menu = None;
         self.viewport = Viewport::default();
         let _ = self.out.flush();
     }
@@ -353,6 +362,9 @@ impl Screen {
         self.detail = None;
         self.picker = None;
         self.transcript_view = None;
+        self.live_preview.clear();
+        self.drag_start = None;
+        self.copy_menu = None;
         self.streaming_answer = None;
         self.answer_layout.clear();
         self.streaming_thinking = None;
@@ -562,6 +574,7 @@ mod live;
 mod menu;
 mod picker;
 mod redraw;
+mod selection;
 mod transcript;
 
 pub use picker::Choice;

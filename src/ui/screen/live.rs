@@ -2,21 +2,35 @@
 
 use super::*;
 
+struct LiveFrame {
+    rows: Vec<HistoryRow<Line>>,
+    cursor: Option<(usize, usize)>,
+    preview: usize,
+}
+
 impl Screen {
+    #[cfg(test)]
     pub(super) fn compose_live(&self) -> (Vec<HistoryRow<Line>>, Option<(usize, usize)>) {
+        let frame = self.compose_frame();
+        (frame.rows, frame.cursor)
+    }
+
+    fn compose_frame(&self) -> LiveFrame {
         if let Some(picker) = &self.picker {
-            return (
-                self.choice_lines(
-                    &picker.title,
-                    &picker.hint,
-                    &picker.choices,
-                    picker.selected,
-                )
-                .into_iter()
-                .map(HistoryRow::hard)
-                .collect(),
-                None,
-            );
+            return LiveFrame {
+                rows: self
+                    .choice_lines(
+                        &picker.title,
+                        &picker.hint,
+                        &picker.choices,
+                        picker.selected,
+                    )
+                    .into_iter()
+                    .map(HistoryRow::hard)
+                    .collect(),
+                cursor: None,
+                preview: 0,
+            };
         }
         let budget = self.height.saturating_sub(1).max(1);
         let rendered_footer = self
@@ -172,6 +186,7 @@ impl Screen {
         }
         let first = preview.len().saturating_sub(room);
         let mut lines = preview.split_off(first);
+        let preview = lines.len();
         lines.extend(above.into_iter().map(HistoryRow::hard));
         if working {
             lines.push(HistoryRow::hard(Line::spans(vec![
@@ -190,8 +205,8 @@ impl Screen {
             lines.push(HistoryRow::hard(Line::blank()));
         }
         let cursor = cursor.map(|(row, column)| (row, column.min(self.width.saturating_sub(1))));
-        (
-            lines
+        LiveFrame {
+            rows: lines
                 .iter()
                 .map(|row| HistoryRow {
                     line: row.line.truncate(self.width),
@@ -199,7 +214,8 @@ impl Screen {
                 })
                 .collect(),
             cursor,
-        )
+            preview,
+        }
     }
 
     pub(super) fn commit(&mut self) {
@@ -240,7 +256,11 @@ impl Screen {
     }
 
     pub(super) fn flush_pending_frame(&mut self) {
-        if self.redraw.ready(std::time::Instant::now()) {
+        let now = std::time::Instant::now();
+        if self.tick_transcript_selection(now) || self.tick_detail_selection(now) {
+            self.redraw.request();
+        }
+        if self.redraw.ready(now) {
             self.draw_live();
         }
     }
@@ -252,15 +272,18 @@ impl Screen {
             let _ = crossterm::execute!(
                 self.out,
                 terminal::EnterAlternateScreen,
-                event::EnableMouseCapture,
+                event::DisableMouseCapture,
                 terminal::Clear(terminal::ClearType::All),
                 cursor::MoveTo(0, 0)
             );
+            // Track presses, wheel and held-button drags, without idle pointer motion.
+            let _ = write!(self.out, "\x1b[?1002h\x1b[?1006h");
             self.alternate_screen = true;
             self.viewport.clear();
         }
         if self.detail.is_some() {
             self.draw_detail();
+            self.draw_copy_menu();
             return;
         }
         if let Some((panel, _)) = self.approval.as_mut() {
@@ -277,6 +300,7 @@ impl Screen {
         }
         if self.transcript_view.is_some() {
             self.draw_transcript();
+            self.draw_copy_menu();
             return;
         }
         let frame = self.live_frame();
@@ -285,7 +309,12 @@ impl Screen {
     }
 
     pub(super) fn live_frame(&mut self) -> String {
-        let (lines, cursor) = self.compose_live();
+        let LiveFrame {
+            rows: lines,
+            cursor,
+            preview,
+        } = self.compose_frame();
+        self.live_preview = lines[..preview].to_vec();
         let reflow = if self
             .viewport
             .needs_reflow(self.width, self.height, lines.len())
