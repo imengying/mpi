@@ -1184,6 +1184,37 @@ fn the_cursor_lands_after_the_buffer_not_below_the_footer() {
         lines[row + 1].line.text().contains("/model"),
         "the menu goes under the input"
     );
+    // Opening, filtering and closing the menu must restore the history it covered.
+    for history_len in [0, 2, 40] {
+        let mut screen = screen_with_commands();
+        screen.set_footer(vec![Line::plain("dir"), Line::plain("stats")]);
+        screen.push(Block::lines(
+            (0..history_len)
+                .map(|index| Line::plain(format!("history {index}")))
+                .collect(),
+        ));
+        let mut terminal = vt100::Parser::new(nz(24), nz(40), 0);
+        for input in ["", "/", "/mo", "/", ""] {
+            set_input(&mut screen, input);
+            screen.sync_menu();
+            terminal.process(screen.live_frame().as_bytes());
+            let visible = terminal.screen().contents();
+            let (row, _) = terminal.screen().cursor_position();
+            if history_len > 0 {
+                assert_eq!(
+                    terminal
+                        .screen()
+                        .rows(0, 40)
+                        .nth(usize::from(row) - 1)
+                        .unwrap(),
+                    format!("history {}", history_len - 1),
+                    "menu {input:?} left a gap above the composer: {visible}"
+                );
+            } else {
+                assert_eq!(row, 0, "empty session moved the composer: {visible}");
+            }
+        }
+    }
 }
 
 #[test]

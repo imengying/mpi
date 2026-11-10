@@ -7,20 +7,19 @@ use std::fmt::Write;
 pub(super) struct Viewport {
     size: Option<(usize, usize)>,
     top: usize,
-    /// Empty space above a shrunken composer, kept out of transcript/scrollback.
-    gap: usize,
     rows: Vec<HistoryRow<String>>,
     cursor: Option<(usize, usize)>,
     invalidated: bool,
 }
 
 impl Viewport {
-    pub(super) fn needs_reflow(&self, width: usize, height: usize) -> bool {
-        self.size
-            .is_some_and(|size| size != (width, height) || self.invalidated)
+    pub(super) fn needs_reflow(&self, width: usize, height: usize, live_rows: usize) -> bool {
+        self.size.is_some_and(|size| {
+            size != (width, height) || self.invalidated || live_rows < self.rows.len()
+        })
     }
 
-    /// Build one synchronized frame. `reflow` is the visible history tail after a resize.
+    /// Build one synchronized frame. Reflow restores history after a resize or menu shrink.
     pub(super) fn draw(
         &mut self,
         size: (usize, usize),
@@ -32,24 +31,9 @@ impl Viewport {
         let (width, height) = size;
         debug_assert!(width > 0 && height > 0 && !rows.is_empty() && rows.len() <= height);
         let first_frame = self.size.is_none();
-        let reflowing = self.needs_reflow(width, height);
+        let reflowing = self.needs_reflow(width, height, rows.len());
         let layout_changed = first_frame || reflowing || self.rows.len() != rows.len();
         let mut frame = String::from("\x1b[?2026h");
-
-        // Recover the transcript boundary before appending or resizing. The gap is only
-        // presentation space; it must never become a blank block in native history.
-        let was_docked = self
-            .size
-            .is_some_and(|(_, height)| self.top + self.rows.len() == height);
-        if self.gap > 0 && (layout_changed || !history.is_empty()) {
-            erase_rows(
-                &mut frame,
-                self.top.min(height),
-                self.rows.len().min(height.saturating_sub(self.top)),
-            );
-            self.top -= self.gap;
-            self.gap = 0;
-        }
 
         if reflowing {
             let shown = reflow.len().min(height - rows.len());
@@ -75,12 +59,6 @@ impl Viewport {
                 self.top -= scroll;
             }
         }
-        if was_docked && (layout_changed || !history.is_empty()) {
-            let anchored = height - rows.len();
-            self.gap = anchored.saturating_sub(self.top);
-            self.top += self.gap;
-        }
-
         let top = self.top;
         let repaint = layout_changed || !history.is_empty();
         let mut index = 0;
@@ -131,8 +109,6 @@ impl Viewport {
         let mut frame = String::from("\x1b[?2026h");
         erase_rows(&mut frame, self.top, self.rows.len());
         // Return to the transcript boundary before a modal overlay or redraw.
-        self.top -= self.gap;
-        self.gap = 0;
         move_to(&mut frame, self.top, 0);
         frame.push_str("\x1b[?25h\x1b[?2026l");
         self.rows.clear();
@@ -245,12 +221,19 @@ mod tests {
             .as_bytes(),
         );
         terminal.process(
-            view.draw((24, 12), rows(&["draft", "stats"]), Some((0, 5)), &[], &[])
-                .as_bytes(),
+            view.draw(
+                (24, 12),
+                rows(&["draft", "stats"]),
+                Some((0, 5)),
+                &[],
+                &transcript,
+            )
+            .as_bytes(),
         );
         assert_eq!(terminal.screen().rows(0, 24).last().unwrap(), "stats");
         assert_eq!(terminal.screen().cursor_position(), (10, 5));
         assert!(terminal.screen().contents().contains("answer 29"));
+        assert_eq!(terminal.screen().rows(0, 24).nth(9).unwrap(), "answer 29");
         assert!(!terminal.screen().contents().contains("three"));
     }
 
@@ -319,8 +302,14 @@ mod tests {
                 Vec::new()
             };
             terminal.process(
-                view.draw((20, 10), live.clone(), Some((0, 0)), &history, &[])
-                    .as_bytes(),
+                view.draw(
+                    (20, 10),
+                    live.clone(),
+                    Some((0, 0)),
+                    &history,
+                    &rows(&["answer"]),
+                )
+                .as_bytes(),
             );
             let visible = terminal.screen().contents();
             assert!(visible.contains("answer"), "{visible}");

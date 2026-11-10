@@ -126,10 +126,12 @@ impl Screen {
         }
         let mut preview = Vec::new();
         if let Some(answer) = &self.streaming_answer {
-            preview.extend(crate::ui::text::history_rows(
-                &crate::ui::markdown::render(answer, self.width),
-                self.width,
-            ));
+            preview.extend(
+                self.answer_layout
+                    .tail(answer, self.width, self.height)
+                    .iter()
+                    .cloned(),
+            );
         }
         if let Some(thinking) = &self.streaming_thinking
             && self.thinking_active
@@ -284,7 +286,10 @@ impl Screen {
 
     pub(super) fn live_frame(&mut self) -> String {
         let (lines, cursor) = self.compose_live();
-        let reflow = if self.viewport.needs_reflow(self.width, self.height) {
+        let reflow = if self
+            .viewport
+            .needs_reflow(self.width, self.height, lines.len())
+        {
             // The viewport only repaints its visible tail. Stop once that tail is filled.
             let mut tail = std::collections::VecDeque::new();
             let mut count = 0;

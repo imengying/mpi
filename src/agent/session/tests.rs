@@ -886,20 +886,20 @@ fn obsolete_session_fields_are_rejected() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("old.jsonl");
-    std::fs::write(
-            &path,
-            concat!(
-                r#"{"type":"session_meta","format":1,"id":"01a0c9b3-b78c-726b-9e74-fc987dcd42bd","timestamp":"2026-09-22T15:19:53Z","cwd":"/tmp","model":"work/m"}"#,
-                "\n",
-                r#"{"type":"response_item","parent_id":"a","id":"x1","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#,
-                "\n",
-                r#"{"type":"compacted","parent_id":"x1","id":"c1","window_id":"w1","previous_window_id":"w0","reason":"manual","summary":"s","replacement_history":[],"read_files":[],"modified_files":[],"timestamp":"2026-09-22T15:20:00Z"}"#,
-                "\n",
-            ),
-        )
-        .unwrap();
-
-    assert!(Session::open(&path).is_err());
+    let header = serde_json::json!({
+        "type":"session_meta", "id":"s", "timestamp":"2026-09-22T15:19:53Z",
+        "cwd":"/tmp", "model":"work/m"
+    });
+    assert!(serde_json::from_value::<Record>(header.clone()).is_ok());
+    for field in ["format", "unexpected_field"] {
+        let mut invalid = header.clone();
+        invalid[field] = serde_json::json!(1);
+        // Test the flattened header itself: another invalid line must not mask it.
+        let error = serde_json::from_value::<Record>(invalid.clone()).unwrap_err();
+        assert!(error.to_string().contains("unknown field"), "{error}");
+        std::fs::write(&path, format!("{invalid}\n")).unwrap();
+        assert!(Session::open(&path).is_err());
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 

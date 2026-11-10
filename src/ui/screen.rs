@@ -114,6 +114,7 @@ pub struct Screen {
     /// A new thinking segment can arrive after an earlier piece of answer text.
     thinking_active: bool,
     streaming_answer: Option<String>,
+    answer_layout: layout::PreviewCache,
     /// The spinner's label while a turn is in flight, and which frame of the animation it
     /// is on.
     ///
@@ -245,6 +246,7 @@ impl Screen {
             running_started: None,
             running_log: None,
             streaming_answer: None,
+            answer_layout: layout::PreviewCache::default(),
             interactive,
             title: None,
             notice: None,
@@ -352,6 +354,7 @@ impl Screen {
         self.picker = None;
         self.transcript_view = None;
         self.streaming_answer = None;
+        self.answer_layout.clear();
         self.streaming_thinking = None;
         self.thinking_active = false;
         self.running_calls.clear();
@@ -446,6 +449,7 @@ impl Screen {
     /// Begin a streaming answer: the thinking preview and the text so far live in the live
     /// region below the transcript until the turn ends.
     pub fn begin_stream(&mut self) {
+        self.answer_layout.clear();
         self.streaming_thinking = None;
         self.thinking_active = false;
         self.streaming_answer = Some(String::new());
@@ -475,6 +479,7 @@ impl Screen {
     /// failed: a half-written answer that was never recorded must not stay on screen.
     pub fn discard_stream(&mut self) {
         self.streaming_answer = None;
+        self.answer_layout.clear();
         self.streaming_thinking = None;
         self.thinking_active = false;
         self.erase_live();
@@ -484,6 +489,7 @@ impl Screen {
     /// Finish the stream and commit the answer. Thinking stays in the live preview only.
     pub fn end_stream(&mut self) -> (String, String) {
         let answer = self.streaming_answer.take().unwrap_or_default();
+        self.answer_layout.clear();
         let thinking = self.streaming_thinking.take().unwrap_or_default();
         self.thinking_active = false;
         if !answer.trim().is_empty() {
