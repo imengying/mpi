@@ -61,9 +61,12 @@ impl Viewport {
             } else {
                 height - rows.len()
             };
-            let shown = reflow.len().min(height - rows.len()).min(capacity);
+            // Restore every previously visible history row before making room for a
+            // taller live region. Truncating to the new height would erase rows that
+            // have not reached native scrollback yet (for example when opening a picker).
+            let shown = reflow.len().min(capacity);
             self.history_top = self.history_top.min(height - 1);
-            let scroll = (self.history_top + shown + rows.len()).saturating_sub(height);
+            let scroll = (self.history_top + shown).saturating_sub(height);
             if scroll > 0 {
                 erase_rows(
                     &mut frame,

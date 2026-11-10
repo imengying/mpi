@@ -66,17 +66,7 @@ impl PanelState {
         None
     }
 
-    pub(crate) fn draw(&mut self, out: &mut impl Write, theme: &Theme) -> std::io::Result<()> {
-        let (width, rows) = terminal::size().unwrap_or((80, 24));
-        self.draw_at(
-            out,
-            theme,
-            usize::from(width.max(1)),
-            usize::from(rows.max(1)),
-        )
-    }
-
-    fn draw_at(
+    pub(crate) fn draw(
         &mut self,
         out: &mut impl Write,
         theme: &Theme,
@@ -285,7 +275,7 @@ mod tests {
             terminal.screen_mut().set_size(nz(height), nz(width));
             let mut frame = Vec::new();
             panel
-                .draw_at(&mut frame, &theme, width as usize, height as usize)
+                .draw(&mut frame, &theme, width as usize, height as usize)
                 .unwrap();
             terminal.process(&frame);
             assert_eq!(terminal.screen().cursor_position().0, height - 1);
@@ -406,6 +396,8 @@ mod tests {
                 &Theme {
                     mode: crate::ui::theme::ColorMode::True,
                 },
+                80,
+                24,
             )
             .unwrap();
         let text = String::from_utf8_lossy(&out).to_string();
@@ -444,6 +436,8 @@ mod tests {
                 &Theme {
                     mode: crate::ui::theme::ColorMode::True,
                 },
+                80,
+                24,
             )
             .unwrap();
         let text = String::from_utf8_lossy(&out).to_string();
@@ -456,20 +450,13 @@ mod tests {
             .collect()
     }
 
-    /// The terminal width the panel will draw at, as the panel itself asks for it.
-    fn terminal_width() -> usize {
-        terminal::size()
-            .map(|(cols, _)| cols as usize)
-            .unwrap_or(80)
-    }
-
     #[test]
     fn every_row_fills_the_terminal_width() {
         // The bug this pins: the padding was computed from the *styled* string, so escape
         // sequences counted as columns and the selected row's background band stopped short
         // of the right edge — it looked like the highlight was a fixed-width box rather than
         // a full-width bar. Every row is exactly the terminal's width, selected or not.
-        let width = terminal_width();
+        let width = 80;
         let mut panel = state_with_rows(3);
         for selected_allow in [true, false] {
             if !selected_allow {

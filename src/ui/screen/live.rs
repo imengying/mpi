@@ -249,7 +249,9 @@ impl Screen {
             return;
         }
         if let Some((panel, _)) = self.approval.as_mut() {
-            if panel.draw(&mut self.out, &self.theme).is_err()
+            if panel
+                .draw(&mut self.out, &self.theme, self.width, self.height)
+                .is_err()
                 && let Some((_, sender)) = self.approval.take()
             {
                 let _ = sender.send(crate::auth::guard::Decision::Deny);

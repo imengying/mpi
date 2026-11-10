@@ -274,6 +274,116 @@ fn streaming_blocks_commit_once_and_remain_in_native_scrollback() {
 }
 
 #[test]
+fn modal_views_preserve_native_history_without_duplicates_or_overlay_text() {
+    fn terminal_rows(terminal: &mut vt100::Parser) -> Vec<String> {
+        let width = terminal.screen().size().1.get();
+        let mut rows = Vec::new();
+        // Read every stored row once, then the visible screen. Checking only the oldest
+        // page misses losses and duplicated history near the composer.
+        for offset in (1..=terminal.screen().scrollback_len()).rev() {
+            terminal.screen_mut().set_scrollback(offset);
+            rows.push(terminal.screen().rows(0, width).next().unwrap());
+        }
+        terminal.screen_mut().set_scrollback(0);
+        rows.extend(terminal.screen().rows(0, width));
+        rows.retain(|row| !row.is_empty());
+        rows
+    }
+
+    for history_count in [5, 60] {
+        for view in ["/resume", "Ctrl+O", "approval"] {
+            let captured = CapturedOutput::default();
+            let mut terminal = vt100::Parser::new(nz(24), nz(80), 300);
+            terminal.process(b"shell history\r\n$ pi\r\n");
+            let mut screen = screen();
+            screen.width = 80;
+            screen.out = Box::new(captured.clone());
+            screen.interactive = true;
+            screen.viewport.start_at(2, 0);
+            set_input(&mut screen, "unsent draft");
+            screen.set_footer(vec![Line::plain("stats")]);
+            let history: Vec<_> = (0..history_count)
+                .map(|index| format!("history {index:03}"))
+                .collect();
+            screen.push_lines(history.iter().map(Line::plain).collect());
+            screen.push(Block::collapsible(
+                vec![Line::plain("tool summary"), Line::plain("detail only")],
+                1,
+                0,
+                0,
+            ));
+            screen.flush();
+            terminal.process(&captured.take());
+            assert_eq!(terminal.screen().scrollback_len() > 0, history_count > 24);
+            let mut expected = vec!["shell history".into(), "$ pi".into()];
+            expected.extend(history);
+            expected.push("tool summary".into());
+
+            // Close normally once, then exit with the view still open. The latter must
+            // restore an approval-covered tail even when no new output is pending.
+            for exit in [false, true] {
+                let mut decision = None;
+                let title = match view {
+                    "/resume" => {
+                        screen.open_picker(
+                            "恢复历史会话",
+                            "Esc 取消",
+                            (0..30)
+                                .map(|n| Choice::new(format!("session {n}")))
+                                .collect(),
+                            0,
+                        );
+                        "恢复历史会话"
+                    }
+                    "Ctrl+O" => {
+                        assert!(screen.show_tool_details());
+                        "detail only"
+                    }
+                    "approval" => {
+                        screen.suspend_live();
+                        let (sender, receiver) = tokio::sync::oneshot::channel();
+                        decision = Some(receiver);
+                        screen.approval = Some((
+                            crate::ui::auth_panel::PanelState::new(&"approval body\n".repeat(30)),
+                            sender,
+                        ));
+                        "approval body"
+                    }
+                    _ => unreachable!(),
+                };
+                screen.flush();
+                terminal.process(&captured.take());
+                assert!(terminal.screen().contents().contains(title), "{view}");
+                assert_eq!(terminal.screen().alternate_screen(), view == "Ctrl+O");
+                if exit {
+                    screen.leave();
+                } else {
+                    screen.push_lines(vec![Line::plain("output while view is open")]);
+                    expected.push("output while view is open".into());
+                    screen.flush();
+                    screen.absorb_event(Event::Key(KeyCode::Esc.into()));
+                    screen.flush();
+                    if let Some(mut receiver) = decision {
+                        assert_eq!(receiver.try_recv(), Ok(crate::auth::guard::Decision::Deny));
+                    }
+                }
+                terminal.process(&captured.take());
+                assert!(!terminal.screen().alternate_screen(), "{view}");
+                let mut expected_rows = expected.clone();
+                if !exit {
+                    expected_rows.extend(["› unsent draft".into(), "stats".into()]);
+                }
+                assert_eq!(
+                    terminal_rows(&mut terminal),
+                    expected_rows,
+                    "{view}, history_count={history_count}, exit={exit}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn streamed_summaries_and_restored_markdown_have_the_same_layout() {
     let long_list = (1..=80)
         .map(|n| {
