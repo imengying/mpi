@@ -113,6 +113,8 @@ os.read(int(sys.argv[2]), 1)
                         return False
                     raise
                 output.extend(chunk)
+                for _ in range(chunk.count(b"\x1b[6n")):
+                    os.write(master, b"\x1b[1;1R")
                 return bool(chunk)
             return False
 
@@ -129,7 +131,7 @@ os.read(int(sys.argv[2]), 1)
             os.write(master, text.encode())
 
         try:
-            until(lambda: b"\x1b[?1049h" in output)
+            until(lambda: b"tok/s" in output)
             pi_pid = int((root / "pi.pid").read_text())
             original = ast.literal_eval((root / "pi.mode").read_text())
             if mode == "picker":
@@ -167,7 +169,8 @@ os.read(int(sys.argv[2]), 1)
             assert exit_status() == expected_status, (mode, exit_status())
             restored = termios.tcgetattr(slave)
             assert restored == original, (mode, "terminal mode not restored", original, restored)
-            assert b"\x1b[?1049l" in output, (mode, "alternate screen not restored")
+            assert b"\x1b[?25h" in output, (mode, "cursor not restored")
+            assert b"\x1b[?1002h" not in output, (mode, "native mouse selection captured")
             if child_pid:
                 status = subprocess.run(["ps", "-o", "stat=", "-p", str(child_pid)],
                                         capture_output=True, text=True).stdout.strip()
@@ -198,6 +201,64 @@ os.read(int(sys.argv[2]), 1)
             server.server_close()
 
 
+def check_background_rendering(artifacts):
+    """Render-only tests must not alter a parent TTY or stop on SIGTTOU inside pi."""
+    candidates = [item["executable"] for line in Path(artifacts).read_text().splitlines()
+                  if (item := json.loads(line)).get("reason") == "compiler-artifact"
+                  and item["target"]["name"] == "mpi" and item["profile"]["test"]
+                  and item.get("executable")]
+    assert len(candidates) == 1, candidates
+    binary = str(Path(candidates[0]).resolve())
+    with tempfile.TemporaryDirectory(prefix="pi-render-tty-") as temp:
+        master, slave = pty.openpty()
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
+
+        def take_terminal():
+            os.setsid()
+            fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+
+        owner = r'''
+import json, os, signal, subprocess, sys, termios
+from pathlib import Path
+original = termios.tcgetattr(0)
+results = []
+for name in ("native_code_selection_keeps_source_newlines_and_indentation_while_streaming_and_after_resize",
+             "native_selection_joins_visual_folds_but_keeps_explicit_prose_line_breaks"):
+    child = subprocess.Popen([sys.argv[1], "--exact", "ui::screen::tests::" + name],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, process_group=0)
+    try:
+        output, _ = child.communicate(timeout=5)
+        results.append({"test": name, "exit": child.returncode,
+                        "passed": b"1 passed" in output,
+                        "mode_unchanged": termios.tcgetattr(0) == original})
+    except subprocess.TimeoutExpired:
+        os.killpg(child.pid, signal.SIGKILL)
+        child.communicate()
+        results.append({"test": name, "timeout": True})
+    finally:
+        termios.tcsetattr(0, termios.TCSANOW, original)
+Path("render-results.json").write_text(json.dumps(results))
+'''
+        process = subprocess.Popen([sys.executable, "-c", owner, binary],
+                                   stdin=slave, stdout=slave, stderr=slave, cwd=temp,
+                                   preexec_fn=take_terminal)
+        try:
+            process.wait(timeout=15)
+            assert process.returncode == 0, process.returncode
+            results = json.loads(Path(temp, "render-results.json").read_text())
+            for result in results:
+                assert (result.get("exit") == 0 and result.get("passed")
+                        and result.get("mode_unchanged")), result
+            print("PASS rendering in background: no SIGTTOU or parent TTY changes")
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            os.close(master)
+            os.close(slave)
+
+
 if __name__ == "__main__":
     binary = Path(sys.argv[1]).resolve()
     try:
@@ -206,6 +267,8 @@ if __name__ == "__main__":
             check(binary, "idle", exit_signal)
         for mode in ("model", "picker", "stream", "approval", "tool"):
             check(binary, mode, signal.SIGTERM)
+        if len(sys.argv) > 2:
+            check_background_rendering(sys.argv[2])
     except Exception as error:
         if os.environ.get("GITHUB_ACTIONS"):
             message = str(error).replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")

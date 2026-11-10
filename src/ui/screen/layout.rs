@@ -203,21 +203,5 @@ mod tests {
                     .all(|entry| entry.index >= 9_970)
             );
         }
-        screen.transcript_event(&Event::Mouse(event::MouseEvent {
-            kind: event::MouseEventKind::ScrollUp,
-            column: 0,
-            row: 0,
-            modifiers: KeyModifiers::NONE,
-        }));
-        screen.transcript_event(&Event::Key(KeyCode::Home.into()));
-        screen.draw_transcript();
-        assert!(screen.layout.entries.iter().any(|entry| entry.index == 0));
-        assert!(
-            screen
-                .layout
-                .entries
-                .iter()
-                .all(|entry| entry.index < 30 || entry.index >= 9_970)
-        );
     }
 }

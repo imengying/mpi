@@ -195,6 +195,9 @@ impl Agent {
         let session = Session::create(&cwd, &model_spec)?;
         let client = Client::new()?;
         let mut screen = Screen::new();
+        if interactive {
+            screen.start_terminal()?;
+        }
         screen.set_commands(COMMANDS);
         // The session id is deliberately *not* announced here: it is printed on the way out,
         // as part of the command that resumes it, which is the only time it is useful.
@@ -256,6 +259,9 @@ impl Agent {
         let dialect = policy::configured_dialect(&config.shell.path);
         let client = Client::new()?;
         let mut screen = Screen::new();
+        if interactive {
+            screen.start_terminal()?;
+        }
         screen.set_commands(COMMANDS);
         // Read from the directory the session is being resumed in: the instructions are
         // about the code being worked on, and that is where the work happens now.

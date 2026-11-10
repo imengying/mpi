@@ -90,11 +90,6 @@ pub struct Screen {
     footer: Vec<Line>,
     footer_state: Option<crate::ui::footer::FooterState>,
     viewport: Viewport,
-    alternate_screen: bool,
-    transcript_view: Option<transcript::TranscriptView>,
-    live_preview: Vec<HistoryRow<Line>>,
-    drag_start: Option<event::MouseEvent>,
-    copy_menu: Option<(usize, usize)>,
     approval: Option<(
         crate::ui::auth_panel::PanelState,
         tokio::sync::oneshot::Sender<crate::auth::guard::Decision>,
@@ -234,11 +229,6 @@ impl Screen {
             footer: Vec::new(),
             footer_state: None,
             viewport: Viewport::default(),
-            alternate_screen: false,
-            transcript_view: None,
-            live_preview: Vec::new(),
-            drag_start: None,
-            copy_menu: None,
             approval: None,
             editing: None,
             history: Vec::new(),
@@ -269,6 +259,19 @@ impl Screen {
 
     pub fn interactive(&self) -> bool {
         self.interactive
+    }
+
+    /// Acquire the real terminal only at session/input entry, never while painting.
+    /// Render tests can then use an in-memory output without touching a parent's TTY.
+    pub(crate) fn start_terminal(&mut self) -> std::io::Result<()> {
+        if !self.interactive || !self.viewport.needs_position() {
+            return Ok(());
+        }
+        crate::ui::terminal::ensure_raw_mode()?;
+        let (column, row) = cursor::position().unwrap_or((0, self.height.saturating_sub(1) as u16));
+        self.viewport
+            .start_at(usize::from(row), usize::from(column));
+        crossterm::execute!(self.out, event::DisableMouseCapture)
     }
 
     /// Set the terminal's window title to `π - <name> - <directory>`.
@@ -322,31 +325,25 @@ impl Screen {
 
     /// Commands reveal their menu or feedback even while browsing output.
     pub(crate) fn close_views(&mut self) {
-        self.close_transcript();
         self.close_detail();
     }
 
-    /// Restore the shell screen without adding session content to its scrollback.
+    /// Keep completed output in native scrollback and remove the composer/footer.
     pub fn leave(&mut self) {
-        if !self.interactive {
-            self.commit();
-        } else if self.alternate_screen {
-            let _ = crossterm::execute!(
-                self.out,
-                terminal::EndSynchronizedUpdate,
-                event::DisableMouseCapture,
-                cursor::Show,
-                terminal::LeaveAlternateScreen
-            );
-            self.alternate_screen = false;
+        if self.detail.take().is_some() {
+            let _ = crossterm::execute!(self.out, terminal::LeaveAlternateScreen);
         }
-        self.detail = None;
+        let restore_history = if let Some((mut panel, _)) = self.approval.take() {
+            panel.clear(&mut self.out);
+            true
+        } else {
+            false
+        };
         self.picker = None;
-        self.transcript_view = None;
-        self.live_preview.clear();
-        self.drag_start = None;
-        self.copy_menu = None;
-        self.viewport = Viewport::default();
+        if !self.interactive || restore_history || self.printed < self.blocks.len() {
+            self.commit();
+        }
+        self.erase_live();
         let _ = self.out.flush();
     }
 
@@ -361,10 +358,6 @@ impl Screen {
         self.printed = 0;
         self.detail = None;
         self.picker = None;
-        self.transcript_view = None;
-        self.live_preview.clear();
-        self.drag_start = None;
-        self.copy_menu = None;
         self.streaming_answer = None;
         self.answer_layout.clear();
         self.streaming_thinking = None;
@@ -574,8 +567,6 @@ mod live;
 mod menu;
 mod picker;
 mod redraw;
-mod selection;
-mod transcript;
 
 pub use picker::Choice;
 

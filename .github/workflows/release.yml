@@ -82,7 +82,8 @@ jobs:
           PI_TEST_REQUIRE_ENGINES: "1"
         run: |
           cargo test --release --locked --target ${{ matrix.target }}
-          python3 tests/terminal_signals.py target/${{ matrix.target }}/release/pi
+          cargo test --release --locked --target ${{ matrix.target }} --lib --no-run --message-format=json > "$RUNNER_TEMP/pi-test-binaries.json"
+          python3 tests/terminal_signals.py target/${{ matrix.target }}/release/pi "$RUNNER_TEMP/pi-test-binaries.json"
 
       - name: Package
         shell: bash

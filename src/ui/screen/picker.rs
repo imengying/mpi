@@ -102,7 +102,7 @@ impl Screen {
             // No terminal to choose on: fall back to the highlighted entry.
             return Some(initial.min(choices.len() - 1));
         }
-        if crate::ui::terminal::ensure_raw_mode().is_err() {
+        if self.start_terminal().is_err() {
             return None;
         }
         self.open_picker(title, hint, choices.to_vec(), initial);
@@ -156,11 +156,6 @@ impl Screen {
         }
         let key = match event {
             Event::Key(key) if key.kind != KeyEventKind::Release => key,
-            Event::Mouse(mouse) => match mouse.kind {
-                event::MouseEventKind::ScrollUp => KeyCode::Up.into(),
-                event::MouseEventKind::ScrollDown => KeyCode::Down.into(),
-                _ => return None,
-            },
             _ => return None,
         };
         let picker = self.picker.as_mut().expect("open picker");

@@ -1,6 +1,5 @@
 //! Temporary history browser. It never mutates transcript blocks or the composer.
 use super::*;
-use selection::{Point, Selection};
 
 pub(super) struct Detail {
     index: usize,
@@ -13,26 +12,15 @@ pub(super) struct Detail {
     live_log: Option<std::path::PathBuf>,
     refreshed: Option<std::time::Instant>,
     follow: bool,
-    selection: Option<Selection>,
+    viewport: Viewport,
 }
 
 impl Detail {
-    pub(super) fn has_selection(&self) -> bool {
-        self.selection
-            .as_ref()
-            .is_some_and(|selection| !selection.is_empty())
-    }
-
     pub(super) fn is_live(&self) -> bool {
         self.live_log.is_some()
     }
 
     fn refresh(&mut self, blocks: &[Block], width: usize) {
-        if self.width != width {
-            self.selection = None;
-        } else if self.selection.is_some() {
-            return;
-        }
         if let Some(path) = &self.live_log {
             if self.width != width
                 || self
@@ -101,9 +89,8 @@ impl Screen {
         if !self.interactive {
             return false;
         }
-        self.close_transcript();
         self.draw_live();
-        let _ = crossterm::execute!(self.out, cursor::Hide);
+        let _ = crossterm::execute!(self.out, terminal::EnterAlternateScreen, cursor::Hide);
         self.detail = Some(Detail {
             index,
             offset: 0,
@@ -113,7 +100,7 @@ impl Screen {
             searching: false,
             found: None,
             follow: live_log.is_some(),
-            selection: None,
+            viewport: Viewport::default(),
             live_log,
             refreshed: None,
         });
@@ -122,11 +109,10 @@ impl Screen {
     }
 
     pub(super) fn close_detail(&mut self) {
-        self.copy_menu = None;
         if self.detail.take().is_none() {
             return;
         }
-        self.erase_live();
+        let _ = crossterm::execute!(self.out, terminal::LeaveAlternateScreen, cursor::Show);
         self.draw_live();
     }
 
@@ -136,25 +122,13 @@ impl Screen {
             self.height = usize::from(height.max(1));
             return;
         }
-        if let Event::Mouse(mouse) = event {
-            self.detail_mouse(mouse);
-            return;
-        }
         let Event::Key(key) = event else {
             return;
         };
         if key.kind == KeyEventKind::Release {
             return;
         }
-        if key.code == KeyCode::Char('c')
-            && key.modifiers.contains(KeyModifiers::CONTROL)
-            && self.detail.as_ref().is_some_and(Detail::has_selection)
-        {
-            self.copy_selection();
-            return;
-        }
         let detail = self.detail.as_mut().expect("open detail");
-        detail.selection = None;
         detail.refresh(&self.blocks, self.width);
         if detail.searching {
             match key.code {
@@ -224,103 +198,6 @@ impl Screen {
         }
     }
 
-    fn detail_mouse(&mut self, mouse: event::MouseEvent) {
-        use event::{MouseButton::Left, MouseEventKind::*};
-        let detail = self.detail.as_mut().expect("open detail");
-        detail.refresh(&self.blocks, self.width);
-        let page = self.height.saturating_sub(2).max(1);
-        let row = usize::from(mouse.row).saturating_sub(1).min(page - 1);
-        let point = Point {
-            block: 0,
-            row: (detail.offset + row).min(detail.rows.len().saturating_sub(1)),
-            column: usize::from(mouse.column),
-        };
-        match mouse.kind {
-            ScrollUp | ScrollDown => {
-                detail.follow = false;
-                detail.offset = if mouse.kind == ScrollUp {
-                    detail.offset.saturating_sub(3)
-                } else {
-                    (detail.offset + 3).min(detail.rows.len().saturating_sub(page))
-                };
-                if let Some(selection) = detail.selection.as_mut()
-                    && let Some((row, column)) = selection.dragging_pointer()
-                {
-                    selection.extend_to(Point {
-                        block: 0,
-                        row: (detail.offset + row.saturating_sub(1).min(page - 1))
-                            .min(detail.rows.len().saturating_sub(1)),
-                        column,
-                    });
-                }
-            }
-            Down(Left)
-                if usize::from(mouse.row) > 0
-                    && usize::from(mouse.row) < self.height.saturating_sub(1)
-                    && !detail.rows.is_empty() =>
-            {
-                detail.follow = false;
-                detail.selection = Some(Selection::new(point, mouse));
-            }
-            Drag(Left) | Up(Left) => {
-                if let Some(selection) = detail
-                    .selection
-                    .as_mut()
-                    .filter(|selection| selection.dragging)
-                {
-                    selection.update(point, mouse);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    pub(super) fn tick_detail_selection(&mut self, now: std::time::Instant) -> bool {
-        let Some(detail) = self.detail.as_mut() else {
-            return false;
-        };
-        let Some(selection) = detail.selection.as_mut() else {
-            return false;
-        };
-        let Some((delta, row, column)) = selection.scroll(now, 1, self.height.saturating_sub(2))
-        else {
-            return false;
-        };
-        let page = self.height.saturating_sub(2).max(1);
-        detail.offset = if delta > 0 {
-            detail.offset.saturating_sub(delta as usize)
-        } else {
-            (detail.offset + delta.unsigned_abs()).min(detail.rows.len().saturating_sub(page))
-        };
-        selection.extend_to(Point {
-            block: 0,
-            row: (detail.offset + row.saturating_sub(1).min(page - 1))
-                .min(detail.rows.len().saturating_sub(1)),
-            column,
-        });
-        true
-    }
-
-    pub(super) fn detail_selection(&self) -> String {
-        let mut text = String::new();
-        if let Some(detail) = &self.detail
-            && let Some(selection) = &detail.selection
-        {
-            for (row, line) in detail.rows.iter().enumerate() {
-                selection.append(
-                    &mut text,
-                    line,
-                    Point {
-                        block: 0,
-                        row,
-                        column: 0,
-                    },
-                );
-            }
-        }
-        text
-    }
-
     pub(super) fn draw_detail(&mut self) {
         let Some(mut detail) = self.detail.take() else {
             return;
@@ -349,46 +226,36 @@ impl Screen {
             format!("/{}", detail.query)
         } else {
             format!(
-                "{}/{} · 滚轮浏览 · 右键复制 · n 下一个",
+                "{}/{} · ↑/↓ 滚动 · 空格翻页 · n 下一个",
                 detail.offset + 1,
                 detail.rows.len()
             )
         };
-        let mut frame = String::from("\x1b[?2026h\x1b[H\x1b[2J\x1b[?25l");
-        let mut lines = vec![Line::dim(util::truncate(&title, self.width, "…"))];
-        lines.extend(
-            detail
-                .rows
-                .iter()
-                .enumerate()
-                .skip(detail.offset)
-                .take(page)
-                .map(|(row, line)| {
-                    detail.selection.as_ref().map_or_else(
-                        || line.line.clone(),
-                        |selection| {
-                            selection.paint(
-                                &line.line,
-                                Point {
-                                    block: 0,
-                                    row,
-                                    column: 0,
-                                },
-                            )
-                        },
-                    )
-                }),
-        );
+        let mut lines = vec![HistoryRow::hard(Line::dim(util::truncate(
+            &title, self.width, "…",
+        )))];
+        lines.extend(detail.rows.iter().skip(detail.offset).take(page).cloned());
+        if let Some(last) = lines.last_mut() {
+            last.wrapped = false;
+        }
         if self.height > 1 {
             while lines.len() < self.height - 1 {
-                lines.push(Line::blank());
+                lines.push(HistoryRow::hard(Line::blank()));
             }
-            lines.push(Line::dim(util::truncate(&footer, self.width, "…")));
+            lines.push(HistoryRow::hard(Line::dim(util::truncate(
+                &footer, self.width, "…",
+            ))));
         }
-        for (row, line) in lines.iter().enumerate() {
-            frame.push_str(&format!("\x1b[{};1H{}", row + 1, self.paint(line)));
-        }
-        frame.push_str("\x1b[?2026l");
+        let rows = lines
+            .iter()
+            .map(|row| HistoryRow {
+                line: self.paint(&row.line),
+                wrapped: row.wrapped,
+            })
+            .collect();
+        let frame = detail
+            .viewport
+            .draw((self.width, self.height), rows, None, &[], &[]);
         let _ = self.out.write_all(frame.as_bytes());
         let _ = self.out.flush();
         self.detail = Some(detail);

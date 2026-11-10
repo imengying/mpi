@@ -2,35 +2,21 @@
 
 use super::*;
 
-struct LiveFrame {
-    rows: Vec<HistoryRow<Line>>,
-    cursor: Option<(usize, usize)>,
-    preview: usize,
-}
-
 impl Screen {
-    #[cfg(test)]
     pub(super) fn compose_live(&self) -> (Vec<HistoryRow<Line>>, Option<(usize, usize)>) {
-        let frame = self.compose_frame();
-        (frame.rows, frame.cursor)
-    }
-
-    fn compose_frame(&self) -> LiveFrame {
         if let Some(picker) = &self.picker {
-            return LiveFrame {
-                rows: self
-                    .choice_lines(
-                        &picker.title,
-                        &picker.hint,
-                        &picker.choices,
-                        picker.selected,
-                    )
-                    .into_iter()
-                    .map(HistoryRow::hard)
-                    .collect(),
-                cursor: None,
-                preview: 0,
-            };
+            return (
+                self.choice_lines(
+                    &picker.title,
+                    &picker.hint,
+                    &picker.choices,
+                    picker.selected,
+                )
+                .into_iter()
+                .map(HistoryRow::hard)
+                .collect(),
+                None,
+            );
         }
         let budget = self.height.saturating_sub(1).max(1);
         let rendered_footer = self
@@ -186,7 +172,6 @@ impl Screen {
         }
         let first = preview.len().saturating_sub(room);
         let mut lines = preview.split_off(first);
-        let preview = lines.len();
         lines.extend(above.into_iter().map(HistoryRow::hard));
         if working {
             lines.push(HistoryRow::hard(Line::spans(vec![
@@ -205,8 +190,8 @@ impl Screen {
             lines.push(HistoryRow::hard(Line::blank()));
         }
         let cursor = cursor.map(|(row, column)| (row, column.min(self.width.saturating_sub(1))));
-        LiveFrame {
-            rows: lines
+        (
+            lines
                 .iter()
                 .map(|row| HistoryRow {
                     line: row.line.truncate(self.width),
@@ -214,8 +199,7 @@ impl Screen {
                 })
                 .collect(),
             cursor,
-            preview,
-        }
+        )
     }
 
     pub(super) fn commit(&mut self) {
@@ -242,9 +226,6 @@ impl Screen {
     }
 
     pub(super) fn erase_live(&mut self) {
-        if let Some(view) = self.transcript_view.as_mut() {
-            view.rendered = None;
-        }
         if self.interactive && self.detail.is_none() {
             let _ = write!(self.out, "{}", self.viewport.erase());
         }
@@ -256,34 +237,15 @@ impl Screen {
     }
 
     pub(super) fn flush_pending_frame(&mut self) {
-        let now = std::time::Instant::now();
-        if self.tick_transcript_selection(now) || self.tick_detail_selection(now) {
-            self.redraw.request();
-        }
-        if self.redraw.ready(now) {
+        if self.redraw.ready(std::time::Instant::now()) {
             self.draw_live();
         }
     }
 
     pub(super) fn draw_live(&mut self) {
         self.redraw.drawn(std::time::Instant::now());
-        if self.interactive && !self.alternate_screen {
-            let _ = crate::ui::terminal::ensure_raw_mode();
-            let _ = crossterm::execute!(
-                self.out,
-                terminal::EnterAlternateScreen,
-                event::DisableMouseCapture,
-                terminal::Clear(terminal::ClearType::All),
-                cursor::MoveTo(0, 0)
-            );
-            // Track presses, wheel and held-button drags, without idle pointer motion.
-            let _ = write!(self.out, "\x1b[?1002h\x1b[?1006h");
-            self.alternate_screen = true;
-            self.viewport.clear();
-        }
         if self.detail.is_some() {
             self.draw_detail();
-            self.draw_copy_menu();
             return;
         }
         if let Some((panel, _)) = self.approval.as_mut() {
@@ -298,27 +260,14 @@ impl Screen {
             self.commit();
             return;
         }
-        if self.transcript_view.is_some() {
-            self.draw_transcript();
-            self.draw_copy_menu();
-            return;
-        }
         let frame = self.live_frame();
         let _ = write!(self.out, "{frame}");
         let _ = self.out.flush();
     }
 
     pub(super) fn live_frame(&mut self) -> String {
-        let LiveFrame {
-            rows: lines,
-            cursor,
-            preview,
-        } = self.compose_frame();
-        self.live_preview = lines[..preview].to_vec();
-        let reflow = if self
-            .viewport
-            .needs_reflow(self.width, self.height, lines.len())
-        {
+        let (lines, cursor) = self.compose_live();
+        let reflow = if self.viewport.needs_reflow(self.width, self.height) {
             // The viewport only repaints its visible tail. Stop once that tail is filled.
             let mut tail = std::collections::VecDeque::new();
             let mut count = 0;

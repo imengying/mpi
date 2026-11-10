@@ -97,7 +97,7 @@ impl Screen {
         // turn that follows: the input line has to keep receiving keys while the model is
         // answering, and a terminal switched back to cooked mode would hold them in the line
         // discipline until the next prompt.
-        crate::ui::terminal::ensure_raw_mode()?;
+        self.start_terminal()?;
         self.begin_line();
         loop {
             if crate::ui::terminal::exit_signal().is_some() {
@@ -205,9 +205,6 @@ impl Screen {
     }
 
     fn handle_event(&mut self, event: Event) -> Option<Action> {
-        if self.copy_menu_event(&event) {
-            return None;
-        }
         if self.detail.is_some() {
             self.detail_event(event);
             return None;
@@ -218,9 +215,6 @@ impl Screen {
         }
         if self.picker.is_some() {
             return self.picker_event(event);
-        }
-        if self.transcript_event(&event) {
-            return None;
         }
         if let Event::Paste(text) = event {
             self.notice = None;

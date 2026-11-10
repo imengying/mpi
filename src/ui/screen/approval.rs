@@ -32,14 +32,6 @@ impl Screen {
     }
 
     pub(super) fn approval_event(&mut self, event: Event) {
-        let event = match event {
-            Event::Mouse(mouse) => match mouse.kind {
-                event::MouseEventKind::ScrollUp => Event::Key(KeyCode::Char('k').into()),
-                event::MouseEventKind::ScrollDown => Event::Key(KeyCode::Char('j').into()),
-                _ => return,
-            },
-            event => event,
-        };
         let decision = match event {
             Event::Key(key) => self
                 .approval

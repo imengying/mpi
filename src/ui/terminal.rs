@@ -1,8 +1,6 @@
 //! The terminal as a device: raw mode, the window title, and putting both back.
 //!
-//! Nothing here knows what is on screen. It is the layer that owns the terminal itself —
-//! which is why raw mode is counted rather than toggled, and why the title is stripped with
-//! the same care it is set.
+//! Device setup is separate from rendering, so drawing into memory never changes a TTY.
 
 use std::io::{IsTerminal, Write};
 use std::path::Path;
@@ -44,6 +42,12 @@ pub fn watch_exit_signals() -> std::io::Result<tokio::task::JoinHandle<()>> {
 /// Raw mode belongs to the interactive session and ends at teardown.
 /// Nested pickers and approval panels reuse it without changing its lifetime.
 pub(crate) fn ensure_raw_mode() -> std::io::Result<()> {
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotConnected,
+            "交互终端不可用",
+        ));
+    }
     if terminal::is_raw_mode_enabled()? {
         return Ok(());
     }

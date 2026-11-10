@@ -72,7 +72,7 @@ fn queued_recall_preserves_an_existing_draft_and_its_images() {
 }
 
 #[tokio::test]
-async fn commands_reveal_their_menus_and_feedback_after_browsing_output() {
+async fn commands_reveal_their_menus_and_feedback_after_tool_details() {
     let dir = std::env::temp_dir().join(format!("pi-queued-view-{}", uuid::Uuid::now_v7()));
     std::fs::create_dir(&dir).unwrap();
     let config = serde_json::from_value(serde_json::json!({
@@ -96,24 +96,11 @@ async fn commands_reveal_their_menus_and_feedback_after_browsing_output() {
     ));
     agent.screen.flush();
     let mut terminal = vt100::Parser::new(nz(24), nz(40), 100);
-    for details in [false, true] {
-        if details {
-            assert!(agent.screen.show_tool_details());
-        } else {
-            agent.screen.absorb_event(Event::Mouse(event::MouseEvent {
-                kind: event::MouseEventKind::ScrollUp,
-                column: 0,
-                row: 0,
-                modifiers: KeyModifiers::NONE,
-            }));
-        }
+    {
+        assert!(agent.screen.show_tool_details());
         agent.screen.flush();
         terminal.process(&captured.take());
-        assert!(terminal.screen().contents().contains(if details {
-            "工具详情"
-        } else {
-            "tool output 0"
-        }));
+        assert!(terminal.screen().contents().contains("工具详情"));
         assert!(agent.command("/model").await.unwrap());
         assert!(agent.screen.picker.is_some());
         agent.screen.begin_stream();
@@ -132,7 +119,6 @@ async fn commands_reveal_their_menus_and_feedback_after_browsing_output() {
         assert!(visible.contains("历史太短"), "{visible}");
         assert!(visible.contains("› draft"), "{visible}");
         assert!(visible.contains("background answer"), "{visible}");
-        assert!(agent.screen.transcript_view.is_none());
         assert!(!visible.contains("工具详情"), "{visible}");
     }
     drop(agent);
@@ -141,39 +127,52 @@ async fn commands_reveal_their_menus_and_feedback_after_browsing_output() {
 
 #[test]
 fn an_error_exit_erases_the_composer_before_the_shell_resumes() {
-    let captured = CapturedOutput::default();
-    let mut terminal = vt100::Parser::new(nz(24), nz(40), 100);
-    {
-        let mut screen = screen();
-        screen.out = Box::new(captured.clone());
-        screen.interactive = true;
-        set_input(&mut screen, "unsent draft");
-        screen.set_footer(vec![Line::plain("stats")]);
-        screen.render();
-        screen.flush();
+    for approval in [false, true] {
+        let captured = CapturedOutput::default();
+        let mut terminal = vt100::Parser::new(nz(24), nz(80), 100);
+        {
+            let mut screen = screen();
+            screen.width = 80;
+            screen.out = Box::new(captured.clone());
+            screen.interactive = true;
+            screen.push_lines(vec![Line::plain("completed output")]);
+            set_input(&mut screen, "unsent draft");
+            screen.set_footer(vec![Line::plain("stats")]);
+            screen.flush();
+            terminal.process(&captured.take());
+            assert!(terminal.screen().contents().contains("unsent draft"));
+            if approval {
+                screen.suspend_live();
+                let (sender, _receiver) = tokio::sync::oneshot::channel();
+                screen.approval = Some((
+                    crate::ui::auth_panel::PanelState::new("APPROVAL_BODY"),
+                    sender,
+                ));
+                screen.flush();
+                terminal.process(&captured.take());
+                assert!(terminal.screen().contents().contains("APPROVAL_BODY"));
+            }
+        }
         terminal.process(&captured.take());
-        assert!(terminal.screen().contents().contains("unsent draft"));
+        let visible = terminal.screen().contents();
+        assert!(visible.contains("completed output"), "{visible}");
+        assert!(
+            !visible.contains("unsent draft") && !visible.contains("APPROVAL_BODY"),
+            "{visible}"
+        );
+        assert_eq!(terminal.screen().cursor_position().1, 0);
     }
-    terminal.process(&captured.take());
-    assert!(!terminal.screen().contents().contains("unsent draft"));
-    assert_eq!(terminal.screen().cursor_position().1, 0);
 }
 
 #[test]
-fn leaving_restores_the_shell_and_preserves_only_its_scrollback() {
-    let mut terminal = vt100::Parser::new(nz(24), nz(40), 100);
-    for index in 0..60 {
-        terminal.process(format!("shell history {index}\r\n").as_bytes());
-    }
-    let shell = terminal.screen().contents();
-    let shell_cursor = terminal.screen().cursor_position();
-    terminal.screen_mut().set_scrollback(100);
-    let shell_history = terminal.screen().contents();
-    terminal.screen_mut().set_scrollback(0);
+fn leaving_preserves_shell_and_session_history_without_the_composer() {
+    let mut terminal = vt100::Parser::new(nz(24), nz(40), 300);
+    terminal.process(b"shell history\r\noriginal prompt> ");
     let captured = CapturedOutput::default();
     let mut screen = screen();
     screen.out = Box::new(captured.clone());
     screen.interactive = true;
+    screen.viewport.start_at(1, 17);
     set_input(&mut screen, "unsent draft");
     screen.set_footer(vec![Line::plain("directory"), Line::plain("stats")]);
     for index in 0..100 {
@@ -181,20 +180,26 @@ fn leaving_restores_the_shell_and_preserves_only_its_scrollback() {
     }
     screen.flush();
     terminal.process(&captured.take());
-    assert!(terminal.screen().alternate_screen());
+    assert!(!terminal.screen().alternate_screen());
     assert!(terminal.screen().contents().contains("session answer 99"));
     screen.push_lines(vec![Line::plain("queued session output")]);
     screen.leave();
     terminal.process(&captured.take());
-    assert!(!terminal.screen().alternate_screen());
-    assert_eq!(terminal.screen().contents(), shell);
-    assert_eq!(terminal.screen().cursor_position(), shell_cursor);
+    let visible = terminal.screen().contents();
+    assert!(visible.contains("session answer 99") && visible.contains("queued session output"));
+    assert!(!visible.contains("draft") && !visible.contains("stats"));
+    assert_eq!(terminal.screen().cursor_position().1, 0);
     assert_eq!(
         terminal.screen().mouse_protocol_mode(),
         vt100::MouseProtocolMode::None
     );
-    terminal.screen_mut().set_scrollback(100);
-    assert_eq!(terminal.screen().contents(), shell_history);
+    terminal.screen_mut().set_scrollback(300);
+    let history = terminal.screen().contents();
+    assert!(
+        history.contains("shell history\noriginal prompt>"),
+        "{history}"
+    );
+    assert!(history.contains("session answer 0"));
     screen.leave();
     assert!(
         captured.take().is_empty(),
@@ -203,7 +208,7 @@ fn leaving_restores_the_shell_and_preserves_only_its_scrollback() {
 }
 
 #[test]
-fn streaming_blocks_commit_once_and_remain_browsable_inside_the_session() {
+fn streaming_blocks_commit_once_and_remain_in_native_scrollback() {
     let mut screen = screen();
     let captured = CapturedOutput::default();
     screen.out = Box::new(captured.clone());
@@ -253,47 +258,18 @@ fn streaming_blocks_commit_once_and_remain_browsable_inside_the_session() {
     }
     assert!(!transcript.contains("思考完成"));
     assert!(!transcript.contains("thinking"));
-    screen.absorb_event(Event::Mouse(event::MouseEvent {
-        kind: event::MouseEventKind::ScrollUp,
-        column: 0,
-        row: 0,
-        modifiers: KeyModifiers::NONE,
-    }));
-    screen.absorb_event(Event::Key(KeyCode::Home.into()));
-    screen.flush();
-    terminal.process(&captured.take());
-    assert!(terminal.screen().contents().contains("paragraph 0"));
-    assert!(!terminal.screen().contents().contains("draft"));
-    // Background completion does not move the page being read.
-    screen.push_lines(vec![Line::plain("new background result")]);
-    screen.flush();
-    terminal.process(&captured.take());
-    assert!(terminal.screen().contents().contains("paragraph 0"));
-    assert!(
-        !terminal
-            .screen()
-            .contents()
-            .contains("new background result")
-    );
-    screen.absorb_event(Event::Key(KeyCode::Esc.into()));
-    screen.flush();
-    terminal.process(&captured.take());
+    terminal.screen_mut().set_scrollback(500);
+    let history = terminal.screen().contents();
+    assert!(history.contains("paragraph 0"), "{history}");
+    assert!(!history.contains("draft") && !history.contains("thinking"));
+    terminal.screen_mut().set_scrollback(0);
     assert!(
         terminal
             .screen()
             .contents()
-            .contains("new background result")
+            .ends_with("› draft\ndirectory\nstats")
     );
-    assert!(terminal.screen().contents().contains("› draft"));
-    screen.absorb_event(Event::Mouse(event::MouseEvent {
-        kind: event::MouseEventKind::ScrollUp,
-        column: 0,
-        row: 0,
-        modifiers: KeyModifiers::NONE,
-    }));
-    assert!(screen.transcript_view.is_some());
     screen.absorb_event(Event::Paste(" more".into()));
-    assert!(screen.transcript_view.is_none());
     assert_eq!(input(&screen), "draft more");
 }
 
@@ -422,141 +398,12 @@ fn native_code_selection_keeps_source_newlines_and_indentation_while_streaming_a
             body,
             "completed, width {width}"
         );
-        assert!(terminal.screen().alternate_screen());
-        assert_ne!(
+        assert!(!terminal.screen().alternate_screen());
+        assert_eq!(
             terminal.screen().mouse_protocol_mode(),
             vt100::MouseProtocolMode::None
         );
     }
-}
-
-#[test]
-fn dragging_preserves_unicode_and_code_and_only_copies_on_request() {
-    use event::{MouseButton::Left, MouseButton::Right, MouseEventKind::*};
-    let mut screen = screen();
-    let captured = CapturedOutput::default();
-    screen.out = Box::new(captured.clone());
-    screen.interactive = true;
-    screen.width = 14;
-    screen.height = 24;
-    set_input(&mut screen, "draft");
-    screen.begin_stream();
-    let code = "let 中文 = \"👩‍💻\";\n  next();";
-    screen.push_text(&format!("```rs\n{code}\n```"));
-    screen.flush();
-    let start = screen
-        .live_preview
-        .iter()
-        .position(|row| row.line.text().starts_with("let "))
-        .unwrap();
-    let end = screen
-        .live_preview
-        .iter()
-        .position(|row| row.line.text().contains("next();"))
-        .unwrap();
-    let mouse = |kind, row: usize, column| {
-        Event::Mouse(event::MouseEvent {
-            kind,
-            row: row as u16,
-            column,
-            modifiers: KeyModifiers::NONE,
-        })
-    };
-    screen.absorb_event(mouse(Down(Left), start, 0));
-    screen.absorb_event(mouse(Drag(Left), end, 13));
-    screen.absorb_event(mouse(Up(Left), end, 13));
-    screen.flush();
-    assert_eq!(screen.transcript_selection(), code);
-    assert!(
-        !String::from_utf8_lossy(&captured.take()).contains("]52;"),
-        "releasing the mouse must not copy"
-    );
-    screen.push_text("\nbackground result");
-    screen.end_stream();
-    assert_eq!(
-        screen.transcript_selection(),
-        code,
-        "completion cannot replace the selected preview"
-    );
-    screen.absorb_event(mouse(Down(Right), 10, 8));
-    screen.flush();
-    let (row, column) = screen.copy_menu.unwrap();
-    assert!(String::from_utf8_lossy(&captured.take()).contains("复制"));
-    screen.absorb_event(mouse(Down(Left), row, column as u16));
-    screen.flush();
-    let output = String::from_utf8(captured.take()).unwrap();
-    let encoded = output
-        .split("\x1b]52;c;")
-        .nth(1)
-        .unwrap()
-        .split('\x07')
-        .next()
-        .unwrap();
-    use base64::Engine;
-    assert_eq!(
-        base64::engine::general_purpose::STANDARD
-            .decode(encoded)
-            .unwrap(),
-        code.as_bytes()
-    );
-    screen.absorb_event(mouse(Down(Right), 10, 8));
-    let (row, column) = screen.copy_menu.unwrap();
-    screen.absorb_event(mouse(Down(Left), row + 1, column as u16));
-    assert!(
-        !String::from_utf8_lossy(&captured.take()).contains("]52;"),
-        "cancel must not copy"
-    );
-    screen.absorb_event(Event::Key(KeyCode::Esc.into()));
-    assert!(screen.transcript_view.is_none());
-    assert_eq!(input(&screen), "draft");
-}
-
-#[test]
-fn dragging_at_the_edge_scrolls_across_blocks_without_new_mouse_events() {
-    use event::{MouseButton::Left, MouseEventKind::*};
-    let mut screen = screen();
-    screen.out = Box::new(Vec::<u8>::new());
-    screen.interactive = true;
-    screen.width = 30;
-    screen.height = 8;
-    set_input(&mut screen, "draft");
-    for index in 0..100 {
-        screen.push_lines(vec![Line::plain(format!("history {index}"))]);
-    }
-    screen.flush();
-    let mouse = |kind, row| {
-        Event::Mouse(event::MouseEvent {
-            kind,
-            row,
-            column: 0,
-            modifiers: KeyModifiers::NONE,
-        })
-    };
-    screen.absorb_event(mouse(Down(Left), 3));
-    screen.absorb_event(mouse(Drag(Left), 0));
-    let now = std::time::Instant::now();
-    for tick in 1..60 {
-        screen.tick_transcript_selection(now + std::time::Duration::from_millis(tick * 60));
-    }
-    screen.absorb_event(mouse(Up(Left), 0));
-    let selected = screen.transcript_selection();
-    assert!(selected.starts_with("history 0\n"), "{selected}");
-    assert!(selected.contains("history 50\n"));
-    screen.push_lines(vec![Line::plain("new output")]);
-    screen.flush();
-    assert_eq!(screen.transcript_selection(), selected);
-    screen.absorb_event(mouse(ScrollDown, 2));
-    assert_eq!(
-        screen.transcript_selection(),
-        selected,
-        "wheel scrolling keeps the selection anchored"
-    );
-    screen.absorb_event(Event::Key(KeyCode::Esc.into()));
-    screen.absorb_event(Event::Key(KeyCode::PageUp.into()));
-    assert!(
-        screen.transcript_view.is_none(),
-        "PageUp no longer opens a separate browser"
-    );
 }
 
 #[test]

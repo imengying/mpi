@@ -57,4 +57,6 @@ jobs:
       - run: sh -n install.sh
       - if: success() || (failure() && steps.tests.outcome == 'failure')
         timeout-minutes: 2
-        run: python3 tests/terminal_signals.py target/debug/pi
+        run: |
+          cargo test --locked --lib --no-run --message-format=json > "$RUNNER_TEMP/pi-test-binaries.json"
+          python3 tests/terminal_signals.py target/debug/pi "$RUNNER_TEMP/pi-test-binaries.json"

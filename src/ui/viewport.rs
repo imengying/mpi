@@ -1,4 +1,4 @@
-//! Incremental painting inside the session's alternate screen.
+//! An inline viewport that keeps completed output in native terminal scrollback.
 
 use crate::ui::text::HistoryRow;
 use std::fmt::Write;
@@ -7,23 +7,32 @@ use std::fmt::Write;
 pub(super) struct Viewport {
     size: Option<(usize, usize)>,
     top: usize,
+    history_top: usize,
+    origin: Option<(usize, usize)>,
     rows: Vec<HistoryRow<String>>,
     cursor: Option<(usize, usize)>,
     invalidated: bool,
 }
 
 impl Viewport {
-    pub(super) fn history_height(&self) -> usize {
-        self.top
+    pub(super) fn needs_position(&self) -> bool {
+        self.size.is_none() && self.origin.is_none()
     }
 
-    pub(super) fn needs_reflow(&self, width: usize, height: usize, live_rows: usize) -> bool {
-        self.size.is_some_and(|size| {
-            size != (width, height) || self.invalidated || live_rows < self.rows.len()
-        })
+    pub(super) fn start_at(&mut self, row: usize, column: usize) {
+        debug_assert!(self.size.is_none());
+        self.top = row;
+        self.history_top = row;
+        self.origin = Some((row, column));
     }
 
-    /// Build one synchronized frame. Reflow restores history after a resize or menu shrink.
+    pub(super) fn needs_reflow(&self, width: usize, height: usize) -> bool {
+        self.size
+            .is_some_and(|size| size != (width, height) || self.invalidated)
+    }
+
+    /// Reflow only on resize/overlay restoration. A shrinking composer keeps its top row:
+    /// restoring older rows here would duplicate text already in native scrollback.
     pub(super) fn draw(
         &mut self,
         size: (usize, usize),
@@ -35,15 +44,43 @@ impl Viewport {
         let (width, height) = size;
         debug_assert!(width > 0 && height > 0 && !rows.is_empty() && rows.len() <= height);
         let first_frame = self.size.is_none();
-        let reflowing = self.needs_reflow(width, height, rows.len());
+        let reflowing = self.needs_reflow(width, height);
         let layout_changed = first_frame || reflowing || self.rows.len() != rows.len();
         let mut frame = String::from("\x1b[?2026h");
 
-        if reflowing {
-            let shown = reflow.len().min(height - rows.len());
-            erase_rows(&mut frame, 0, height);
-            write_rows(&mut frame, 0, &reflow[reflow.len() - shown..]);
-            self.top = shown;
+        if first_frame {
+            self.top = self.top.min(height - 1);
+            if self.origin.is_some_and(|(_, column)| column != 0) {
+                frame.push_str("\r\n");
+                self.top = (self.top + 1).min(height - 1);
+            }
+            self.history_top = self.top;
+        } else if reflowing {
+            let capacity = if self.size == Some(size) {
+                self.top.saturating_sub(self.history_top)
+            } else {
+                height - rows.len()
+            };
+            let shown = reflow.len().min(height - rows.len()).min(capacity);
+            self.history_top = self.history_top.min(height - 1);
+            let scroll = (self.history_top + shown + rows.len()).saturating_sub(height);
+            if scroll > 0 {
+                erase_rows(
+                    &mut frame,
+                    self.top.min(height),
+                    self.rows.len().min(height.saturating_sub(self.top)),
+                );
+                scroll_screen(&mut frame, height, scroll);
+                self.history_top = self.history_top.saturating_sub(scroll);
+            }
+            // Shell output above our first row belongs to the terminal, even on resize.
+            erase_rows(&mut frame, self.history_top, height - self.history_top);
+            write_rows(
+                &mut frame,
+                self.history_top,
+                &reflow[reflow.len() - shown..],
+            );
+            self.top = self.history_top + shown;
         } else if layout_changed || !history.is_empty() {
             // The previous live rows are ours. Clear them before appending history or growing
             // the composer, so drafts can never be moved into native scrollback.
@@ -51,16 +88,19 @@ impl Viewport {
         }
 
         if !history.is_empty() {
+            let scroll = (self.top + history.len() + rows.len()).saturating_sub(height);
             write_rows(&mut frame, self.top, history);
             // Reserve the live rows, retaining native wrap flags for text selection.
             frame.push_str(&"\r\n\x1b[K".repeat(rows.len()));
             self.top = (self.top + history.len()).min(height - rows.len());
+            self.history_top = self.history_top.saturating_sub(scroll);
         } else {
             let scroll = (self.top + rows.len()).saturating_sub(height);
             if scroll > 0 {
                 // Old live rows were erased before scrolling, so drafts never enter history.
                 scroll_screen(&mut frame, height, scroll);
                 self.top -= scroll;
+                self.history_top = self.history_top.saturating_sub(scroll);
             }
         }
         let top = self.top;
@@ -123,6 +163,7 @@ impl Viewport {
 
     pub(super) fn clear(&mut self) {
         *self = Self::default();
+        self.start_at(0, 0);
     }
 }
 
@@ -208,7 +249,7 @@ mod tests {
     }
 
     #[test]
-    fn a_shrinking_live_area_stays_docked_after_the_screen_fills() {
+    fn a_shrinking_live_area_stays_next_to_history_without_replaying_it() {
         let mut terminal = vt100::Parser::new(nz(12), nz(24), 0);
         let mut view = Viewport::default();
         let transcript: Vec<_> = (0..30)
@@ -234,10 +275,10 @@ mod tests {
             )
             .as_bytes(),
         );
-        assert_eq!(terminal.screen().rows(0, 24).last().unwrap(), "stats");
-        assert_eq!(terminal.screen().cursor_position(), (10, 5));
+        assert_eq!(terminal.screen().rows(0, 24).nth(8).unwrap(), "stats");
+        assert_eq!(terminal.screen().cursor_position(), (7, 5));
         assert!(terminal.screen().contents().contains("answer 29"));
-        assert_eq!(terminal.screen().rows(0, 24).nth(9).unwrap(), "answer 29");
+        assert_eq!(terminal.screen().rows(0, 24).nth(6).unwrap(), "answer 29");
         assert!(!terminal.screen().contents().contains("three"));
     }
 
