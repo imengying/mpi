@@ -365,6 +365,25 @@ pub fn note_lines(text: &str, style: Style) -> Vec<Line> {
     out
 }
 
+/// The three notes pi writes, named by what they mean rather than by their colour.
+///
+/// Every call site used to spell out `Style::new(Color::…)`, which made the transcript's
+/// vocabulary a matter of picking a colour at each site — and made a note's weight easy to
+/// change in one place and not the others. These are the whole set: a remark the user reads
+/// past (`dim`), something that went wrong (`error`), and something the user may want to act
+/// on (`warning`).
+pub fn note(text: &str) -> Vec<Line> {
+    note_lines(text, Style::new(Color::Dim))
+}
+
+pub fn error(text: &str) -> Vec<Line> {
+    note_lines(text, Style::new(Color::Red))
+}
+
+pub fn warning(text: &str) -> Vec<Line> {
+    note_lines(text, Style::new(Color::Yellow))
+}
+
 /// Replay a stored conversation into transcript blocks.
 ///
 /// Resuming used to echo only the user's own lines, which made a resumed session look like

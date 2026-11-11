@@ -82,10 +82,7 @@ impl Agent {
                 // and the turn is over. Without the stop the loop would send them and ask the
                 // model for the next step — of the very turn that was just stopped.
                 Ok(TurnEnd::Stopped) => {
-                    self.screen.push_lines(ui_compact::note_lines(
-                        "已停止",
-                        crate::ui::screen::Style::new(Color::Dim),
-                    ));
+                    self.screen.push_lines(ui_compact::note("已停止"));
                     break;
                 }
                 Err(err) => {
@@ -93,10 +90,7 @@ impl Agent {
                         .downcast_ref::<llm::LlmError>()
                         .map(llm::LlmError::summary)
                         .unwrap_or_else(|| err.to_string());
-                    self.screen.push_lines(ui_compact::note_lines(
-                        &message,
-                        crate::ui::screen::Style::new(Color::Red),
-                    ));
+                    self.screen.push_lines(ui_compact::error(&message));
                     break;
                 }
             }
@@ -138,10 +132,8 @@ impl Agent {
                     // The footer shows that compaction is running. A failure must not lose
                     // the turn: the request may still fit, otherwise overflow recovery runs.
                     if let Err(err) = self.compact(Reason::Threshold, None).await {
-                        self.screen.push_lines(ui_compact::note_lines(
-                            &format!("自动压缩未完成：{err}"),
-                            crate::ui::screen::Style::new(Color::Yellow),
-                        ));
+                        self.screen
+                            .push_lines(ui_compact::warning(&format!("自动压缩未完成：{err}")));
                     }
                     messages = self.session.context_messages();
                 }
@@ -315,10 +307,7 @@ impl Agent {
         if !citations.is_empty() {
             let mut lines = Vec::new();
             for line in &citations {
-                lines.push(crate::ui::screen::Line::new(
-                    line.clone(),
-                    crate::ui::screen::Style::new(Color::Dim),
-                ));
+                lines.push(crate::ui::screen::Line::dim(line.clone()));
             }
             lines.push(crate::ui::screen::Line::blank());
             self.screen.push_lines(lines);
@@ -349,10 +338,8 @@ impl Agent {
         self.render_footer(None);
 
         if let Some(error) = &completion.error {
-            self.screen.push_lines(ui_compact::note_lines(
-                &format!("上游返回错误：{error}"),
-                crate::ui::screen::Style::new(Color::Red),
-            ));
+            self.screen
+                .push_lines(ui_compact::error(&format!("上游返回错误：{error}")));
             return Ok(TurnEnd::Done);
         }
         self.after_completion(&completion).await

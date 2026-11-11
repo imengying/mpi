@@ -261,10 +261,8 @@ impl Agent {
         if let Err(err) = self.compact(Reason::Overflow, None).await {
             // The one thing left to say: the automatic recovery did not work, so what happens
             // next is the user's call.
-            self.screen.push_lines(ui_compact::note_lines(
-                &format!("压缩失败：{err}"),
-                crate::ui::screen::Style::new(Color::Red),
-            ));
+            self.screen
+                .push_lines(ui_compact::error(&format!("压缩失败：{err}")));
             return Ok(Some(TurnEnd::Done));
         }
         Ok(Some(TurnEnd::Continue))

@@ -23,6 +23,36 @@ pub struct SummaryRequest<'a> {
     pub custom_instructions: Option<&'a str>,
 }
 
+/// The same material as [`SummaryRequest`], owned.
+///
+/// A compaction runs for as long as the summary model call takes, and the composer stays
+/// alive while it does — so the future that drives it may not borrow the agent. These are
+/// the fields it needs, copied out before the request starts; [`Self::request`] lends them
+/// back in the shape the summariser already speaks.
+pub struct OwnedSummaryRequest {
+    pub provider: Provider,
+    pub model: ModelConfig,
+    pub session_id: String,
+    pub system_prompt: Option<String>,
+    pub tools: Vec<ToolSpec>,
+    pub level: String,
+    pub custom_instructions: Option<String>,
+}
+
+impl OwnedSummaryRequest {
+    pub fn request(&self) -> SummaryRequest<'_> {
+        SummaryRequest {
+            provider: &self.provider,
+            model: &self.model,
+            session_id: &self.session_id,
+            system_prompt: self.system_prompt.as_deref(),
+            tools: &self.tools,
+            level: &self.level,
+            custom_instructions: self.custom_instructions.as_deref(),
+        }
+    }
+}
+
 /// Owned request material. The source session is never changed while planning a summary.
 pub struct PreparedSummary {
     pub model: ModelConfig,

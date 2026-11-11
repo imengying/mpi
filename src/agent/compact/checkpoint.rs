@@ -225,6 +225,7 @@ impl FileOps {
 }
 
 /// Facts copied from original session records, never inferred from a previous summary.
+#[derive(Clone)]
 pub struct CheckpointFacts {
     pub files: FileOps,
     pub user_requests: Vec<String>,
@@ -244,7 +245,7 @@ pub(super) fn user_request_block(requests: &[String]) -> String {
     )
 }
 
-pub fn format_file_blocks(read_files: &[String], modified_files: &[String]) -> String {
+pub(crate) fn format_file_blocks(read_files: &[String], modified_files: &[String]) -> String {
     let mut sections = Vec::new();
     if !read_files.is_empty() {
         sections.push(format!(

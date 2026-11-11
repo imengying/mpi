@@ -419,8 +419,12 @@ fn streamed_summaries_and_restored_markdown_have_the_same_layout() {
     }
 }
 
+/// Everything the screen wrote, so a test can assert on the escape stream itself.
+///
+/// Shared with the agent's tests: they drive the same `Screen`, and a second copy of this
+/// would be a second thing to keep in step.
 #[derive(Clone, Default)]
-struct CapturedOutput(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+pub(crate) struct CapturedOutput(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
 
 impl Write for CapturedOutput {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -433,8 +437,13 @@ impl Write for CapturedOutput {
 }
 
 impl CapturedOutput {
-    fn take(&self) -> Vec<u8> {
+    pub(crate) fn take(&self) -> Vec<u8> {
         std::mem::take(&mut *self.0.lock().unwrap())
+    }
+
+    /// The same bytes as text, for assertions that only look for a phrase.
+    pub(crate) fn text(&self) -> String {
+        String::from_utf8_lossy(&self.take()).to_string()
     }
 }
 

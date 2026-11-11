@@ -58,37 +58,14 @@ impl Screen {
     /// The menu for `/model` uses this so the current choice starts highlighted and Enter
     /// keeps it.
     pub fn pick_at(&mut self, title: &str, items: &[String], initial: usize) -> Option<usize> {
-        self.pick_hinted(title, items, initial, "↑↓ 选择 · Enter 确认 · Esc 取消")
-    }
-
-    /// [`Screen::pick_at`] for entries that carry a line of explanation each.
-    ///
-    /// The chooser stacks them the way the authorization panel stacks its two answers: one
-    /// entry per block, the selected block painted across the full width. A choice that
-    /// changes what the agent may do without asking deserves to be read as a choice, not as
-    /// a line of prose with an em dash in it.
-    pub fn pick_choices(
-        &mut self,
-        title: &str,
-        hint: &str,
-        choices: &[Choice],
-        initial: usize,
-    ) -> Option<usize> {
-        self.pick_choices_at(title, choices, initial, hint)
-    }
-
-    pub(super) fn pick_hinted(
-        &mut self,
-        title: &str,
-        items: &[String],
-        initial: usize,
-        hint: &str,
-    ) -> Option<usize> {
         let choices: Vec<Choice> = items.iter().map(Choice::new).collect();
-        self.pick_choices_at(title, &choices, initial, hint)
+        self.pick_choices(title, &choices, initial, "↑↓ 选择 · Enter 确认 · Esc 取消")
     }
 
-    fn pick_choices_at(
+    /// The one chooser. Entries are stacked one per block with the selected block painted
+    /// across the full width, the way the authorization panel stacks its answers: a choice
+    /// that changes what the agent may do deserves to be read as a choice.
+    fn pick_choices(
         &mut self,
         title: &str,
         choices: &[Choice],

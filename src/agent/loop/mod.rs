@@ -17,7 +17,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::agent::compact::{
-    self, CompactError, CompactionState, Reason, RetryBudget, SummaryRequest,
+    self, CheckpointFacts, CompactError, CompactionState, OwnedSummaryRequest, Reason, RetryBudget,
 };
 use crate::agent::session::Session;
 use crate::auth::guard::PermissionGate;
@@ -210,9 +210,8 @@ impl Agent {
         // a bare `AGENTS.md` in the transcript is understood, and a label in front of it is
         // the sort of prose this project keeps out of the way.
         if let Some((path, _)) = &agents {
-            screen.push_lines(ui_compact::note_lines(
+            screen.push_lines(ui_compact::note(
                 util::shorten_home(path, dirs::home_dir().as_deref()).as_str(),
-                crate::ui::screen::Style::new(Color::Dim),
             ));
         }
         // The environment block becomes the head of the conversation and is persisted with
@@ -284,10 +283,7 @@ impl Agent {
         // turns already in the file look like they were never typed.
         screen.seed_history(session.user_history());
         for note in session.recovery_notes() {
-            screen.push_lines(ui_compact::note_lines(
-                note,
-                crate::ui::screen::Style::new(Color::Yellow),
-            ));
+            screen.push_lines(ui_compact::warning(note));
         }
         // The working directory travels with the session: the newest environment block names
         // it, so running the tools somewhere else would make the transcript lie about where
@@ -303,22 +299,19 @@ impl Agent {
             // longer resolve here; whether it still exists tells the user which of the two
             // ways it went. How the environment block was refreshed is bookkeeping.
             let missing = !recorded.is_dir();
-            screen.push_lines(ui_compact::note_lines(
-                &if missing {
-                    format!(
-                        "会话原目录 {} 已不存在，本次在 {} 继续。",
-                        recorded.display(),
-                        cwd.display()
-                    )
-                } else {
-                    format!(
-                        "会话原目录 {}，本次在 {} 继续。",
-                        recorded.display(),
-                        cwd.display()
-                    )
-                },
-                crate::ui::screen::Style::new(Color::Dim),
-            ));
+            screen.push_lines(ui_compact::note(&if missing {
+                format!(
+                    "会话原目录 {} 已不存在，本次在 {} 继续。",
+                    recorded.display(),
+                    cwd.display()
+                )
+            } else {
+                format!(
+                    "会话原目录 {}，本次在 {} 继续。",
+                    recorded.display(),
+                    cwd.display()
+                )
+            }));
             // Append a fresh block instead of rewriting the old one: the file is append-only,
             // and the newest block is the one the model should trust.
             let block = environment_block(&cwd, &session.header().id, &config.shell.path);
@@ -379,10 +372,7 @@ impl Agent {
         }
         self.screen.seed_history(self.session.user_history());
         for note in self.session.recovery_notes() {
-            self.screen.push_lines(ui_compact::note_lines(
-                note,
-                crate::ui::screen::Style::new(Color::Yellow),
-            ));
+            self.screen.push_lines(ui_compact::warning(note));
         }
         Ok(())
     }
@@ -402,10 +392,8 @@ impl Agent {
         match action {
             Ok(action) => action,
             Err(err) => {
-                self.screen.push_lines(ui_compact::note_lines(
-                    &format!("读取输入失败：{err}"),
-                    crate::ui::screen::Style::new(Color::Red),
-                ));
+                self.screen
+                    .push_lines(ui_compact::error(&format!("读取输入失败：{err}")));
                 Action::Eof
             }
         }
@@ -503,10 +491,7 @@ impl Agent {
             Action::Eof => Ok(()),
         };
         if let Err(err) = result {
-            self.screen.push_lines(ui_compact::note_lines(
-                &err.to_string(),
-                crate::ui::screen::Style::new(Color::Red),
-            ));
+            self.screen.push_lines(ui_compact::error(&err.to_string()));
         }
         self.render_footer(None);
         self.exit_requested
@@ -588,10 +573,7 @@ fn apply_delta(screen: &mut Screen, delta: Delta) {
     match delta {
         Delta::Text(text) => screen.push_text(&text),
         Delta::Thinking(text) => screen.push_thinking(&text),
-        Delta::Notice(text) => screen.push_lines(ui_compact::note_lines(
-            &text,
-            crate::ui::screen::Style::new(Color::Dim),
-        )),
+        Delta::Notice(text) => screen.push_lines(ui_compact::note(&text)),
         Delta::Retry(retry) => {
             screen.set_working(&format!("请求重试 {}/{}", retry.attempt, retry.limit))
         }

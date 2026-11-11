@@ -19,7 +19,7 @@ impl Screen {
         self.approval = Some((PanelState::new(&body), sender));
         let _ = crossterm::execute!(self.out, cursor::Hide);
         self.draw_live();
-        let mut tick = tokio::time::interval(std::time::Duration::from_millis(16));
+        let mut tick = tokio::time::interval(super::redraw::FRAME_INTERVAL);
         let decision = loop {
             tokio::select! {
                 decision = &mut receiver => break decision.unwrap_or(Decision::Deny),

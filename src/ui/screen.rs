@@ -323,9 +323,31 @@ impl Screen {
         self.open_detail()
     }
 
-    /// Commands reveal their menu or feedback even while browsing output.
+    /// Close the detail view so a command's own feedback is what the user reads next.
+    ///
+    /// `close_detail` is `pub(super)`; this is the one entry point the agent's command
+    /// dispatcher needs, and keeping it named for the intent is what stops that dispatch
+    /// from reaching into the screen's module.
     pub(crate) fn close_views(&mut self) {
         self.close_detail();
+    }
+
+    /// Make the screen behave as it does on a real terminal.
+    ///
+    /// It also anchors the viewport at the top of a virtual 24-row terminal, which the
+    /// interactive path needs before it will paint a live frame at all.
+    #[cfg(test)]
+    pub(crate) fn pretend_interactive(&mut self) {
+        self.interactive = true;
+        self.width = 80;
+        self.height = 24;
+        self.viewport.start_at(0, 0);
+    }
+
+    /// Redirect the screen's output. Tests capture it; production always writes to stdout.
+    #[cfg(test)]
+    pub(crate) fn set_output(&mut self, out: Box<dyn Write + Send + Sync>) {
+        self.out = out;
     }
 
     /// Keep completed output in native scrollback and remove the composer/footer.
@@ -571,4 +593,4 @@ mod redraw;
 pub use picker::Choice;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

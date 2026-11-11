@@ -25,12 +25,12 @@ mod prune;
 mod run;
 mod summary;
 
-pub use checkpoint::{CheckpointFacts, FileOps, format_file_blocks};
+pub use checkpoint::{CheckpointFacts, FileOps};
 pub use prune::{PruneOutcome, prune_tool_results};
 pub use run::{
     CompactionOutcome, CompactionState, RetryBudget, detect_overflow, looks_like_overflow, run,
 };
-pub use summary::{PreparedSummary, SummaryRequest, prepare_summary};
+pub use summary::{OwnedSummaryRequest, PreparedSummary, SummaryRequest, prepare_summary};
 
 #[cfg(test)]
 mod tests;
@@ -79,6 +79,8 @@ pub enum CompactError {
     TooShort,
     #[error("正在输出，无法压缩")]
     Streaming,
+    #[error("上次压缩被打断，未写入检查点（会话记录完好）")]
+    Cancelled,
     #[error("上一次压缩尚未完成")]
     InProgress,
     #[error("摘要请求失败：{0}")]

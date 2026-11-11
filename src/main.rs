@@ -9,8 +9,8 @@ use clap::Parser;
 use mpi::agent::r#loop::Agent;
 use mpi::cli::{Cli, Command};
 use mpi::config::Config;
+use mpi::ui::compact as ui_compact;
 use mpi::ui::screen::{Action, teardown};
-use mpi::ui::{compact as ui_compact, theme::Color};
 
 fn main() {
     let panic_hook = std::panic::take_hook();
@@ -147,10 +147,9 @@ async fn run_session(cli: Cli) -> anyhow::Result<()> {
     // Piped transcripts retain a resume hint. Interactive sessions restore the shell.
     if !agent.screen.interactive() && !agent.session_deleted() && agent.session().is_saved() {
         let id = agent.session().id();
-        agent.screen.push_lines(ui_compact::note_lines(
-            &format!("继续此会话：pi resume {id}"),
-            mpi::ui::screen::Style::new(Color::Dim),
-        ));
+        agent
+            .screen
+            .push_lines(ui_compact::note(&format!("继续此会话：pi resume {id}")));
     }
     // Restore the terminal before returning, including when a detail view is open.
     agent.screen.leave();
@@ -171,10 +170,9 @@ async fn run_turn_and_drain(
             // is still perfectly usable, and ending the program over one bad request
             // would throw it away. Whatever was queued behind it is still acted on,
             // because it was typed and the user is waiting to see it run.
-            agent.screen.push_lines(ui_compact::note_lines(
-                &format!("本轮失败：{err:#}"),
-                mpi::ui::screen::Style::new(Color::Red),
-            ));
+            agent
+                .screen
+                .push_lines(ui_compact::error(&format!("本轮失败：{err:#}")));
         }
         if agent.wants_exit() {
             return Ok(false);
