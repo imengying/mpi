@@ -144,8 +144,18 @@ async fn run_session(cli: Cli) -> anyhow::Result<()> {
         }
     }
 
-    // Piped transcripts retain a resume hint. Interactive sessions restore the shell.
-    if !agent.screen.interactive() && !agent.session_deleted() && agent.session().is_saved() {
+    // Leave the user something they can act on: the exact command that brings this
+    // conversation back, not the path of the file it happens to live in. The id is the file
+    // stem, so it is already the shortest thing that names the session.
+    //
+    // Interactive sessions get it too. The output stays in the terminal's scrollback now, so
+    // this line is written as ordinary output on the way out rather than dropped with the
+    // live region — without it, quitting leaves no trace of which id to resume.
+    //
+    // After `/delete` there is no session to resume, so nothing is printed — offering a
+    // command for a file that no longer exists would be worse than silence. A session that
+    // never said anything has no file, so there is no command to give either.
+    if !agent.session_deleted() && agent.session().is_saved() {
         let id = agent.session().id();
         agent
             .screen

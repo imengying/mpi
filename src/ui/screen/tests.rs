@@ -183,10 +183,17 @@ fn leaving_preserves_shell_and_session_history_without_the_composer() {
     assert!(!terminal.screen().alternate_screen());
     assert!(terminal.screen().contents().contains("session answer 99"));
     screen.push_lines(vec![Line::plain("queued session output")]);
+    // The resume hint is pushed the same way on the way out, so it lives or dies with this
+    // path: if a queued line were dropped here, quitting would name no session to resume.
+    screen.push_lines(vec![Line::plain("继续此会话：pi resume 01a1c13d")]);
     screen.leave();
     terminal.process(&captured.take());
     let visible = terminal.screen().contents();
     assert!(visible.contains("session answer 99") && visible.contains("queued session output"));
+    assert!(
+        visible.contains("继续此会话：pi resume 01a1c13d"),
+        "the resume hint has to survive the exit: {visible}"
+    );
     assert!(!visible.contains("draft") && !visible.contains("stats"));
     assert_eq!(terminal.screen().cursor_position().1, 0);
     assert_eq!(
