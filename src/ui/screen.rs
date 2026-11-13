@@ -353,7 +353,7 @@ impl Screen {
     /// Keep completed output in native scrollback and remove the composer/footer.
     pub fn leave(&mut self) {
         if self.detail.take().is_some() {
-            let _ = crossterm::execute!(self.out, terminal::LeaveAlternateScreen);
+            let _ = crate::ui::terminal::leave_alternate_screen(&mut self.out);
         }
         let restore_history = if let Some((mut panel, _)) = self.approval.take() {
             panel.clear(&mut self.out);
@@ -363,9 +363,15 @@ impl Screen {
         };
         self.picker = None;
         if !self.interactive || restore_history || self.printed < self.blocks.len() {
+            // Interactive sessions still need the region brought up to date, but it must not
+            // be left behind: `erase_live` below takes it down again. The blocks themselves
+            // reach the terminal through this call, which is why it has to happen before the
+            // erase rather than instead of it.
             self.commit();
         }
         self.erase_live();
+        // Anything that only became "printed" through the call above is already on screen;
+        // nothing else is written here.
         let _ = self.out.flush();
     }
 

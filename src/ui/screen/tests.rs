@@ -214,6 +214,64 @@ fn leaving_preserves_shell_and_session_history_without_the_composer() {
     );
 }
 
+/// The exit path the agent actually takes: a turn has finished and been painted, then the
+/// resume hint is queued with **no flush in between**, and the session ends. The hint has to
+/// reach the terminal, and the composer and footer must not survive underneath it.
+#[test]
+fn a_queued_resume_hint_reaches_the_terminal_without_the_composer() {
+    let mut terminal = vt100::Parser::new(nz(20), nz(60), 300);
+    terminal.process(b"shell history\r\noriginal prompt> ");
+    let captured = CapturedOutput::default();
+    let mut screen = screen();
+    screen.out = Box::new(captured.clone());
+    screen.interactive = true;
+    screen.viewport.start_at(0, 0);
+    set_input(&mut screen, "unsent draft");
+    screen.set_footer(vec![Line::plain("directory"), Line::plain("stats")]);
+    for index in 0..30 {
+        screen.push_lines(vec![Line::plain(format!("answer {index}"))]);
+    }
+    screen.flush();
+    terminal.process(&captured.take());
+    // Exactly what main.rs does on the way out, with nothing rendered in between.
+    screen.push_lines(vec![Line::plain(
+        "继续此会话：pi resume 01a1d415-b467-7421-94ac",
+    )]);
+    screen.leave();
+    terminal.process(&captured.take());
+    let visible = terminal.screen().contents();
+    assert!(
+        visible.contains("继续此会话：pi resume 01a1d415"),
+        "the resume hint has to survive the exit: {visible}"
+    );
+    assert!(
+        !visible.contains("unsent draft"),
+        "the composer must not survive underneath the hint: {visible}"
+    );
+    assert!(
+        !visible.contains("stats"),
+        "the footer must not survive underneath the hint: {visible}"
+    );
+    assert!(
+        !visible.contains("answer 29\nanswer"),
+        "history must not be printed twice: {visible}"
+    );
+
+    // `main` calls `leave`, and `Screen::drop` calls it again. The second pass must be a
+    // no-op: it is what used to put the composer and footer back under the hint.
+    screen.leave();
+    terminal.process(&captured.take());
+    let visible = terminal.screen().contents();
+    assert!(
+        visible.contains("继续此会话：pi resume 01a1d415"),
+        "a second leave must not erase what the first one printed: {visible}"
+    );
+    assert!(
+        !visible.contains("unsent draft") && !visible.contains("stats"),
+        "a second leave must not repaint the composer: {visible}"
+    );
+}
+
 #[test]
 fn streaming_blocks_commit_once_and_remain_in_native_scrollback() {
     let mut screen = screen();

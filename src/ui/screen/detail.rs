@@ -90,7 +90,7 @@ impl Screen {
             return false;
         }
         self.draw_live();
-        let _ = crossterm::execute!(self.out, terminal::EnterAlternateScreen, cursor::Hide);
+        let _ = crate::ui::terminal::enter_alternate_screen(&mut self.out);
         self.detail = Some(Detail {
             index,
             offset: 0,
@@ -112,7 +112,7 @@ impl Screen {
         if self.detail.take().is_none() {
             return;
         }
-        let _ = crossterm::execute!(self.out, terminal::LeaveAlternateScreen, cursor::Show);
+        let _ = crate::ui::terminal::leave_alternate_screen(&mut self.out);
         self.draw_live();
     }
 

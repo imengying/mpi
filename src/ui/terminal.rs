@@ -4,7 +4,7 @@
 
 use std::io::{IsTerminal, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 use crossterm::{cursor, event, terminal};
 
@@ -66,6 +66,29 @@ pub(crate) fn ensure_raw_mode() -> std::io::Result<()> {
     result
 }
 
+/// Whether the alternate screen is currently ours, so teardown knows whether to leave it.
+///
+/// The session itself never uses the alternate screen — completed output belongs in native
+/// scrollback — but the tool-detail browser does. Leaving a screen we never entered is not a
+/// no-op: `1049l` restores whatever the terminal showed *before*, which would take the
+/// resume hint with it.
+static IN_ALTERNATE_SCREEN: AtomicBool = AtomicBool::new(false);
+
+/// Take the alternate screen for a full-screen view, remembering that it is ours.
+pub(crate) fn enter_alternate_screen(out: &mut impl Write) -> std::io::Result<()> {
+    crossterm::execute!(out, terminal::EnterAlternateScreen, cursor::Hide)?;
+    IN_ALTERNATE_SCREEN.store(true, Ordering::Relaxed);
+    Ok(())
+}
+
+/// Give it back. Safe to call when no view is open.
+pub(crate) fn leave_alternate_screen(out: &mut impl Write) -> std::io::Result<()> {
+    if !IN_ALTERNATE_SCREEN.swap(false, Ordering::Relaxed) {
+        return Ok(());
+    }
+    crossterm::execute!(out, terminal::LeaveAlternateScreen, cursor::Show)
+}
+
 /// Leave the terminal clean when pi exits. Piped output gets no escape sequences.
 pub fn teardown() {
     let active = terminal::is_raw_mode_enabled().unwrap_or(false);
@@ -80,9 +103,10 @@ pub fn teardown() {
         event::DisableBracketedPaste,
         event::DisableMouseCapture,
         cursor::Show,
-        terminal::EndSynchronizedUpdate,
-        terminal::LeaveAlternateScreen
+        terminal::EndSynchronizedUpdate
     );
+    // Only if a view still holds it — a panic inside the detail browser, say.
+    let _ = leave_alternate_screen(&mut out);
     let _ = out.flush();
 }
 
