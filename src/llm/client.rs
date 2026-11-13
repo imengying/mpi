@@ -32,6 +32,26 @@ pub struct Client {
 const DEFAULT_REQUEST_RETRIES: u32 = 5;
 const DEFAULT_STREAM_RETRIES: u32 = 2;
 
+/// Ceiling on a buffered response body, and on a single SSE frame.
+///
+/// The two limits exist for the same reason: a gateway that answers a request with a huge
+/// body (a proxied HTML error page, a runaway tool payload) must not be able to fill memory
+/// before anything looks at it. Sized far above a legitimate answer.
+const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
+/// What an error body is allowed to occupy. An error is a sentence, not a document, and the
+/// only part of it that reaches the user is `describe_error`'s summary.
+const MAX_ERROR_BYTES: usize = 64 * 1024;
+
+/// The message a runaway frame produces. One constructor so the limit and the number in the
+/// text cannot disagree.
+fn frame_too_large() -> LlmError {
+    LlmError::Decode(format!(
+        "SSE 单帧超过 {} MiB",
+        MAX_RESPONSE_BYTES / (1024 * 1024)
+    ))
+}
+
 /// The first wait, doubling per attempt: 0.5s, 1s, 2s, 4s, 8s. About 15s of patience.
 ///
 /// Under `cfg(test)` it is a millisecond, so a test that exhausts the budget — or proves a
@@ -317,7 +337,7 @@ impl Client {
         let status = response.status();
         if !status.is_success() {
             let retry_after = retry_after(&response);
-            let text = bounded_body(response, idle, 64 * 1024)
+            let text = bounded_body(response, idle, MAX_ERROR_BYTES)
                 .await
                 .unwrap_or_else(|err| err.to_string());
             return Attempt::Failed {
@@ -379,8 +399,8 @@ impl Client {
                     break;
                 }
                 tokio::task::yield_now().await;
-                if buffer.len() > 8 * 1024 * 1024 {
-                    interruption = Some("SSE 单帧超过 8 MiB".into());
+                if buffer.len() > MAX_RESPONSE_BYTES {
+                    interruption = Some(frame_too_large().to_string());
                     break;
                 }
             }
@@ -477,9 +497,9 @@ impl Client {
             })?;
         let status = response.status();
         let limit = if status.is_success() {
-            8 * 1024 * 1024
+            MAX_RESPONSE_BYTES
         } else {
-            64 * 1024
+            MAX_ERROR_BYTES
         };
         let text = bounded_body(response, idle, limit).await?;
         if !status.is_success() {
@@ -680,8 +700,8 @@ fn drain_sse(
             None
         });
         let Some(end) = end else { break };
-        if end > 8 * 1024 * 1024 {
-            return Err(LlmError::Decode("SSE 单帧超过 8 MiB".into()));
+        if end > MAX_RESPONSE_BYTES {
+            return Err(frame_too_large());
         }
         let frame =
             std::str::from_utf8(&rest[..end]).map_err(|err| LlmError::Decode(err.to_string()))?;

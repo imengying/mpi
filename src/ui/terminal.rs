@@ -39,10 +39,18 @@ pub fn watch_exit_signals() -> std::io::Result<tokio::task::JoinHandle<()>> {
     }))
 }
 
+/// Whether both ends of the session are a terminal.
+///
+/// The one definition of "interactive": reading keys needs a terminal to read them from, and
+/// drawing needs one to write to, so either missing means the piped path.
+pub fn is_interactive() -> bool {
+    std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+}
+
 /// Raw mode belongs to the interactive session and ends at teardown.
 /// Nested pickers and approval panels reuse it without changing its lifetime.
 pub(crate) fn ensure_raw_mode() -> std::io::Result<()> {
-    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+    if !is_interactive() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotConnected,
             "交互终端不可用",

@@ -179,6 +179,22 @@ fn restored_selection(config: &Config, session: &Session) -> anyhow::Result<(Str
     Ok((model_spec, level))
 }
 
+/// The two pieces every constructor builds the same way.
+///
+/// A screen that has already taken the terminal when the session is interactive, and a
+/// client. Kept in one place because "did we acquire the terminal" is exactly the sort of
+/// step that gets forgotten in the second constructor and only shows up as a broken prompt
+/// on resume.
+fn base_runtime(interactive: bool) -> anyhow::Result<(Screen, Client)> {
+    let client = Client::new()?;
+    let mut screen = Screen::new();
+    if interactive {
+        screen.start_terminal()?;
+    }
+    screen.set_commands(COMMANDS);
+    Ok((screen, client))
+}
+
 impl Agent {
     pub fn new(config: Config, cwd: PathBuf, interactive: bool) -> anyhow::Result<Self> {
         let model_spec = config
@@ -193,12 +209,7 @@ impl Agent {
         };
         let dialect = policy::configured_dialect(&config.shell.path);
         let session = Session::create(&cwd, &model_spec)?;
-        let client = Client::new()?;
-        let mut screen = Screen::new();
-        if interactive {
-            screen.start_terminal()?;
-        }
-        screen.set_commands(COMMANDS);
+        let (mut screen, client) = base_runtime(interactive)?;
         // The session id is deliberately *not* announced here: it is printed on the way out,
         // as part of the command that resumes it, which is the only time it is useful.
         // No `AGENTS.md` means no system message at all: pi has no prompt of its own.
@@ -256,12 +267,7 @@ impl Agent {
         let mut session = Session::open(path)?;
         let (model_spec, level) = restored_selection(&config, &session)?;
         let dialect = policy::configured_dialect(&config.shell.path);
-        let client = Client::new()?;
-        let mut screen = Screen::new();
-        if interactive {
-            screen.start_terminal()?;
-        }
-        screen.set_commands(COMMANDS);
+        let (mut screen, client) = base_runtime(interactive)?;
         // Read from the directory the session is being resumed in: the instructions are
         // about the code being worked on, and that is where the work happens now.
         let system_prompt = system_prompt_from(&cwd);

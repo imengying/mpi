@@ -48,15 +48,9 @@ pub(super) struct Picker {
 impl Screen {
     /// Show a list next to the footer and let the user choose one entry.
     ///
-    /// The highlighted entry starts on the first one, so Enter accept the obvious default.
-    /// Returns `None` for Esc / Ctrl+C / `q`, and the index of the chosen entry otherwise.
-    pub fn pick(&mut self, title: &str, items: &[String]) -> Option<usize> {
-        self.pick_at(title, items, 0)
-    }
-
-    /// Like [`Screen::pick`], with the initial highlight on `initial` (clamped into range).
-    /// The menu for `/model` uses this so the current choice starts highlighted and Enter
-    /// keeps it.
+    /// `initial` is where the highlight starts (clamped into range): `/model` passes the
+    /// current choice so Enter keeps it, while a fresh question passes 0 so Enter accepts
+    /// the obvious default. Returns `None` for Esc / Ctrl+C / `q`.
     pub fn pick_at(&mut self, title: &str, items: &[String], initial: usize) -> Option<usize> {
         let choices: Vec<Choice> = items.iter().map(Choice::new).collect();
         self.pick_choices(title, &choices, initial, "↑↓ 选择 · Enter 确认 · Esc 取消")

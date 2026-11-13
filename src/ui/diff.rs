@@ -57,18 +57,14 @@ pub enum Kind {
     Context,
 }
 
-/// Build the display payload for a replacement.
-pub fn for_edit(before: &str, after: &str) -> Display {
-    build(before, after)
-}
-
-pub fn for_write(before: &str, after: &str) -> Display {
-    build(before, after)
-}
-
-/// A brand-new file has no "before", so every line is an addition.
-pub fn for_new_file(content: &str) -> Display {
-    build("", content)
+/// The diff a tool result carries.
+///
+/// `before` is `None` for a file that did not exist, so every line is an addition. Which tool
+/// asked is not a parameter: `edit` and `write` are different ways of reaching the same pair
+/// of texts, and the diff of two texts depends on the texts alone. Splitting this per tool
+/// meant two functions with identical bodies, which is the shape that drifts.
+pub fn for_tool(before: Option<&str>, after: &str) -> Display {
+    build(before.unwrap_or(""), after)
 }
 
 fn build(before: &str, after: &str) -> Display {
@@ -366,7 +362,7 @@ mod tests {
 
     #[test]
     fn a_small_change_keeps_both_sides() {
-        let display = for_edit("a\nb\nc\n", "a\nB\nc\n");
+        let display = for_tool(Some("a\nb\nc\n"), "a\nB\nc\n");
         assert_eq!(counts(&display), (1, 1));
         let rendered = rows(&display);
         // Both the old and the new line survive, with one line number each — the number the
@@ -383,7 +379,7 @@ mod tests {
         // column, one of which is blank on every single row. On a narrow terminal that spent
         // the width twice and made the numbers alternate sides down a hunk. There is one
         // column now, and every row puts its number in it.
-        let display = for_edit("a\nb\nc\nd\n", "a\nB\nc\nD\n");
+        let display = for_tool(Some("a\nb\nc\nd\n"), "a\nB\nc\nD\n");
         let rendered = rows(&display);
         for row in &rendered {
             let (marker, rest) = row.split_at(1);
@@ -414,7 +410,7 @@ mod tests {
         // number of the addition that replaced it (delete 2414–2417, add 2414 again).
         let before: String = (1..=10).map(|i| format!("line {i}\n")).collect();
         let after = "line 1\nline 2\nline 3\nline 4\nREPLACEMENT\nline 9\nline 10\n";
-        let rendered = rows(&for_edit(&before, after));
+        let rendered = rows(&for_tool(Some(&before), after));
 
         let mut last = 0usize;
         for row in &rendered {
@@ -443,7 +439,7 @@ mod tests {
 
     #[test]
     fn a_new_file_is_all_additions() {
-        let display = for_new_file("one\ntwo\n");
+        let display = for_tool(None, "one\ntwo\n");
         assert_eq!(counts(&display), (2, 0));
     }
 
@@ -459,7 +455,7 @@ mod tests {
         let mut after = before.clone();
         before[250] = "OLD LINE 251\n".into();
         after[250] = "NEW LINE 251\n".into();
-        let display = for_edit(&before.concat(), &after.concat());
+        let display = for_tool(Some(&before.concat()), &after.concat());
         let rendered = rows(&display);
 
         assert_eq!(counts(&display), (1, 1));
@@ -487,7 +483,7 @@ mod tests {
         after[10] = "NEW A\n".into();
         before[150] = "OLD B\n".into();
         after[150] = "NEW B\n".into();
-        let rendered = rows(&for_edit(&before.concat(), &after.concat()));
+        let rendered = rows(&for_tool(Some(&before.concat()), &after.concat()));
 
         assert!(
             rendered.iter().any(|row| row.contains("OLD A")),
@@ -523,7 +519,7 @@ mod tests {
         let mut after = before.clone();
         before[40] = "OLD\n".into();
         after[40] = "NEW\n".into();
-        let rendered = rows(&for_edit(&before.concat(), &after.concat()));
+        let rendered = rows(&for_tool(Some(&before.concat()), &after.concat()));
 
         assert!(
             rendered.iter().any(|row| row.contains("OLD")),
@@ -547,7 +543,7 @@ mod tests {
         // the real file.
         let before: String = (0..MAX_DIFF_LINES).map(|i| format!("old {i}\n")).collect();
         let after: String = (0..MAX_DIFF_LINES).map(|i| format!("new {i}\n")).collect();
-        let display = for_edit(&before, &after);
+        let display = for_tool(Some(&before), &after);
         let rendered = rows(&display);
         assert!(
             rendered.iter().any(|row| row.contains("old 0")),
@@ -589,7 +585,7 @@ mod tests {
         let middle = before.len() / 2;
         before[middle] = "OLD MIDDLE".to_string();
         after[middle] = "NEW MIDDLE".to_string();
-        let display = for_edit(&before.join("\n"), &after.join("\n"));
+        let display = for_tool(Some(&before.join("\n")), &after.join("\n"));
 
         assert_eq!(counts(&display), (1, 1), "one line changed on each side");
         let rendered = rows(&display);
@@ -619,7 +615,7 @@ mod tests {
             .map(|i| format!("line {i}\n"))
             .collect();
         let after = format!("{before}APPENDED\n");
-        let display = for_edit(&before, &after);
+        let display = for_tool(Some(&before), &after);
         assert_eq!(counts(&display), (1, 0));
         assert!(
             rows(&display).iter().any(|row| row.contains("APPENDED")),
@@ -635,7 +631,7 @@ mod tests {
         // newline-stripped lines discarded it, and the line that only differed in its ending
         // came out as both removed and added — the same text on two tinted rows. Keeping each
         // line's terminator with it is what makes these two texts compare as they read.
-        let joined = for_edit("a\nb", "a\nb\n");
+        let joined = for_tool(Some("a\nb"), "a\nb\n");
         assert_eq!(
             counts(&joined),
             (1, 1),
@@ -643,7 +639,7 @@ mod tests {
             rows(&joined)
         );
 
-        let same = for_edit("a\nb\n", "a\nb\n");
+        let same = for_tool(Some("a\nb\n"), "a\nb\n");
         assert_eq!(counts(&same), (0, 0), "identical files differ in nothing");
     }
 
@@ -655,7 +651,7 @@ mod tests {
             .collect();
         let mut after = vec!["HEADER".to_string()];
         after.extend(body.clone());
-        let display = for_edit(&body.join("\n"), &after.join("\n"));
+        let display = for_tool(Some(&body.join("\n")), &after.join("\n"));
         assert_eq!(counts(&display), (1, 0));
         let rendered = rows(&display);
         assert!(
@@ -671,7 +667,7 @@ mod tests {
         // replaced it at the bottom.
         let before: String = (0..MAX_DIFF_LINES).map(|i| format!("old {i}\n")).collect();
         let after: String = (0..MAX_DIFF_LINES).map(|i| format!("new {i}\n")).collect();
-        let rendered = rows(&for_edit(&before, &after));
+        let rendered = rows(&for_tool(Some(&before), &after));
         assert!(
             rendered.iter().any(|row| row.contains("old 0")),
             "the first removal: {rendered:?}"
@@ -695,7 +691,10 @@ mod tests {
 
     #[test]
     fn rendering_keeps_long_source_lines_and_the_screen_wraps_them() {
-        let display = for_edit("short\n", "a much longer replacement line that overflows\n");
+        let display = for_tool(
+            Some("short\n"),
+            "a much longer replacement line that overflows\n",
+        );
         let lines = render(&display);
         assert!(lines.iter().any(|line| {
             line.text()

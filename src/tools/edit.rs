@@ -174,7 +174,7 @@ async fn apply_one(
     observed.forget(&resolved);
     Ok(ToolOutput {
         content: format!("已修改（替换 {replaced} 处）"),
-        display: diff::for_edit(&before, &after),
+        display: diff::for_tool(Some(&before), &after),
         is_error: false,
         duration: None,
         images: Vec::new(),
@@ -503,7 +503,7 @@ async fn apply_batch(
             diff,
             added: a,
             removed: r,
-        } = diff::for_edit(before, after)
+        } = diff::for_tool(Some(before), after)
         else {
             continue;
         };

@@ -98,9 +98,10 @@ impl Agent {
         }
         // A refusal is still reported: the session ends only when the user says so, and the
         // manual command is the one thing they can do about it.
-        let choice = self.screen.pick(
+        let choice = self.screen.pick_at(
             &format!("删除会话「{name}」？"),
             &["不删，继续".to_string(), "是的，删除并退出".to_string()],
+            0,
         );
         // The safe option is highlighted first, so a reflexive Enter keeps the session. No
         // note for it: the session is still on screen, which is the answer to "was it kept?".
@@ -392,7 +393,7 @@ impl Agent {
         let running = job.run(self.client.clone());
         tokio::pin!(running);
         let mut ticker = ticker();
-        let mut dropped_command = None;
+        let mut dropped_command: Option<&str> = None;
         let outcome = loop {
             // Esc is the same key that stops a turn; here it abandons the summary. Text typed
             // meanwhile is queued exactly as it is during a turn — but a slash command is not
@@ -402,16 +403,12 @@ impl Agent {
                 match action {
                     Action::Stop | Action::Interrupt => break Err(CompactError::Cancelled),
                     Action::Line(text) => {
-                        if queue_mid_turn(&mut self.screen, text, Vec::new()).is_some() {
-                            dropped_command =
-                                Some("压缩期间命令不执行；完成后请重新输入".to_string());
-                        }
+                        let command = queue_mid_turn(&mut self.screen, text, Vec::new());
+                        dropped_command = dropped_command.or(command.map(|_| DURING_COMPACTION));
                     }
                     Action::LineWithImages(text, images) => {
-                        if queue_mid_turn(&mut self.screen, text, images).is_some() {
-                            dropped_command =
-                                Some("压缩期间命令不执行；完成后请重新输入".to_string());
-                        }
+                        let command = queue_mid_turn(&mut self.screen, text, images);
+                        dropped_command = dropped_command.or(command.map(|_| DURING_COMPACTION));
                     }
                     action => {
                         // Tool details and picker picks do not dispatch a command, so they are
@@ -439,7 +436,7 @@ impl Agent {
             }
         };
         if let Some(note) = dropped_command {
-            self.screen.push_lines(ui_compact::warning(&note));
+            self.screen.push_lines(ui_compact::warning(note));
         }
         self.screen.clear_working();
         // A cancelled summary never produced a checkpoint, and an interrupted request may have
@@ -536,6 +533,9 @@ impl Agent {
         Ok(())
     }
 }
+
+/// Said once however many commands were typed: the note is about the mode, not each keypress.
+const DURING_COMPACTION: &str = "压缩期间命令不执行；完成后请重新输入";
 
 /// One prepared compaction, owning everything its model call needs.
 ///

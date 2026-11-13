@@ -1392,7 +1392,7 @@ mod tests {
     fn a_diff_block_keeps_red_and_green_rows() {
         let output = ToolOutput {
             content: "已修改 a.rs".into(),
-            display: crate::ui::diff::for_edit("one\ntwo\n", "one\nTWO\n"),
+            display: crate::ui::diff::for_tool(Some("one\ntwo\n"), "one\nTWO\n"),
             is_error: false,
             duration: None,
             images: Vec::new(),
@@ -1447,7 +1447,7 @@ mod tests {
         let after: String = (0..40).map(|i| format!("new {i}\n")).collect();
         let output = ToolOutput {
             content: "已修改 big.rs".into(),
-            display: crate::ui::diff::for_edit(&before, &after),
+            display: crate::ui::diff::for_tool(Some(&before), &after),
             is_error: false,
             duration: None,
             images: Vec::new(),

@@ -35,10 +35,7 @@ pub async fn execute(arguments: &serde_json::Value, cwd: &Path) -> Result<ToolOu
         .await
         .map_err(|err| format!("无法写入：{err}"))?;
     let existed = before.is_some();
-    let display = match &before {
-        Some(before) => diff::for_write(before, content),
-        None => diff::for_new_file(content),
-    };
+    let display = diff::for_tool(before.as_deref(), content);
     let action = if existed { "已覆盖" } else { "已创建" };
     Ok(ToolOutput {
         content: format!("{action}（{} 字节）", content.len()),

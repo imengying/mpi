@@ -262,13 +262,19 @@ impl Screen {
     }
 }
 
+/// How much of a running command's log the live view keeps up with.
+///
+/// A tail rather than the whole file: `bash` output during a build can be hundreds of
+/// megabytes, and only the end of it is what the user is watching for.
+const LIVE_LOG_TAIL_BYTES: u64 = 64 * 1024;
+
 fn read_log_tail(path: &Path) -> std::io::Result<String> {
     use std::io::{Read, Seek, SeekFrom};
     let mut file = std::fs::File::open(path)?;
-    let offset = file.metadata()?.len().saturating_sub(64 * 1024);
+    let offset = file.metadata()?.len().saturating_sub(LIVE_LOG_TAIL_BYTES);
     file.seek(SeekFrom::Start(offset))?;
     let mut bytes = Vec::new();
-    file.take(64 * 1024).read_to_end(&mut bytes)?;
+    file.take(LIVE_LOG_TAIL_BYTES).read_to_end(&mut bytes)?;
     let start = if offset > 0 {
         bytes
             .iter()

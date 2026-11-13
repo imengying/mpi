@@ -9,7 +9,7 @@ pub use crate::ui::terminal::{clear_title, teardown, window_title};
 use crate::ui::text::HistoryRow;
 pub use crate::ui::text::{Bg, Block, Collapsible, Line, Span, Style};
 
-use std::io::{IsTerminal, Write};
+use std::io::Write;
 use std::path::Path;
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -214,7 +214,7 @@ impl Screen {
 
     pub fn new() -> Self {
         let theme = Theme::default();
-        let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+        let interactive = crate::ui::terminal::is_interactive();
         let mut screen = Screen {
             out: Box::new(std::io::stdout()),
             theme,
@@ -386,10 +386,7 @@ impl Screen {
         self.printed = 0;
         self.detail = None;
         self.picker = None;
-        self.streaming_answer = None;
-        self.answer_layout.clear();
-        self.streaming_thinking = None;
-        self.thinking_active = false;
+        self.clear_stream();
         self.running_calls.clear();
         self.running_started = None;
         self.running_log = None;
@@ -508,13 +505,21 @@ impl Screen {
         }
     }
 
-    /// Throw away an in-flight preview without committing anything. Used when a request
-    /// failed: a half-written answer that was never recorded must not stay on screen.
-    pub fn discard_stream(&mut self) {
+    /// Drop the in-flight answer and thinking, plus the layout cached for them.
+    ///
+    /// Four fields that only ever change together: a stream that is gone but whose rows are
+    /// still cached would paint a preview of an answer that no longer exists.
+    fn clear_stream(&mut self) {
         self.streaming_answer = None;
         self.answer_layout.clear();
         self.streaming_thinking = None;
         self.thinking_active = false;
+    }
+
+    /// Throw away an in-flight preview without committing anything. Used when a request
+    /// failed: a half-written answer that was never recorded must not stay on screen.
+    pub fn discard_stream(&mut self) {
+        self.clear_stream();
         self.erase_live();
         let _ = self.out.flush();
     }
